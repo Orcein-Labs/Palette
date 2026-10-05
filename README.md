@@ -1,11 +1,11 @@
 # Palette
 
-A persistent Julia operator surface for interactive work and agent harnesses.
+A persistent Julia operator surface (conceptually similar to Bash or IPython, or could also be equated to DaemonMode.jl or Pluto.jl) for interactive work and agent harnesses.
 Palette keeps bindings across calls, captures results and process output, and
 revives saved state after a kernel restart with an explicit report of what
-survived, changed, or was lost.
+survived, changed, or was lost. It's Jupyter on steroids, basically.
 
-Palette supplies the execution surface. Harnesses such as Cyan provide the
+Palette supplies the execution surface. Harnesses such as Prime-Agent or Hermes provide the
 agent loop, model inference, and orchestration.
 
 ## Use Palette in your chatbot
