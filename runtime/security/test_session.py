@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -244,3 +245,27 @@ class TestAuthorityUnderPersistence(SessionTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadRoots(SessionTestCase):
+    """PALETTE_READ_ROOTS: the kernel reads the host directory at its own
+    path, cannot write it, and sees nothing beside it."""
+
+    def test_a_read_root_is_readable_not_writable_and_nothing_else_appears(self):
+        outside = Path(tempfile.mkdtemp(prefix="palette-read-root-", dir=str(Path.home())))
+        root = outside / "shared"
+        root.mkdir()
+        (root / "data.txt").write_text("from the host\n")
+        (outside / "sibling.txt").write_text("not shared\n")
+        try:
+            with unittest.mock.patch.dict(os.environ, {"PALETTE_READ_ROOTS": str(root)}):
+                with PaletteSession(project_dir=PROJECT_DIR, ceiling={}) as s:
+                    r = s.turn(f'read({str(root / "data.txt")!r}, String)'.replace("'", '"'))
+                    self.assertEqual(r["data"], "from the host\n")
+                    r = s.turn(f'try; write({str(root / "new.txt")!r}, "x"); "wrote"; catch e; "refused"; end'.replace("'", '"'))
+                    self.assertEqual(r["data"], "refused")
+                    r = s.turn(f'isfile({str(outside / "sibling.txt")!r})'.replace("'", '"'))
+                    self.assertIs(r["data"], False)
+            self.assertFalse((root / "new.txt").exists())
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
