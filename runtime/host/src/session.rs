@@ -64,21 +64,23 @@ pub struct PaletteSession {
     stderr_tail: Arc<Mutex<String>>,
     next_request_id: u64,
     server: Option<BrokerServer>,
-    cleanup: Cleanup,
+    cleanser: PaletteCleanser,
     closed: bool,
     /// Set from outside (a signal) to give up waiting on the worker.
     pub stop: Arc<AtomicBool>,
 }
 
+/// Scrubs a session's per-run residue (depot clone, tmp root, socket dir)
+/// between courses without touching the caller's workspace or durable state.
 #[derive(Default)]
-struct Cleanup {
+struct PaletteCleanser {
     depot_clone: Option<PathBuf>,
     tmp_root: Option<PathBuf>,
     short_sock_dir: Option<PathBuf>,
 }
 
-impl Cleanup {
-    fn run(&mut self) {
+impl PaletteCleanser {
+    fn cleanse(&mut self) {
         for p in [self.depot_clone.take(), self.tmp_root.take(), self.short_sock_dir.take()].into_iter().flatten() {
             let _ = fs::remove_dir_all(p);
         }
@@ -97,19 +99,19 @@ fn dead(msg: impl Into<String>) -> SessionError {
 impl PaletteSession {
     pub fn start(o: SessionOptions, stop: Arc<AtomicBool>) -> Result<PaletteSession, SessionError> {
         let session_id = format!("palette-{}", util::hex(16));
-        let mut cleanup = Cleanup::default();
-        match Self::start_inner(&o, &session_id, &mut cleanup, stop) {
+        let mut cleanser = PaletteCleanser::default();
+        match Self::start_inner(&o, &session_id, &mut cleanser, stop) {
             Ok(s) => Ok(s),
             Err(e) => {
                 // A failure anywhere in startup must not leak the depot clone,
                 // the broker's socket or the scratch directories.
-                cleanup.run();
+                cleanser.cleanse();
                 Err(e)
             }
         }
     }
 
-    fn start_inner(o: &SessionOptions, session_id: &str, cleanup: &mut Cleanup, stop: Arc<AtomicBool>)
+    fn start_inner(o: &SessionOptions, session_id: &str, cleanser: &mut PaletteCleanser, stop: Arc<AtomicBool>)
         -> Result<PaletteSession, SessionError> {
         let err = |e: String| dead(e);
         let tmp_root = o.scratch_root.as_deref().map(PathBuf::from).unwrap_or_else(|| util::home().join(".palette-sessions").join(session_id));
@@ -165,7 +167,7 @@ impl PaletteSession {
                 return Err(err(e));
             }
         }
-        cleanup.tmp_root = Some(tmp_root.clone());
+        cleanser.tmp_root = Some(tmp_root.clone());
         let workspace = match task_workspace {
             Some(tw) => tw,
             None => {
@@ -177,7 +179,7 @@ impl PaletteSession {
         let workspace = workspace.to_string_lossy().into_owned();
 
         let depot_clone = sandbox::create_session_depot(None).map_err(err)?;
-        cleanup.depot_clone = Some(depot_clone.clone());
+        cleanser.depot_clone = Some(depot_clone.clone());
 
         // A Unix socket path is limited to 108 bytes; under a long HOME the
         // socket gets a short private directory of its own.
@@ -185,7 +187,7 @@ impl PaletteSession {
         fs::create_dir_all(&broker_root).map_err(|e| err(e.to_string()))?;
         let sock_dir = if broker_root.join("broker.sock").as_os_str().len() > 100 {
             let d = util::mkdtemp("nj-").map_err(|e| err(e.to_string()))?;
-            cleanup.short_sock_dir = Some(d.clone());
+            cleanser.short_sock_dir = Some(d.clone());
             d
         } else {
             broker_root.clone()
@@ -301,7 +303,7 @@ impl PaletteSession {
             stderr_tail,
             next_request_id: 0,
             server: Some(server),
-            cleanup: std::mem::take(cleanup),
+            cleanser: std::mem::take(cleanser),
             closed: false,
             stop,
         };
@@ -451,7 +453,7 @@ impl PaletteSession {
         if let Some(s) = self.server.take() {
             s.shutdown();
         }
-        self.cleanup.run();
+        self.cleanser.cleanse();
     }
 
     pub fn close(&mut self) {
