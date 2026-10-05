@@ -253,6 +253,25 @@ function reconstruction_dependencies(ex)
     return sort!(string.(setdiff(refs, Set(KERNEL_BINDINGS))))
 end
 
+function round_trips(st)
+    text = string(st)
+    reread = try
+        Meta.parse(text)
+    catch
+        return false
+    end
+    return Base.remove_linenums!(deepcopy(reread)) == Base.remove_linenums!(deepcopy(st))
+end
+
+function expr_hex(st)
+    buf = IOBuffer()
+    serialize(buf, st)
+    return bytes2hex(take!(buf))
+end
+
+# A logged definition statement: the Expr itself when it was kept, else its text.
+logged_statement(e) = haskey(e, "expr_hex") ? deserialize(IOBuffer(hex2bytes(e["expr_hex"]))) : Meta.parse(e["code"])
+
 function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Module}=nothing)
     ex = try
         parse_complete(code; filename="call $call")
@@ -264,6 +283,10 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
         kind === nothing && continue
         entry = Dict{String, Any}("call" => call, "kind" => kind, "code" => string(st),
                                   "names" => kind == "using" ? imported_names(st) : defined_names(st), "requires" => reconstruction_dependencies(st))
+        # Expr printing does not always read back (a multi-iterator generator
+        # with a filter prints as `$(Expr(:filter, ...))`). Such a statement is
+        # kept as the Expr itself, so revival rebuilds exactly what ran.
+        round_trips(st) || (entry["expr_hex"] = expr_hex(st))
         if kind == "include"
             path = abspath(WORKSPACE_ROOT[], st.args[2])
             any(e -> e["kind"] == "include" && e["call"] == call && e["path"] == path, DEFINITION_LOG) && continue
@@ -313,7 +336,19 @@ struct Walk
     seen::IdDict{Any, Nothing}
     user::Set{String}
     ids::Set{UInt}
+    # `check_type` result per type: a value holds few distinct types but may
+    # hold millions of objects, and the check scans every loaded module.
+    checked::IdDict{Any, Union{Nothing, String}}
+    visits::Base.RefValue{Int}
+    # Asked every `WALK_YIELD_EVERY` mutable objects; true abandons the walk.
+    give_way::Function
 end
+Walk(mod::Module, seen, user, ids) = Walk(mod, seen, user, ids, IdDict{Any, Union{Nothing, String}}(), Ref(0), () -> false)
+
+# Thrown inside a walk when a waiting request should go first; the snapshot
+# that started it stops and the last complete snapshot stays.
+struct GaveWay <: Exception end
+const WALK_YIELD_EVERY = 4096
 
 const REFUSED_TYPES = (Task, Channel, Condition, Threads.Condition, ReentrantLock, Threads.SpinLock, Timer,
                        Base.Process, Base.ProcessChain, Base.Libc.RawFD, WeakRef, Module, Core.MethodInstance,
@@ -408,6 +443,15 @@ end
 
 function check_type(w::Walk, @nospecialize(T))
     T isa DataType || return nothing
+    # Memoised: every side effect below is an idempotent set insertion, so a
+    # cached answer is the same answer.
+    haskey(w.checked, T) && return w.checked[T]
+    r = check_type_uncached(w, T)
+    w.checked[T] = r
+    return r
+end
+
+function check_type_uncached(w::Walk, T::DataType)
     anonymous_function_type(T) && (r = closure_module_refusal(w, T)) !== nothing && return r
     for p in T.parameters
         p isa Type && (r = check_type(w, p)) !== nothing && return r
@@ -460,7 +504,11 @@ function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
         return nothing
     end
     haskey(w.seen, x) && return nothing
-    ismutable(x) && (w.seen[x] = nothing; push!(w.ids, objectid(x)))
+    if ismutable(x)
+        w.seen[x] = nothing
+        push!(w.ids, objectid(x))
+        (w.visits[] += 1) % WALK_YIELD_EVERY == 0 && w.give_way() && throw(GaveWay())
+    end
     (r = check_type(w, T)) === nothing || return r
     return refusal_struct(w, x)
 end
@@ -606,9 +654,12 @@ returns `nothing`; the last complete snapshot stays.
 function snapshot_state!(call::Int; waiting::Function = () -> false)
     dir = STATE_DIR[]
     isempty(dir) && return nothing
-    give_way() = LAST_SNAPSHOT_SECONDS[] >= SLOW_SNAPSHOT_SECONDS && call - LAST_SAVED_CALL[] < MAX_UNSAVED_CALLS && waiting()
-    give_way() && return nothing
     started = time()
+    # Gives way when this snapshot or the last one is slow: a first slow
+    # snapshot must not hold a waiting request past its deadline either.
+    give_way() = (LAST_SNAPSHOT_SECONDS[] >= SLOW_SNAPSHOT_SECONDS || time() - started >= SLOW_SNAPSHOT_SECONDS) &&
+                 call - LAST_SAVED_CALL[] < MAX_UNSAVED_CALLS && waiting()
+    give_way() && return nothing
     mod = get_kernel_state().eval_module
     consts = Set(n for e in DEFINITION_LOG if e["kind"] == "const" for n in e["names"])
     defnames = Set(n for e in DEFINITION_LOG if e["kind"] in ("def", "include") for n in e["names"])
@@ -641,10 +692,11 @@ function snapshot_state!(call::Int; waiting::Function = () -> false)
             b["class"] = haskey(Base.loaded_modules, Base.PkgId(v)) ? "import" : "runtime"
             b["class"] == "runtime" && (b["reason"] = "a module defined in the session cannot be revived")
         else
-            w = Walk(mod, IdDict{Any, Nothing}(), Set{String}(), Set{UInt}())
+            w = Walk(mod, IdDict{Any, Nothing}(), Set{String}(), Set{UInt}(), IdDict{Any, Union{Nothing, String}}(), Ref(0), give_way)
             why = try
                 refusal(w, v)
             catch e
+                e isa GaveWay && return nothing
                 "it could not be inspected ($(typeof(e)))"
             end
             if why === nothing
@@ -828,7 +880,15 @@ function revive_state!()
                 push!(pending, (file, st, e))
             end
         else
-            push!(pending, (nothing, Meta.parse(e["code"]), e))
+            # One unreadable definition costs only the names it binds, not the
+            # whole revival.
+            st = try
+                logged_statement(e)
+            catch err
+                foreach(n -> errors[n] = "its definition could not be read back ($(typeof(err)))", e["names"])
+                continue
+            end
+            push!(pending, (nothing, st, e))
         end
     end
     # Keep original order among replacements of the same binding, but build
