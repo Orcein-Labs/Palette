@@ -100,6 +100,16 @@ pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
             }
             // A grandchild's own ceiling is checked against this child's when it is spawned.
             "spawn_child_worker" => {}
+            "host_command" => {
+                // A child may keep a subset of the parent's commands, each
+                // exactly as the parent defines it: no new argv, cwd or timeout.
+                let (rcmds, pcmds) = (obj(rc.get("commands").unwrap_or(&Value::Null)), obj(pc.get("commands").unwrap_or(&Value::Null)));
+                for (name, spec) in &rcmds {
+                    if pcmds.get(name) != Some(spec) {
+                        return (false, format!("requested host_command {} is not one of the parent's commands as the parent defines it", q(name)));
+                    }
+                }
+            }
             "host_request" => {
                 let Some(rt) = str_list(rc.get("allowed_types")).filter(|_| rc.get("allowed_types").is_some_and(Value::is_array)) else {
                     return (false, "requested host_request must name allowed_types explicitly (no unrestricted child grant)".into());
@@ -127,7 +137,15 @@ pub struct Broker {
     host_bridge: Mutex<Option<HostBridge>>,
     log_lock: Mutex<()>,
     depot_lock: Mutex<()>,
+    // host_command jobs started with action "start"; dropping the broker
+    // (the session ending) kills any still running.
+    jobs: Mutex<BTreeMap<String, sandbox::HostJob>>,
 }
+
+/// At most this many host_command jobs run at once per session.
+const MAX_HOST_JOBS: usize = 8;
+const HOST_COMMAND_MAX_TIMEOUT_S: f64 = 4.0 * 3600.0;
+const HOST_COMMAND_OUTPUT: usize = 16 * 1024;
 
 pub struct BrokerConfig {
     pub ceiling: Value,
@@ -155,6 +173,7 @@ impl Broker {
             host_bridge: Mutex::new(None),
             log_lock: Mutex::new(()),
             depot_lock: Mutex::new(()),
+            jobs: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -423,6 +442,84 @@ impl Broker {
         Ok(json!({"digests": digests, "observer": "host", "algorithm": "sha256"}))
     }
 
+    /// Run a command the operator named in the ceiling, on the host, outside
+    /// the sandbox: the way a kernel reaches a GPU, a renderer or a build it
+    /// cannot run itself. The ceiling fixes each command's argv (absolute
+    /// program), cwd and timeout; a request only picks a command by name,
+    /// and passes arguments only to a command that allows them. Never a
+    /// shell. Actions: "run" (default) waits for the result; "start"
+    /// returns a job id at once, for commands longer than a turn; "poll"
+    /// with that id returns {"running": true} or the result.
+    /// Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
+    ///   "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}
+    fn host_command(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
+        let cap = self.cap("host_command").ok_or_else(|| Denied("host_command not in this session's ceiling".into()))?;
+        let action = p.get("action").and_then(Value::as_str).unwrap_or("run");
+        if action == "poll" {
+            let id = p.get("job").and_then(Value::as_str).ok_or_else(|| Denied("host_command poll requires a string 'job'".into()))?;
+            let mut jobs = self.jobs.lock().unwrap();
+            let job = jobs.get_mut(id).ok_or_else(|| Denied(format!("no running host_command job {}", q(id))))?;
+            return match job.poll().map_err(Internal)? {
+                None => Ok(json!({"job": id, "running": true})),
+                Some(r) => {
+                    jobs.remove(id);
+                    Ok(host_job_json(Some(id), &r))
+                }
+            };
+        }
+        if action != "run" && action != "start" {
+            return Err(Denied(format!("host_command action must be run, start or poll, not {}", q(action))));
+        }
+        let name = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())
+            .ok_or_else(|| Denied("host_command requires a non-empty string 'name'".into()))?;
+        let commands = obj(cap.get("commands").unwrap_or(&Value::Null));
+        let spec = obj(commands.get(name).ok_or_else(|| Denied(format!("host command {} is not in this session's ceiling", q(name))))?);
+        let misconfigured = |why: &str| Denied(format!("host command {} is misconfigured in the ceiling: {why}", q(name)));
+        let mut argv = str_list(spec.get("argv")).filter(|a| !a.is_empty() && spec["argv"].as_array().is_some_and(|x| x.len() == a.len()))
+            .ok_or_else(|| misconfigured("'argv' must be a non-empty list of strings"))?;
+        if !Path::new(&argv[0]).is_absolute() || !Path::new(&argv[0]).is_file() {
+            return Err(misconfigured("argv[0] must be an absolute path to a program"));
+        }
+        let cwd = spec.get("cwd").and_then(Value::as_str).map(PathBuf::from)
+            .filter(|c| c.is_absolute() && c.is_dir()).ok_or_else(|| misconfigured("'cwd' must be an absolute directory"))?;
+        let timeout_s = spec.get("timeout_s").map(|t| t.as_f64().filter(|t| *t > 0.0 && *t <= HOST_COMMAND_MAX_TIMEOUT_S))
+            .unwrap_or(Some(60.0)).ok_or_else(|| misconfigured("'timeout_s' must be a number in (0, 14400]"))?;
+        let args = match p.get("args") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => {
+                let args: Vec<String> = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                if args.len() != a.len() {
+                    return Err(Denied("host_command 'args' must be a list of strings".into()));
+                }
+                args
+            }
+            Some(_) => return Err(Denied("host_command 'args' must be a list of strings".into())),
+        };
+        if !args.is_empty() && spec.get("extra_args").and_then(Value::as_bool) != Some(true) {
+            return Err(Denied(format!("host command {} takes no arguments (its ceiling entry does not set extra_args)", q(name))));
+        }
+        if args.len() > 64 || args.iter().any(|a| a.contains('\0') || a.len() > 4096) {
+            return Err(Denied("host_command accepts at most 64 arguments of at most 4096 bytes, without NUL".into()));
+        }
+        argv.extend(args);
+        let timeout = Duration::from_secs_f64(timeout_s);
+        if action == "start" {
+            let mut jobs = self.jobs.lock().unwrap();
+            if jobs.len() >= MAX_HOST_JOBS {
+                return Err(Denied(format!("at most {MAX_HOST_JOBS} host_command jobs may run at once; poll one to completion first")));
+            }
+            let job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
+            let id = util::hex(16);
+            jobs.insert(id.clone(), job);
+            return Ok(json!({"job": id, "name": name, "running": true}));
+        }
+        let mut job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
+        let r = job.wait().map_err(Internal)?;
+        let mut v = host_job_json(None, &r);
+        v["name"] = json!(name);
+        Ok(v)
+    }
+
     pub fn handle_request(&self, req: &Value) -> Value {
         let req_id = req.get("id").cloned().unwrap_or_else(|| json!(util::uuid4()));
         let category = req.get("category").cloned().unwrap_or(Value::Null);
@@ -435,6 +532,7 @@ impl Broker {
             Some("spawn_child_worker") => self.spawn_child_worker(&p),
             Some("host_request") => self.host_request(&p),
             Some("fs_digest") => self.fs_digest(&p),
+            Some("host_command") => self.host_command(&p),
             _ => Err(Denied(format!("unknown capability category: {}", py_repr(&category)))),
         };
         let (approved, result, reason) = match outcome {
@@ -470,6 +568,15 @@ impl Broker {
 
 /// Stream a file through SHA-256 in 1 MiB chunks, as the Python broker does,
 /// and report (hex, bytes, mtime in seconds since the epoch).
+fn host_job_json(job: Option<&str>, r: &sandbox::HostJobResult) -> Value {
+    let mut v = json!({"returncode": r.returncode, "timed_out": r.timed_out, "seconds": (r.seconds * 1000.0).round() / 1000.0,
+                       "stdout": r.stdout, "stderr": r.stderr, "running": false});
+    if let Some(id) = job {
+        v["job"] = json!(id);
+    }
+    v
+}
+
 fn sha256_file(path: &Path) -> std::io::Result<(String, u64, f64)> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -772,4 +879,133 @@ mod tests {
         assert!(outcomes.contains(&true));
         assert!(outcomes.contains(&false));
     }
+
+    fn cmd_broker(dir: &Path, commands: Value) -> Broker {
+        broker(json!({"host_command": {"commands": commands}}), &dir.join("receipts.jsonl"))
+    }
+
+    fn cmd(b: &Broker, params: Value) -> Value {
+        b.handle_request(&json!({"category": "host_command", "params": params}))
+    }
+
+    /// Gone, or a zombie waiting for init: no longer running either way.
+    fn pid_dead(pid: &str) -> bool {
+        for _ in 0..100 {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => return true,
+                Ok(stat) if stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z') => return true,
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn host_command_runs_a_named_command_with_its_fixed_argv_and_cwd() {
+        let d = tmpdir("hostcmd-run");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "echo": {"argv": ["/bin/echo", "fixed"], "cwd": dir, "extra_args": true},
+            "pwd": {"argv": ["/bin/pwd"], "cwd": dir},
+        }));
+        let r = cmd(&b, json!({"name": "echo", "args": ["one", "two words"]}));
+        assert_eq!(r["approved"], json!(true), "{r}");
+        assert_eq!(r["result"]["stdout"], json!("fixed one two words\n"));
+        assert_eq!(r["result"]["returncode"], json!(0));
+        let r = cmd(&b, json!({"name": "pwd"}));
+        assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), fs::canonicalize(&d.0).unwrap().to_string_lossy());
+        // Every request is receipted, approved or not.
+        cmd(&b, json!({"name": "nope"}));
+        let receipts = fs::read_to_string(d.0.join("receipts.jsonl")).unwrap();
+        assert_eq!(receipts.lines().filter(|l| l.contains("\"host_command\"")).count(), 3);
+    }
+
+    #[test]
+    fn host_command_refuses_unnamed_commands_unasked_args_and_bad_specs() {
+        let d = tmpdir("hostcmd-deny");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "pwd": {"argv": ["/bin/pwd"], "cwd": dir},
+            "relative": {"argv": ["sh", "-c", "true"], "cwd": dir},
+            "nocwd": {"argv": ["/bin/true"]},
+            "slow": {"argv": ["/bin/true"], "cwd": dir, "timeout_s": 999999},
+        }));
+        let reason = |params: Value| cmd(&b, params)["reason"].as_str().unwrap_or("APPROVED").to_string();
+        assert!(reason(json!({"name": "rm"})).contains("not in this session's ceiling"));
+        assert!(reason(json!({"name": "pwd", "args": ["-P"]})).contains("takes no arguments"));
+        assert!(reason(json!({"name": "pwd", "args": "-P"})).contains("list of strings"));
+        assert!(reason(json!({"name": "relative"})).contains("absolute path"));
+        assert!(reason(json!({"name": "nocwd"})).contains("'cwd'"));
+        assert!(reason(json!({"name": "slow"})).contains("timeout_s"));
+        assert!(reason(json!({"name": "pwd", "action": "sudo"})).contains("run, start or poll"));
+        let none = broker(json!({}), &d.0.join("r2.jsonl"));
+        assert_eq!(cmd(&none, json!({"name": "pwd"}))["approved"], json!(false));
+    }
+
+    #[test]
+    fn host_command_timeout_kills_the_whole_process_group() {
+        let d = tmpdir("hostcmd-timeout");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": dir, "timeout_s": 0.5},
+        }));
+        let started = std::time::Instant::now();
+        let r = cmd(&b, json!({"name": "hang"}));
+        assert_eq!(r["result"]["timed_out"], json!(true), "{r}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let helper = fs::read_to_string(d.0.join("helper.pid")).unwrap();
+        assert!(pid_dead(helper.trim()), "the backgrounded helper outlived the timeout");
+    }
+
+    #[test]
+    fn host_command_helpers_do_not_outlive_a_finished_command() {
+        let d = tmpdir("hostcmd-orphan");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "spawn": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $!"], "cwd": dir, "timeout_s": 30},
+        }));
+        let started = std::time::Instant::now();
+        let r = cmd(&b, json!({"name": "spawn"}));
+        assert_eq!(r["result"]["returncode"], json!(0), "{r}");
+        assert!(started.elapsed() < Duration::from_secs(5), "an orphan's open pipe held the reply");
+        assert!(pid_dead(r["result"]["stdout"].as_str().unwrap().trim()));
+    }
+
+    #[test]
+    fn host_command_start_and_poll_for_work_longer_than_a_turn() {
+        let d = tmpdir("hostcmd-job");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "job": {"argv": ["/bin/sh", "-c", "sleep 0.4; echo done"], "cwd": dir},
+            "long": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > long.pid; wait"], "cwd": dir},
+        }));
+        let r = cmd(&b, json!({"name": "job", "action": "start"}));
+        let id = r["result"]["job"].as_str().unwrap().to_string();
+        assert_eq!(r["result"]["running"], json!(true));
+        assert_eq!(cmd(&b, json!({"action": "poll", "job": id}))["result"]["running"], json!(true));
+        std::thread::sleep(Duration::from_millis(700));
+        let r = cmd(&b, json!({"action": "poll", "job": id}));
+        assert_eq!(r["result"]["running"], json!(false), "{r}");
+        assert_eq!(r["result"]["stdout"], json!("done\n"));
+        assert!(cmd(&b, json!({"action": "poll", "job": id}))["reason"].as_str().unwrap().contains("no running"));
+        // A session that ends kills the jobs it started.
+        cmd(&b, json!({"name": "long", "action": "start"}));
+        std::thread::sleep(Duration::from_millis(200));
+        let helper = fs::read_to_string(d.0.join("long.pid")).unwrap();
+        drop(b);
+        assert!(pid_dead(helper.trim()), "a job outlived its session");
+    }
+
+    #[test]
+    fn child_ceiling_keeps_only_parent_commands_unchanged() {
+        let parent = json!({"host_command": {"commands": {"render": {"argv": ["/bin/true"], "cwd": "/tmp"}}}});
+        assert!(ceiling_is_subset(&json!({"host_command": {"commands": {}}}), &parent).0);
+        assert!(ceiling_is_subset(&parent, &parent).0);
+        let widened = json!({"host_command": {"commands": {"render": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}});
+        assert!(!ceiling_is_subset(&widened, &parent).0);
+        let extra = json!({"host_command": {"commands": {"shell": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}});
+        assert!(!ceiling_is_subset(&extra, &parent).0);
+        assert!(!ceiling_is_subset(&parent, &json!({})).0);
+    }
+
 }

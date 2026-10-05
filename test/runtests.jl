@@ -484,11 +484,13 @@ end
     r3e = execute(EphemeralTool("Core.eval(Base, :(function show(io::IO, x::Int); print(io, \"PWNED2\"); end))"))
     @test r3e.result.success  # succeeds -- this IS the documented open gap
     @test sprint(show, 42) != "42"  # Base.show really is compromised at this point
-    # Restore Base.show can't be undone (Julia has no method deletion) --
-    # this test necessarily leaves Base.show permanently altered for the
-    # rest of THIS process. Acceptable here (test runs in its own `julia
-    # Pkg.test()` process, never reused), but never call this pattern
-    # against a persistent session worth continuing to trust.
+    # Undo it: `Base.delete_method` removes the injected method and integers
+    # print through Base's own again. Leaving it in place made every later
+    # test in this process print integers as "PWNED2" (Palette seam S-7: it
+    # broke Expr round-trip checks and the test summary's own counts). Never
+    # run this pattern against a persistent session worth continuing to trust.
+    Base.delete_method(which(show, (IO, Int)))
+    @test sprint(show, 42) == "42"
 
     # `using` alone (no import) remains fully unrestricted -- ephemeral
     # tools keep unbounded power to USE anything, only extension is guarded
@@ -553,4 +555,61 @@ end
     # the receipt log keeps outcomes, not values
     run("zeros(10^6)")
     @test get_kernel_state().receipt_log[end].result.data === nothing
+end
+
+@testset "Snapshot of a large value stays fast (seam S-2)" begin
+    # A non-empty workspace root is what made `check_type` scan every loaded
+    # module once per walked object (77 s for 100k objects); ephemeral
+    # processes have an empty root and never showed it.
+    reset_kernel_state()
+    old_root, old_state = Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[]
+    Palette.WORKSPACE_ROOT[] = mktempdir()
+    Palette.STATE_DIR[] = mktempdir()
+    try
+        @test execute(ExecuteCode("big = Any[Any[Float64(i), Float64(i + 1)] for i in 1:100_000]; length(big)")).result.data == 100_000
+        Palette.snapshot_state!(1)                       # compile once
+        started = time()
+        manifest = Palette.snapshot_state!(2)
+        @test manifest !== nothing
+        @test time() - started < 5.0
+    finally
+        Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[] = old_root, old_state
+    end
+end
+
+@testset "A definition that does not print back is kept exactly (seam S-3)" begin
+    st = Meta.parse("meanrgb(I) = [sum(Float64(I[ch, r, c]) for r in 1:2, c in 1:2 if r == c) for ch in 1:3]")
+    @test !Palette.round_trips(st)                       # Julia prints it as $(Expr(:filter, ...))
+    @test Palette.round_trips(Meta.parse("f(x) = x + 1"))
+    entry = Dict{String,Any}("code" => string(st), "expr_hex" => Palette.expr_hex(st))
+    @test Base.remove_linenums!(deepcopy(Palette.logged_statement(entry))) == Base.remove_linenums!(deepcopy(st))
+    # Logged as the session loop logs a call: the entry carries the Expr.
+    empty!(Palette.DEFINITION_LOG)
+    Palette.log_definitions!("meanrgb(I) = [sum(Float64(I[ch, r, c]) for r in 1:2, c in 1:2 if r == c) for ch in 1:3]", 1)
+    logged = Palette.DEFINITION_LOG[end]
+    @test haskey(logged, "expr_hex")
+    @test Base.remove_linenums!(deepcopy(Palette.logged_statement(logged))) == Base.remove_linenums!(deepcopy(st))
+end
+
+@testset "Walk verdicts come from the type, cached per walk" begin
+    reset_kernel_state()
+    mod = get_kernel_state().eval_module
+    execute(ExecuteCode("mutable struct WalkBox; v::Any; end"))
+    Box = getglobal(mod, :WalkBox)
+    cases = Any[
+        (1, nothing), ("s", nothing), (big(2)^70, nothing), (r"a+", nothing), (IOBuffer("x"), nothing),
+        (Task(() -> 1), "a Task cannot be revived"), (Ptr{Cvoid}(0), "it holds a pointer"),
+        (devnull, "an open DevNull cannot be revived"), ([C_NULL], "its elements hold pointers"),
+        (Any[1, Task(() -> 2)], "a Task cannot be revived"), (Dict(1 => Channel(1)), "a Channel cannot be revived"),
+        (Box(Box(1)), nothing), (sin, nothing), (x -> x + 1, nothing), (Int, nothing),
+    ]
+    w = Palette.Walk(mod, IdDict{Any,Nothing}(), Set{String}(), Set{UInt}())
+    for pass in 1:2                      # the second pass answers from the type cache
+        for (v, expected) in cases
+            empty!(w.seen)
+            @test Palette.refusal(w, v) == expected
+        end
+    end
+    @test "WalkBox" in w.user
+    @test w.kinds[Vector{Any}] === :object && w.kinds[Int] === nothing
 end

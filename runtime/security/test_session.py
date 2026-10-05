@@ -12,11 +12,13 @@ Run:
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -244,3 +246,69 @@ class TestAuthorityUnderPersistence(SessionTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReadRoots(SessionTestCase):
+    """PALETTE_READ_ROOTS: the kernel reads the host directory at its own
+    path, cannot write it, and sees nothing beside it."""
+
+    def test_a_read_root_is_readable_not_writable_and_nothing_else_appears(self):
+        outside = Path(tempfile.mkdtemp(prefix="palette-read-root-", dir=str(Path.home())))
+        root = outside / "shared"
+        root.mkdir()
+        (root / "data.txt").write_text("from the host\n")
+        (outside / "sibling.txt").write_text("not shared\n")
+        try:
+            with unittest.mock.patch.dict(os.environ, {"PALETTE_READ_ROOTS": str(root)}):
+                with PaletteSession(project_dir=PROJECT_DIR, ceiling={}) as s:
+                    r = s.turn(f'read({str(root / "data.txt")!r}, String)'.replace("'", '"'))
+                    self.assertEqual(r["data"], "from the host\n")
+                    r = s.turn(f'try; write({str(root / "new.txt")!r}, "x"); "wrote"; catch e; "refused"; end'.replace("'", '"'))
+                    self.assertEqual(r["data"], "refused")
+                    r = s.turn(f'isfile({str(outside / "sibling.txt")!r})'.replace("'", '"'))
+                    self.assertIs(r["data"], False)
+            self.assertFalse((root / "new.txt").exists())
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+
+class TestHostCommand(SessionTestCase):
+    """host_command end to end: turn code -> broker -> a host process the
+    sandbox could not start itself."""
+
+    def test_turn_code_runs_only_the_commands_its_ceiling_names(self):
+        outside = Path(tempfile.mkdtemp(prefix="palette-host-command-", dir=str(Path.home())))
+        (outside / "marker.txt").write_text("host side\n")
+        os.mkfifo(outside / "started")
+        os.mkfifo(outside / "go")
+        ceiling = {"host_command": {"commands": {
+            "cat-marker": {"argv": ["/bin/cat", "marker.txt"], "cwd": str(outside), "timeout_s": 10},
+            "echo": {"argv": ["/bin/echo"], "cwd": str(outside), "extra_args": True},
+            "gated": {"argv": ["/bin/sh", "-c", "echo $$ > started; read line < go; echo finished"], "cwd": str(outside)},
+        }}}
+        try:
+            with PaletteSession(project_dir=PROJECT_DIR, ceiling=ceiling) as s:
+                # The sandbox cannot see the directory; the host command can.
+                self.assertIs(s.turn(f'isdir("{outside}")')["data"], False)
+                self.assertEqual(s.turn('Palette.host_command("cat-marker")["stdout"]')["data"], "host side\n")
+                self.assertEqual(s.turn('Palette.host_command("echo", "a", "b c")["stdout"]')["data"], "a b c\n")
+                r = s.turn('try; Palette.host_command("cat-marker", "/etc/shadow"); catch e; sprint(showerror, e); end')
+                self.assertIn("takes no arguments", r["data"])
+                r = s.turn('try; Palette.host_command("sh"); catch e; sprint(showerror, e); end')
+                self.assertIn("not in this session's ceiling", r["data"])
+                s.turn('job = Palette.host_command("gated"; wait=false)["job"]')
+                with open(outside / "started") as f:      # the job is running, blocked on `go`
+                    shell = int(f.read())
+                self.assertIs(s.turn('Palette.host_command_poll(job)["running"]')["data"], True)
+                with open(outside / "go", "w") as f:
+                    f.write("go\n")
+                fd = os.pidfd_open(shell)
+                try:
+                    self.assertTrue(select.select([fd], [], [], 10)[0])
+                finally:
+                    os.close(fd)
+                r = s.turn('Palette.host_command_poll(job)')
+                self.assertIs(r["data"]["running"], False)
+                self.assertEqual(r["data"]["stdout"], "finished\n")
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)

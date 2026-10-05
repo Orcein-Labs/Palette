@@ -176,6 +176,43 @@ fn check_writable_roots_not_masked(
     Ok(())
 }
 
+/// Host directories the kernel may read, from PALETTE_READ_ROOTS
+/// (':'-separated absolute paths), each bound read-only at its own path so
+/// paths read in the sandbox are the paths outside it.
+pub(crate) fn parse_read_roots(spec: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for entry in spec.unwrap_or("").split(':').filter(|e| !e.is_empty()) {
+        if !Path::new(entry).is_absolute() {
+            return Err(format!("PALETTE_READ_ROOTS entries must be absolute paths: {entry}"));
+        }
+        roots.push(canonical_dir("read root", Path::new(entry))?);
+    }
+    Ok(roots)
+}
+
+/// A read root may not contain any other mount, so no mount order can let it
+/// hide one (a writable depot clone, the synthetic /tmp), and it may not lie
+/// inside a writable mount, where the worker could write what it reads.
+pub(crate) fn check_read_roots(
+    roots: &[PathBuf],
+    writable: &[(&str, &Path)],
+    others: &[(&str, &Path)],
+) -> Result<(), String> {
+    for root in roots {
+        for (name, path) in writable.iter().chain(others) {
+            if path.starts_with(root) {
+                return Err(format!("read root {} contains the {name} mount {}", root.display(), path.display()));
+            }
+        }
+        for (name, path) in writable {
+            if root.starts_with(path) {
+                return Err(format!("read root {} lies inside the writable {name} mount {}", root.display(), path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     let toolchain = Path::new(s.julia_bin).parent().and_then(Path::parent).unwrap_or(Path::new("/"));
     let workspace = canonical_dir("workspace", Path::new(s.workspace_dir))?;
@@ -223,6 +260,10 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     // /tmp/workspace-style child mounts are intentional; only an equal or
     // ancestor workspace/state mount could hide the synthetic /tmp or /run root.
     check_writable_roots_not_masked(&writable, &required_roots)?;
+    let read_roots = parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?;
+    let others: Vec<(&str, &Path)> = protected.iter().chain(required_roots.iter()).copied().collect();
+    check_read_roots(&read_roots, &writable, &others)?;
+    let read_roots: Vec<String> = read_roots.iter().map(|r| r.to_string_lossy().into_owned()).collect();
 
     let workspace = workspace.to_str().ok_or("workspace path is not valid UTF-8")?;
     let state_dir = state_dir.as_deref().map(|p| p.to_str().ok_or("state directory path is not valid UTF-8")).transpose()?;
@@ -254,6 +295,9 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
            "--bind", workspace, workspace]);
     if let Some(t) = task_tools {
         push(&["--ro-bind", t, t]);
+    }
+    for r in &read_roots {
+        push(&["--ro-bind", r, r]);
     }
     if let Some(d) = broker_socket_dir {
         push(&["--ro-bind", d, d]);
@@ -359,6 +403,44 @@ mod tests {
         assert!(check_writable_roots_not_masked(&[("workspace", Path::new("/"))], &[("/tmp", &tmp), ("/run", &run)]).is_err());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn read_roots_parse_and_refuse_relative_or_missing() {
+        let root = util::mkdtemp("palette-read-roots-").unwrap();
+        let a = canonical_dir("a", &dir(&root, "a")).unwrap();
+        let b = canonical_dir("b", &dir(&root, "b")).unwrap();
+        let spec = format!("{}::{}", a.display(), b.display());
+        assert_eq!(parse_read_roots(Some(&spec)).unwrap(), vec![a.clone(), b]);
+        assert!(parse_read_roots(None).unwrap().is_empty());
+        assert!(parse_read_roots(Some("relative/dir")).is_err());
+        assert!(parse_read_roots(Some(&root.join("missing").to_string_lossy())).is_err());
+        let file = root.join("file");
+        fs::write(&file, "x").unwrap();
+        assert!(parse_read_roots(Some(&file.to_string_lossy())).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_roots_never_contain_a_mount_or_sit_in_a_writable_one() {
+        let root = util::mkdtemp("palette-read-roots-").unwrap();
+        let data = canonical_dir("data", &dir(&root, "data")).unwrap();
+        let workspace = canonical_dir("workspace", &dir(&root, "ws")).unwrap();
+        let depot = canonical_dir("depot", &dir(&root, "home/depot")).unwrap();
+        let home = canonical_dir("home", &root.join("home")).unwrap();
+        let writable = [("workspace", workspace.as_path())];
+        let others = [("shared Julia depot", depot.as_path()), ("system /tmp", Path::new("/tmp")),
+                      ("system /usr", Path::new("/usr"))];
+        // Disjoint from every mount: accepted.
+        assert!(check_read_roots(&[data.clone()], &writable, &others).is_ok());
+        // Containing a mount (the depot, a system root, the workspace): refused.
+        assert!(check_read_roots(&[home], &writable, &others).unwrap_err().contains("contains the shared Julia depot"));
+        assert!(check_read_roots(&[PathBuf::from("/")], &writable, &others).is_err());
+        assert!(check_read_roots(&[root.clone()], &writable, &others).unwrap_err().contains("contains"));
+        // Inside the writable workspace: refused.
+        let inner = canonical_dir("inner", &dir(&workspace, "inner")).unwrap();
+        assert!(check_read_roots(&[inner], &writable, &others).unwrap_err().contains("inside the writable workspace"));
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 pub struct WorkerResult {
@@ -413,6 +495,148 @@ pub fn run_captured(argv: &[String], env: Option<&BTreeMap<String, Option<String
     use std::os::unix::process::ExitStatusExt;
     let returncode = status.code().unwrap_or_else(|| -status.signal().unwrap_or(0));
     Ok(WorkerResult { returncode, stdout, stderr, timed_out })
+}
+
+/// Keeps only the last `cap` bytes a pipe produces: a renderer may print for
+/// minutes, and only the end of its output is reported.
+fn read_tail(mut r: impl Read + Send + 'static, cap: usize) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let (mut kept, mut buf) = (Vec::new(), [0u8; 8192]);
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buf[..n]);
+            if kept.len() > 2 * cap {
+                kept.drain(..kept.len() - cap);
+            }
+        }
+        if kept.len() > cap {
+            kept.drain(..kept.len() - cap);
+        }
+        kept
+    })
+}
+
+/// An operator-named host command (the broker's host_command), started in a
+/// process group of its own. A watchdog kills the whole group at the
+/// deadline whether or not anyone is waiting, so helper processes a
+/// renderer starts never outlive it; dropping the job kills it too. The
+/// group is always signalled before the command is reaped, under one lock
+/// with the watchdog, so a signal can never reach a reused pid.
+pub struct HostJob {
+    child: std::process::Child,
+    out: Option<std::thread::JoinHandle<Vec<u8>>>,
+    err: Option<std::thread::JoinHandle<Vec<u8>>>,
+    started: Instant,
+    // (finished, timed_out)
+    state: std::sync::Arc<std::sync::Mutex<(bool, bool)>>,
+}
+
+pub struct HostJobResult {
+    pub returncode: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub seconds: f64,
+}
+
+fn kill_group(pgid: i32) {
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+/// Whether `pid` has exited, without reaping it (WNOWAIT).
+fn exited_unreaped(pid: i32, block: bool) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | if block { 0 } else { libc::WNOHANG };
+    loop {
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        if rc == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("waitid: {e}"));
+        }
+    }
+}
+
+impl HostJob {
+    pub fn start(argv: &[String], cwd: &Path, timeout: Duration, output_cap: usize) -> Result<HostJob, String> {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(cwd).process_group(0)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("starting {}: {e}", argv[0]))?;
+        let out = read_tail(child.stdout.take().unwrap(), output_cap);
+        let err = read_tail(child.stderr.take().unwrap(), output_cap);
+        let state = std::sync::Arc::new(std::sync::Mutex::new((false, false)));
+        let (pgid, watched) = (child.id() as i32, state.clone());
+        let deadline = Instant::now() + timeout;
+        std::thread::spawn(move || loop {
+            {
+                let mut st = watched.lock().unwrap();
+                if st.0 {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    st.1 = true;
+                    kill_group(pgid);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        Ok(HostJob { child, out: Some(out), err: Some(err), started: Instant::now(), state })
+    }
+
+    /// The result once the command has exited, `None` while it runs.
+    pub fn poll(&mut self) -> Result<Option<HostJobResult>, String> {
+        if !exited_unreaped(self.child.id() as i32, false)? {
+            return Ok(None);
+        }
+        self.finish().map(Some)
+    }
+
+    pub fn wait(&mut self) -> Result<HostJobResult, String> {
+        exited_unreaped(self.child.id() as i32, true)?;
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<HostJobResult, String> {
+        use std::os::unix::process::ExitStatusExt;
+        let timed_out = {
+            let mut st = self.state.lock().unwrap();
+            st.0 = true;
+            // Helpers left in the group after the command exited go too:
+            // their open pipes would otherwise keep the output readers waiting.
+            kill_group(self.child.id() as i32);
+            st.1
+        };
+        let status = self.child.wait().map_err(|e| e.to_string())?;
+        let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            String::from_utf8_lossy(&h.map(|h| h.join().unwrap_or_default()).unwrap_or_default()).into_owned()
+        };
+        Ok(HostJobResult {
+            returncode: status.code().unwrap_or_else(|| -status.signal().unwrap_or(0)),
+            stdout: text(self.out.take()),
+            stderr: text(self.err.take()),
+            timed_out,
+            seconds: self.started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+impl Drop for HostJob {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap();
+        if !st.0 {
+            st.0 = true;
+            kill_group(self.child.id() as i32);
+            drop(st);
+            let _ = self.child.wait();
+        }
+    }
 }
 
 pub struct RunWorker<'a> {

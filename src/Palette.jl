@@ -717,6 +717,9 @@ host_request(rtype::AbstractString, payload::AbstractDict=Dict{String,Any}()) = 
 const rlm = Palette.rlm
 request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...) =
     Palette.request_capability(category, params; kwargs...)
+host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette.host_command(name, args...; kwargs...)
+host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
+fs_digest(paths::Vector{String}) = Palette.fs_digest(paths)
 reloads() = deepcopy(Palette.RELOAD_REPORTS)
 revival() = deepcopy(Palette.REVIVAL_OBSERVATION[])
 jobs() = Palette.task_observations()
@@ -1750,6 +1753,44 @@ function fs_digest(paths::Vector{String})
     return resp["result"]
 end
 
+"""
+    Palette.host_command(name, args...; wait=true, timeout_s=14460) -> Dict
+
+Run a command the operator named in this session's ceiling, on the host,
+outside the sandbox: the way a kernel reaches a GPU, a renderer or a build
+it cannot run itself. The ceiling fixes the command's program, working
+directory and timeout; `args` are passed only to a command whose ceiling
+entry sets `extra_args`. Never a shell. Broker-side ceiling shape:
+`{"host_command": {"commands": {"render": {"argv": ["/abs/prog", ...],
+"cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`.
+
+With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
+KiB), `timed_out` and `seconds`. With `wait=false` returns at once with a
+`job` id, for work longer than a turn; `host_command_poll(job)` returns
+`running => true` until the result.
+"""
+function host_command(name::AbstractString, args::AbstractString...; wait::Bool=true, timeout_s::Real=14460.0)
+    params = Dict{String,Any}("name" => String(name), "args" => collect(String, args),
+                              "action" => wait ? "run" : "start")
+    resp = request_capability("host_command", params; timeout_s)
+    get(resp, "approved", false) === true ||
+        error("host_command $(repr(name)) was not allowed: $(get(resp, "reason", "no reason given"))")
+    return resp["result"]
+end
+
+"""
+    Palette.host_command_poll(job) -> Dict
+
+The result of a `host_command(...; wait=false)` job once it has finished,
+or `running => true` while it runs.
+"""
+function host_command_poll(job::AbstractString)
+    resp = request_capability("host_command", Dict{String,Any}("action" => "poll", "job" => String(job)))
+    get(resp, "approved", false) === true ||
+        error("host_command poll was not allowed: $(get(resp, "reason", "no reason given"))")
+    return resp["result"]
+end
+
 #==============================================================================
 PHASE 10: Integration Demo Helpers
 ==============================================================================#
@@ -1828,7 +1869,7 @@ export KernelState, ExecutionRecord
 export get_kernel_state, reset_kernel_state
 export OperatorType, OperatorVocabulary
 export CODE_EXECUTION_VOCAB, OPERATOR_INVOCATION_VOCAB, STATE_QUERY_VOCAB
-export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest
+export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll
 export EphemeralTool, EphemeralToolViolation, check_ephemeral_source!, record_tool_capsule
 export register_operator!
 export OperationResult, StructuredResponse

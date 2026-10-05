@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from filesystem_layout import require_disjoint, require_preserved_roots
+from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
 
 
 def _clone_depot(real_depot: str, clone_root: str) -> str:
@@ -177,6 +177,8 @@ def build_bwrap_argv(
     writable = [workspace_dir] + ([state_dir] if state_dir else [])
     require_disjoint(writable, protected)
     require_preserved_roots(writable, ("/tmp", "/run"))
+    read_roots = parse_read_roots(os.environ.get("PALETTE_READ_ROOTS"))
+    require_read_roots(read_roots, writable, protected + ["/tmp", "/run"])
 
     argv = [
         "bwrap",
@@ -238,6 +240,9 @@ def build_bwrap_argv(
     if task_tools:
         argv += ["--ro-bind", task_tools, task_tools]
     for path in extra_ro_binds or []:
+        argv += ["--ro-bind", path, path]
+    # Host directories the operator lets the kernel read (PALETTE_READ_ROOTS).
+    for path in read_roots:
         argv += ["--ro-bind", path, path]
     if broker_socket_dir:
         argv += ["--ro-bind", broker_socket_dir, broker_socket_dir]

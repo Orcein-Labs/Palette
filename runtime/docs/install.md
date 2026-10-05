@@ -52,6 +52,8 @@ The adapter's entrypoint is `runtime/security/operator_workspace_router.py`. It 
 | `PALETTE_STATE_DIR` | Legacy snapshots, outside the worker workspace |
 | `PALETTE_WORKSPACE_STATE_ROOT` | Routed world registry and snapshots |
 | `PALETTE_PATCH_ROOTS` | Trusted administrator's JSON mapping of writable targets |
+| `PALETTE_READ_ROOTS` | Host directories the kernel may read, `:`-separated; see [authority](authority.md) |
+| `PALETTE_HOST_COMMANDS` | JSON file of host commands the kernel may run; see [authority](authority.md) |
 | `JULIA_DEPOT_PATH` | Provisioned Julia depot |
 | `JULIA_PKG_OFFLINE` | Julia's offline package policy |
 
