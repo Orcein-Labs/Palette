@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import socket
 import sys
 import tempfile
@@ -19,16 +20,30 @@ from broker import Broker, ceiling_is_subset  # noqa: E402
 from host_adapter import HOST_BIN, _RustBrokerServer  # noqa: E402
 
 
-def pid_dead(pid):
-    for _ in range(100):
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-        except FileNotFoundError:
-            return True
-        if stat.rsplit(")", 1)[1].split()[0] == "Z":
-            return True
-        time.sleep(0.02)
-    return False
+def pid_dead(pid, timeout=5.0):
+    """Whether `pid` has exited (a zombie counts), waiting on its pidfd: the
+    kernel signals the descriptor when the process exits."""
+    try:
+        fd = os.pidfd_open(int(pid))
+    except ProcessLookupError:
+        return True
+    try:
+        return bool(select.select([fd], [], [], timeout)[0])
+    finally:
+        os.close(fd)
+
+
+def read_fifo(path):
+    """Blocks until a writer opens the FIFO and closes it: a deterministic
+    'the command has reached this point'."""
+    with open(path) as f:
+        return f.read().strip()
+
+
+def write_fifo(path, text="go"):
+    """Blocks until the command opens the FIFO to read, then releases it."""
+    with open(path, "w") as f:
+        f.write(text + "\n")
 
 
 class PythonBroker:
@@ -64,6 +79,8 @@ class HostCommandParity:
         if self.Broker is RustBroker and not (HOST_BIN and Path(HOST_BIN).is_file()):
             raise unittest.SkipTest("no palette-host binary (set PALETTE_HOST_BIN)")
         self.tmp = Path(tempfile.mkdtemp(prefix="palette-hostcmd-")).resolve()
+        for fifo in ("go", "started", "long-ready"):
+            os.mkfifo(self.tmp / fifo)
         d = str(self.tmp)
         self.b = self.Broker({"host_command": {"commands": {
             "echo": {"argv": ["/bin/echo", "fixed"], "cwd": d, "extra_args": True},
@@ -71,8 +88,8 @@ class HostCommandParity:
             "relative": {"argv": ["sh", "-c", "true"], "cwd": d},
             "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": d, "timeout_s": 0.5},
             "spawn": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $!"], "cwd": d, "timeout_s": 30},
-            "job": {"argv": ["/bin/sh", "-c", "sleep 0.4; echo done"], "cwd": d},
-            "long": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > long.pid; wait"], "cwd": d},
+            "job": {"argv": ["/bin/sh", "-c", "echo $$ > started; read line < go; echo done"], "cwd": d},
+            "long": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > long-ready; wait"], "cwd": d},
         }}}, self.tmp)
 
     def tearDown(self):
@@ -110,14 +127,15 @@ class HostCommandParity:
 
     def test_start_poll_and_session_end(self):
         job = self.b({"name": "job", "action": "start"})["result"]["job"]
+        shell = read_fifo(self.tmp / "started")          # the job is running, blocked on `go`
         self.assertTrue(self.b({"action": "poll", "job": job})["result"]["running"])
-        time.sleep(0.7)
+        write_fifo(self.tmp / "go")
+        self.assertTrue(pid_dead(shell))
         r = self.b({"action": "poll", "job": job})
         self.assertEqual(r["result"]["stdout"], "done\n", r)
         self.assertIn("no running", self.b({"action": "poll", "job": job})["reason"])
         self.b({"name": "long", "action": "start"})
-        time.sleep(0.2)
-        helper = (self.tmp / "long.pid").read_text().strip()
+        helper = read_fifo(self.tmp / "long-ready")
         self.b.close()
         self.assertTrue(pid_dead(helper), "a job outlived its session")
 

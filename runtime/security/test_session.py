@@ -12,11 +12,11 @@ Run:
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -279,10 +279,12 @@ class TestHostCommand(SessionTestCase):
     def test_turn_code_runs_only_the_commands_its_ceiling_names(self):
         outside = Path(tempfile.mkdtemp(prefix="palette-host-command-", dir=str(Path.home())))
         (outside / "marker.txt").write_text("host side\n")
+        os.mkfifo(outside / "started")
+        os.mkfifo(outside / "go")
         ceiling = {"host_command": {"commands": {
             "cat-marker": {"argv": ["/bin/cat", "marker.txt"], "cwd": str(outside), "timeout_s": 10},
             "echo": {"argv": ["/bin/echo"], "cwd": str(outside), "extra_args": True},
-            "slow": {"argv": ["/bin/sh", "-c", "sleep 1; echo finished"], "cwd": str(outside)},
+            "gated": {"argv": ["/bin/sh", "-c", "echo $$ > started; read line < go; echo finished"], "cwd": str(outside)},
         }}}
         try:
             with PaletteSession(project_dir=PROJECT_DIR, ceiling=ceiling) as s:
@@ -294,13 +296,19 @@ class TestHostCommand(SessionTestCase):
                 self.assertIn("takes no arguments", r["data"])
                 r = s.turn('try; Palette.host_command("sh"); catch e; sprint(showerror, e); end')
                 self.assertIn("not in this session's ceiling", r["data"])
-                s.turn('job = Palette.host_command("slow"; wait=false)["job"]')
+                s.turn('job = Palette.host_command("gated"; wait=false)["job"]')
+                with open(outside / "started") as f:      # the job is running, blocked on `go`
+                    shell = int(f.read())
                 self.assertIs(s.turn('Palette.host_command_poll(job)["running"]')["data"], True)
-                for _ in range(50):
-                    r = s.turn('Palette.host_command_poll(job)')
-                    if r["data"]["running"] is False:
-                        break
-                    time.sleep(0.1)
+                with open(outside / "go", "w") as f:
+                    f.write("go\n")
+                fd = os.pidfd_open(shell)
+                try:
+                    self.assertTrue(select.select([fd], [], [], 10)[0])
+                finally:
+                    os.close(fd)
+                r = s.turn('Palette.host_command_poll(job)')
+                self.assertIs(r["data"]["running"], False)
                 self.assertEqual(r["data"]["stdout"], "finished\n")
         finally:
             shutil.rmtree(outside, ignore_errors=True)
