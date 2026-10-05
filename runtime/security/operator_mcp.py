@@ -29,6 +29,20 @@ binding_epoch = None
 connection_failure = None
 
 
+
+def operator_ceiling():
+    """The operator session's capability ceiling. PALETTE_HOST_COMMANDS names
+    a JSON file of host commands ({"<name>": {"argv": [...], "cwd": "/abs",
+    "timeout_s": 600, "extra_args": false}}) the kernel may run outside the
+    sandbox through the broker; without it the ceiling is empty."""
+    path = os.environ.get("PALETTE_HOST_COMMANDS")
+    if not path:
+        return {}
+    commands = json.loads(Path(path).read_text())
+    if not isinstance(commands, dict):
+        raise RuntimeError(f"PALETTE_HOST_COMMANDS must name a JSON object of commands: {path}")
+    return {"host_command": {"commands": commands}}
+
 def project_result(event, *, full=False, ephemeral=False):
     global binding_view, binding_epoch
     result = dict(event)
@@ -147,7 +161,7 @@ def start(*, prepared=True):
     Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     command = [HOST, "session", "--project-dir", REPO, "--repo-dir", REPO,
-               "--workspace-dir", WORKSPACE, "--state-dir", str(STATE_DIR), "--ceiling", "{}"]
+               "--workspace-dir", WORKSPACE, "--state-dir", str(STATE_DIR), "--ceiling", json.dumps(operator_ceiling())]
     if os.environ.get("PALETTE_SCRATCH_ROOT"):
         command += ["--scratch-root", os.environ["PALETTE_SCRATCH_ROOT"]]
     started = time.monotonic()

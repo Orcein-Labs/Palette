@@ -497,6 +497,148 @@ pub fn run_captured(argv: &[String], env: Option<&BTreeMap<String, Option<String
     Ok(WorkerResult { returncode, stdout, stderr, timed_out })
 }
 
+/// Keeps only the last `cap` bytes a pipe produces: a renderer may print for
+/// minutes, and only the end of its output is reported.
+fn read_tail(mut r: impl Read + Send + 'static, cap: usize) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let (mut kept, mut buf) = (Vec::new(), [0u8; 8192]);
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            kept.extend_from_slice(&buf[..n]);
+            if kept.len() > 2 * cap {
+                kept.drain(..kept.len() - cap);
+            }
+        }
+        if kept.len() > cap {
+            kept.drain(..kept.len() - cap);
+        }
+        kept
+    })
+}
+
+/// An operator-named host command (the broker's host_command), started in a
+/// process group of its own. A watchdog kills the whole group at the
+/// deadline whether or not anyone is waiting, so helper processes a
+/// renderer starts never outlive it; dropping the job kills it too. The
+/// group is always signalled before the command is reaped, under one lock
+/// with the watchdog, so a signal can never reach a reused pid.
+pub struct HostJob {
+    child: std::process::Child,
+    out: Option<std::thread::JoinHandle<Vec<u8>>>,
+    err: Option<std::thread::JoinHandle<Vec<u8>>>,
+    started: Instant,
+    // (finished, timed_out)
+    state: std::sync::Arc<std::sync::Mutex<(bool, bool)>>,
+}
+
+pub struct HostJobResult {
+    pub returncode: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub seconds: f64,
+}
+
+fn kill_group(pgid: i32) {
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+}
+
+/// Whether `pid` has exited, without reaping it (WNOWAIT).
+fn exited_unreaped(pid: i32, block: bool) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | if block { 0 } else { libc::WNOHANG };
+    loop {
+        let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        if rc == 0 {
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("waitid: {e}"));
+        }
+    }
+}
+
+impl HostJob {
+    pub fn start(argv: &[String], cwd: &Path, timeout: Duration, output_cap: usize) -> Result<HostJob, String> {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(cwd).process_group(0)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("starting {}: {e}", argv[0]))?;
+        let out = read_tail(child.stdout.take().unwrap(), output_cap);
+        let err = read_tail(child.stderr.take().unwrap(), output_cap);
+        let state = std::sync::Arc::new(std::sync::Mutex::new((false, false)));
+        let (pgid, watched) = (child.id() as i32, state.clone());
+        let deadline = Instant::now() + timeout;
+        std::thread::spawn(move || loop {
+            {
+                let mut st = watched.lock().unwrap();
+                if st.0 {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    st.1 = true;
+                    kill_group(pgid);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        Ok(HostJob { child, out: Some(out), err: Some(err), started: Instant::now(), state })
+    }
+
+    /// The result once the command has exited, `None` while it runs.
+    pub fn poll(&mut self) -> Result<Option<HostJobResult>, String> {
+        if !exited_unreaped(self.child.id() as i32, false)? {
+            return Ok(None);
+        }
+        self.finish().map(Some)
+    }
+
+    pub fn wait(&mut self) -> Result<HostJobResult, String> {
+        exited_unreaped(self.child.id() as i32, true)?;
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<HostJobResult, String> {
+        use std::os::unix::process::ExitStatusExt;
+        let timed_out = {
+            let mut st = self.state.lock().unwrap();
+            st.0 = true;
+            // Helpers left in the group after the command exited go too:
+            // their open pipes would otherwise keep the output readers waiting.
+            kill_group(self.child.id() as i32);
+            st.1
+        };
+        let status = self.child.wait().map_err(|e| e.to_string())?;
+        let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            String::from_utf8_lossy(&h.map(|h| h.join().unwrap_or_default()).unwrap_or_default()).into_owned()
+        };
+        Ok(HostJobResult {
+            returncode: status.code().unwrap_or_else(|| -status.signal().unwrap_or(0)),
+            stdout: text(self.out.take()),
+            stderr: text(self.err.take()),
+            timed_out,
+            seconds: self.started.elapsed().as_secs_f64(),
+        })
+    }
+}
+
+impl Drop for HostJob {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap();
+        if !st.0 {
+            st.0 = true;
+            kill_group(self.child.id() as i32);
+            drop(st);
+            let _ = self.child.wait();
+        }
+    }
+}
+
 pub struct RunWorker<'a> {
     pub workspace_dir: &'a str,
     pub project_dir: &'a str,

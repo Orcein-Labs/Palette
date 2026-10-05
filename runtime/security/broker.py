@@ -121,6 +121,13 @@ def ceiling_is_subset(requested: dict, parent: dict) -> tuple[bool, str]:
                 return False, "requested host_request must name allowed_types explicitly (no unrestricted child grant)"
             if not set(req_types).issubset(set(parent_cap.get("allowed_types") or [])):
                 return False, f"requested host_request types {req_types} are not a subset of parent's {parent_cap.get('allowed_types')}"
+        elif category == "host_command":
+            # A child may keep a subset of the parent's commands, each exactly
+            # as the parent defines it: no new argv, cwd or timeout.
+            parent_cmds = parent_cap.get("commands") or {}
+            for name, spec in (req_cap.get("commands") or {}).items():
+                if parent_cmds.get(name) != spec:
+                    return False, f"requested host_command {name!r} is not one of the parent's commands as the parent defines it"
         elif category == "spawn_child_worker":
             # No sub-fields of its own to narrow here -- a grandchild's
             # actual ceiling gets its own full ceiling_is_subset check
@@ -131,6 +138,93 @@ def ceiling_is_subset(requested: dict, parent: dict) -> tuple[bool, str]:
         else:
             return False, f"unrecognized category {category!r} cannot be validated as a subset -- denied, not ignored"
     return True, ""
+
+
+MAX_HOST_JOBS = 8
+HOST_COMMAND_MAX_TIMEOUT_S = 4 * 3600.0
+HOST_COMMAND_OUTPUT = 16 * 1024
+
+
+class HostJob:
+    """An operator-named host command (host_command), in a process group of
+    its own. A watchdog kills the whole group at the deadline whether or not
+    anyone is waiting; the group is always signalled before the command is
+    reaped, under one lock with the watchdog, so a signal never reaches a
+    reused pid. Mirrors runtime/host/src/sandbox.rs HostJob."""
+
+    def __init__(self, argv, cwd, timeout_s, output_cap=HOST_COMMAND_OUTPUT):
+        self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, start_new_session=True)
+        self.started = time.monotonic()
+        self._lock = threading.Lock()
+        self._finished = False
+        self._timed_out = False
+        self._tails = {}
+        self._readers = [threading.Thread(target=self._read_tail, args=(name, pipe, output_cap), daemon=True)
+                         for name, pipe in (("stdout", self.proc.stdout), ("stderr", self.proc.stderr))]
+        for t in self._readers:
+            t.start()
+        deadline = self.started + timeout_s
+        threading.Thread(target=self._watchdog, args=(deadline,), daemon=True).start()
+
+    def _read_tail(self, name, pipe, cap):
+        kept = bytearray()
+        for chunk in iter(lambda: pipe.read1(8192), b""):
+            kept += chunk
+            if len(kept) > 2 * cap:
+                del kept[:len(kept) - cap]
+        self._tails[name] = bytes(kept[-cap:]).decode("utf-8", "replace")
+
+    def _kill_group(self):
+        try:
+            os.killpg(self.proc.pid, 9)
+        except ProcessLookupError:
+            pass
+
+    def _watchdog(self, deadline):
+        while True:
+            with self._lock:
+                if self._finished:
+                    return
+                if time.monotonic() >= deadline:
+                    self._timed_out = True
+                    self._kill_group()
+                    return
+            time.sleep(0.05)
+
+    def _exited(self, block):
+        flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
+        return os.waitid(os.P_PID, self.proc.pid, flags) is not None
+
+    def poll(self):
+        """The result once the command has exited, None while it runs."""
+        return self._finish() if self._exited(False) else None
+
+    def wait(self):
+        self._exited(True)
+        return self._finish()
+
+    def _finish(self):
+        with self._lock:
+            self._finished = True
+            # Helpers left in the group go too: their open pipes would
+            # otherwise keep the output readers waiting.
+            self._kill_group()
+            timed_out = self._timed_out
+        returncode = self.proc.wait()
+        for t in self._readers:
+            t.join()
+        return {"returncode": returncode, "timed_out": timed_out,
+                "seconds": round(time.monotonic() - self.started, 3),
+                "stdout": self._tails.get("stdout", ""), "stderr": self._tails.get("stderr", ""), "running": False}
+
+    def kill(self):
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            self._kill_group()
+        self.proc.wait()
 
 
 class Broker:
@@ -190,7 +284,23 @@ class Broker:
         # the agent host to act and waits for its answer. Set on the host
         # side only; no request can supply or replace it.
         self.host_bridge = None
+        # host_command jobs started with action "start"; close() kills any
+        # still running when the session ends.
+        self._jobs: dict[str, HostJob] = {}
+        self._jobs_lock = threading.Lock()
         Path(receipt_log_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def close(self):
+        with self._jobs_lock:
+            jobs, self._jobs = list(self._jobs.values()), {}
+        for job in jobs:
+            job.kill()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ---- capability handlers -------------------------------------------------
 
@@ -488,6 +598,76 @@ class Broker:
                 digests[p] = {"error_class": "os_error", "detail": str(e)}
         return {"digests": digests, "observer": "host", "algorithm": "sha256"}
 
+    def _handle_host_command(self, params: dict) -> Any:
+        """Run a command the operator named in the ceiling, on the host,
+        outside the sandbox: the way a kernel reaches a GPU, a renderer or a
+        build it cannot run itself. The ceiling fixes each command's argv
+        (absolute program), cwd and timeout; a request only picks a command
+        by name, and passes arguments only to a command that allows them.
+        Never a shell. Actions: "run" (default) waits; "start" returns a job
+        id at once; "poll" with that id returns {"running": True} or the
+        result. Mirrors runtime/host/src/broker.rs host_command.
+
+        Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
+        "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}"""
+        cap = self.ceiling.get("host_command")
+        if cap is None:
+            raise CapabilityDenied("host_command not in this session's ceiling")
+        action = params.get("action", "run")
+        if action == "poll":
+            job_id = params.get("job")
+            if not isinstance(job_id, str):
+                raise CapabilityDenied("host_command poll requires a string 'job'")
+            with self._jobs_lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    raise CapabilityDenied(f"no running host_command job {job_id!r}")
+                result = job.poll()
+                if result is None:
+                    return {"job": job_id, "running": True}
+                del self._jobs[job_id]
+            return {**result, "job": job_id}
+        if action not in ("run", "start"):
+            raise CapabilityDenied(f"host_command action must be run, start or poll, not {action!r}")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            raise CapabilityDenied("host_command requires a non-empty string 'name'")
+        spec = (cap.get("commands") or {}).get(name)
+        if not isinstance(spec, dict):
+            raise CapabilityDenied(f"host command {name!r} is not in this session's ceiling")
+
+        def misconfigured(why):
+            return CapabilityDenied(f"host command {name!r} is misconfigured in the ceiling: {why}")
+
+        argv = spec.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise misconfigured("'argv' must be a non-empty list of strings")
+        if not os.path.isabs(argv[0]) or not os.path.isfile(argv[0]):
+            raise misconfigured("argv[0] must be an absolute path to a program")
+        cwd = spec.get("cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+            raise misconfigured("'cwd' must be an absolute directory")
+        timeout_s = spec.get("timeout_s", 60.0)
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= HOST_COMMAND_MAX_TIMEOUT_S:
+            raise misconfigured("'timeout_s' must be a number in (0, 14400]")
+        args = params.get("args")
+        if args is None:
+            args = []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise CapabilityDenied("host_command 'args' must be a list of strings")
+        if args and spec.get("extra_args") is not True:
+            raise CapabilityDenied(f"host command {name!r} takes no arguments (its ceiling entry does not set extra_args)")
+        if len(args) > 64 or any("\0" in a or len(a.encode()) > 4096 for a in args):
+            raise CapabilityDenied("host_command accepts at most 64 arguments of at most 4096 bytes, without NUL")
+        if action == "start":
+            with self._jobs_lock:
+                if len(self._jobs) >= MAX_HOST_JOBS:
+                    raise CapabilityDenied(f"at most {MAX_HOST_JOBS} host_command jobs may run at once; poll one to completion first")
+                job_id = uuid.uuid4().hex[:16]
+                self._jobs[job_id] = HostJob(argv + args, cwd, float(timeout_s))
+            return {"job": job_id, "name": name, "running": True}
+        return {**HostJob(argv + args, cwd, float(timeout_s)).wait(), "name": name}
+
     HANDLERS = {
         "host_request": _handle_host_request,
         "external_fs_write": _handle_external_fs_write,
@@ -495,6 +675,7 @@ class Broker:
         "package_management": _handle_package_management,
         "spawn_child_worker": _handle_spawn_child_worker,
         "fs_digest": _handle_fs_digest,
+        "host_command": _handle_host_command,
     }
 
     # ---- request handling ------------------------------------------------

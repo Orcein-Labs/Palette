@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -267,5 +268,39 @@ class TestReadRoots(SessionTestCase):
                     r = s.turn(f'isfile({str(outside / "sibling.txt")!r})'.replace("'", '"'))
                     self.assertIs(r["data"], False)
             self.assertFalse((root / "new.txt").exists())
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+
+class TestHostCommand(SessionTestCase):
+    """host_command end to end: turn code -> broker -> a host process the
+    sandbox could not start itself."""
+
+    def test_turn_code_runs_only_the_commands_its_ceiling_names(self):
+        outside = Path(tempfile.mkdtemp(prefix="palette-host-command-", dir=str(Path.home())))
+        (outside / "marker.txt").write_text("host side\n")
+        ceiling = {"host_command": {"commands": {
+            "cat-marker": {"argv": ["/bin/cat", "marker.txt"], "cwd": str(outside), "timeout_s": 10},
+            "echo": {"argv": ["/bin/echo"], "cwd": str(outside), "extra_args": True},
+            "slow": {"argv": ["/bin/sh", "-c", "sleep 1; echo finished"], "cwd": str(outside)},
+        }}}
+        try:
+            with PaletteSession(project_dir=PROJECT_DIR, ceiling=ceiling) as s:
+                # The sandbox cannot see the directory; the host command can.
+                self.assertIs(s.turn(f'isdir("{outside}")')["data"], False)
+                self.assertEqual(s.turn('Palette.host_command("cat-marker")["stdout"]')["data"], "host side\n")
+                self.assertEqual(s.turn('Palette.host_command("echo", "a", "b c")["stdout"]')["data"], "a b c\n")
+                r = s.turn('try; Palette.host_command("cat-marker", "/etc/shadow"); catch e; sprint(showerror, e); end')
+                self.assertIn("takes no arguments", r["data"])
+                r = s.turn('try; Palette.host_command("sh"); catch e; sprint(showerror, e); end')
+                self.assertIn("not in this session's ceiling", r["data"])
+                s.turn('job = Palette.host_command("slow"; wait=false)["job"]')
+                self.assertIs(s.turn('Palette.host_command_poll(job)["running"]')["data"], True)
+                for _ in range(50):
+                    r = s.turn('Palette.host_command_poll(job)')
+                    if r["data"]["running"] is False:
+                        break
+                    time.sleep(0.1)
+                self.assertEqual(r["data"]["stdout"], "finished\n")
         finally:
             shutil.rmtree(outside, ignore_errors=True)
