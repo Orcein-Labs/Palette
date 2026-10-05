@@ -342,8 +342,13 @@ struct Walk
     visits::Base.RefValue{Int}
     # Asked every `WALK_YIELD_EVERY` mutable objects; true abandons the walk.
     give_way::Function
+    # `value_kind` per type: what the walk does with a value of that type is
+    # decided once, not by a chain of `isa` tests on every object.
+    kinds::IdDict{Any, Any}
 end
 Walk(mod::Module, seen, user, ids) = Walk(mod, seen, user, ids, IdDict{Any, Union{Nothing, String}}(), Ref(0), () -> false)
+Walk(mod::Module, seen, user, ids, checked, visits, give_way) =
+    Walk(mod, seen, user, ids, checked, visits, give_way, IdDict{Any, Any}())
 
 # Thrown inside a walk when a waiting request should go first; the snapshot
 # that started it stops and the last complete snapshot stays.
@@ -471,20 +476,33 @@ function check_type_uncached(w::Walk, T::DataType)
     return nothing
 end
 
-function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
-    x isa Union{Nothing, Missing, Bool, Char, String, Symbol, BigInt, BigFloat} && return nothing
-    T = typeof(x)
-    x isa Number && isprimitivetype(T) && Base.moduleroot(parentmodule(T)) in (Base, Core) && return nothing
+# What the walk does with a value of type T, from the type alone: `nothing`
+# (nothing inside it can refuse), a refusal, `:function` (a named function,
+# or a closure when its name starts with '#'), `:type`, or `:object` (walked).
+function value_kind(@nospecialize(T))
+    T <: Union{Nothing, Missing, Bool, Char, String, Symbol, BigInt, BigFloat} && return nothing
+    T <: Number && isprimitivetype(T) && Base.moduleroot(parentmodule(T)) in (Base, Core) && return nothing
     for R in REFUSED_TYPES
-        x isa R && return "a $(nameof(R)) cannot be revived"
+        T <: R && return "a $(nameof(R)) cannot be revived"
     end
     # Serialization saves a Regex as its pattern and flags and compiles it
     # again. Two bindings sharing one Regex come back as two equal copies; a
     # Regex cannot be changed, so only `===` can tell.
-    x isa Regex && return nothing
-    x isa Ptr && return "it holds a pointer"
-    x isa IO && !(x isa IOBuffer) && return "an open $(nameof(T)) cannot be revived"
-    if x isa Function && isdefined(T, :instance) && !startswith(string(nameof(x)), '#')
+    T <: Regex && return nothing
+    T <: Ptr && return "it holds a pointer"
+    T <: IO && !(T <: IOBuffer) && return "an open $(nameof(T)) cannot be revived"
+    T <: Function && isdefined(T, :instance) && return :function
+    T <: Type && return :type
+    return :object
+end
+
+function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
+    T = typeof(x)
+    kind = get(w.kinds, T, :unknown)
+    kind === :unknown && (kind = w.kinds[T] = value_kind(T))
+    kind === nothing && return nothing
+    kind isa String && return kind
+    if kind === :function && !startswith(string(nameof(x)), '#')
         m = parentmodule(x)
         m === w.mod && (push!(w.user, string(nameof(x))); return nothing)
         any(pair -> first(pair) === Base.moduleroot(m), workspace_packages()) &&
@@ -494,7 +512,7 @@ function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
     end
     # Any other function value is a closure or an anonymous function: checked
     # below like a struct whose fields are the values it captured.
-    if x isa Type
+    if kind === :type
         u = Base.unwrap_unionall(x)
         key = u isa DataType ? workspace_type_key(u) : nothing
         key === nothing && u isa DataType && (key = session_type_key(u, w.mod))
@@ -515,21 +533,21 @@ end
 
 function refusal_struct(w::Walk, @nospecialize(x))
     T = typeof(x)
-    if x isa Union{Array, Memory}
-        E = eltype(x)
-        if isbitstype(E)
-            return ptr_free(E) ? nothing : "its elements hold pointers"
-        end
-        for i in eachindex(x)
-            isassigned(x, i) || continue
-            (r = refusal(w, @inbounds x[i])) === nothing || return r
-        end
-        return nothing
-    end
+    x isa Union{Array, Memory} && return refusal_elements(w, x)
     isbitstype(T) && return ptr_free(T) ? nothing : "it holds a pointer"
     for i in 1:nfields(x)
         isdefined(x, i) || continue
         (r = refusal(w, getfield(x, i))) === nothing || return r
+    end
+    return nothing
+end
+
+# Compiled per array type, so the loop indexes without dynamic dispatch.
+function refusal_elements(w::Walk, x::AbstractArray{E}) where {E}
+    isbitstype(E) && return ptr_free(E) ? nothing : "its elements hold pointers"
+    for i in eachindex(x)
+        isassigned(x, i) || continue
+        (r = refusal(w, @inbounds x[i])) === nothing || return r
     end
     return nothing
 end

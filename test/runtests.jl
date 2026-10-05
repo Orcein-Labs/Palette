@@ -590,3 +590,26 @@ end
     @test haskey(logged, "expr_hex")
     @test Base.remove_linenums!(deepcopy(Palette.logged_statement(logged))) == Base.remove_linenums!(deepcopy(st))
 end
+
+@testset "Walk verdicts come from the type, cached per walk" begin
+    reset_kernel_state()
+    mod = get_kernel_state().eval_module
+    execute(ExecuteCode("mutable struct WalkBox; v::Any; end"))
+    Box = getglobal(mod, :WalkBox)
+    cases = Any[
+        (1, nothing), ("s", nothing), (big(2)^70, nothing), (r"a+", nothing), (IOBuffer("x"), nothing),
+        (Task(() -> 1), "a Task cannot be revived"), (Ptr{Cvoid}(0), "it holds a pointer"),
+        (devnull, "an open DevNull cannot be revived"), ([C_NULL], "its elements hold pointers"),
+        (Any[1, Task(() -> 2)], "a Task cannot be revived"), (Dict(1 => Channel(1)), "a Channel cannot be revived"),
+        (Box(Box(1)), nothing), (sin, nothing), (x -> x + 1, nothing), (Int, nothing),
+    ]
+    w = Palette.Walk(mod, IdDict{Any,Nothing}(), Set{String}(), Set{UInt}())
+    for pass in 1:2                      # the second pass answers from the type cache
+        for (v, expected) in cases
+            empty!(w.seen)
+            @test Palette.refusal(w, v) == expected
+        end
+    end
+    @test "WalkBox" in w.user
+    @test w.kinds[Vector{Any}] === :object && w.kinds[Int] === nothing
+end
