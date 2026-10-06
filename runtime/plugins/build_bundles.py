@@ -62,6 +62,7 @@ def main():
     # A client upload must declare exactly one plugin. The SDK's repository
     # marketplace and client manifests are authoring files, not nested plugins.
     excluded = {'.agents/plugins/marketplace.json',
+                'Palette-Launch-Bundles.zip',
                 'runtime/plugins/palette/plugin.json',
                 'runtime/plugins/claude/manifest.json'}
     shared={
