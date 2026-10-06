@@ -12,8 +12,20 @@ from unittest.mock import patch
 
 import patch_broker as patch_broker_module
 from patch_broker import PatchBroker, request_digest
-from repair_broker import RepairBroker
+from repair_broker import RepairBroker, normalize_recipe, run_isolated_test
 from prewarm_depot import resolve_real_julia_binary
+
+
+def python_test_recipe(recipe_id, *arguments, executable=None, toolchain_root=None,
+                       additional_read_roots=()):
+    """Declare only the interpreter's trusted toolchain to the test worker."""
+    executable = str(Path(executable).absolute() if executable else Path(sys.executable).resolve())
+    root = Path(toolchain_root or sys.base_prefix).resolve(strict=True)
+    if not Path(executable).is_relative_to(root):
+        raise ValueError("Python executable must be contained by its declared toolchain root")
+    roots = [root, *(Path(path).resolve(strict=True) for path in additional_read_roots)]
+    return {"id": recipe_id, "argv": [executable, *arguments],
+            "read_roots": list(dict.fromkeys(str(path) for path in roots))}
 
 
 class PatchTests(unittest.TestCase):
@@ -194,7 +206,7 @@ class PatchTests(unittest.TestCase):
             "    def test_value(self): self.assertEqual(VALUE, 'after')\n"
         )
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "-v", "test_recipe"]}},
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "-v", "test_recipe")},
             {"project": [("recipes", "recipes")]})
         before = hashlib.sha256(b"VALUE = 'before'\n").hexdigest()
         proposal = broker.call({"action": "propose", "target": "project", "changes": [
@@ -219,7 +231,7 @@ class PatchTests(unittest.TestCase):
             "    def test_value(self): self.assertEqual(VALUE, 'after')\n"
         )
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "-v", "test_recipe"]}},
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "-v", "test_recipe")},
             {"project": [("recipes", "recipes")]})
         before = hashlib.sha256(b"VALUE = 'before'\n").hexdigest()
         proposal = broker.propose({"target": "project", "changes": [
@@ -237,7 +249,7 @@ class PatchTests(unittest.TestCase):
         classes = {"project": [("runtime", "runtime"), ("tools", "tools"),
                                ("recipes", "recipes"), ("adapters", "adapters")]}
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest"]}}, classes)
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest")}, classes)
         self.assertFalse(broker.patches.classify("project", "runtime/security/patch_broker.py")["self_apply"])
         self.assertFalse(broker.patches.classify("project", "runtime/capabilities/manifest.json")["self_apply"])
         self.assertEqual(broker.patches.classify("project", "settings/credentials.json")["class"], "forbidden")
@@ -253,7 +265,7 @@ class PatchTests(unittest.TestCase):
         original = "VALUE = 'before'\n"
         (self.root / "recipes" / "value.py").write_text(original)
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest"]}},
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest")},
             {"project": [("recipes", "recipes")]})
         proposal = broker.propose({"target": "project", "changes": [{
             "path": "recipes/value.py", "before_sha256": hashlib.sha256(original.encode()).hexdigest(),
@@ -279,7 +291,7 @@ class PatchTests(unittest.TestCase):
             "    def test_candidate(self): self.assertIn(\"after\", Path('runtime/security/logic.py').read_text())\n"
         )
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "-v", "test_recipe"]}})
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "-v", "test_recipe")})
         proposal = broker.propose({"target": "project", "changes": [{
             "path": "runtime/security/logic.py", "before_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "content": "VALUE = 'after'\n"}]}, "world-a")
@@ -301,7 +313,7 @@ class PatchTests(unittest.TestCase):
             "class RepairTests(unittest.TestCase):\n"
             "    def test_value(self): self.assertEqual(VALUE, 'after')\n"
         )
-        recipe = {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "test_recipe"]}
+        recipe = python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "test_recipe")
         broker = RepairBroker(self.broker, {"project": recipe}, {"project": [("recipes", "recipes")]})
         proposal = broker.propose({"target": "project", "changes": [{
             "path": "recipes/value.py", "before_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -356,7 +368,7 @@ class PatchTests(unittest.TestCase):
             "VALUE = 'after'\n"
         )
         broker = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "-v", "test_recipe"]}},
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "-v", "test_recipe")},
             {"project": [("recipes", "recipes")]})
         proposal = broker.propose({"target": "project", "changes": [{
             "path": "recipes/value.py", "before_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -506,7 +518,7 @@ class PatchTests(unittest.TestCase):
             "    def test_value(self): self.assertEqual(VALUE, 'after')\n"
         )
         repair = RepairBroker(self.broker,
-            {"project": {"id": "fixed-unittest-v1", "argv": [sys.executable, "-B", "-m", "unittest", "-v", "test_value"]}},
+            {"project": python_test_recipe("fixed-unittest-v1", "-B", "-m", "unittest", "-v", "test_value")},
             {"project": [("tools", "tools")]})
         proposal = repair.propose({"target": "project", "changes": [{
             "path": "tools/value.py", "before_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -536,8 +548,7 @@ class PatchTests(unittest.TestCase):
             (target / "main.jl").write_text("fixture() = 1\n")
             config_path = root / "repair-config.json"
             config_path.write_text(json.dumps({
-                "test_recipes": {"fixture": {"id": "fixed-fixture-v1",
-                    "argv": [sys.executable, "-c", "pass"]}},
+                "test_recipes": {"fixture": python_test_recipe("fixed-fixture-v1", "-c", "pass")},
                 "auto_apply_prefixes": {"fixture": [["adapters", "main.jl"]]},
             }))
             ceiling = root / "ceiling.json"
@@ -566,6 +577,32 @@ class PatchTests(unittest.TestCase):
             self.assertEqual({tool["name"] for tool in router_after},
                              {"palette", "palette_control", "palette_workspace", "palette_patch"})
             self.assertEqual(router_after, router_before)
+
+    def test_R16_python_recipe_mounts_only_its_declared_toolchain(self):
+        with tempfile.TemporaryDirectory(prefix="palette-python-toolchain-", dir=Path.home()) as tmp:
+            toolchain = Path(tmp)
+            binary = toolchain / "bin" / "python3"
+            binary.parent.mkdir()
+            binary.symlink_to(Path(sys.executable).resolve())
+            code = "import sys; print('PYTHON_TOOLCHAIN_OK:' + str(sys.version_info.major))"
+
+            declared = normalize_recipe(python_test_recipe(
+                "relocated-python-v1", "-B", "-c", code,
+                executable=str(binary), toolchain_root=str(toolchain),
+                additional_read_roots=(sys.base_prefix,)))
+            passed = run_isolated_test(self.root, declared)
+            self.assertEqual(passed["status"], "passed", passed)
+            self.assertIn("PYTHON_TOOLCHAIN_OK:3", passed["output"])
+
+            omitted = normalize_recipe({
+                "id": "relocated-python-without-root-v1",
+                "argv": [str(binary), "-B", "-c", code],
+                "read_roots": [str(Path(sys.base_prefix).resolve())],
+            })
+            failed = run_isolated_test(self.root, omitted)
+            self.assertEqual(failed["status"], "failed", failed)
+            self.assertNotEqual(failed["exit_code"], 0)
+            self.assertIn("No such file or directory", failed["output"])
 
 
 if __name__ == "__main__":

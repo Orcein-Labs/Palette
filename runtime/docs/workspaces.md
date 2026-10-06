@@ -48,8 +48,10 @@ The operator configures the target's fixed test recipe, frozen host-command prot
 `test` starts verification and returns `testing`; inspect `status` in a later
 call before applying. Verification does not consume the interactive Julia turn's
 deadline. A host restart during verification reports unknown completion rather
-than treating the interrupted candidate as passed. Julia recipes can name narrow
-host `read_roots` for a pinned toolchain and prepared dependencies; optional
+than treating the interrupted candidate as passed. Fixed recipes can name narrow
+host `read_roots` for a pinned toolchain and prepared dependencies. A Python
+installation outside `/usr` needs its exact toolchain directory declared here;
+an absolute interpreter in `argv` does not grant access to that directory. Optional
 `julia_depots` must be a subset of those roots. The candidate and host dependency
 mounts remain read-only, and new compile caches go in private temporary storage.
 
