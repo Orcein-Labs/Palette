@@ -160,6 +160,10 @@ jobs:
       with:
         python-version: '3.12'
     - uses: dtolnay/rust-toolchain@stable
+    - name: Check local model command boundaries and client packaging
+      run: |
+        python3 runtime/security/test_vibethinker.py
+        python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/palette-bundles"
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
     - name: Prepare real operator dependencies and host

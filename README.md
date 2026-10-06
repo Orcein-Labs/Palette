@@ -79,6 +79,9 @@ package live under `runtime/docs/` and `runtime/plugins/`.
 Rust builds Palette's host; Python supports its adapters. Additional language
 kernels and SDKs are provisioned by deployments, rather than bundled with Palette.
 
+An operator-provisioned [local VibeThinker-3B](runtime/docs/vibethinker.md) can
+answer prompts through the host-command broker using llama.cpp and a GGUF model.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, verification, and research archival.
