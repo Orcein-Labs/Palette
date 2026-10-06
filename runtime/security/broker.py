@@ -50,6 +50,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from launch_worker import (
+    build_package_installer_argv, create_session_depot, default_depot, package_store_lock, package_store_paths,
+    resolve_real_julia_binary, run_worker,
+)
+from provisioning import protected_host_paths
+
 
 class CapabilityDenied(Exception):
     def __init__(self, reason: str):
@@ -115,6 +121,8 @@ def ceiling_is_subset(requested: dict, parent: dict) -> tuple[bool, str]:
                 return False, "requested package_management must name allowed_packages explicitly (no unrestricted child grant)"
             if parent_pkgs is not None and not set(req_pkgs).issubset(set(parent_pkgs)):
                 return False, f"requested allowed_packages {req_pkgs} is not a subset of parent's {parent_pkgs}"
+            if parent_cap.get("offline") is True and req_cap.get("offline") is not True:
+                return False, "requested package_management permits online package access but parent's grant is offline-only"
         elif category == "host_request":
             req_types = req_cap.get("allowed_types")
             if not isinstance(req_types, list):
@@ -234,6 +242,8 @@ class Broker:
         receipt_log_path: str,
         session_id: str,
         depot_dir: str | None = None,
+        package_depot_dir: str | None = None,
+        package_environment_dir: str | None = None,
         project_dir: str | None = None,
         repo_dir: str | None = None,
         child_timeout: float = 90.0,
@@ -266,15 +276,11 @@ class Broker:
         # below its own turn timeout, so a hung ephemeral child is killed
         # before the session gives up on the turn and kills the kernel too.
         self.child_timeout = child_timeout
-        # This session's own private depot clone (see launch_worker.
-        # create_session_depot), if one has been set up for it. Needed by
-        # package_management: a bind mount is a live view of a directory,
-        # not a snapshot, so the broker installing a package into this
-        # exact path (from the host, unsandboxed, with real network access)
-        # makes it appear inside an already-running worker immediately --
-        # but only if the broker actually knows which depot is this
-        # session's, which nothing before package_management ever needed.
+        # Durable package content is operator-owned and mounted read-only in
+        # workers. The broker alone writes it; a stable path survives restarts.
         self.depot_dir = depot_dir
+        self.package_depot_dir = package_depot_dir
+        self.package_environment_dir = package_environment_dir
         self._log_lock = threading.Lock()
         # Serialize package mutations in this session's cloned depot so
         # concurrent requests cannot race on shared package state.
@@ -387,19 +393,15 @@ class Broker:
         harmless filesystem I/O, exactly the leak flagged in this
         project's own audit notes before this category existed).
 
-        Installs into `self.depot_dir` -- this session's own private depot
-        clone (see launch_worker.create_session_depot) -- with no active
-        project, so Pkg targets that depot's own default shared environment
-        (`@v#.#`), which every worker sharing this depot already has beneath
-        its own project on LOAD_PATH. A bind mount is a live view of a
-        directory, not a snapshot: an already-running worker sees the new
-        package the moment this finishes, no new mount, no restart.
+        Installs into the operator's durable package store. Workers see its
+        content through a read-only bind and load its explicit environment;
+        their private writable depot remains first for compiled caches.
         """
         cap = self.ceiling.get("package_management")
         if not cap or cap.get("allowed_packages") is None:
             raise CapabilityDenied("package_management is not in this session's capability ceiling")
-        if self.depot_dir is None:
-            raise CapabilityDenied("no session depot is configured for this broker -- package_management requires one")
+        if self.package_depot_dir is None or self.package_environment_dir is None:
+            raise CapabilityDenied("no durable package store is configured for this broker -- package_management requires one")
 
         name = params.get("name")
         version = params.get("version")
@@ -413,20 +415,33 @@ class Broker:
             raise CapabilityDenied(f"package {name!r} is not in this session's allowed_packages {allowed}")
 
         spec = f'name="{name}"' + (f', version="{version}"' if version else "")
-        env = dict(os.environ)
-        env["JULIA_DEPOT_PATH"] = self.depot_dir
-        env.pop("JULIA_PROJECT", None)  # target the depot's own shared @v#.# environment, not any caller's project
+        julia = resolve_real_julia_binary()
+
+        # Reuse the prepared stdlib cache; an empty sole depot recompiles Pkg
+        # for over a minute. Install into the durable first depot, while worker
+        # imports compile in their own private caches.
+        package_store_root = str(Path(self.package_depot_dir).resolve().parent)
+        protected_paths = [str(path) for path in protected_host_paths(self.ceiling, include_package_depot=False)]
+        protected_paths.append(self.receipt_log_path)
+        protected_paths.extend(path for path in (self.project_dir, self.repo_dir) if path)
+        installer_argv = build_package_installer_argv(
+            julia_bin=julia, package_store_root=package_store_root,
+            package_depot_dir=self.package_depot_dir,
+            package_environment_dir=self.package_environment_dir,
+            base_depot=default_depot(), offline=cap.get("offline", False),
+            script=f"using Pkg; Pkg.add(Pkg.PackageSpec({spec}))",
+            protected_paths=protected_paths,
+        )
         with self._depot_lock:
-            # stdin=DEVNULL: see launch_worker.resolve_real_julia_binary's
-            # docstring -- an unspecified stdin here inherits the broker
-            # process's own, and `julia -e` silently breaks that process's
-            # own future stdin reads. This handler runs inside a
-            # persistent session's own process exactly as often as any
-            # turn calls package_management.
-            proc = subprocess.run(
-                ["julia", "--startup-file=no", "-e", f"using Pkg; Pkg.add(Pkg.PackageSpec({spec}))"],
-                env=env, capture_output=True, text=True, errors="replace", timeout=300, stdin=subprocess.DEVNULL,
-            )
+            with package_store_lock(package_store_root):
+                # The Julia process is sandboxed because Pkg runs package
+                # build scripts as part of installation. Only the managed
+                # package store is a writable host mount.
+                proc = subprocess.run(
+                    installer_argv, env={"PATH": "/usr/bin:/bin"},
+                    capture_output=True, text=True, errors="replace", timeout=300,
+                    stdin=subprocess.DEVNULL,
+                )
         if proc.returncode != 0:
             raise CapabilityDenied(f"Pkg.add({name!r}) failed: {proc.stderr[-800:]}")
         return {"name": name, "version": version, "installed": True, "stdout_tail": proc.stdout[-500:]}
@@ -463,12 +478,9 @@ class Broker:
         child_workspace = tempfile.mkdtemp(prefix="palette-child-ws-")
         child_project = self.project_dir
         child_repo = self.repo_dir
-        from launch_worker import create_session_depot, run_worker
-
-        # Only children that actually requested package_management pay for
-        # their own depot clone (create_session_depot costs a real, if
-        # cheap, reflink copy) -- everyone else keeps the old
-        # one-clone-per-launch behavior via run_worker's own default.
+        # A package-capable child keeps a private prepared-depot clone for
+        # writable caches; package content itself is shared through the
+        # durable host store and mounted read-only.
         child_depot_dir = create_session_depot() if "package_management" in requested_ceiling else None
 
         # A child's OS-level network namespace is NEVER unshared, no matter
@@ -491,6 +503,8 @@ class Broker:
             child_receipts,
             f"{self.session_id}/child",
             depot_dir=child_depot_dir,
+            package_depot_dir=self.package_depot_dir,
+            package_environment_dir=self.package_environment_dir,
             project_dir=child_project,
             repo_dir=child_repo,
         )
@@ -772,15 +786,24 @@ def serve(
     session_id: str,
     stop_event: threading.Event | None = None,
     depot_dir: str | None = None,
+    package_depot_dir: str | None = None,
+    package_environment_dir: str | None = None,
     project_dir: str | None = None,
     repo_dir: str | None = None,
     child_timeout: float = 90.0,
 ):
+    if package_depot_dir is None and package_environment_dir is None:
+        _, package_depot_dir, package_environment_dir = package_store_paths(
+            ceiling=ceiling,
+            protected_paths=[sock_path, receipt_log_path, project_dir or "", repo_dir or ""],
+        )
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     broker = Broker(
         ceiling, receipt_log_path, session_id,
-        depot_dir=depot_dir, project_dir=project_dir, repo_dir=repo_dir, child_timeout=child_timeout,
+        depot_dir=depot_dir, package_depot_dir=package_depot_dir,
+        package_environment_dir=package_environment_dir,
+        project_dir=project_dir, repo_dir=repo_dir, child_timeout=child_timeout,
     )
     server = _UnixSocketServer(sock_path, _ConnHandler)
     server.broker = broker  # type: ignore[attr-defined]

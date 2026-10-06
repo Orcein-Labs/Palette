@@ -42,6 +42,9 @@ def main():
     host = ROOT / "runtime/host/target/release/palette-host"
     run([sys.executable, ROOT / "runtime/security/prewarm_depot.py", "--project-dir", project,
          "--repo-dir", ROOT, "--host-bin", host], env)
+    for suite in ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py"):
+        run([sys.executable, ROOT / "runtime/security" / suite, "-v"], env)
+    run([sys.executable, ROOT / "runtime/integrations/gesso/test_gesso.py", "-v"], env)
     implementations = ("rust", "python") if args.implementation == "both" else (args.implementation,)
     for implementation in implementations:
         print(f"\noperator implementation: {implementation}", flush=True)

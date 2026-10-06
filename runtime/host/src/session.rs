@@ -126,6 +126,13 @@ impl PaletteSession {
             None => None,
         };
         let state_dir = o.state_dir.as_deref().map(|p| fs::canonicalize(p).map_err(|e| err(e.to_string()))).transpose()?;
+        let mut package_protection = vec![
+            PathBuf::from(&o.project_dir), PathBuf::from(&o.repo_dir), tmp_root.clone(),
+        ];
+        for path in [o.state_dir.as_deref(), o.task_workspace_dir.as_deref(), o.receipts_dir.as_deref()].into_iter().flatten() {
+            package_protection.push(PathBuf::from(path));
+        }
+        let package_store = sandbox::package_store_paths(&package_protection, Some(&o.ceiling)).map_err(err)?;
         if let Some(state) = state_dir.as_deref() {
             if !state.is_dir() {
                 return Err(err(format!("state directory is not a directory: {}", state.display())));
@@ -134,6 +141,7 @@ impl PaletteSession {
         let mut protected_layout = Vec::new();
         if let Some(tw) = task_workspace.as_deref() { protected_layout.push(("task workspace", tw)); }
         if let Some(state) = state_dir.as_deref() { protected_layout.push(("persistent state directory", state)); }
+        protected_layout.push(("persistent package store", package_store.root.as_path()));
         // Resolve the future scratch path before creating it so rejecting a
         // caller-owned workspace or durable state cannot transfer it to recursive cleanup.
         let planned_root = util::resolve(&tmp_root);
@@ -201,13 +209,15 @@ impl PaletteSession {
         let mut writable = vec![("workspace", writable_workspace.as_path())];
         if let Some(state) = writable_state.as_deref() { writable.push(("state directory", state)); }
         sandbox::check_writable_mounts_disjoint(&writable,
-            &[("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path())]).map_err(err)?;
+            &[("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path()),
+              ("persistent package store", package_store.root.as_path())]).map_err(err)?;
         let receipts = receipts_root.join("receipts.jsonl");
         let broker = Arc::new(Broker::new(BrokerConfig {
             ceiling: o.ceiling.clone(),
             receipt_log_path: receipts,
             session_id: session_id.to_string(),
-            depot_dir: Some(depot_clone.to_string_lossy().into_owned()),
+            package_depot_dir: Some(package_store.depot.to_string_lossy().into_owned()),
+            package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
             project_dir: Some(o.project_dir.clone()),
             repo_dir: Some(o.repo_dir.clone()),
             // Leaves the child's own shutdown and the reply time to land inside the call.
@@ -228,6 +238,9 @@ impl PaletteSession {
             julia_depot: &depot,
             network_enabled: o.network_enabled,
             depot_clone_dir: Some(&depot_clone_s),
+            package_store_root: Some(package_store.root.to_str().ok_or_else(|| err("package store path is not valid UTF-8".into()))?),
+            package_depot_dir: Some(package_store.depot.to_str().ok_or_else(|| err("package depot path is not valid UTF-8".into()))?),
+            package_environment_dir: Some(package_store.environment.to_str().ok_or_else(|| err("package environment path is not valid UTF-8".into()))?),
             state_dir: o.state_dir.as_deref(),
         }).map_err(err)?;
         let mut setenv = |k: &str, v: String| argv.extend(["--setenv".to_string(), k.to_string(), v]);

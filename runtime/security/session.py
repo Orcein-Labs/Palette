@@ -37,7 +37,7 @@ import threading
 import uuid
 from pathlib import Path
 
-from launch_worker import resolve_real_julia_binary, build_bwrap_argv, create_session_depot
+from launch_worker import resolve_real_julia_binary, build_bwrap_argv, create_session_depot, package_store_paths
 from filesystem_layout import require_disjoint
 
 import broker as _broker
@@ -136,6 +136,15 @@ class PaletteSession:
         # call here no matter how early the failure happened.
         try:
             scratch = Path(workspace_dir or Path.home() / ".palette-sessions" / self.session_id).resolve()
+            planned_receipts_dir = receipts_dir or str(scratch / "broker")
+            package_root, package_depot, package_environment = package_store_paths(
+                ceiling=ceiling,
+                protected_paths=[
+                    scratch, project_dir, repo_dir, state_dir or "",
+                    task_workspace_dir or "", planned_receipts_dir,
+                ],
+            )
+            require_disjoint([scratch], [package_root])
             if state_dir:
                 require_disjoint([state_dir], [scratch])
             if task_workspace_dir is not None:
@@ -151,6 +160,7 @@ class PaletteSession:
                 Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
 
             self.depot_clone_dir = create_session_depot()
+            self.package_store_root = package_root
 
             # A Unix socket path is limited to 108 bytes. Under a long HOME the
             # session root pushed it past that and no kernel could start
@@ -165,11 +175,13 @@ class PaletteSession:
                 self._broker_sock_dir = str(broker_root)
             receipts_path = str(Path(receipts_dir or broker_root) / "receipts.jsonl")
             require_disjoint([self.workspace_dir] + ([state_dir] if state_dir else []),
-                [broker_root, Path(receipts_path).parent, self.depot_clone_dir])
+                [broker_root, Path(receipts_path).parent, self.depot_clone_dir, self.package_store_root])
             self._broker_server, self._broker = _broker.serve(
                 str(Path(self._broker_sock_dir) / "broker.sock"),
                 ceiling, receipts_path, self.session_id,
                 depot_dir=self.depot_clone_dir,
+                package_depot_dir=package_depot,
+                package_environment_dir=package_environment,
                 project_dir=self.project_dir,
                 repo_dir=self.repo_dir,
                 # Leaves the child's own shutdown and the reply time to land
@@ -186,6 +198,9 @@ class PaletteSession:
                 julia_bin=julia_bin,
                 julia_depot=os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia")).split(":")[-1],
                 depot_clone_dir=self.depot_clone_dir,
+                package_store_root=package_root,
+                package_depot_dir=package_depot,
+                package_environment_dir=package_environment,
                 network_enabled=network_enabled,
                 state_dir=state_dir,
             )

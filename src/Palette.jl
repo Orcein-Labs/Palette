@@ -205,6 +205,7 @@ mutable struct KernelState
         # single turn just to reach the one function that's the entire
         # point of the authority fence.
         Core.eval(state.eval_module, :(const Palette = $(Api)))
+        Core.eval(state.eval_module, :(const Api = $(Api)))
         Core.eval(state.eval_module, :(const Main = $(state.eval_module)))
         # A bare `Module(...)` never gets `include` for free (confirmed by
         # direct testing across all constructor flag combinations -- this
@@ -714,6 +715,7 @@ found `reset_kernel_state()`, which silently discarded every binding, and
 module Api
 import ..Palette
 host_request(rtype::AbstractString, payload::AbstractDict=Dict{String,Any}()) = Palette.host_request(rtype, payload)
+runtime(action::AbstractString, payload::AbstractDict=Dict{String,Any}()) = Palette.runtime(action, payload)
 const rlm = Palette.rlm
 request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...) =
     Palette.request_capability(category, params; kwargs...)
@@ -757,7 +759,7 @@ end
 
 # Bindings the kernel creates in every session module. They are not the
 # model's own variables, so GetState and varinfo() leave them out.
-const KERNEL_BINDINGS = (:eval, :include, :bash, Symbol("@sh_str"), :Palette, :ShellResult,
+const KERNEL_BINDINGS = (:eval, :include, :bash, Symbol("@sh_str"), :Palette, :Api, :ShellResult,
                          :varinfo, :kernelinfo, :ans, :PAYLOAD, :Main)
 
 """
@@ -1879,6 +1881,7 @@ export ErrorHandler, SafetyGuard, validate, check_patterns, safe_execute
 export demo_setup, run_demo
 export execute, mean
 export request_capability
+export host_request, runtime
 
 """
     ephemeral_main(code)

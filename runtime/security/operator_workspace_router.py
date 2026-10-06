@@ -21,19 +21,21 @@ import uuid
 
 from patch_broker import PatchBroker, PATCH_SCHEMA
 from filesystem_layout import require_disjoint
+from provisioning import operator_ceiling, protected_host_paths
 
 REPO = Path(os.environ.get("PALETTE_REPO", Path(__file__).absolute().parents[2])).resolve()
 BASE = Path(os.environ["OPERATOR_WORKSPACE"]).resolve()
 LEGACY = Path(os.environ.get("PALETTE_STATE_DIR", str(Path.home() / ".local/share/operator-surfaces/palette-state" / hashlib.sha256(str(BASE).encode()).hexdigest()))).resolve()
+LEGACY_RECEIPTS = LEGACY.with_name(LEGACY.name + ".receipts")
 ROOT = Path(os.environ.get("PALETTE_WORKSPACE_STATE_ROOT", str(Path.home() / ".local/share/operator-surfaces/palette-workspaces"))).resolve()
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_LIVE = int(os.environ.get("PALETTE_MAX_LIVE_WORKSPACES", "4"))
 IDLE_SECONDS = float(os.environ.get("PALETTE_WORKSPACE_IDLE_SECONDS", "900"))
 if MAX_LIVE < 1 or IDLE_SECONDS <= 0:
     raise ValueError("Workspace limits must be positive")
-require_disjoint([BASE], [REPO, ROOT, LEGACY, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
-require_disjoint([ROOT, LEGACY], [REPO])
-require_disjoint([LEGACY], [ROOT])
+require_disjoint([BASE], [REPO, ROOT, LEGACY, LEGACY_RECEIPTS, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
+require_disjoint([ROOT, LEGACY, LEGACY_RECEIPTS], [REPO])
+require_disjoint([LEGACY, LEGACY_RECEIPTS], [ROOT])
 
 
 def atomic_json(path, value):
@@ -282,8 +284,18 @@ def validate(args, schema):
 def main():
     capabilities = {}
     roots = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
-    require_disjoint(roots.values(), [ROOT, LEGACY])
-    broker = PatchBroker(ROOT / "patches", roots)
+    require_disjoint(roots.values(), [ROOT, LEGACY, LEGACY_RECEIPTS])
+    ceiling = operator_ceiling()
+    repair_config_path = os.environ.get("PALETTE_REPAIR_CONFIG")
+    repair_config = json.loads(Path(repair_config_path).expanduser().read_text(encoding="utf-8")) if repair_config_path else {}
+    if not isinstance(repair_config, dict) or set(repair_config) - {"test_recipes", "auto_apply_prefixes", "sandbox_source_paths"}:
+        raise ValueError("PALETTE_REPAIR_CONFIG has unsupported fields")
+    auto_apply_prefixes = repair_config.get("auto_apply_prefixes", {})
+    runtime_root = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(__file__).resolve().parents[1] / "capabilities"))).expanduser().resolve()
+    broker = PatchBroker(ROOT / "patches", roots, auto_apply_prefixes,
+                         protected_paths=[*protected_host_paths(ceiling, include_runtime_root=False), ROOT, LEGACY, LEGACY_RECEIPTS],
+                         registry_root=runtime_root,
+                         sandbox_source_paths=repair_config.get("sandbox_source_paths", {}))
     for raw in sys.stdin:
         mid = None
         try:

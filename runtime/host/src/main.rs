@@ -61,11 +61,17 @@ fn run_worker(argv: &[String]) -> Result<i32, String> {
 fn run_broker(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
     let get = |k: &str| f.get(k).cloned().ok_or_else(|| format!("--{k} is required"));
+    let ceiling = ceiling_arg(&get("ceiling")?)?;
+    let receipt_path = PathBuf::from(get("receipts")?);
+    let mut protected = vec![receipt_path.clone(), PathBuf::from(get("socket")?)];
+    for key in ["project", "repo"] { if let Some(path) = f.get(key) { protected.push(PathBuf::from(path)); } }
+    let package_store = sandbox::package_store_paths(&protected, Some(&ceiling))?;
     let b = Arc::new(broker::Broker::new(broker::BrokerConfig {
-        ceiling: ceiling_arg(&get("ceiling")?)?,
-        receipt_log_path: PathBuf::from(get("receipts")?),
+        ceiling,
+        receipt_log_path: receipt_path,
         session_id: f.get("session-id").cloned().unwrap_or_else(util::uuid4),
-        depot_dir: f.get("depot").cloned(),
+        package_depot_dir: Some(package_store.depot.to_string_lossy().into_owned()),
+        package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
         project_dir: f.get("project").cloned(),
         repo_dir: f.get("repo").cloned(),
         child_timeout: Duration::from_secs_f64(f.get("child-timeout").map_or(Ok(90.0), |t| t.parse::<f64>()).map_err(|e| e.to_string())?),
@@ -100,6 +106,7 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
     let julia = sandbox::resolve_julia()?;
     let workspace = util::mkdtemp("palette-prewarm-").map_err(|e| e.to_string())?;
     let depot = sandbox::default_depot();
+    let packages = sandbox::package_store_paths(&[project.clone(), repo.clone(), workspace.clone()], None)?;
     // No depot clone: the real depot is bound writable at its own path.
     let mut argv = sandbox::build_bwrap_argv(&sandbox::SandboxSpec {
         workspace_dir: &workspace.to_string_lossy(),
@@ -110,6 +117,9 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
         julia_depot: &depot,
         network_enabled: false,
         depot_clone_dir: None,
+        package_store_root: Some(packages.root.to_str().ok_or("package store path is not UTF-8")?),
+        package_depot_dir: Some(packages.depot.to_str().ok_or("package depot path is not UTF-8")?),
+        package_environment_dir: Some(packages.environment.to_str().ok_or("package environment path is not UTF-8")?),
         state_dir: None,
     })?;
     argv.extend(["--".into(), julia, "--startup-file=no".into(), "-e".into(), PREWARM.into()]);

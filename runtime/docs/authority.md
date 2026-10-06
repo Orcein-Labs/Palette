@@ -15,6 +15,20 @@ A network capability grants broker-mediated access, not unrestricted raw worker
 networking. Read-only runtime mounts remain read-only even when Julia can run
 arbitrary code. Credentials belong to host services rather than worker bindings.
 
+`package_management.allowed_packages` is an explicit operator allowlist. The
+broker installs approved packages into the durable host package store, while
+workers receive that store read-only and keep compiled caches in a private
+session depot. The optional `offline` flag defaults to `false`; when enabled,
+the broker resolves only from its prepared registry and source cache. Package
+fetches are broker effects, never worker networking. The store survives adapter
+restarts.
+
+Package installation itself runs in a separate filesystem namespace because
+Julia executes dependency build scripts. The installer cannot write runtime
+source, saved worlds, credentials, or broker configuration. It receives private
+scratch space and the managed package directories; prepared dependencies remain
+read-only. Offline installation also disables network access at the OS boundary.
+
 Writable workspace and saved-state mounts must be disjoint from protected
 runtime, project, toolchain, shared depot, OS and broker-socket paths. Canonical
 path checks reject parent, child, equal and symlink overlaps before launch.
