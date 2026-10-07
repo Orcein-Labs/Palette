@@ -82,7 +82,8 @@ operator already has a tunnel client and profile, generate its unit with:
 ```sh
 python3 runtime/security/palette_service.py install \
   --repo-dir "$PWD" --workspace-dir /absolute/path/to/workspace \
-  --tunnel-client /absolute/path/to/tunnel-client --tunnel-profile existing-profile
+  --tunnel-client /absolute/path/to/tunnel-client --tunnel-profile existing-profile \
+  --tunnel-profile-dir /absolute/path/to/profile-directory
 ```
 
 Add `--tunnel-env-file /absolute/path/to/operator.env` only when the existing

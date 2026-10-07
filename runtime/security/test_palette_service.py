@@ -55,8 +55,17 @@ class PaletteServiceTests(unittest.TestCase):
         credentials = self.root / "operator credentials.env"
         credentials.write_text("TOKEN=operator-owned\n")
         credentials.chmod(0o600)
-        unit = service.render_tunnel_unit(client, "existing profile", credentials)
-        self.assertIn('"run" "--profile" "existing profile"', unit)
+        profile_dir = self.root / "profiles with spaces"
+        profile_dir.mkdir()
+        (profile_dir / "existing profile.yaml").write_text("config_version: 1\n")
+        sock = self.runtime / "palette" / "daemon.sock"
+        unit = service.render_tunnel_unit(client, "existing profile", credentials,
+                                          profile_dir=profile_dir, sock=sock)
+        self.assertIn('"run" "--profile" "existing profile" "--profile-dir"', unit)
+        self.assertIn(service.unit_quote(profile_dir.resolve()), unit)
+        self.assertIn("Environment=PALETTE_SOCKET=" + service.unit_quote(sock.resolve()), unit)
+        self.assertIn("UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY PALETTE_HOST_COMMANDS", service.render_palette_unit(
+            self.repo, self.workspace, self.runtime / "palette/daemon.sock"))
         self.assertIn('EnvironmentFile=' + service.unit_path(credentials.resolve()), unit)
         self.assertNotIn('EnvironmentFile="', unit)
         self.assertIn('Restart=on-failure', unit)
@@ -69,6 +78,8 @@ class PaletteServiceTests(unittest.TestCase):
             service.render_palette_unit(self.repo, self.workspace, self.runtime / "palette/daemon.sock", env_file=credentials)
         with self.assertRaisesRegex(ValueError, "existing executable"):
             service.render_tunnel_unit(self.root / "missing", "existing")
+        with self.assertRaisesRegex(ValueError, "profile must exist"):
+            service.render_tunnel_unit(client, "missing", profile_dir=profile_dir)
 
     def test_install_updates_only_owned_units_and_runs_fake_systemctl(self):
         units = self.root / "config/systemd/user"

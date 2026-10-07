@@ -86,6 +86,7 @@ UMask=0077
 PrivateTmp=yes
 NoNewPrivileges=yes
 {env_lines}
+UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY PALETTE_HOST_COMMANDS
 StandardOutput=journal
 StandardError=journal
 
@@ -94,16 +95,24 @@ WantedBy=default.target
 """
 
 
-def render_tunnel_unit(client, profile, env_file=None):
+def render_tunnel_unit(client, profile, env_file=None, profile_dir=None, sock=None):
     client = Path(client).expanduser().resolve()
     if not client.is_file() or not os.access(client, os.X_OK):
         raise ValueError(f"tunnel client must be an existing executable: {client}")
     if not profile or "\n" in profile:
         raise ValueError("an existing tunnel profile name is required")
+    profile_args = []
+    if profile_dir:
+        profile_dir = Path(profile_dir).expanduser().resolve()
+        if not profile_dir.is_dir() or not any((profile_dir / (profile + suffix)).is_file() for suffix in (".yaml", ".yml")):
+            raise ValueError(f"tunnel profile must exist in the configured profile directory: {profile_dir}")
+        profile_args = ["--profile-dir", profile_dir]
     env_line = ""
     if env_file:
         env_line = "EnvironmentFile=" + unit_path(operator_env_file(env_file)) + "\n"
-    command = " ".join(unit_quote(value) for value in (client, "run", "--profile", profile))
+    if sock is not None:
+        env_line += "Environment=PALETTE_SOCKET=" + unit_quote(Path(sock).expanduser().resolve()) + "\n"
+    command = " ".join(unit_quote(value) for value in (client, "run", "--profile", profile, *profile_args))
     return f"""[Unit]
 Description=Palette operator-owned Chat tunnel client
 After=palette.service
@@ -175,6 +184,7 @@ def main(argv=None):
                         help="service to control for start, stop, restart, and status")
     parser.add_argument("--tunnel-client", help="existing tunnel-client executable; enables separate tunnel unit generation")
     parser.add_argument("--tunnel-profile", help="operator's existing tunnel profile")
+    parser.add_argument("--tunnel-profile-dir", help="directory containing the existing tunnel profile")
     parser.add_argument("--tunnel-env-file", help="existing operator-owned 0600 credentials file")
     args = parser.parse_args(argv)
     try:
@@ -185,7 +195,9 @@ def main(argv=None):
             if args.tunnel_client or args.tunnel_profile or args.tunnel_env_file:
                 if not args.tunnel_client or not args.tunnel_profile:
                     parser.error("--tunnel-client and --tunnel-profile must be supplied together")
-                atomic_write(UNIT_DIR / "palette-tunnel.service", render_tunnel_unit(args.tunnel_client, args.tunnel_profile, args.tunnel_env_file))
+                atomic_write(UNIT_DIR / "palette-tunnel.service", render_tunnel_unit(
+                    args.tunnel_client, args.tunnel_profile, args.tunnel_env_file,
+                    profile_dir=args.tunnel_profile_dir, sock=sock))
             systemctl("daemon-reload", None)
             print(json.dumps({"installed": [str(palette)], "socket": str(sock), "tunnel_unit": str(UNIT_DIR / "palette-tunnel.service") if args.tunnel_client else None}))
         else:
