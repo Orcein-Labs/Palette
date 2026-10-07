@@ -1,6 +1,6 @@
 # Palette
 
-Palette gives a chat a Julia computer on your machine, and that computer is still running when the next message arrives.
+Palette gives any harness that accepts plugins, a Julia computer on your machine, and that computer is still running when the next message arrives.
 
 ChatGPT Chat, Claude, Grok, and Codex talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
 
@@ -17,7 +17,7 @@ This is the default ChatGPT chat product. The UI labels it Chat.
 
 The workspace is `palette_os_lab_20261005`, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
 
-We've run long-horizon R&D spirals on this desk. Bugs showed up. The World was still on disk after the kernel came back.
+We've run long-horizon R&D spirals on this desk. Bugs showed up and they were able to be fixed from the inside. The World was still on disk after the kernel came back.
 
 Clients attach over MCP, or over the host session (newline-delimited JSON on stdio). The kernel is local. Talk to whichever model you already use.
 
