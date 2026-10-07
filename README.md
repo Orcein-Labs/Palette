@@ -1,12 +1,24 @@
 # Palette
 
-A persistent Julia operator surface (conceptually similar to Bash or IPython, or could also be equated to DaemonMode.jl or Pluto.jl) for interactive work and agent harnesses.
-Palette keeps bindings across calls, captures results and process output, and
-revives saved state after a kernel restart with an explicit report of what
-survived, changed, or was lost. It's Jupyter on steroids, basically.
+Palette gives a chat a Julia computer on your machine, and that computer is still running when the next message arrives.
 
-Palette supplies the execution surface. Harnesses such as Prime-Agent or Hermes provide the
-agent loop, model inference, and orchestration.
+ChatGPT Chat, Claude, Grok, and Codex talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
+
+Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives, and host-side effects go through a capability broker and leave a receipt.
+
+## ChatGPT Chat, October 2025
+
+This is the default ChatGPT chat product. The UI labels it Chat.
+
+![ChatGPT Chat mode, confirmed in the UI, driving Palette](runtime/docs/images/chatgpt-chat-mode.png)
+
+The workspace is `palette_os_lab_20261005`, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
+
+![Crash-recovery of a symbolic World from ChatGPT Chat, using Palette as the lab](runtime/docs/images/chatgpt-os-lab.png)
+
+We've run long-horizon R&D spirals on this desk. Bugs showed up. The World was still on disk after the kernel came back.
+
+Clients attach over MCP, or over the host session (newline-delimited JSON on stdio). The kernel is local. Talk to whichever model you already use.
 
 ## Use Palette in your chatbot
 
@@ -42,6 +54,20 @@ message, send `{"request_id":"1","code":"x = 41"}` and then
 Keep state outside the workspace. The plain Julia API above does not create an
 OS sandbox; the supervised host does.
 
+## Talking to the kernel
+
+Three shell doors. Get `$` wrong and you will have a bad day.
+
+| door | `$` meaning | use when |
+|------|-------------|----------|
+| `sh"cmd"` | raw text, bash owns `$` | shell-native commands, bash arithmetic |
+| `bash("cmd $var")` | `$var` is Julia interpolation | splicing kernel bindings into a command |
+| `bash(PAYLOAD)` | payload text goes to bash verbatim | quoting, `$`, backticks, or user text |
+
+Default to the payload for anything non-trivial. Verify by the content of the reply. Silence is a bug signature: a healthy kernel answers every request with an event.
+
+Revival labels are `restored / rebuilt / stale / lost` (and uncertain, when that is the honest answer). Tasks, IO, pointers, and values built from an earlier version of a type do not come back. Files are the durable tier. Capability grants die with the generation: re-grant after a revival.
+
 ## Features
 
 - Persistent bindings, functions, types, packages, and workspace files.
@@ -62,9 +88,7 @@ OS sandbox; the supervised host does.
 representations, compiled helpers, provenance, and controlled experiments.
 Provide it as context when you want a model to start with those practices, or
 withhold it when evaluating unprimed exploration. It is guidance, not a required
-runtime dependency. You can use it as a seed for curated training examples;
-validate those examples and evaluate a tuned model on held-out tasks rather than
-assuming that fine-tuning on this prose improves performance.
+runtime dependency.
 
 ## Repository layout
 
@@ -77,16 +101,6 @@ assuming that fine-tuning on this prose improves performance.
 The tracked root has five folders: the three SDK directories above, `.github/`
 for CI, and `.agents/` for the plugin marketplace. Public docs and the plugin
 package live under `runtime/docs/` and `runtime/plugins/`.
-
-Rust builds Palette's host; Python supports its adapters. Additional language
-kernels and SDKs are provisioned by deployments, rather than bundled with Palette.
-
-Models and additional toolchains use operator-configured provisioning and the
-host-command broker. Their artifacts, input format and execution limits belong
-to deployment configuration.
-
-The optional [Gesso integration](runtime/integrations/gesso/README.md) exposes its
-existing tokenizer, CPU inference, fork and profiling through runtime capabilities.
 
 ## Development
 
@@ -106,11 +120,6 @@ with this checkout plus JSON, CSV, DataFrames, EzXML, and IJulia, then run:
 python3 runtime/security/verify_operator.py --project-dir /absolute/path/to/test-env --implementation both
 ```
 
-Internal development research and run receipts belong in the gitignored
-`.archive/` directory or a private external archive. Keep revisions, hashes,
-attribution, and failed attempts for future research publication. Public `runtime/docs/`
-contains supported product documentation.
-
 CI runs package, host, Jupyter integration, workspace/patch, and process gates.
 The package manifest declares Julia 1.10+; supervised development and CI are tested on Julia 1.12.
 
@@ -119,3 +128,7 @@ The package manifest declares Julia 1.10+; supervised development and CI are tes
 Core: **AGPL-3.0-only**. Identified client/plugin packages and public docs:
 **Apache-2.0**. Inherited MIT notices remain preserved. See
 [license boundaries](runtime/licenses/README.md) and [LICENSE](LICENSE).
+
+## ChatGPT ToS
+
+I combed OpenAI's Terms of Use. A local Palette kernel attached to ChatGPT Chat over the plugin/MCP path sits inside them. On a paid plan, Chat is unlimited usage. Those tokens get spent either way. Put them into actual work: work that survives the thread, persists into a new one, and lets ChatGPT (or whatever you attach) keep the world.
