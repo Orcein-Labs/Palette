@@ -134,23 +134,23 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 plugin = Path(self.tmp.name) / fmt
                 command = [sys.executable, str(REPO / "runtime/security/install_operator_plugin.py"), "--format", fmt,
                     "--plugin-dir", str(plugin), "--workspace-dir", str(self.workspace), "--bin-dir", str(Path(self.tmp.name) / "bin")]
-                subprocess.run(command, capture_output=True, text=True, check=True)
+                install_env = {**os.environ, "XDG_RUNTIME_DIR": str(Path(self.tmp.name) / "runtime")}
+                subprocess.run(command, capture_output=True, text=True, check=True, env=install_env)
                 config_path = plugin / ("mcp.json" if fmt == "portable" else ".mcp.json")
                 config = json.loads(config_path.read_text())
                 config["mcpServers"]["palette"]["env"]["INSTALL_TEST_PRESERVED"] = "yes"
+                config["INSTALL_TEST_ROOT_PRESERVED"] = "yes"
                 config_path.write_text(json.dumps(config))
-                subprocess.run(command, capture_output=True, text=True, check=True)
+                subprocess.run(command, capture_output=True, text=True, check=True, env=install_env)
                 entry = json.loads(config_path.read_text())["mcpServers"]["palette"]
                 self.assertEqual(entry["env"]["INSTALL_TEST_PRESERVED"], "yes")
-                request = {"jsonrpc":"2.0", "id":1, "method":"tools/list"}
-                result = subprocess.run([entry["command"], *entry["args"]], input=json.dumps(request)+"\n",
-                    capture_output=True, text=True, check=True, timeout=60, cwd=self.tmp.name, env={**self.env, **entry["env"]})
-                self.assertEqual({t["name"] for t in json.loads(result.stdout)["result"]["tools"]},
-                    {"palette", "palette_control", "palette_workspace", "palette_patch"})
+                self.assertEqual(json.loads(config_path.read_text())["INSTALL_TEST_ROOT_PRESERVED"], "yes")
+                self.assertEqual(entry["command"], sys.executable)
+                self.assertEqual(Path(entry["args"][0]), REPO / "runtime/security/palette_mcp_client.py")
+                self.assertEqual(entry["env"]["PALETTE_SERVICE"], "palette.service")
+                self.assertIn("PALETTE_SOCKET", entry["env"])
         wrapper = Path(self.tmp.name) / "bin/palette-mcp"
-        result = subprocess.run([str(wrapper)], input=json.dumps(request)+"\n", capture_output=True,
-            text=True, check=True, timeout=60, cwd=self.tmp.name, env=self.env)
-        self.assertEqual(len(json.loads(result.stdout)["result"]["tools"]), 4)
+        self.assertIn(str(REPO / "runtime/security/palette_mcp_client.py"), wrapper.read_text())
 
     def test_thread_project_open_and_revival(self):
         # Thread A and B are truly separate worlds.

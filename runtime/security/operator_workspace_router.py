@@ -12,6 +12,8 @@ from pathlib import Path
 import queue
 import re
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -164,8 +166,28 @@ class Child:
                 return frame["result"]
 
     def call(self, name, args):
+        stop_idle_children(self)
         with self.lock:
-            self.start()
+            key = self.entry["state_dir"]
+            if self.proc is not None and self.proc.poll() is not None:
+                self.stop()
+            reserved = False
+            with children_lock:
+                if self.proc is None:
+                    occupied = {key for key, child in children.items()
+                                if child.proc is not None and child.proc.poll() is None}
+                    occupied.update(starting_children)
+                    occupied.update(stopping_children)
+                    if len(occupied) >= MAX_LIVE:
+                        raise RuntimeError(f"Live workspace limit ({MAX_LIVE}); close an unused workspace first")
+                    starting_children.add(key)
+                    reserved = True
+            if reserved:
+                try:
+                    self.start()
+                finally:
+                    with children_lock:
+                        starting_children.discard(key)
             try:
                 return self.exchange("tools/call", {"name": name, "arguments": args})
             except Exception:
@@ -176,7 +198,11 @@ class Child:
 
     def stop(self):
         with self.lock:
-            proc, self.proc = self.proc, None
+            proc = self.proc
+            if proc is not None:
+                with children_lock:
+                    self.proc = None
+                    stopping_children.add(self.entry["state_dir"])
             try:
                 if proc:
                     try:
@@ -197,20 +223,39 @@ class Child:
                 if self.lease:
                     self.lease.close()
                     self.lease = None
+                if proc:
+                    with children_lock:
+                        stopping_children.discard(self.entry["state_dir"])
 
 
 children = {}
+children_lock = threading.RLock()
+starting_children = set()
+stopping_children = set()
+
+
+def stop_idle_children(except_child=None):
+    with children_lock:
+        candidates = [child for child in children.values()
+                      if child is not except_child and child.proc is not None
+                      and time.monotonic() - child.last_used >= IDLE_SECONDS]
+    for child in candidates:
+        if not child.lock.acquire(blocking=False):
+            continue
+        try:
+            with children_lock:
+                idle = (child.proc is not None
+                        and time.monotonic() - child.last_used >= IDLE_SECONDS)
+            if idle:
+                child.stop()
+        finally:
+            child.lock.release()
 
 
 def child_for(entry):
-    for child in children.values():
-        if child.proc and time.monotonic() - child.last_used >= IDLE_SECONDS:
-            child.stop()
-    key = entry["state_dir"]
-    child = children.setdefault(key, Child(entry))
-    if not child.proc and sum(c.proc is not None and c.proc.poll() is None for c in children.values()) >= MAX_LIVE:
-        raise RuntimeError(f"Live workspace limit ({MAX_LIVE}); close an unused workspace first")
-    return child
+    with children_lock:
+        key = entry["state_dir"]
+        return children.setdefault(key, Child(entry))
 
 
 def workspace_control(args):
@@ -242,12 +287,29 @@ def workspace_control(args):
         with registry() as reg:
             reg["active"][context_key(context)] = entry["workspace_id"]
         return {"active_workspace_id": entry["workspace_id"]}
-    child = children.get(entry["state_dir"])
+    with children_lock:
+        child = children.get(entry["state_dir"])
     if action == "close":
+        # close is linearized against starts and waits for any in-flight call
+        # to finish before stopping the worker. A later call may start it again.
         if child:
-            child.stop()
+            with child.lock:
+                proc = child.proc
+                with children_lock:
+                    current = children.get(entry["state_dir"])
+                if current is child and proc:
+                    child.stop()
         return {"workspace_id": entry["workspace_id"], "closed": True, "state_retained": True}
-    return {**entry, "running": bool(child and child.proc and child.proc.poll() is None), "local_adapter_pid": child.proc.pid if child and child.proc and child.proc.poll() is None else None, "observation": "running describes this router; another router may hold ownership"}
+    if child:
+        with child.lock:
+            with children_lock:
+                current = children.get(entry["state_dir"])
+            proc = child.proc if current is child else None
+            running = bool(proc and proc.poll() is None)
+            adapter_pid = proc.pid if running else None
+    else:
+        running, adapter_pid = False, None
+    return {**entry, "running": running, "local_adapter_pid": adapter_pid, "observation": "running describes this router; another router may hold ownership"}
 
 
 def text_result(value, error=False):
@@ -281,7 +343,7 @@ def validate(args, schema):
             raise ValueError("Invalid " + key)
 
 
-def main():
+def serve_stream(stdin, stdout):
     capabilities = {}
     roots = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
     require_disjoint(roots.values(), [ROOT, LEGACY, LEGACY_RECEIPTS])
@@ -296,7 +358,7 @@ def main():
                          protected_paths=[*protected_host_paths(ceiling, include_runtime_root=False), ROOT, LEGACY, LEGACY_RECEIPTS],
                          registry_root=runtime_root,
                          sandbox_source_paths=repair_config.get("sandbox_source_paths", {}))
-    for raw in sys.stdin:
+    for raw in stdin:
         mid = None
         try:
             msg = json.loads(raw)
@@ -324,7 +386,7 @@ def main():
                     else:
                         entry = resolve(args)
                         if name == "palette_patch":
-                            result = text_result(broker.call(args, entry["workspace_id"], capabilities, sys.stdin, sys.stdout))
+                            result = text_result(broker.call(args, entry["workspace_id"], capabilities, stdin, stdout))
                         else:
                             forwarded = {k: v for k, v in args.items() if k not in ("workspace_id", "context_id")}
                             result = child_for(entry).call(name, forwarded)
@@ -335,13 +397,137 @@ def main():
                     result = text_result({"success": False, "error": f"{type(exc).__name__}: {exc}"}, True)
             else:
                 raise ValueError("Unsupported method")
-            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}), flush=True)
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}), file=stdout, flush=True)
         except Exception as exc:
-            print(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": str(exc)}}), flush=True)
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": str(exc)}}), file=stdout, flush=True)
+
+
+def _safe_socket_path(path):
+    path = Path(path).expanduser().absolute()
+    current = Path(path.anchor)
+    directories = []
+    for part in path.parts[1:-1]:
+        current /= part
+        try:
+            st = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            st = current.lstat()
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise ValueError("Palette socket path components must be real directories")
+        directories.append((current, st))
+    for index, (directory, st) in enumerate(directories):
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            if not (stat.S_ISVTX & st.st_mode) or index + 1 == len(directories):
+                raise PermissionError("Palette socket path has a writable non-sticky ancestor")
+            child, child_stat = directories[index + 1]
+            if child_stat.st_uid != os.getuid() or stat.S_IMODE(child_stat.st_mode) & 0o077:
+                raise PermissionError("A sticky socket-path ancestor must contain a private directory owned by this user")
+    parent_stat = path.parent.lstat()
+    if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
+        raise PermissionError("Palette socket parent must be owned by this user with private permissions")
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return path
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode):
+        raise ValueError("Palette socket path exists and is not a socket")
+    if st.st_uid != os.getuid():
+        raise PermissionError("Palette socket is owned by another user")
+    # A stale socket may be removed; a live one is rejected by the connect probe.
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(str(path))
+    except OSError:
+        path.unlink()
+    else:
+        raise RuntimeError("Palette daemon socket is already accepting connections")
+    finally:
+        probe.close()
+    return path
+
+
+def serve_connection(conn):
+    stream = None
+    with conn:
+        try:
+            if peer_uid(conn) != os.getuid():
+                return
+            stream = conn.makefile("rwb", buffering=0)
+            class TextInput:
+                def fileno(self):
+                    return stream.fileno()
+                def readline(self, limit=-1):
+                    line = stream.readline(1048577 if limit < 0 else limit)
+                    if len(line) > 1048576:
+                        raise ValueError("MCP frame exceeded 1 MiB")
+                    return line.decode("utf-8")
+                def __iter__(self):
+                    while True:
+                        line = stream.readline(1048577)
+                        if not line:
+                            return
+                        if len(line) > 1048576:
+                            raise ValueError("MCP frame exceeded 1 MiB")
+                        yield line.decode("utf-8")
+            class TextOutput:
+                def write(self, value):
+                    return stream.write(value.encode("utf-8"))
+                def flush(self):
+                    return None
+            serve_stream(TextInput(), TextOutput())
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        except Exception as exc:
+            print(f"Palette socket client rejected: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            if stream is not None:
+                stream.close()
+
+
+def peer_uid(conn):
+    if hasattr(socket, "SO_PEERCRED"):
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        return __import__("struct").unpack("3i", creds)[1]
+    if hasattr(conn, "getpeereid"):
+        return conn.getpeereid()[0]
+    raise RuntimeError("This platform cannot verify Unix socket peer credentials")
+
+
+def serve_socket(path):
+    path = _safe_socket_path(path)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o077)
+    try:
+        listener.bind(str(path))
+    finally:
+        os.umask(old_umask)
+    os.chmod(path, 0o600)
+    owned_inode = path.stat().st_ino
+    listener.listen(16)
+    listener.settimeout(1.0)
+    print(f"Palette daemon listening on {path}", file=sys.stderr, flush=True)
+    try:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=serve_connection, args=(conn,), daemon=True).start()
+    finally:
+        listener.close()
+        try:
+            st = path.lstat()
+            if stat.S_ISSOCK(st.st_mode) and st.st_ino == owned_inode:
+                path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def stop_all():
-    for child in children.values():
+    with children_lock:
+        owned = list(children.values())
+    for child in owned:
         child.stop()
 
 
@@ -350,9 +536,16 @@ def terminate(signum, frame):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--socket", dest="socket_path")
+    options = parser.parse_args()
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGHUP, terminate)
     try:
-        main()
+        if options.socket_path:
+            serve_socket(options.socket_path)
+        else:
+            serve_stream(sys.stdin, sys.stdout)
     finally:
         stop_all()
