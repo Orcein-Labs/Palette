@@ -10,11 +10,12 @@ Every call is parsed whole before any of it runs. A call that never yields gets 
 
 This is the default ChatGPT chat product. The UI labels it Chat.
 
-![ChatGPT Chat mode, confirmed in the UI, driving Palette](runtime/docs/images/chatgpt-chat-mode.png)
+<p align="center">
+  <img src="runtime/docs/images/chatgpt-chat-mode.png" alt="ChatGPT Chat mode, confirmed in the UI, driving Palette" width="48%" />
+  <img src="runtime/docs/images/chatgpt-os-lab.png" alt="Crash-recovery of a symbolic World from ChatGPT Chat, using Palette as the lab" width="48%" />
+</p>
 
 The workspace is `palette_os_lab_20261005`, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
-
-![Crash-recovery of a symbolic World from ChatGPT Chat, using Palette as the lab](runtime/docs/images/chatgpt-os-lab.png)
 
 We've run long-horizon R&D spirals on this desk. Bugs showed up. The World was still on disk after the kernel came back.
 
