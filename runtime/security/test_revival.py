@@ -232,6 +232,21 @@ class RevivalTest(unittest.TestCase):
         self.assertTrue(r["success"], r)
         self.assertEqual(r["data"], [7, 5.0, "[1]", "on", "sub", 2.0])
 
+    def test_legacy_snapshot_retains_current_managed_package_environment(self):
+        with tempfile.TemporaryDirectory(prefix="palette-revival-packages-") as store:
+            env = {"PALETTE_PACKAGE_DEPOT": store}
+            package_environment = str(Path(store, "environment"))
+            self.session("retained_before_provisioning=42", env=env)
+            manifest = self.manifest()
+            manifest["load_path"] = [p for p in manifest["load_path"] if p != package_environment]
+            manifest["env"]["PALETTE_PACKAGE_ENVIRONMENT"] = self.ws
+            Path(self.state, "manifest.json").write_text(json.dumps(manifest))
+            code = '(retained_before_provisioning, ' + json.dumps(package_environment) + ' in LOAD_PATH, ' + \
+                   'ENV["PALETTE_PACKAGE_ENVIRONMENT"] == ' + json.dumps(package_environment) + ', Palette.revival()["lost"])'
+            out, result = self.revive(code, env=env)
+            self.assertTrue(result["success"], result)
+            self.assertEqual(result["data"], [42, True, True, []], out)
+
     # --- what must be marked, not restored silently --------------------
 
     def test_value_computed_from_a_file_that_changed_is_marked_stale(self):

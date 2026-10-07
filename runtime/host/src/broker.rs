@@ -97,6 +97,10 @@ pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
                         return (false, format!("requested allowed_packages {} is not a subset of parent's {}", ql(&rp), ql(&pp)));
                     }
                 }
+                if pc.get("offline").and_then(Value::as_bool) == Some(true)
+                    && rc.get("offline").and_then(Value::as_bool) != Some(true) {
+                    return (false, "requested package_management permits online package access but parent's grant is offline-only".into());
+                }
             }
             // A grandchild's own ceiling is checked against this child's when it is spawned.
             "spawn_child_worker" => {}
@@ -130,7 +134,8 @@ pub struct Broker {
     receipt_log_path: PathBuf,
     session_id: String,
     // Trusted paths fixed when the session starts; never taken from a request.
-    depot_dir: Option<String>,
+    package_depot_dir: Option<String>,
+    package_environment_dir: Option<String>,
     project_dir: Option<String>,
     repo_dir: Option<String>,
     child_timeout: Duration,
@@ -151,7 +156,8 @@ pub struct BrokerConfig {
     pub ceiling: Value,
     pub receipt_log_path: PathBuf,
     pub session_id: String,
-    pub depot_dir: Option<String>,
+    pub package_depot_dir: Option<String>,
+    pub package_environment_dir: Option<String>,
     pub project_dir: Option<String>,
     pub repo_dir: Option<String>,
     pub child_timeout: Duration,
@@ -166,7 +172,8 @@ impl Broker {
             ceiling: c.ceiling,
             receipt_log_path: c.receipt_log_path,
             session_id: c.session_id,
-            depot_dir: c.depot_dir,
+            package_depot_dir: c.package_depot_dir,
+            package_environment_dir: c.package_environment_dir,
             project_dir: c.project_dir,
             repo_dir: c.repo_dir,
             child_timeout: c.child_timeout,
@@ -255,8 +262,8 @@ impl Broker {
         let Some(allowed) = str_list(cap.get("allowed_packages")) else {
             return Err(Denied("package_management is not in this session's capability ceiling".into()));
         };
-        let Some(depot) = &self.depot_dir else {
-            return Err(Denied("no session depot is configured for this broker -- package_management requires one".into()));
+        let (Some(depot), Some(environment)) = (&self.package_depot_dir, &self.package_environment_dir) else {
+            return Err(Denied("no durable package store is configured for this broker -- package_management requires one".into()));
         };
         let name = p.get("name").and_then(Value::as_str).unwrap_or("");
         let ident = !name.is_empty()
@@ -277,15 +284,33 @@ impl Broker {
             Some(v) => format!("name=\"{name}\", version=\"{v}\""),
             None => format!("name=\"{name}\""),
         };
-        let mut env = BTreeMap::new();
-        env.insert("JULIA_DEPOT_PATH".to_string(), Some(depot.clone()));
-        env.insert("JULIA_PROJECT".to_string(), None);
-        let argv: Vec<String> = vec!["julia".into(), "--startup-file=no".into(), "-e".into(),
-                                     format!("using Pkg; Pkg.add(Pkg.PackageSpec({spec}))")];
-        let r = {
+        let julia = sandbox::resolve_julia().map_err(Internal)?;
+        // Pkg executes registered package build scripts. Keep the same warm
+        // prepared cache, but run the installer in its own filesystem (and,
+        // when offline, network) namespace with only the durable store writable.
+        let store = Path::new(depot).parent().ok_or_else(|| Internal("package depot has no store root".into()))?;
+        let mut protected_paths = vec![self.receipt_log_path.clone()];
+        for path in [&self.project_dir, &self.repo_dir].into_iter().flatten() {
+            protected_paths.push(PathBuf::from(path));
+        }
+        for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT"] {
+            if let Ok(path) = std::env::var(key) {
+                if !path.is_empty() { protected_paths.push(PathBuf::from(path)); }
+            }
+        }
+        protected_paths.extend(sandbox::protected_command_paths(&self.ceiling));
+        let argv = sandbox::package_installer_argv(
+            &julia, store, Path::new(depot), Path::new(environment),
+            Path::new(&sandbox::default_depot()),
+            cap.get("offline").and_then(Value::as_bool).unwrap_or(false),
+            &format!("using Pkg; Pkg.add(Pkg.PackageSpec({spec}))"), &protected_paths,
+        ).map_err(Internal)?;
+        let result = {
             let _g = self.depot_lock.lock().unwrap();
-            sandbox::run_captured(&argv, Some(&env), Duration::from_secs(300)).map_err(Internal)?
+            let _store_guard = sandbox::package_store_lock(depot).map_err(Internal)?;
+            sandbox::run_captured_clean(&argv, &BTreeMap::new(), Duration::from_secs(300))
         };
+        let r = result.map_err(Internal)?;
         if r.returncode != 0 || r.timed_out {
             return Err(Denied(format!("Pkg.add({}) failed: {}", q(name), util::tail(&r.stderr, 800))));
         }
@@ -323,7 +348,8 @@ impl Broker {
                 ceiling: requested.clone(),
                 receipt_log_path: sock_dir.join("receipts.jsonl"),
                 session_id: format!("{}/child", self.session_id),
-                depot_dir: child_depot.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                package_depot_dir: self.package_depot_dir.clone(),
+                package_environment_dir: self.package_environment_dir.clone(),
                 project_dir: Some(project.clone()),
                 repo_dir: Some(repo.clone()),
                 child_timeout: Duration::from_secs(90),
@@ -727,7 +753,8 @@ mod tests {
             ceiling,
             receipt_log_path: receipts.to_path_buf(),
             session_id: "test".into(),
-            depot_dir: None,
+            package_depot_dir: None,
+            package_environment_dir: None,
             project_dir: None,
             repo_dir: None,
             child_timeout: Duration::from_secs(90),

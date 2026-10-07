@@ -23,8 +23,10 @@ interactive client; see [preparation and updates](../../docs/install.md).
 
 Import that generated directory in an Agent Plugins-compatible client. For the
 Codex compatibility format, omit `--format portable` and choose a separate plugin
-directory. Generic stdio MCP clients can run `palette-mcp`, or run
-`python3 /absolute/path/to/Palette/runtime/security/serve_palette.py` directly.
+directory. Generic stdio MCP clients can run `palette-mcp`. First install and
+start the user service described in [installation](../../docs/install.md#user-service-lifecycle);
+the launcher connects to its stable runtime socket and does not own the Julia
+daemon lifecycle.
 
 The repository marketplace is `.agents/plugins/marketplace.json`. Install the
 runtime and put the generated `palette-mcp` command on PATH before enabling its

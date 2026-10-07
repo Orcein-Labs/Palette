@@ -26,10 +26,12 @@ PALETTE_TEST_PROJECT_DIR to that environment; see runtime/docs/install.md.
 from __future__ import annotations
 
 import http.server
+import hashlib
 import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -39,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 # The broker and worker launcher under test: the Rust host when PALETTE_HOST_BIN is set.
 from host_adapter import B, create_session_depot, run_worker  # noqa: E402
+from launch_worker import build_package_installer_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
 REPO_DIR = str(Path(__file__).resolve().parents[2])
 
@@ -82,15 +85,6 @@ def _skip_if_no_project():
             f"no Julia dev project at {PROJECT_DIR} -- set PALETTE_TEST_PROJECT_DIR "
             "to a project with Palette (dev-installed from this repo) and IJulia"
         )
-
-
-def _skip_if_no_network():
-    import socket
-
-    try:
-        socket.create_connection(("pkg.julialang.org", 443), timeout=5).close()
-    except OSError:
-        raise unittest.SkipTest("no network reachable -- package_management needs the real Julia registry")
 
 
 class SandboxTestCase(unittest.TestCase):
@@ -545,23 +539,71 @@ class TestNestedChildWorker(SandboxTestCase):
 
 class TestPackageManagement(SandboxTestCase):
     """package_management: the broker decides whether a specific package is
-    allowed and performs the real Pkg.add itself, into this session's own
-    private depot clone -- never a worker's own writable JULIA_DEPOT_PATH
-    (that would let it install and run arbitrary build/artifact-download
-    code as an ungated, sandbox-local effect). Real network, real registry,
-    real install -- see broker.py's _handle_package_management docstring
-    for why this needs a shared, session-lifetime depot clone rather than
-    the one-clone-per-launch default every other test in this file uses.
+    allowed and performs Pkg.add into the durable operator package store.
+    Workers receive that store read-only and use a separate private writable
+    depot for precompile caches. Parsers is already present in the prepared
+    depot as a transitive dependency, so this regression runs without a live
+    registry or package download.
     """
 
     def setUp(self):
         super().setUp()
-        _skip_if_no_network()
+        self._old_package_depot = os.environ.get("PALETTE_PACKAGE_DEPOT")
+        self.package_store = tempfile.mkdtemp(prefix="palette-pkg-store-")
+        os.environ["PALETTE_PACKAGE_DEPOT"] = self.package_store
+        self._package_worker_evidence = []
+        self._package_test_passed = False
         self.depot_dir = create_session_depot()
 
     def tearDown(self):
+        if not self._package_test_passed and getattr(self, "package_store", None):
+            archive = Path(REPO_DIR) / ".archive" / "maturity-20261006" / f"failed-package-store-{time.time_ns()}"
+            archive.mkdir(parents=True, exist_ok=True)
+            inventory = []
+            for path in sorted(Path(self.package_store).rglob("*")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                digest = hashlib.sha256()
+                with path.open("rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(block)
+                inventory.append({"path": str(path.relative_to(self.package_store)),
+                                  "bytes": path.stat().st_size, "sha256": digest.hexdigest()})
+            Path(archive, "store-inventory.json").write_text(
+                json.dumps(inventory, indent=2), encoding="utf-8")
+            Path(archive, "store-bytes.json").write_text(json.dumps({
+                "root": self.package_store,
+                "total_bytes": sum(entry["bytes"] for entry in inventory),
+                "file_count": len(inventory),
+            }, indent=2), encoding="utf-8")
+            Path(archive, "worker-output.json").write_text(
+                json.dumps(self._package_worker_evidence, indent=2), encoding="utf-8")
+            Path(archive, "failure.txt").write_text("Package authority test failed; see unittest output.\n",
+                                                        encoding="utf-8")
+            print(f"PRESERVED_PACKAGE_STORE: {archive}")
         shutil.rmtree(self.depot_dir, ignore_errors=True)
+        shutil.rmtree(self.package_store, ignore_errors=True)
+        if self._old_package_depot is None:
+            os.environ.pop("PALETTE_PACKAGE_DEPOT", None)
+        else:
+            os.environ["PALETTE_PACKAGE_DEPOT"] = self._old_package_depot
         super().tearDown()
+
+    def _run_package_worker(self, label, **kwargs):
+        try:
+            result = run_worker(**kwargs)
+        except subprocess.TimeoutExpired as exc:
+            self._package_worker_evidence.append({
+                "label": label, "timeout": exc.timeout,
+                "stdout": (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout,
+                "stderr": (exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr,
+            })
+            raise
+        self._package_worker_evidence.append({
+            "label": label, "returncode": result.returncode,
+            "stdout": result.stdout, "stderr": result.stderr,
+        })
+        return result
 
     def _serve(self, ceiling):
         sock_dir = tempfile.mkdtemp(prefix="njl-pkgmgmt-bsock-")
@@ -573,47 +615,241 @@ class TestPackageManagement(SandboxTestCase):
         )
         return sock_dir, server
 
+    def test_P02_package_store_rejects_protected_collision_before_mutation(self):
+        root = Path(self.package_store).parent / f"{Path(self.package_store).name}-runtime-collision"
+        previous = os.environ.get("PALETTE_RUNTIME_ROOT")
+        previous_read_roots = os.environ.get("PALETTE_READ_ROOTS")
+        self.addCleanup(lambda: os.environ.pop("PALETTE_RUNTIME_ROOT", None)
+                        if previous is None else os.environ.__setitem__("PALETTE_RUNTIME_ROOT", previous))
+        self.addCleanup(lambda: os.environ.pop("PALETTE_READ_ROOTS", None)
+                        if previous_read_roots is None else os.environ.__setitem__("PALETTE_READ_ROOTS", previous_read_roots))
+        os.environ["PALETTE_RUNTIME_ROOT"] = str(root)
+        with self.assertRaisesRegex(RuntimeError, "overlaps protected host path"):
+            package_store_paths(str(root))
+        self.assertFalse(root.exists(), "rejected package store collision created a protected path")
+
+        read_root = Path(self.package_store).parent / f"{Path(self.package_store).name}-read-root"
+        read_root.mkdir(mode=0o755)
+        self.addCleanup(shutil.rmtree, read_root, ignore_errors=True)
+        os.chmod(read_root, 0o755)
+        os.environ["PALETTE_READ_ROOTS"] = str(read_root)
+        with self.assertRaisesRegex(RuntimeError, "overlaps protected host path"):
+            package_store_paths(str(read_root))
+        self.assertEqual(read_root.stat().st_mode & 0o777, 0o755,
+                         "rejected read-root overlap changed the protected directory mode")
+        self.assertFalse((read_root / "depot").exists(),
+                         "rejected read-root overlap created a package depot")
+        self._package_test_passed = True
+
+    def test_P03_package_store_rejects_symlink_seed_before_chmod_or_copy(self):
+        root = Path(self.package_store).parent / f"{Path(self.package_store).name}-symlink-seed"
+        depot = root / "depot"
+        outside = root.parent / f"{root.name}-outside"
+        outside.mkdir(mode=0o755)
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "sentinel").write_text("untouched", encoding="utf-8")
+        depot.mkdir(parents=True, mode=0o755)
+        os.chmod(root, 0o755)
+        os.chmod(depot, 0o755)
+        (depot / "registries").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "must not be a symlink"):
+            package_store_paths(str(root))
+        self.assertEqual((outside / "sentinel").read_text(encoding="utf-8"), "untouched")
+        self.assertEqual(root.stat().st_mode & 0o777, 0o755, "rejected store was chmodded before validation")
+        self.assertEqual(depot.stat().st_mode & 0o777, 0o755, "rejected depot was chmodded before validation")
+        (depot / "registries").unlink()
+        nested = depot / "packages" / "Fixture" / "slug" / "src"
+        nested.mkdir(parents=True)
+        (nested / "module.jl").symlink_to(outside / "sentinel")
+        with self.assertRaisesRegex(RuntimeError, "symlinks"):
+            package_store_paths(str(root))
+        self.assertEqual((outside / "sentinel").read_text(encoding="utf-8"), "untouched")
+        self.assertEqual(root.stat().st_mode & 0o777, 0o755, "nested-link rejection happened after chmod")
+        self._package_test_passed = True
+
+    def test_P01_pkg_build_script_cannot_write_outside_durable_store(self):
+        """Pkg's real build phase runs with only its managed store writable."""
+        store = Path(self.package_store)
+        depot = store / "depot"
+        environment = store / "environment"
+        depot.mkdir(mode=0o700, exist_ok=True)
+        environment.mkdir(mode=0o700, exist_ok=True)
+        registries = depot / "registries"
+        shutil.rmtree(registries, ignore_errors=True)
+        package_name = "BuildProbe"
+        package_uuid = "7b4f9f1c-2bc0-4ae6-85f8-0a1327452f61"
+        registry_uuid = "36eb0b89-20d6-4ff4-9494-24ad49e82f57"
+        repository = depot / "fixture-repository"
+        (repository / "src").mkdir(parents=True)
+        (repository / "deps").mkdir()
+        gesso_source = store / "sources" / "gesso"
+        (gesso_source / "src").mkdir(parents=True)
+        gesso_uuid = "b63ad0dc-6b3b-4c45-a9c4-123dbbcc1940"
+        (gesso_source / "Project.toml").write_text(
+            f'name = "GessoFixture"\nuuid = "{gesso_uuid}"\nversion = "0.1.0"\n', encoding="utf-8")
+        (gesso_source / "src" / "GessoFixture.jl").write_text(
+            "module GessoFixture\nfixture_value() = 42\nend\n", encoding="utf-8")
+        outside_marker = store.parent / f"{store.name}-outside-write"
+        self.addCleanup(outside_marker.unlink, missing_ok=True)
+        source_marker = gesso_source / "build-script-write"
+        self.addCleanup(source_marker.unlink, missing_ok=True)
+        store_marker = depot / "build-script-ran"
+        project = repository / "Project.toml"
+        project.write_text(
+            f'name = "{package_name}"\nuuid = "{package_uuid}"\nversion = "0.1.0"\n',
+            encoding="utf-8",
+        )
+        (repository / "src" / f"{package_name}.jl").write_text(
+            f"module {package_name}\nend\n", encoding="utf-8")
+        # The first write is authorized because it stays in the managed store.
+        # The second targets a real host sibling that is intentionally absent
+        # from the installer's filesystem namespace.
+        (repository / "deps" / "build.jl").write_text(
+            f'open({_julia_str(str(store_marker))}, "w") do io; write(io, "ran"); end\n'
+            f'try; open({_julia_str(str(gesso_source / "build-script-write"))}, "w") do io; write(io, "escaped"); end; '
+            'catch; println("SOURCE_WRITE_BLOCKED"); end\n'
+            f'try; open({_julia_str(str(outside_marker))}, "w") do io; write(io, "escaped"); end; '
+            'catch; println("OUTSIDE_WRITE_BLOCKED"); end\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(["git", "-c", "user.name=Palette test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "installer confinement fixture"], cwd=repository, check=True)
+        tree_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=repository, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        registry = registries / "LocalFixture"
+        package_registry = registry / "B" / package_name
+        package_registry.mkdir(parents=True)
+        registry.joinpath("Registry.toml").write_text(
+            f'name = "LocalFixture"\nuuid = "{registry_uuid}"\nrepo = "file://{registry}"\n\n'
+            f'[packages]\n"{package_uuid}" = {{ name = "{package_name}", path = "B/{package_name}" }}\n',
+            encoding="utf-8",
+        )
+        (package_registry / "Package.toml").write_text(
+            f'name = "{package_name}"\nuuid = "{package_uuid}"\nrepo = "file://{repository}"\n',
+            encoding="utf-8",
+        )
+        (package_registry / "Versions.toml").write_text(
+            f'["0.1.0"]\ngit-tree-sha1 = "{tree_hash}"\n', encoding="utf-8")
+        julia = resolve_real_julia_binary()
+        # The package source/registry are private local fixtures. Disabling the
+        # Pkg server in this one-shot script keeps the proof independent of any
+        # external registry or package service; Pkg clones the fixture's file URL.
+        script = (
+            'ENV["JULIA_PKG_SERVER"] = ""; using Pkg; '
+            f'Pkg.develop(path={_julia_str(str(gesso_source))}); '
+            f'Pkg.add(Pkg.PackageSpec(name="{package_name}", version="0.1.0")); '
+            'using GessoFixture; println("GESSO_VALUE=", GessoFixture.fixture_value())'
+        )
+        argv = build_package_installer_argv(
+            julia_bin=julia, package_store_root=str(store), package_depot_dir=str(depot),
+            package_environment_dir=str(environment), base_depot=default_depot(),
+            offline=False, script=script,
+        )
+        result = subprocess.run(
+            argv, env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+            errors="replace", timeout=180, stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GESSO_VALUE=42", result.stdout)
+        build_logs = list((depot / "scratchspaces").glob("**/build.log"))
+        self.assertTrue(
+            any("SOURCE_WRITE_BLOCKED" in log.read_text(encoding="utf-8", errors="replace")
+                for log in build_logs),
+            f"Pkg build log did not record the protected developed-source write denial: {build_logs}",
+        )
+        self.assertTrue(store_marker.is_file(), "fixture build script did not run in the managed store")
+        self.assertFalse(source_marker.exists(), "Pkg build script modified operator-owned developed source")
+        self.assertFalse(outside_marker.exists(), "Pkg build script wrote outside its writable package store")
+        # Independent negative control: run the exact build script directly
+        # under the same private fixture project/depot, with no namespace.
+        direct_home = tempfile.mkdtemp(prefix="palette-pkg-direct-home-")
+        self.addCleanup(shutil.rmtree, direct_home, ignore_errors=True)
+        direct_env = {
+            "HOME": direct_home,
+            "JULIA_PROJECT": str(environment),
+            "JULIA_DEPOT_PATH": f"{depot}:{default_depot()}",
+            "JULIA_PKG_PRECOMPILE_AUTO": "0",
+            "JULIA_PKG_OFFLINE": "true",
+            "JULIA_PKG_SERVER": "",
+            "PATH": "/usr/bin:/bin",
+        }
+        direct = subprocess.run(
+            [julia, "--startup-file=no", "-e", f"include({_julia_str(str(repository / 'deps' / 'build.jl'))})"],
+            env=direct_env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=60,
+        )
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertTrue(source_marker.is_file(), "unconfined build fixture did not demonstrate the source write")
+        self.assertTrue(outside_marker.is_file(), "unconfined build fixture did not demonstrate the outside write")
+        source_marker.unlink()
+        outside_marker.unlink()
+        self._package_test_passed = True
+
     def test_allowed_package_installs_and_becomes_usable(self):
-        sock_dir, server = self._serve({"package_management": {"allowed_packages": ["Crayons"]}})
+        sock_dir, server = self._serve({"package_management": {"allowed_packages": ["Parsers"], "offline": True}})
         try:
             script = (
                 'using Palette\n'
-                'r = Palette.request_capability("package_management", Dict("name" => "Crayons"))\n'
+                'println("PARSERS_BEFORE: ", Base.find_package("Parsers") !== nothing)\n'
+                'r = Palette.request_capability("package_management", Dict("name" => "Parsers"))\n'
                 'println("approved: ", r["approved"])\n'
-                'using Crayons\n'
-                'println("USABLE")\n'
+                'Core.eval(Main, :(using Parsers))\n'
+                'println("PARSED: ", Parsers.parse(Int, "42"))\n'
+                'store_write = try; write(joinpath(DEPOT_PATH[2], "worker-must-not-write"), "no"); true; catch; false; end\n'
+                'println("PACKAGE_STORE_WRITE: ", store_write)\n'
             )
-            r = run_worker(
+            r = self._run_package_worker("authorized-install-and-use",
                 workspace_dir=self.workspace, project_dir=PROJECT_DIR, repo_dir=REPO_DIR,
                 script=script, broker_socket_dir=sock_dir, network_enabled=False,
                 depot_clone_dir=self.depot_dir, timeout=400,
             )
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("PARSERS_BEFORE: false", r.stdout)
             self.assertIn("approved: true", r.stdout)
-            self.assertIn("USABLE", r.stdout)
+            self.assertIn("PARSED: 42", r.stdout)
+            self.assertIn("PACKAGE_STORE_WRITE: false", r.stdout)
         finally:
             server.shutdown()
             server.server_close()
             shutil.rmtree(sock_dir, ignore_errors=True)
+        self.assertFalse(Path(self.package_store, "depot", "worker-must-not-write").exists())
+        restarted = self._run_package_worker("fresh-process-restart",
+            workspace_dir=self.workspace, project_dir=PROJECT_DIR, repo_dir=REPO_DIR,
+            script='println("RESTART_LOAD_PATH: ", repr(LOAD_PATH)); '
+                   'println("RESTART_DEPOT_PATH: ", repr(DEPOT_PATH)); '
+                   'println("RESTART_ACTIVE_PROJECT: ", Base.active_project()); '
+                   'println("PARSERS_AFTER_RESTART: ", Base.find_package("Parsers") !== nothing); '
+                   'using Parsers; println("RESTART_PARSED: ", Parsers.parse(Int, "42"))',
+            network_enabled=False, timeout=400,
+        )
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        self.assertIn("PARSERS_AFTER_RESTART: true", restarted.stdout)
+        self.assertIn("RESTART_PARSED: 42", restarted.stdout)
+        self._package_test_passed = True
 
     def test_package_outside_allowlist_is_denied_without_installing(self):
-        sock_dir, server = self._serve({"package_management": {"allowed_packages": ["Crayons"]}})
+        sock_dir, server = self._serve({"package_management": {"allowed_packages": ["Parsers"], "offline": True}})
         try:
             script = (
                 'using Palette\n'
-                'r = Palette.request_capability("package_management", Dict("name" => "HTTP"))\n'
+                'r = Palette.request_capability("package_management", Dict("name" => "DefinitelyNotAllowed"))\n'
                 'println("approved: ", r["approved"])\n'
-                'ok = try; using HTTP; true; catch; false; end\n'
-                'println("HTTP_USABLE: ", ok)\n'
+                'ok = Base.find_package("DefinitelyNotAllowed") !== nothing\n'
+                'println("FORBIDDEN_USABLE: ", ok)\n'
             )
-            r = run_worker(
+            r = self._run_package_worker("unauthorized-package-denial",
                 workspace_dir=self.workspace, project_dir=PROJECT_DIR, repo_dir=REPO_DIR,
                 script=script, broker_socket_dir=sock_dir, network_enabled=False,
-                depot_clone_dir=self.depot_dir, timeout=60,
+                depot_clone_dir=self.depot_dir, timeout=180,
             )
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("approved: false", r.stdout)
-            self.assertIn("HTTP_USABLE: false", r.stdout)
+            self.assertIn("FORBIDDEN_USABLE: false", r.stdout)
+            self._package_test_passed = True
         finally:
             server.shutdown()
             server.server_close()

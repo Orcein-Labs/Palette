@@ -874,12 +874,18 @@ function revive_state!()
     mod = state.eval_module
     call = Int(m["call"])
 
+    # Keep the current launcher's managed package environment available when
+    # reviving a snapshot created before broker provisioning was configured.
+    # Snapshot ENV changes cannot replace this host-selected, read-only mount.
+    package_environment = get(INITIAL_ENV[], "PALETTE_PACKAGE_ENVIRONMENT", "")
     # The environment turn code set up: where packages load from, and where it works.
     empty!(LOAD_PATH); append!(LOAD_PATH, String.(m["load_path"]))
+    isempty(package_environment) || package_environment in LOAD_PATH || push!(LOAD_PATH, package_environment)
     isempty(m["active_project"]) || (Base.ACTIVE_PROJECT[] = m["active_project"])
     isdir(m["cwd"]) && cd(m["cwd"])
     for (k, v) in m["env"]; ENV[k] = v; end
     for k in m["env_removed"]; delete!(ENV, k); end
+    isempty(package_environment) || (ENV["PALETTE_PACKAGE_ENVIRONMENT"] = package_environment)
 
     # Definitions, in call order. Package code loads first from `using`.
     errors = Dict{String, String}()

@@ -2,7 +2,11 @@ using Palette
 failed = String[]
 stdlibs = filter(n -> isfile(joinpath(Sys.STDLIB, n, "Project.toml")), readdir(Sys.STDLIB))
 project_deps = collect(keys(get(Base.parsed_toml(Base.active_project()), "deps", Dict())))
-for name in sort(unique([stdlibs; project_deps]))
+managed_environment = get(ENV, "PALETTE_PACKAGE_ENVIRONMENT", "")
+managed_project = joinpath(managed_environment, "Project.toml")
+optional_deps = !isempty(managed_environment) && isfile(managed_project) ?
+    collect(keys(get(Base.parsed_toml(managed_project), "deps", Dict()))) : String[]
+for name in sort(unique([stdlibs; project_deps; optional_deps]))
     try
         Core.eval(Main, :(import $(Symbol(name))))
     catch e

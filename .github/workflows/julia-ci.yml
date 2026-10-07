@@ -160,12 +160,18 @@ jobs:
       with:
         python-version: '3.12'
     - uses: dtolnay/rust-toolchain@stable
+    - name: Check generic toolchain boundaries and client packaging
+      run: |
+        python3 runtime/security/test_provisioning.py
+        python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/palette-bundles"
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
     - name: Prepare real operator dependencies and host
       run: |
         julia --project=@. -e 'using Pkg; Pkg.instantiate()'
         cargo build --manifest-path runtime/host/Cargo.toml --release --locked
+    - name: Check optional Gesso installer and extension loading
+      run: python3 runtime/integrations/gesso/test_gesso.py
     - name: Prepare the sandbox depot before bounded MCP interactions
       env:
         JULIA_NUM_THREADS: '1'
@@ -179,4 +185,4 @@ jobs:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime

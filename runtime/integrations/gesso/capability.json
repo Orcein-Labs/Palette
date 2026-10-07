@@ -1,0 +1,9 @@
+{
+  "id": "gesso",
+  "version": "0.1.0",
+  "source": "gesso.jl",
+  "entrypoint": "gesso",
+  "dependencies": ["Gesso", "JSON"],
+  "requires": [],
+  "description": "Optional Gesso local inference, tokenizer, compatibility, fork, and profiling surface"
+}

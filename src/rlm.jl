@@ -23,6 +23,79 @@ function host_request(rtype::AbstractString, payload::AbstractDict=Dict{String,A
     error("host request $rtype returned unexpected status: $(repr(status))")
 end
 
+"""
+    Palette.runtime(action, payload=Dict()) -> Dict
+
+Discover, invoke, refresh, or repair a deployed runtime capability through the
+fixed broker request type `palette.runtime`. Capability source is supplied by
+the trusted host registry and is evaluated only inside this sandboxed Julia
+worker. The host never imports or executes capability code.
+"""
+function runtime(action::AbstractString, payload::AbstractDict=Dict{String,Any}())
+    action in ("discover", "invoke", "refresh", "repair") ||
+        throw(ArgumentError("runtime action must be discover, invoke, refresh, or repair"))
+    result = host_request("palette.runtime", Dict{String,Any}(
+        "action" => String(action), "payload" => Dict{String,Any}(String(k) => v for (k, v) in payload)))
+    result isa AbstractDict || error("palette.runtime returned a non-object result")
+    response = Dict{String,Any}(String(k) => v for (k, v) in result)
+    if action == "discover"
+        by_capability = Dict{String,Vector{String}}()
+        all_missing = Set{String}()
+        for capability in get(response, "available_capabilities", Any[])
+            capability isa AbstractDict || continue
+            identifier = get(capability, "id", nothing)
+            dependencies = get(capability, "dependencies", Any[])
+            identifier isa String && dependencies isa AbstractVector || continue
+            missing = String[]
+            for dependency in dependencies
+                dependency isa String || continue
+                Base.find_package(dependency) === nothing && push!(missing, dependency)
+            end
+            isempty(missing) || (by_capability[identifier] = missing)
+            union!(all_missing, missing)
+        end
+        response["missing_dependencies"] = sort!(collect(all_missing))
+        response["missing_dependencies_by_capability"] = by_capability
+    elseif action == "invoke"
+        source = get(response, "source", nothing)
+        manifest = get(response, "manifest", nothing)
+        source isa String || error("palette.runtime invoke reply has no Julia source")
+        manifest isa AbstractDict || error("palette.runtime invoke reply has no manifest")
+        identifier = get(manifest, "id", nothing)
+        entrypoint = get(manifest, "entrypoint", nothing)
+        expected = get(response, "source_sha256", nothing)
+        identifier isa String && entrypoint isa String || error("palette.runtime invoke manifest is incomplete")
+        expected isa String && bytes2hex(SHA.sha256(source)) == expected || error("palette.runtime capability source identity mismatch")
+        dependencies = get(manifest, "dependencies", Any[])
+        dependencies isa AbstractVector || error("palette.runtime manifest dependencies are invalid")
+        missing = String[dependency for dependency in dependencies if dependency isa String && Base.find_package(dependency) === nothing]
+        isempty(missing) || throw(ArgumentError("capability $(identifier) is missing Julia dependencies: $(join(missing, ", "))"))
+        occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", entrypoint) || error("palette.runtime entrypoint is invalid")
+        generation = get(response, "generation", nothing)
+        generation isa String || error("palette.runtime invoke reply has no generation")
+        key = (identifier, generation)
+        mod = get!(RUNTIME_CAPABILITY_MODULES, key) do
+            name = Symbol("PaletteCapability_", replace(identifier, r"[^A-Za-z0-9_]" => "_"), "_", first(generation, 12))
+            module_ = Module(name)
+            isdefined(module_, Symbol(entrypoint)) &&
+                throw(ArgumentError("palette.runtime entrypoint $(entrypoint) shadows a Julia Base/Core binding"))
+            Core.eval(module_, :(const Palette = $(@__MODULE__)))
+            Base.include_string(module_, source, "capability://$(identifier)/$(generation).jl")
+            module_
+        end
+        isdefined(mod, Symbol(entrypoint)) || error("palette.runtime entrypoint $(entrypoint) was not defined by capability source")
+        fn = getfield(mod, Symbol(entrypoint))
+        fn isa Function || error("palette.runtime entrypoint $(entrypoint) is not a function")
+        arguments = get(payload, "arguments", Dict{String,Any}())
+        arguments isa AbstractDict || throw(ArgumentError("invoke payload.arguments must be an object"))
+        value = Base.invokelatest(fn, Dict{String,Any}(String(k) => v for (k, v) in arguments))
+        return Dict{String,Any}("id" => identifier, "generation" => generation, "result" => value)
+    end
+    return response
+end
+
+const RUNTIME_CAPABILITY_MODULES = Dict{Tuple{String,String},Module}()
+
 module rlm
 
 using ..Palette: host_request

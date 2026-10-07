@@ -18,6 +18,10 @@ A trusted local operator configures PALETTE_PATCH_ROOTS as JSON mapping target n
 
 Use palette_patch action=read, target=palette-core, path=runtime/security/example.py to inspect bounded UTF-8 content and its SHA-256. Use action=prepare with target and changes, where each change is exactly `{path, before_sha256, content}`. Null before_sha256 means create a file. Existing parent directories are required. The response includes the full review diff, digest, expiry and request_id.
 
+Credential and secret paths cannot be read or patched through this interface,
+including requests approved before the current policy. Disposable repair stages
+omit these files so candidate code cannot return their contents through test output.
+
 Use action=apply with request_id in the same logical workspace. When the client advertises MCP form elicitation, the broker asks the client to present an explicit confirmation for the exact digest and review diff. Accepting that form authorizes one attempt. Client-confirmed approval is not proof of a named human's identity; this relies on a trusted MCP client honoring user interaction. Julia and model-supplied tool arguments cannot mint grants.
 
 If the client does not support confirmation, the request remains pending. An explicitly authorized local administrator can inspect and approve it:
@@ -33,7 +37,44 @@ Grants expire after 15 minutes and bind the exact change set, root filesystem id
 
 Individual replacements are atomic. A multi-file patch is not an all-or-nothing transaction. Use a quiescent source checkout; brokers sharing a canonical target serialize through a sibling lock across registries. Arbitrary unmanaged host writers do not participate in that lock. The host must be able to create this sibling lock. Partial completion lists committed paths and hashes and cannot be replayed with the same grant. Receipts survive the Julia world and record authority, timing, scope, digests and outcome.
 
-Targets should be a separate source checkout. Editing that checkout does not deploy it: tests and a controlled installation switch remain separate actions. Do not allow the deployed adapter's own directory as a patch target.
+Targets should be a separate source checkout. Editing that checkout does not deploy it: tests and a controlled installation switch remain separate actions. The deployed adapter's trust-chain paths are protected from self-application by the host classifier; changes there still require the existing explicit approval flow.
+
+## Tested repair workflow
+
+The host runtime can expose repair actions through `Palette.runtime("repair", payload)` without adding an MCP tool. The repair broker accepts `detect`, `classify`, `propose`, `test`, `status`, and `apply`. Detection reads only bounded files under a host-configured target. Proposals use the same exact `{path, before_sha256, content}` changes and digest binding as `palette_patch`.
+
+The operator configures the target's fixed test recipe, frozen host-command protected paths, and any ordinary self-apply prefixes when constructing the host broker. None is accepted in a model request. Tests run in a disposable Bubblewrap worker with networking disabled, no inherited environment or capabilities, the staged candidate tree read-only, and only private scratch writable. Missing Bubblewrap or a failed recipe blocks application. A test result binds the exact proposed content digest and fixed recipe identity and arguments.
+
+`test` starts verification and returns `testing`; inspect `status` in a later
+call before applying. Verification does not consume the interactive Julia turn's
+deadline. A host restart during verification reports unknown completion rather
+than treating the interrupted candidate as passed. Fixed recipes can name narrow
+host `read_roots` for a pinned toolchain and prepared dependencies. A Python
+installation outside `/usr` needs its exact toolchain directory declared here;
+an absolute interpreter in `argv` does not grant access to that directory. Optional
+`julia_depots` must be a subset of those roots. The candidate and host dependency
+mounts remain read-only, and new compile caches go in private temporary storage.
+
+Self-application is limited to operator-classified `runtime`, `tools`, `recipes`, and sandbox-only `adapters` paths outside the immutable deployed trust chain. Canonical deployed `runtime/security`, `runtime/host`, `runtime/plugins`, and `runtime/scripts` remain protected even when the configured target is a subtree. The registry at `PALETTE_RUNTIME_ROOT` is protected by default. An operator may opt in one sandbox-only Julia source per installed capability with `sandbox_source_paths`; this never makes the manifest or neighboring files patchable. The target must be an immediate operator-owned capability directory beneath the configured registry, and the listed regular single-link `.jl` file must be the source named by its `capability.json`. It must also match an explicit `adapters` or `tools` prefix and pass that target's fixed test recipe before the broker can auto-apply it. Any independently protected host-command executable, imported-code root, config file, or working directory still requires approval.
+
+For example, a trusted repair configuration for the installed `gesso` capability can select only its Julia entrypoint:
+
+```json
+{
+  "test_recipes": {
+    "gesso": {
+      "id": "gesso-source-v1",
+      "argv": ["/srv/palette/julia/bin/julia", "--startup-file=no", "--project=/srv/palette/packages/environment", "-e", "using Test; include(\"gesso.jl\"); d=gesso(Dict{String,Any}(\"action\"=>\"diagnose\")); @test d[\"status\"]==\"ready\"; @test d[\"cpu\"][\"status\"]==\"available\"; @test d[\"tokenizer\"][\"round_trip\"]"],
+      "read_roots": ["/srv/palette/julia", "/srv/palette/base-depot", "/srv/palette/packages", "/srv/palette/packages/depot", "/srv/palette/gesso-models/smollm2-135m"],
+      "julia_depots": ["/srv/palette/packages/depot", "/srv/palette/base-depot"]
+    }
+  },
+  "auto_apply_prefixes": {"gesso": [["adapters", "gesso.jl"]]},
+  "sandbox_source_paths": {"gesso": ["gesso.jl"]}
+}
+```
+
+The operator separately maps `gesso` to the installed capability directory in `PALETTE_PATCH_ROOTS` and sets `PALETTE_RUNTIME_ROOT` to its registry parent. Replace the example roots with the pinned Julia toolchain, prepared base depot, managed package store, exact managed depot, and exact versioned model artifact printed by the installer. The inline verifier is fixed operator configuration; it runs from the staged capability directory and is not supplied by a patch request. Keep all recipe dependencies read-only and the repair configuration outside every patch target. Credentials and secrets are forbidden; unknown, configuration, test, and authority paths require the existing elicitation or local administrator approval for the exact patch digest. The repair payload cannot claim approval or supply a test command. Receipts record the linked patch request, tested content digest, recipe identity and arguments, result, and apply outcome, signed with a private host-side key that is unavailable to the worker.
 
 ## Deployment
 

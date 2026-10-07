@@ -13,8 +13,10 @@ agent loop, model inference, and orchestration.
 Get **Palette-ChatGPT.zip** or **Palette-Claude.zip** from the release assets
 when published. Each is one uploadable plugin with SDK source and setup
 instructions. Claude Desktop extensions use the separate `.mcpb` option. Read the [client installation guide](runtime/plugins/DISTRIBUTION.md).
-Linux/WSL2 preparation is required; ChatGPT Chat additionally needs your own
-tunnel or hosted connection. ZIP upload alone does not start a runtime.
+Prepare a Linux runtime locally or on a server; ChatGPT Chat needs a supported
+remote connection to it. [Server deployment](runtime/docs/server.md) keeps normal
+compute, packages and state on that server, with local devices as optional edges.
+ZIP upload alone does not start a runtime.
 
 ## Quick start
 
@@ -52,7 +54,7 @@ OS sandbox; the supervised host does.
 ## Documentation
 
 [Plugin installation](runtime/plugins/palette/README.md) · [Operator API](runtime/docs/operator.md) · [Installation and MCP](runtime/docs/install.md) ·
-[Workspaces and patches](runtime/docs/workspaces.md) · [Authority boundaries](runtime/docs/authority.md) · [Static analysis policy](runtime/docs/static-analysis.md)
+[Workspaces and patches](runtime/docs/workspaces.md) · [Runtime capabilities](runtime/docs/capabilities.md) · [Authority boundaries](runtime/docs/authority.md) · [Server deployment](runtime/docs/server.md) · [Static analysis policy](runtime/docs/static-analysis.md)
 
 ## Optional operator briefing
 
@@ -78,6 +80,13 @@ package live under `runtime/docs/` and `runtime/plugins/`.
 
 Rust builds Palette's host; Python supports its adapters. Additional language
 kernels and SDKs are provisioned by deployments, rather than bundled with Palette.
+
+Models and additional toolchains use operator-configured provisioning and the
+host-command broker. Their artifacts, input format and execution limits belong
+to deployment configuration.
+
+The optional [Gesso integration](runtime/integrations/gesso/README.md) exposes its
+existing tokenizer, CPU inference, fork and profiling through runtime capabilities.
 
 ## Development
 

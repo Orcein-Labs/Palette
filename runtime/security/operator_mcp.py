@@ -13,12 +13,17 @@ import time
 import uuid
 
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
+from provisioning import operator_ceiling, protected_host_paths
+from runtime_registry import RuntimeRegistry
+from patch_broker import PatchBroker
+from repair_broker import RepairBroker
 
 REPO = os.environ.get("PALETTE_REPO", str(Path(__file__).absolute().parents[2]))
 HOST = os.environ.get("PALETTE_HOST", str(Path(REPO, "runtime/host/target/release/palette-host")))
 WORKSPACE = str(Path(os.environ["OPERATOR_WORKSPACE"]).absolute())
 STATE_DIR = Path(os.environ.get("PALETTE_STATE_DIR", str(Path.home() / ".local/share/operator-surfaces/palette-state" /
     hashlib.sha256(WORKSPACE.encode()).hexdigest()))).absolute()
+RECEIPTS_DIR = STATE_DIR.with_name(STATE_DIR.name + ".receipts")
 proc = None
 frames = queue.Queue()
 hello = None
@@ -27,21 +32,34 @@ preparation = None
 binding_view = {}
 binding_epoch = None
 connection_failure = None
+FROZEN_CEILING = operator_ceiling()
+RUNTIME_ROOT = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(REPO, "runtime/capabilities")))).expanduser().resolve()
+runtime_registry = RuntimeRegistry(RUNTIME_ROOT, FROZEN_CEILING, workspace=WORKSPACE, state_dir=STATE_DIR,
+                                   repo=REPO, host_binary=HOST)
+refresh_pending = None
+PATCH_STATE_ROOT = Path(os.environ.get("PALETTE_WORKSPACE_STATE_ROOT",
+    str(Path.home() / ".local/share/operator-surfaces/palette-workspaces"))).expanduser().resolve()
+PROTECTED_PATHS = [*protected_host_paths(FROZEN_CEILING, include_runtime_root=False), STATE_DIR, RECEIPTS_DIR, PATCH_STATE_ROOT]
+try:
+    PATCH_ROOTS = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
+    if not isinstance(PATCH_ROOTS, dict):
+        raise ValueError("PALETTE_PATCH_ROOTS must contain a JSON object")
+    repair_config_path = os.environ.get("PALETTE_REPAIR_CONFIG")
+    REPAIR_CONFIG = json.loads(Path(repair_config_path).expanduser().read_text(encoding="utf-8")) if repair_config_path else {}
+    if not isinstance(REPAIR_CONFIG, dict) or set(REPAIR_CONFIG) - {"test_recipes", "auto_apply_prefixes", "sandbox_source_paths"}:
+        raise ValueError("PALETTE_REPAIR_CONFIG has unsupported fields")
+    PATCH_BROKER = PatchBroker(PATCH_STATE_ROOT / "patches", PATCH_ROOTS,
+                               REPAIR_CONFIG.get("auto_apply_prefixes", {}),
+                               protected_paths=PROTECTED_PATHS,
+                               registry_root=RUNTIME_ROOT,
+                               sandbox_source_paths=REPAIR_CONFIG.get("sandbox_source_paths", {}))
+    REPAIR_BROKER = RepairBroker(PATCH_BROKER, REPAIR_CONFIG.get("test_recipes", {}),
+                                 REPAIR_CONFIG.get("auto_apply_prefixes", {}),
+                                 protected_paths=PROTECTED_PATHS)
+except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    raise RuntimeError(f"Invalid trusted repair configuration: {exc}") from exc
 
 
-
-def operator_ceiling():
-    """The operator session's capability ceiling. PALETTE_HOST_COMMANDS names
-    a JSON file of host commands ({"<name>": {"argv": [...], "cwd": "/abs",
-    "timeout_s": 600, "extra_args": false}}) the kernel may run outside the
-    sandbox through the broker; without it the ceiling is empty."""
-    path = os.environ.get("PALETTE_HOST_COMMANDS")
-    if not path:
-        return {}
-    commands = json.loads(Path(path).read_text())
-    if not isinstance(commands, dict):
-        raise RuntimeError(f"PALETTE_HOST_COMMANDS must name a JSON object of commands: {path}")
-    return {"host_command": {"commands": commands}}
 
 def project_result(event, *, full=False, ephemeral=False):
     global binding_view, binding_epoch
@@ -113,13 +131,15 @@ def receive(deadline):
 def stop():
     global proc
     if proc is None:
-        return
+        return {"stopped": False, "returncode": None, "timed_out": False}
     child, proc = proc, None
+    timed_out = False
     child.stdin.close()
     try:
         # The Rust owner gives its last snapshot up to 30s before killing it.
         child.wait(timeout=35)
     except subprocess.TimeoutExpired:
+        timed_out = True
         child.terminate()
         try:
             child.wait(timeout=5)
@@ -128,6 +148,7 @@ def stop():
             child.wait()
     finally:
         child.stdout.close()
+    return {"stopped": True, "returncode": child.returncode, "timed_out": timed_out}
 
 
 def prepare_session():
@@ -161,7 +182,8 @@ def start(*, prepared=True):
     Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     command = [HOST, "session", "--project-dir", REPO, "--repo-dir", REPO,
-               "--workspace-dir", WORKSPACE, "--state-dir", str(STATE_DIR), "--ceiling", json.dumps(operator_ceiling())]
+               "--workspace-dir", WORKSPACE, "--state-dir", str(STATE_DIR),
+               "--receipts-dir", str(RECEIPTS_DIR), "--ceiling", json.dumps(FROZEN_CEILING)]
     if os.environ.get("PALETTE_SCRATCH_ROOT"):
         command += ["--scratch-root", os.environ["PALETTE_SCRATCH_ROOT"]]
     started = time.monotonic()
@@ -206,14 +228,37 @@ def execute(args):
 
 
 def receive_result(rid, args):
-    global session_notice, connection_failure
+    global session_notice, connection_failure, refresh_pending
     send_child({"request_id": rid, **args})
     deadline = time.monotonic() + 90
     while True:
         event = receive(deadline)
         if event.get("event") == "host_request":
-            send_child({"host_reply": event["id"], "reply": {"status": "error",
-                "error": "This Palette operator has no Cyan harness host services configured."}})
+            data = event.get("data", {})
+            if isinstance(data, dict) and data.get("type") == "palette.runtime":
+                try:
+                    action = data.get("action")
+                    payload = data.get("payload", {})
+                    if not isinstance(payload, dict):
+                        raise ValueError("palette.runtime payload must be an object")
+                    if action == "refresh" and args.get("ephemeral") is True:
+                        raise PermissionError("runtime refresh is unavailable to disposable workers")
+                    if action == "repair":
+                        result = REPAIR_BROKER.call(payload, os.environ.get("PALETTE_WORKSPACE_ID", "default"),
+                                                    None, None, None)
+                    else:
+                        result = runtime_registry.handle(action, payload, epoch=hello.get("epoch"))
+                    if action == "refresh":
+                        result["deferred"] = True
+                        result["snapshot"] = "pending_current_turn_completion"
+                        refresh_pending = {"request_id": event["id"], "requested": dict(result),
+                                           "previous_epoch": hello.get("epoch"), "previous_generation": result["previous_generation"]}
+                    send_child({"host_reply": event["id"], "reply": {"status": "ok", "result": result}})
+                except Exception as exc:
+                    send_child({"host_reply": event["id"], "reply": {"status": "error", "error": f"{type(exc).__name__}: {exc}"}})
+            else:
+                send_child({"host_reply": event["id"], "reply": {"status": "error",
+                    "error": "This Palette operator has no host service for that request type."}})
             continue
         if event.get("request_id") == rid:
             if hello.get("capabilities", {}).get("revival_observation_v1") and isinstance(event.get("revival"), dict):
@@ -223,7 +268,80 @@ def receive_result(rid, args):
                 event["session"] = session_notice
                 session_notice = None
                 connection_failure = None
+            if refresh_pending is not None:
+                event = complete_runtime_refresh(event)
             return event
+
+
+def snapshot_evidence(call):
+    manifest_path = STATE_DIR / "manifest.json"
+    last_call_path = STATE_DIR / "last_call"
+    result = {"manifest_present": manifest_path.is_file(), "manifest_call": None,
+              "last_completed_call": None, "workspace_matches": False}
+    if not manifest_path.is_file():
+        return result
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        saved_call = manifest.get("call")
+        result["manifest_call"] = saved_call
+        result["workspace_matches"] = manifest.get("workspace") == str(Path(WORKSPACE).resolve())
+        result["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        last = last_call_path.read_text(encoding="utf-8").strip() if last_call_path.is_file() else ""
+        result["last_completed_call"] = int(last) if last.isdigit() else None
+        result["covers_completed_turn"] = isinstance(saved_call, int) and saved_call >= call and (
+            result["last_completed_call"] is None or result["last_completed_call"] >= call)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        result["read_error"] = f"{type(exc).__name__}: {exc}"
+        result["covers_completed_turn"] = False
+    return result
+
+
+def complete_runtime_refresh(turn_event):
+    global refresh_pending, connection_failure
+    pending, refresh_pending = refresh_pending, None
+    before_epoch = pending["previous_epoch"]
+    call = turn_event.get("call")
+    stopped = stop()
+    snapshot = snapshot_evidence(call) if isinstance(call, int) else {"covers_completed_turn": False, "manifest_present": False}
+    try:
+        snapshot_committed = (stopped.get("returncode") == 0 and not stopped.get("timed_out") and
+                              snapshot.get("covers_completed_turn") is True and snapshot.get("workspace_matches") is True)
+        commit = runtime_registry.commit_refresh() if snapshot_committed else None
+        if commit is None:
+            runtime_registry.cancel_refresh()
+        start(prepared=False)
+        revived = execute({"code": "nothing", "view": "full"})
+        revival = revived.get("revival")
+        after_epoch = hello.get("epoch") if hello else None
+        saved_call = revival.get("saved_call") if isinstance(revival, dict) else None
+        observed = isinstance(saved_call, int) and isinstance(call, int) and saved_call >= call
+        success = (snapshot_committed and commit is not None and
+                   commit["capability_generation"] == pending["requested"]["capability_generation"] and
+                   after_epoch is not None and after_epoch != before_epoch and observed)
+        refresh = {**pending["requested"], **(commit or {}), "deferred": False, "success": success,
+                   "snapshot": {**snapshot, "stop_returncode": stopped.get("returncode"),
+                                "stop_timed_out": stopped.get("timed_out")},
+                   "previous_epoch": before_epoch, "epoch": after_epoch,
+                   "revival": revival, "observed_saved_call": saved_call}
+        turn_event["runtime_refresh"] = refresh
+        if not success:
+            turn_event["success"] = False
+            turn_event["runtime_refresh"]["error"] = "snapshot commit or revival of the completed turn was not established"
+            turn_event["error"] = (str(turn_event.get("error") or "") +
+                                   " Runtime refresh did not establish snapshot and revival; inspect runtime_refresh evidence.").strip()
+        return turn_event
+    except Exception as exc:
+        runtime_registry.cancel_refresh()
+        connection_failure = {"epoch": before_epoch, "error": str(exc), "completion": "runtime_refresh_uncertain"}
+        turn_event["success"] = False
+        turn_event["runtime_refresh"] = {**pending["requested"], "deferred": False, "success": False,
+            "snapshot": {**snapshot, "stop_returncode": stopped.get("returncode"), "stop_timed_out": stopped.get("timed_out")},
+            "previous_epoch": before_epoch, "epoch": hello.get("epoch") if hello else None,
+            "error": f"{type(exc).__name__}: {exc}"}
+        turn_event["error"] = (str(turn_event.get("error") or "") +
+                                " Runtime refresh recovery is uncertain; inspect runtime_refresh evidence.").strip()
+        stop()
+        return turn_event
 
 
 def control(args):

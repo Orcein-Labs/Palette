@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from launch_worker import build_bwrap_argv, default_depot, resolve_real_julia_binary  # noqa: E402
+from launch_worker import build_bwrap_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
 PREWARM = Path(__file__).with_name("prewarm_workload.jl").read_text()
 
@@ -47,6 +47,10 @@ def preparation_identity(project_dir: str, repo_dir: str, julia_bin: str) -> dic
                                   *project.joinpath("src").rglob("*.jl"),
                                   *repo.joinpath("runtime", "scripts").glob("*.jl"),
                                   *project.glob("*Project.toml"), *project.glob("*Manifest.toml")]))}
+    package_root = Path(os.environ.get("PALETTE_PACKAGE_DEPOT", str(Path.home() / ".palette/packages"))).expanduser().resolve()
+    package_environment = package_root / "environment"
+    optional_files = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in sorted([*package_environment.glob("*Project.toml"), *package_environment.glob("*Manifest.toml")])}
     version = subprocess.run([julia_bin, "--startup-file=no", "--version"],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout.strip()
     return {"project": str(project), "repo": str(repo), "source": files,
@@ -54,6 +58,7 @@ def preparation_identity(project_dir: str, repo_dir: str, julia_bin: str) -> dic
             "runtime": {"binary": julia_bin, "version": version, "machine": os.uname().machine},
             "task_environment": (hashlib.sha256(Path(os.environ["PALETTE_TASK_ENV"]).read_bytes()).hexdigest()
                                  if os.environ.get("PALETTE_TASK_ENV") else None),
+            "package_environment": {"path": str(package_environment), "files": optional_files},
             "depot": default_depot()}
 
 
@@ -103,9 +108,18 @@ def process_start(pid: int) -> str:
 
 def prepare(project_dir: str, repo_dir: str, *, state_dir: str | None = None,
             host_bin: str | None = None, force: bool = False) -> dict:
+    with tempfile.TemporaryDirectory(prefix="palette-prewarm-") as workspace:
+        return _prepare_in_workspace(project_dir, repo_dir, workspace, state_dir=state_dir,
+                                     host_bin=host_bin, force=force)
+
+
+def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, state_dir: str | None = None,
+                          host_bin: str | None = None, force: bool = False) -> dict:
     julia_bin = resolve_real_julia_binary()
     identity = preparation_identity(project_dir, repo_dir, julia_bin)
     path = preparation_path(identity, state_dir)
+    package_root, package_depot, package_environment = package_store_paths(
+        protected_paths=[identity["project"], identity["repo"], state_dir or "", path.parent, workspace])
     path.parent.mkdir(parents=True, exist_ok=True)
     def save(record):
         with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
@@ -122,15 +136,16 @@ def prepare(project_dir: str, repo_dir: str, *, state_dir: str | None = None,
         save(record)
         started = time.monotonic()
         try:
-            with tempfile.TemporaryDirectory(prefix="palette-prewarm-") as workspace:
-                if host_bin:
-                    argv = [host_bin, "prewarm", "--project-dir", project_dir, "--repo-dir", repo_dir]
-                else:
-                    argv = build_bwrap_argv(workspace_dir=workspace, broker_socket_dir=None,
-                        project_dir=identity["project"], repo_dir=identity["repo"], julia_bin=julia_bin,
-                        julia_depot=identity["depot"], network_enabled=False)
-                    argv += ["--", julia_bin, "--startup-file=no", "-e", PREWARM]
-                result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            if host_bin:
+                argv = [host_bin, "prewarm", "--project-dir", project_dir, "--repo-dir", repo_dir]
+            else:
+                argv = build_bwrap_argv(workspace_dir=workspace, broker_socket_dir=None,
+                    project_dir=identity["project"], repo_dir=identity["repo"], julia_bin=julia_bin,
+                    julia_depot=identity["depot"], network_enabled=False,
+                    package_store_root=package_root, package_depot_dir=package_depot,
+                    package_environment_dir=package_environment)
+                argv += ["--", julia_bin, "--startup-file=no", "-e", PREWARM]
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
             record.update(state="prepared" if result.returncode == 0 else "failed",
                           returncode=result.returncode, output=result.stdout, stderr=result.stderr,
                           error=None if result.returncode == 0 else result.stderr or result.stdout)

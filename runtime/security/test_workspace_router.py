@@ -19,6 +19,8 @@ import unittest
 REPO = Path(__file__).resolve().parents[2]
 ROUTER = REPO / "runtime/security/operator_workspace_router.py"
 HOST = REPO / "runtime/host/target/release/palette-host"
+sys.path.insert(0, str(REPO / "runtime/security"))
+from runtime_registry import RuntimeRegistry, RuntimeRegistryError  # noqa: E402
 
 
 class WorkspaceRouterIntegration(unittest.TestCase):
@@ -108,7 +110,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         root = Path(self.tmp.name)
         alias = root / "source-alias"
         alias.symlink_to(REPO, target_is_directory=True)
-        for workspace in (REPO, REPO.parent, alias, root, root / "registry", root / "registry/child", root / "legacy-state"):
+        for workspace in (REPO, REPO.parent, alias, root, root / "registry", root / "registry/child", root / "legacy-state", root / "legacy-state.receipts"):
             with self.subTest(workspace=workspace):
                 result = subprocess.run([sys.executable, str(ROUTER)],
                     input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
@@ -132,23 +134,23 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 plugin = Path(self.tmp.name) / fmt
                 command = [sys.executable, str(REPO / "runtime/security/install_operator_plugin.py"), "--format", fmt,
                     "--plugin-dir", str(plugin), "--workspace-dir", str(self.workspace), "--bin-dir", str(Path(self.tmp.name) / "bin")]
-                subprocess.run(command, capture_output=True, text=True, check=True)
+                install_env = {**os.environ, "XDG_RUNTIME_DIR": str(Path(self.tmp.name) / "runtime")}
+                subprocess.run(command, capture_output=True, text=True, check=True, env=install_env)
                 config_path = plugin / ("mcp.json" if fmt == "portable" else ".mcp.json")
                 config = json.loads(config_path.read_text())
                 config["mcpServers"]["palette"]["env"]["INSTALL_TEST_PRESERVED"] = "yes"
+                config["INSTALL_TEST_ROOT_PRESERVED"] = "yes"
                 config_path.write_text(json.dumps(config))
-                subprocess.run(command, capture_output=True, text=True, check=True)
+                subprocess.run(command, capture_output=True, text=True, check=True, env=install_env)
                 entry = json.loads(config_path.read_text())["mcpServers"]["palette"]
                 self.assertEqual(entry["env"]["INSTALL_TEST_PRESERVED"], "yes")
-                request = {"jsonrpc":"2.0", "id":1, "method":"tools/list"}
-                result = subprocess.run([entry["command"], *entry["args"]], input=json.dumps(request)+"\n",
-                    capture_output=True, text=True, check=True, timeout=60, cwd=self.tmp.name, env={**self.env, **entry["env"]})
-                self.assertEqual({t["name"] for t in json.loads(result.stdout)["result"]["tools"]},
-                    {"palette", "palette_control", "palette_workspace", "palette_patch"})
+                self.assertEqual(json.loads(config_path.read_text())["INSTALL_TEST_ROOT_PRESERVED"], "yes")
+                self.assertEqual(entry["command"], sys.executable)
+                self.assertEqual(Path(entry["args"][0]), REPO / "runtime/security/palette_mcp_client.py")
+                self.assertEqual(entry["env"]["PALETTE_SERVICE"], "palette.service")
+                self.assertIn("PALETTE_SOCKET", entry["env"])
         wrapper = Path(self.tmp.name) / "bin/palette-mcp"
-        result = subprocess.run([str(wrapper)], input=json.dumps(request)+"\n", capture_output=True,
-            text=True, check=True, timeout=60, cwd=self.tmp.name, env=self.env)
-        self.assertEqual(len(json.loads(result.stdout)["result"]["tools"]), 4)
+        self.assertIn(str(REPO / "runtime/security/palette_mcp_client.py"), wrapper.read_text())
 
     def test_thread_project_open_and_revival(self):
         # Thread A and B are truly separate worlds.
@@ -340,6 +342,154 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.assertEqual(receipt["status"],"applied",receipt)
         self.assertEqual(receipt["granted_by"],"mcp_client_confirmed_user")
         self.assertEqual((target/"new.txt").read_text(),"approved content\n")
+
+    def test_C02_runtime_discovery_invoke_refresh_and_frozen_ceiling(self):
+        runtime_root = Path(self.tmp.name) / "runtime-capabilities"
+        ceiling_path = Path(self.tmp.name) / "ceiling.json"
+        runtime_root.mkdir()
+        ceiling = {"host_request": {"allowed_types": ["palette.runtime"]},
+                   "package_management": {"allowed_packages": ["Parsers"], "offline": True},
+                   "network_access": {"allowed": False, "allowed_hosts": []}}
+        ceiling_path.write_text(json.dumps(ceiling))
+
+        def install(identifier, version, source, *, dependencies=None, requires=None):
+            target = runtime_root / identifier
+            target.mkdir(exist_ok=True)
+            (target / "main.jl").write_text(source)
+            (target / "capability.json").write_text(json.dumps({
+                "id": identifier, "version": version, "source": "main.jl", "entrypoint": "runtime_capability",
+                "dependencies": dependencies or [], "requires": requires or [], "description": identifier,
+            }))
+
+        install("echo", "1.0", 'function runtime_capability(args); get(args, "n", 0) + 2; end\n',
+                dependencies=[])
+        install("network-tool", "1.0", "function runtime_capability(args); :unused; end\n", requires=["network_access"])
+        install("needs-package", "1.0", "function runtime_capability(args); :unused; end\n",
+                dependencies=["PaletteMissingDependencyForRuntimeTest"])
+
+        self.proc.stdin.close(); self.proc.wait(timeout=60); self.proc.stdout.close()
+        self.env["PALETTE_RUNTIME_ROOT"] = str(runtime_root)
+        self.env["PALETTE_CAPABILITY_CEILING"] = str(ceiling_path)
+        self.env["PALETTE_PACKAGE_DEPOT"] = str(Path(self.tmp.name) / "package-store")
+        self.start_router()
+
+        def schemas():
+            request = {"jsonrpc": "2.0", "id": "schemas", "method": "tools/list"}
+            self.proc.stdin.write(json.dumps(request) + "\n"); self.proc.stdin.flush()
+            with selectors.DefaultSelector() as selector:
+                selector.register(self.proc.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(timeout=30), "tools/list response deadline exceeded")
+            frame = json.loads(self.proc.stdout.readline())
+            return {tool["name"]: tool["inputSchema"] for tool in frame["result"]["tools"]}
+
+        before = schemas()
+        self.assertEqual(set(before), {"palette", "palette_control", "palette_workspace", "palette_patch"})
+        found = self.call("palette", {"code": 'Palette.runtime("discover")'})["data"]
+        echo = next(item for item in found["available_capabilities"] if item["id"] == "echo")
+        self.assertEqual(echo["state"], "active")
+        self.assertIn("PaletteMissingDependencyForRuntimeTest", found["missing_dependencies"])
+        self.assertIn("network-tool", found["unauthorized_capabilities"])
+        first_generation = found["capability_generation"]
+        self.assertFalse(self.call("palette", {"code": 'Base.find_package("Parsers") !== nothing'})["data"])
+        self.assertEqual(found["authorized_ceiling"]["network_access"]["allowed"], False)
+        initial = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"echo", "arguments"=>Dict("n"=>5)))'})
+        self.assertEqual(initial["data"]["result"], 7)
+        denied = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"network-tool"))'}, error=True)
+        self.assertIn("outside the operator ceiling", denied["error"])
+
+        install("echo", "2.0", 'function runtime_capability(args); get(args, "n", 0) + 20; end\n',
+                dependencies=[])
+        install("new-cap", "1.0", 'using Parsers; function runtime_capability(args); Parsers.parse(Int, get(args, "text", "42")); end\n',
+                dependencies=["Parsers"])
+        ceiling["network_access"] = {"allowed": True, "allowed_hosts": ["example.invalid"]}
+        ceiling_path.write_text(json.dumps(ceiling))
+        available = self.call("palette", {"code": 'Palette.runtime("discover")'})["data"]
+        updated = next(item for item in available["available_capabilities"] if item["id"] == "echo")
+        self.assertEqual(updated["state"], "available_update")
+        self.assertEqual(next(item for item in available["available_capabilities"] if item["id"] == "new-cap")["state"], "available")
+        self.assertNotEqual(available["available_generation"], first_generation)
+        self.assertEqual(available["authorized_ceiling"]["network_access"]["allowed"], False)
+        self.assertIn("network-tool", available["unauthorized_capabilities"])
+        still_old = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"echo", "arguments"=>Dict("n"=>5)))'})
+        self.assertEqual(still_old["data"]["result"], 7)
+
+        refreshed = self.call("palette", {"code": 'keep_me=44; requested=Palette.runtime("refresh"); '
+            'view=Palette.runtime("discover"); (requested["deferred"], view["capability_generation"], view["available_generation"])'})
+        observation = refreshed["runtime_refresh"]
+        self.assertTrue(observation["success"], observation)
+        self.assertNotEqual(observation["epoch"], observation["previous_epoch"])
+        self.assertTrue(observation["snapshot"]["covers_completed_turn"], observation)
+        self.assertGreaterEqual(observation["revival"]["saved_call"], refreshed["call"])
+        self.assertTrue(refreshed["data"][0])
+        self.assertEqual(refreshed["data"][1], first_generation)
+        self.assertNotEqual(refreshed["data"][2], first_generation)
+        self.assertEqual(self.call("palette", {"code": "keep_me"})["data"], 44)
+        changed = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"echo", "arguments"=>Dict("n"=>5)))'})
+        self.assertEqual(changed["data"]["result"], 25)
+        missing = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"new-cap"))'}, error=True)
+        self.assertIn("missing Julia dependencies", missing["error"])
+        installed = self.call("palette", {"code": 'package_receipt=Api.request_capability("package_management", Dict("name"=>"Parsers")); package_receipt'})
+        self.assertTrue(installed["data"]["approved"], installed)
+        new_cap = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"new-cap"))'})
+        self.assertEqual(new_cap["data"]["result"], 42)
+        denied_package = self.call("palette", {"code": 'Api.request_capability("package_management", Dict("name"=>"DefinitelyNotAllowed"))'})
+        self.assertFalse(denied_package["data"]["approved"], denied_package)
+        self.assertIn("allow", denied_package["data"]["reason"].lower())
+        receipt_file = Path(self.env["PALETTE_STATE_DIR"] + ".receipts") / "receipts.jsonl"
+        receipts = [json.loads(line) for line in receipt_file.read_text().splitlines()]
+        package_receipts = [item for item in receipts if item.get("category") == "package_management"]
+        self.assertTrue(any(item["approved"] and item["params"]["name"] == "Parsers" for item in package_receipts), package_receipts)
+        self.assertTrue(any(not item["approved"] and item["params"]["name"] == "DefinitelyNotAllowed" for item in package_receipts), package_receipts)
+        prior_epoch = observation["epoch"]
+        restarted = self.call("palette_control", {"action": "restart", "restore": True})
+        self.assertNotEqual(restarted["session"]["epoch"], prior_epoch)
+        continued = self.call("palette", {"code": 'keep_me + Palette.runtime("invoke", Dict("id"=>"new-cap"))["result"]'})
+        self.assertEqual(continued["data"], 86)
+        persisted_receipts = [json.loads(line) for line in receipt_file.read_text().splitlines()]
+        self.assertTrue({item["receipt_id"] for item in package_receipts}.issubset(
+            {item["receipt_id"] for item in persisted_receipts}))
+        installed_discovery = self.call("palette", {"code": 'Palette.runtime("discover")'})["data"]
+        self.assertNotIn("Parsers", installed_discovery["missing_dependencies"])
+        still_denied = self.call("palette", {"code": 'Palette.runtime("invoke", Dict("id"=>"network-tool"))'}, error=True)
+        self.assertIn("outside the operator ceiling", still_denied["error"])
+        after = schemas()
+        self.assertEqual(after, before)
+
+    def test_C03_runtime_registry_rejects_manifest_authority_and_source_escape(self):
+        root = Path(self.tmp.name) / "registry-negative"
+        workspace = Path(self.tmp.name) / "registry-negative-workspace"
+        state = Path(self.tmp.name) / "registry-negative-state"
+        workspace.mkdir(); state.mkdir(); root.mkdir()
+        cap = root / "bad-authority"
+        cap.mkdir()
+        (cap / "main.jl").write_text("function safe_entry(args); 1; end\n")
+        (cap / "capability.json").write_text(json.dumps({"id": "bad-authority", "version": "1",
+            "source": "main.jl", "entrypoint": "safe_entry", "ceiling": {"network_access": {"allowed": True}}}))
+        with self.assertRaisesRegex(RuntimeRegistryError, "forbidden field"):
+            RuntimeRegistry(root, {}, workspace=workspace, state_dir=state)
+
+        (cap / "capability.json").write_text(json.dumps({"id": "bad-authority", "version": "1",
+            "source": "../outside.jl", "entrypoint": "safe_entry"}))
+        (root / "outside.jl").write_text("function safe_entry(args); 1; end\n")
+        with self.assertRaisesRegex(RuntimeRegistryError, "inside its directory"):
+            RuntimeRegistry(root, {}, workspace=workspace, state_dir=state)
+
+    def test_C01_runtime_registry_toolchain_checks_nested_fixed_artifacts(self):
+        root = Path(self.tmp.name) / "registry-toolchains"
+        workspace = Path(self.tmp.name) / "registry-toolchains-workspace"
+        state = Path(self.tmp.name) / "registry-toolchains-state"
+        cwd = Path(self.tmp.name) / "configured-tool"
+        root.mkdir(); workspace.mkdir(); state.mkdir(); cwd.mkdir()
+        executable = cwd / "runner"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        artifact = cwd / "model.bin"
+        argv = [str(executable), "--fixed-arg=--model=" + str(artifact)]
+        ceiling = {"host_command": {"commands": {"model": {"argv": argv, "cwd": str(cwd)}}}}
+        registry = RuntimeRegistry(root, ceiling, workspace=workspace, state_dir=state)
+        self.assertEqual(next(item for item in registry._toolchains() if item["name"] == "model")["status"], "missing")
+        artifact.write_bytes(b"model")
+        self.assertEqual(next(item for item in registry._toolchains() if item["name"] == "model")["status"], "ready")
 
 
     def test_live_limit_and_router_crash_recovery(self):

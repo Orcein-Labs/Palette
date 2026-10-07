@@ -881,6 +881,10 @@ class TestSessionCli(unittest.TestCase):
                 "--plugin-dir", str(plugin), "--workspace-dir", self.task_workspace], stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, check=True)
             connection = json.loads((plugin / ".mcp.json").read_text())["mcpServers"]["palette"]
+            # This test targets MCP adapter restart/revival semantics directly;
+            # service ownership and the socket transport are covered separately.
+            connection["command"] = sys.executable
+            connection["args"] = [str(Path(REPO_DIR, "runtime/security/serve_palette.py"))]
             env = {**os.environ, **connection["env"], "PALETTE_STATE_DIR": state,
                    "PALETTE_SCRATCH_ROOT": str(Path(state_root, "scratch"))}
             adapter = subprocess.Popen([connection["command"], *connection["args"]],

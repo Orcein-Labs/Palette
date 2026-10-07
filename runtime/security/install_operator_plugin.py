@@ -36,7 +36,8 @@ def main():
     repo, plugin = Path(args.repo_dir).resolve(), Path(args.plugin_dir).resolve()
     require_disjoint([args.workspace_dir], [repo, plugin] + ([args.bin_dir] if args.bin_dir else []))
     host = repo / "runtime/host/target/release/palette-host"
-    for path in (repo / "Project.toml", repo / "Manifest.toml", repo / "runtime/security/operator_mcp.py", repo / "runtime/security/operator_workspace_router.py", repo / "runtime/security/serve_palette.py", host):
+    client = repo / "runtime/security/palette_mcp_client.py"
+    for path in (repo / "Project.toml", repo / "Manifest.toml", client, host):
         if not path.is_file():
             parser.error(f"missing {path}; instantiate the local project and build the Rust host before installing")
     if not os.access(host, os.X_OK):
@@ -52,8 +53,15 @@ def main():
     if set(config.get("mcpServers", {})) - {"palette"}:
         parser.error("target contains other servers; use a dedicated Palette plugin")
     entry = config.setdefault("mcpServers", {}).setdefault("palette", {})
-    entry.update(command=sys.executable, args=[str(repo / "runtime/security/serve_palette.py")],
-        env={**entry.get("env", {}), "PALETTE_REPO": str(repo), "PALETTE_HOST": str(host), "OPERATOR_WORKSPACE": str(Path(args.workspace_dir).resolve())})
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    default_socket = Path(runtime_dir) / "palette/daemon.sock" if runtime_dir else None
+    socket = Path(os.environ.get("PALETTE_SOCKET", default_socket)).expanduser().resolve() if os.environ.get("PALETTE_SOCKET") or default_socket else None
+    client_env = {**entry.get("env", {}), "PALETTE_REPO": str(repo), "PALETTE_HOST": str(host),
+                  "OPERATOR_WORKSPACE": str(Path(args.workspace_dir).resolve()), "PALETTE_SERVICE": "palette.service"}
+    if socket:
+        client_env["PALETTE_SOCKET"] = str(socket)
+    entry.update(command=sys.executable, args=[str(client)],
+        env=client_env)
     entry.setdefault("startup_timeout_sec", 200)
     entry.setdefault("tool_timeout_sec", 210)
     manifest["mcpServers"] = "./.mcp.json"
@@ -70,7 +78,8 @@ def main():
         entry["env"] = {**prior.get("env", {}), **entry["env"]}
         entry.pop("startup_timeout_sec", None)
         entry.pop("tool_timeout_sec", None)
-        config = {"$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json", "mcpServers": {"palette": {"type": "stdio", **entry}}}
+        config = {**existing, "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                  "mcpServers": {**existing.get("mcpServers", {}), "palette": {"type": "stdio", **entry}}}
         manifest = portable
         assets = plugin / "assets"
         assets.mkdir(parents=True, exist_ok=True)
@@ -87,10 +96,11 @@ def main():
             old = launcher.read_text()
             if not old.startswith("#!/bin/sh\n# Palette-managed launcher\n"):
                 parser.error("refusing to overwrite an unmanaged palette-mcp executable")
-        launcher.write_text("#!/bin/sh\n# Palette-managed launcher\nexec " + shlex.quote(sys.executable) + " " + shlex.quote(str(repo / "runtime/security/serve_palette.py")) + ' "$@"\n')
+        launcher.write_text("#!/bin/sh\n# Palette-managed launcher\nexec " + shlex.quote(sys.executable) + " " + shlex.quote(str(client)) + ' "$@"\n')
         launcher.chmod(0o755)
     print(json.dumps({"plugin": str(plugin), "repo": str(repo), "workspace": entry["env"]["OPERATOR_WORKSPACE"],
-        "preparation": "checked on first operator start", "state": "existing state directory wired by operator"}))
+        "preparation": "checked on first operator start", "state": "existing state directory wired by operator",
+        "socket": str(socket) if socket else "${XDG_RUNTIME_DIR}/palette/daemon.sock", "service": "palette.service"}))
 
 
 if __name__ == "__main__":
