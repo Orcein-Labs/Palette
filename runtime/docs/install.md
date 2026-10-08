@@ -90,7 +90,11 @@ Add `--tunnel-env-file /absolute/path/to/operator.env` only when the existing
 client requires credentials; the file must already belong to the operator and
 have mode `0600`. The generated `palette-tunnel.service` reconnects to the
 daemon through its configured profile and can be restarted without restarting
-Palette. Both services log to the user journal (`journalctl --user -u
+Palette. The tunnel restarts after both successful and failed process exits,
+because a closed daemon connection can make the tunnel exit successfully. Use
+one supervisor for a profile: stop a managed `tunnel-client runtimes connect`
+process before starting its systemd unit. An explicit service stop stays stopped.
+Both services log to the user journal (`journalctl --user -u
 palette.service` or `palette-tunnel.service`).
 
 By default, user services run while the user manager exists and stop after the

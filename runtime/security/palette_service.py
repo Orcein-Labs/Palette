@@ -121,7 +121,7 @@ Wants=palette.service
 [Service]
 Type=simple
 ExecStart={command}
-Restart=on-failure
+Restart=always
 RestartSec=2s
 UMask=0077
 PrivateTmp=yes

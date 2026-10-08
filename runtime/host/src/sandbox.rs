@@ -46,12 +46,17 @@ pub fn resolve_julia() -> Result<String, String> {
     Ok(format!("{}/julia", String::from_utf8_lossy(&out.stdout).trim()))
 }
 
-pub fn default_depot() -> String {
-    std::env::var("JULIA_DEPOT_PATH")
-        .ok()
-        .and_then(|v| v.split(':').next_back().map(str::to_string))
+fn primary_depot(value: Option<&str>, fallback: &Path) -> String {
+    value
+        .and_then(|v| v.split(':').next())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| util::home().join(".julia").to_string_lossy().into_owned())
+        .map(str::to_string)
+        .unwrap_or_else(|| fallback.to_string_lossy().into_owned())
+}
+
+pub fn default_depot() -> String {
+    let configured = std::env::var("JULIA_DEPOT_PATH").ok();
+    primary_depot(configured.as_deref(), &util::home().join(".julia"))
 }
 
 /// Build the isolated command for a broker-owned Pkg operation. Julia package

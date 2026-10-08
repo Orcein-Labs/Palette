@@ -4,9 +4,13 @@ Palette ships these reusable MCP adapters for independent execution worlds and e
 
 ## Choose a world
 
-Call `palette_workspace` with action=create, workspace_id=your-lab, context_id=a-stable-unique-key, scope=thread. Include workspace_id and context_id on subsequent palette and palette_control calls. Context-active routing also works, and attachment persists across router restart. Explicit workspace_id wins. Missing both fields uses the visibly identified shared legacy world; it does not automatically create an isolated thread.
+Call `palette_workspace` with action=create, workspace_id=your-lab, context_id=a-stable-unique-key, scope=thread. Include workspace_id and context_id on subsequent palette and palette_control calls. To select a host-configured project directory, also pass its `project_root_id`; omitting it selects the legacy workspace. Context-active routing also works, and attachment persists across router restart. Explicit workspace_id wins. Missing both fields uses the visibly identified shared legacy world; it does not automatically create an isolated thread.
 
-Scope thread compares caller-supplied keys. It prevents accidental collisions, not impersonation by a caller who knows the key. Project scope shares a world for the same canonical project folder; open is an explicit cross-project sharing choice. Project files stay shared even when execution worlds are independent.
+The operator configures `PALETTE_PROJECT_ROOTS` as a JSON object mapping stable IDs to absolute directories. `palette_workspace` list returns those IDs. Tool arguments select an ID and never supply a path. The configured directory is mounted writable as the worker's workspace at its host path. Keep each root narrow and disjoint from the legacy workspace, runtime, registry, saved state, scratch, toolchains, package stores, and read-only roots. Do not also configure a writable project root under `PALETTE_READ_ROOTS`.
+
+Scope thread compares caller-supplied keys. It prevents accidental collisions, not impersonation by a caller who knows the key. Project scope makes a workspace visible across contexts for its configured root; contexts share a Julia world by attaching to the same workspace ID. Open is an explicit cross-context sharing choice. Multiple workspaces can select the same root: their Julia state is independent while their project files are shared.
+
+The ownership lock is per Julia world. It does not coordinate different worlds or external editors such as local Work. Use one writer at a time for a shared checkout.
 
 Close retains the saved state. Another router may attach the same metadata but cannot execute a world until the current owner closes it. Ownership locks are outside the worker mount and inherited by the adapter; abrupt router death cannot immediately admit a second writer. The adapter handles EOF and normal teardown before releasing ownership. Uncertain calls are not automatically retried.
 
