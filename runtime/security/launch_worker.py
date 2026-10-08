@@ -301,7 +301,12 @@ def build_bwrap_argv(
 
 
 def default_depot() -> str:
-    return os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia")).split(":")[-1]
+    configured = os.environ.get("JULIA_DEPOT_PATH")
+    if configured:
+        primary = configured.split(os.pathsep, 1)[0]
+        if primary:
+            return primary
+    return str(Path.home() / ".julia")
 
 
 def build_package_installer_argv(

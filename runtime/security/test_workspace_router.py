@@ -31,6 +31,10 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         root = Path(self.tmp.name)
         self.workspace = root / "project"
         self.workspace.mkdir()
+        package_store = root / "package-store"
+        package_store.mkdir()
+        runtime_root = root / "runtime-capabilities"
+        runtime_root.mkdir()
 
         env = {
             **os.environ,
@@ -40,7 +44,15 @@ class WorkspaceRouterIntegration(unittest.TestCase):
             "PALETTE_STATE_DIR": str(root / "legacy-state"),
             "PALETTE_WORKSPACE_STATE_ROOT": str(root / "registry"),
             "PALETTE_SCRATCH_ROOT": str(root / "scratch"),
+            "PALETTE_PACKAGE_DEPOT": str(package_store),
+            "PALETTE_RUNTIME_ROOT": str(runtime_root),
+            "PALETTE_PROJECT_ROOTS": "{}",
+            "PALETTE_PATCH_ROOTS": "{}",
+            "PALETTE_READ_ROOTS": "",
         }
+        for key in ("PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG",
+                    "PALETTE_TASK_TOOLS", "PALETTE_TASK_ENV"):
+            env.pop(key, None)
         self.env = env
         self.router_stderr = (root / "router-stderr.log").open("w+")
         self.start_router()
@@ -98,6 +110,14 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.assertEqual(bool(reply.get("isError")), error, f"{reply}\n{self.diagnostics()}")
         return json.loads(reply["content"][0]["text"])
 
+    def start_without_prepare(self, workspace_id=None, context_id=None):
+        arguments = {"action":"restart", "prepare":False}
+        if workspace_id:
+            arguments["workspace_id"] = workspace_id
+        if context_id:
+            arguments["context_id"] = context_id
+        self.call("palette_control", arguments)
+
     def test_startup_failure_keeps_its_cause_through_router(self):
         self.proc.stdin.close(); self.proc.wait(timeout=60); self.proc.stdout.close()
         self.env["PALETTE_HOST"] = str(Path(self.tmp.name) / "missing-host")
@@ -123,10 +143,79 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.call("palette_workspace", {"action":"create", "workspace_id":"registry-check", "scope":"open"})
         path = Path(self.env["PALETTE_WORKSPACE_STATE_ROOT"]) / "registry.json"
         registry = json.loads(path.read_text())
+        registry["workspaces"]["registry-check"].pop("project_root_id")
+        path.write_text(json.dumps(registry))
+        self.assertEqual(self.call("palette", {"workspace_id":"registry-check", "code":"pwd()"})["data"], str(self.workspace))
+        registry = json.loads(path.read_text())
         registry["workspaces"]["registry-check"]["workspace_dir"] = str(Path(self.tmp.name))
         path.write_text(json.dumps(registry))
         result = self.call("palette", {"workspace_id":"registry-check", "code":"1"}, error=True)
         self.assertIn("registry paths", result["error"])
+
+    def test_D04_project_root_allowlist_rejects_protected_paths(self):
+        alias = Path(self.tmp.name) / "runtime-alias"
+        alias.symlink_to(REPO, target_is_directory=True)
+        for path in (REPO, alias, self.workspace, Path.home() / ".julia"):
+            with self.subTest(path=path):
+                result = subprocess.run(
+                    [sys.executable, str(ROUTER)],
+                    input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
+                    capture_output=True, text=True, timeout=60,
+                    env={**self.env, "PALETTE_PROJECT_ROOTS":json.dumps({"unsafe":str(path)})},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("overlap", result.stderr)
+
+    def test_C04_configured_project_roots_share_files_and_isolate_worlds(self):
+        shadow = Path(self.tmp.name) / "shadow-project"
+        shadow.mkdir()
+        self.proc.stdin.close(); self.proc.wait(timeout=60); self.proc.stdout.close()
+        self.env["PALETTE_PROJECT_ROOTS"] = json.dumps({"shadow":str(shadow)})
+        self.start_router()
+
+        def create(workspace_id, scope, context_id=None):
+            args = {"action":"create", "workspace_id":workspace_id, "scope":scope, "project_root_id":"shadow"}
+            if context_id:
+                args["context_id"] = context_id
+            return self.call("palette_workspace", args)
+
+        def palette(workspace_id, context_id, code):
+            return self.call("palette", {"workspace_id":workspace_id, "context_id":context_id, "code":code})
+
+        listing = self.call("palette_workspace", {"action":"list"})
+        self.assertIn({"project_root_id":"shadow", "workspace_dir":str(shadow)}, listing["available_project_roots"])
+        first = create("shadow-a", "thread", "ctx-shadow-a")
+        self.assertEqual(first["workspace_dir"], str(shadow))
+        self.assertEqual(first["project_root_id"], "shadow")
+        self.start_without_prepare("shadow-a", "ctx-shadow-a")
+        self.assertEqual(palette("shadow-a", "ctx-shadow-a", 'write("shared.txt", "from-a"); shadow_value=73; pwd()')["data"], str(shadow))
+        self.assertEqual((shadow / "shared.txt").read_text(), "from-a")
+
+        create("shadow-b", "thread", "ctx-shadow-b")
+        self.start_without_prepare("shadow-b", "ctx-shadow-b")
+        self.assertFalse(palette("shadow-b", "ctx-shadow-b", "isdefined(@__MODULE__, :shadow_value)")["data"])
+        self.assertEqual(palette("shadow-b", "ctx-shadow-b", 'read("shared.txt", String)')["data"], "from-a")
+
+        create("shadow-project", "project", "ctx-project-a")
+        self.start_without_prepare("shadow-project", "ctx-project-a")
+        self.call("palette_workspace", {
+            "action":"attach", "workspace_id":"shadow-project", "context_id":"ctx-project-b",
+        })
+        palette("shadow-project", "ctx-project-a", "project_value=19")
+        self.assertEqual(palette("shadow-project", "ctx-project-b", "project_value")["data"], 19)
+
+        self.start_without_prepare()
+        default = self.call("palette", {"code":"pwd()"})
+        self.assertEqual(default["data"], str(self.workspace))
+        self.assertTrue(default["legacy_shared"])
+        unknown = self.call("palette_workspace", {
+            "action":"create", "workspace_id":"unknown-root", "scope":"open", "project_root_id":"/tmp",
+        }, error=True)
+        self.assertIn("Unknown project_root_id", unknown["error"])
+        raw_path = self.call("palette_workspace", {
+            "action":"create", "workspace_id":"raw-path", "scope":"open", "project_dir":str(shadow),
+        }, error=True)
+        self.assertIn("Invalid tool arguments", raw_path["error"])
 
     def test_portable_and_compatibility_installation(self):
         for fmt in ("portable", "codex"):
@@ -346,7 +435,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
     def test_C02_runtime_discovery_invoke_refresh_and_frozen_ceiling(self):
         runtime_root = Path(self.tmp.name) / "runtime-capabilities"
         ceiling_path = Path(self.tmp.name) / "ceiling.json"
-        runtime_root.mkdir()
+        runtime_root.mkdir(exist_ok=True)
         ceiling = {"host_request": {"allowed_types": ["palette.runtime"]},
                    "package_management": {"allowed_packages": ["Parsers"], "offline": True},
                    "network_access": {"allowed": False, "allowed_hosts": []}}

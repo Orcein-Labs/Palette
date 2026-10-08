@@ -38,3 +38,9 @@ Thumbs.db
 
 # Private development research, provenance, and future-paper material
 /.archive/
+/research/
+/.local/
+
+# Generated launch archives and campaign backup copies
+/Palette-Launch-Bundles.zip
+*.pre-*

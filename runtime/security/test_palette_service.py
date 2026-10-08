@@ -68,7 +68,7 @@ class PaletteServiceTests(unittest.TestCase):
             self.repo, self.workspace, self.runtime / "palette/daemon.sock"))
         self.assertIn('EnvironmentFile=' + service.unit_path(credentials.resolve()), unit)
         self.assertNotIn('EnvironmentFile="', unit)
-        self.assertIn('Restart=on-failure', unit)
+        self.assertIn('Restart=always', unit)
         credentials.chmod(0o640)
         with self.assertRaisesRegex(ValueError, "mode 0600"):
             service.render_tunnel_unit(client, "existing", credentials)

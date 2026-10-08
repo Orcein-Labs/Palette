@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 
+from source_transport import normalize_palette_call
+
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, protected_host_paths
 from runtime_registry import RuntimeRegistry
@@ -369,9 +371,9 @@ def control(args):
     raise ValueError("unknown control action")
 
 
-schema = {"type": "object", "properties": {"code": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
+schema = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
     {"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
-    "ephemeral": {"type": "boolean"}}, "required": ["code"], "additionalProperties": False}
+    "ephemeral": {"type": "boolean"}}, "additionalProperties": False}
 control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart"]},
     "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
 
@@ -401,7 +403,8 @@ def main():
                     try:
                         if params["name"] == "palette_control":
                             event = control(args)
-                        elif params["name"] == "palette" and isinstance(args.get("code"), str):
+                        elif params["name"] == "palette":
+                            args = normalize_palette_call(args)
                             start()
                             event = execute(args)
                         else:

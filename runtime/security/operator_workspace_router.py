@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -24,12 +25,17 @@ import uuid
 from patch_broker import PatchBroker, PATCH_SCHEMA
 from filesystem_layout import require_disjoint
 from provisioning import operator_ceiling, protected_host_paths
+from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
+from generation_runtime import GenerationStore
+from source_transport import normalize_palette_call
 
 REPO = Path(os.environ.get("PALETTE_REPO", Path(__file__).absolute().parents[2])).resolve()
 BASE = Path(os.environ["OPERATOR_WORKSPACE"]).resolve()
 LEGACY = Path(os.environ.get("PALETTE_STATE_DIR", str(Path.home() / ".local/share/operator-surfaces/palette-state" / hashlib.sha256(str(BASE).encode()).hexdigest()))).resolve()
 LEGACY_RECEIPTS = LEGACY.with_name(LEGACY.name + ".receipts")
 ROOT = Path(os.environ.get("PALETTE_WORKSPACE_STATE_ROOT", str(Path.home() / ".local/share/operator-surfaces/palette-workspaces"))).resolve()
+GENERATIONS = GenerationStore(ROOT / "runtime-generations", REPO, os.environ.get("PALETTE_HOST"))
+generation_lock = threading.RLock()
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_LIVE = int(os.environ.get("PALETTE_MAX_LIVE_WORKSPACES", "4"))
 IDLE_SECONDS = float(os.environ.get("PALETTE_WORKSPACE_IDLE_SECONDS", "900"))
@@ -38,6 +44,65 @@ if MAX_LIVE < 1 or IDLE_SECONDS <= 0:
 require_disjoint([BASE], [REPO, ROOT, LEGACY, LEGACY_RECEIPTS, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
 require_disjoint([ROOT, LEGACY, LEGACY_RECEIPTS], [REPO])
 require_disjoint([LEGACY, LEGACY_RECEIPTS], [ROOT])
+
+
+def workspace_protected_paths():
+    protected = [BASE, REPO, ROOT, LEGACY, LEGACY_RECEIPTS,
+                 Path(os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch")))]
+    protected.extend(Path(root) for root in os.environ.get("PALETTE_READ_ROOTS", "").split(":") if root)
+    protected.extend(protected_host_paths(operator_ceiling()))
+    depot = os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia"))
+    protected.extend(Path(path) for path in depot.split(os.pathsep) if path)
+    julia = os.environ.get("PALETTE_JULIA_BIN") or shutil.which("julia")
+    if julia:
+        protected.append(Path(julia).expanduser().resolve().parent.parent)
+    for name in ("PALETTE_HOST", "PALETTE_TASK_TOOLS", "PALETTE_TASK_ENV", "PALETTE_PACKAGE_DEPOT",
+                 "PALETTE_RUNTIME_ROOT", "PALETTE_SOCKET", "PALETTE_CAPABILITY_CEILING",
+                 "PALETTE_REPAIR_CONFIG"):
+        value = os.environ.get(name)
+        if value:
+            protected.append(Path(value).expanduser())
+    try:
+        patch_roots = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object") from exc
+    if not isinstance(patch_roots, dict):
+        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object")
+    for target, raw_path in patch_roots.items():
+        if not isinstance(target, str) or not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise ValueError("PALETTE_PATCH_ROOTS must map target IDs to absolute paths")
+        protected.append(Path(raw_path).expanduser())
+    return protected
+
+
+def configured_project_roots():
+    try:
+        configured = json.loads(os.environ.get("PALETTE_PROJECT_ROOTS", "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("PALETTE_PROJECT_ROOTS must be a JSON object") from exc
+    if not isinstance(configured, dict):
+        raise ValueError("PALETTE_PROJECT_ROOTS must be a JSON object")
+
+    roots = {"default": BASE}
+    protected = workspace_protected_paths()
+
+    for identifier, raw_path in configured.items():
+        if not isinstance(identifier, str) or not ID_RE.fullmatch(identifier) or identifier == "default":
+            raise ValueError("PALETTE_PROJECT_ROOTS keys must be valid non-default project root IDs")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise ValueError(f"Project root {identifier} must be an absolute path")
+        try:
+            path = Path(raw_path).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"Project root {identifier} is unavailable") from exc
+        if not path.is_dir():
+            raise ValueError(f"Project root {identifier} is not a directory")
+        require_disjoint([path], [*protected, *roots.values()])
+        roots[identifier] = path
+    return roots
+
+
+PROJECT_ROOTS = configured_project_roots()
 
 
 def atomic_json(path, value):
@@ -74,12 +139,21 @@ def context_key(context):
 
 
 def default_entry():
-    return {"workspace_id": "default", "scope": "project", "workspace_dir": str(BASE), "project_dir": str(BASE), "state_dir": str(LEGACY), "legacy": True}
+    return {"workspace_id": "default", "scope": "project", "project_root_id": "default", "workspace_dir": str(BASE), "project_dir": str(BASE), "state_dir": str(LEGACY), "lineage_id": "legacy:default", "legacy": True}
+
+
+def normalized_entry(entry):
+    value = dict(entry)
+    value.setdefault("project_root_id", "default")
+    return value
 
 
 def visible(entry, context):
+    project_root = PROJECT_ROOTS.get(entry.get("project_root_id", "default"))
+    if project_root is None:
+        return False
     return (entry["scope"] == "open" or
-            entry["scope"] == "project" and entry["project_dir"] == str(BASE) or
+            entry["scope"] == "project" and entry["project_dir"] == str(project_root) or
             entry["scope"] == "thread" and bool(context) and entry["owner_context"] == context)
 
 
@@ -92,8 +166,19 @@ def resolve(args):
             raise ValueError("Unknown workspace_id")
         if not ID_RE.fullmatch(identifier):
             raise ValueError("Invalid workspace_id in registry")
-        expected_state = LEGACY if identifier == "default" else ROOT / "states" / identifier
-        if entry.get("workspace_dir") != str(BASE) or Path(entry.get("state_dir", "")).resolve() != expected_state.resolve():
+        entry = normalized_entry(entry)
+        project_root = PROJECT_ROOTS.get(entry["project_root_id"])
+        if project_root is None:
+            raise PermissionError("Workspace project root is not configured")
+        if entry.get("scope") not in {"thread", "project", "open"}:
+            raise PermissionError("Workspace scope is invalid")
+        if identifier == "default":
+            if Path(entry.get("state_dir", "")).resolve() != LEGACY.resolve():
+                raise PermissionError("Workspace registry paths differ from the configured layout")
+        else:
+            entry = normalize_lineage_entry(reg, ROOT, entry)
+        expected_project = str(project_root) if entry["scope"] == "project" else None
+        if entry.get("workspace_dir") != str(project_root) or entry.get("project_dir") != expected_project:
             raise PermissionError("Workspace registry paths differ from the configured layout")
         if not visible(entry, context):
             raise PermissionError("Workspace is outside this context's scope")
@@ -108,14 +193,25 @@ class Child:
         self.frames = queue.Queue()
         self.last_used = time.monotonic()
         self.lock = threading.RLock()
+        self.generation_id = None
 
     def start(self):
         if self.proc is not None and self.proc.poll() is None:
             return
         self.stop()
         state = Path(self.entry["state_dir"]).resolve()
-        require_disjoint([self.entry["workspace_dir"]], [REPO, ROOT, LEGACY])
-        require_disjoint([state], [REPO] + [ROOT / name for name in ("patches", "registry.json", "registry.lock", "client-capabilities.json", "scratch")])
+        workspace = Path(self.entry["workspace_dir"]).resolve()
+        generation = GENERATIONS.resolve()
+        generation_repo = Path(generation["repo"]).resolve()
+        generation_adapter = Path(generation["adapter"]).resolve()
+        generation_host = Path(generation["host"]).resolve()
+        protected = workspace_protected_paths() + [generation_repo, generation_adapter, generation_host]
+        if workspace == BASE:
+            protected = [path for path in protected if path != BASE]
+        else:
+            protected.append(BASE)
+        require_disjoint([workspace], protected)
+        require_disjoint([state], [REPO, generation_repo] + [ROOT / name for name in ("patches", "registry.json", "registry.lock", "client-capabilities.json", "scratch", "runtime-generations")])
         state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Outside the state mount; a worker cannot unlink its ownership lock.
         self.lease = state.with_name(state.name + ".owner.lock").open("a+")
@@ -125,13 +221,14 @@ class Child:
             self.lease.close()
             self.lease = None
             raise RuntimeError("Workspace already owned by another router; close it there before attaching here")
-        env = dict(os.environ, OPERATOR_WORKSPACE=self.entry["workspace_dir"], PALETTE_STATE_DIR=str(state), PALETTE_WORKSPACE_ID=self.entry["workspace_id"])
+        env = dict(os.environ, OPERATOR_WORKSPACE=self.entry["workspace_dir"], PALETTE_STATE_DIR=str(state), PALETTE_WORKSPACE_ID=self.entry.get("lineage_id", self.entry["workspace_id"]), PALETTE_REPO=str(generation_repo), PALETTE_HOST=str(generation_host))
         scratch = Path(env.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))) / hashlib.sha256(str(state).encode()).hexdigest()
         scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
         env["PALETTE_SCRATCH_ROOT"] = str(scratch)
         self.frames = queue.Queue()
         try:
-            self.proc = subprocess.Popen([sys.executable, str(REPO / "runtime/security/operator_mcp.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True, bufsize=1, cwd=self.entry["workspace_dir"], env=env, pass_fds=(self.lease.fileno(),))
+            self.proc = subprocess.Popen([sys.executable, str(generation_adapter)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True, bufsize=1, cwd=self.entry["workspace_dir"], env=env, pass_fds=(self.lease.fileno(),))
+            self.generation_id = generation["generation_id"]
             threading.Thread(target=self.pump, args=(self.proc, self.frames), daemon=True).start()
             self.exchange("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": "0.3.0"}})
         except Exception:
@@ -260,26 +357,42 @@ def child_for(entry):
 
 def workspace_control(args):
     action, context = args["action"], args.get("context_id")
+    if action != "create" and "project_root_id" in args:
+        raise ValueError("project_root_id is only valid when creating a workspace")
     if action == "create":
         scope = args.get("scope", "thread")
         if scope == "thread" and not context:
             raise ValueError("Thread scope requires context_id (a routing key, not authenticated identity)")
+        project_root_id = args.get("project_root_id", "default")
+        project_root = PROJECT_ROOTS.get(project_root_id)
+        if project_root is None:
+            raise ValueError("Unknown project_root_id")
         identifier = args.get("workspace_id", "ws-" + uuid.uuid4().hex)
         if not ID_RE.fullmatch(identifier) or identifier == "default":
             raise ValueError("Invalid or reserved workspace_id")
         with registry() as reg:
             if identifier in reg["workspaces"]:
                 raise ValueError("workspace_id already exists")
-            state = ROOT / "states" / identifier
-            state.mkdir(parents=True, mode=0o700)
-            entry = {"workspace_id": identifier, "scope": scope, "owner_context": context if scope == "thread" else None, "project_dir": str(BASE) if scope == "project" else None, "workspace_dir": str(BASE), "state_dir": str(state)}
+            if scope == "project":
+                state = project_state_dir(ROOT, project_root_id)
+            else:
+                state = workspace_state_dir(ROOT, identifier)
+            state.mkdir(parents=True, exist_ok=True, mode=0o700)
+            entry = {"workspace_id": identifier, "scope": scope, "project_root_id": project_root_id, "owner_context": context if scope == "thread" else None, "project_dir": str(project_root) if scope == "project" else None, "workspace_dir": str(project_root), "state_dir": str(state), "lineage_id": lineage_id(scope, project_root_id, identifier)}
             reg["workspaces"][identifier] = entry
+            if scope == "project":
+                ensure_project_lineage(reg, ROOT, project_root_id)
+                entry = dict(reg["workspaces"][identifier])
             if context and args.get("attach", True):
                 reg["active"][context_key(context)] = identifier
         return {**entry, "active_for_context": bool(context and args.get("attach", True))}
     if action == "list":
         with registry() as reg:
-            return {"workspaces": [default_entry()] + [e for e in reg["workspaces"].values() if visible(e, context)], "identity": "caller-supplied context routing; not authentication"}
+            entries = [normalized_entry(e) for e in reg["workspaces"].values()]
+            workspaces = [default_entry()] + [e for e in entries if visible(e, context)]
+            roots = [{"project_root_id": identifier, "workspace_dir": str(path)}
+                     for identifier, path in sorted(PROJECT_ROOTS.items())]
+            return {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
     entry = resolve(args)
     if action == "attach":
         if not context or not args.get("workspace_id"):
@@ -312,20 +425,66 @@ def workspace_control(args):
     return {**entry, "running": running, "local_adapter_pid": adapter_pid, "observation": "running describes this router; another router may hold ownership"}
 
 
+
+def generation_control(args, entry):
+    action = args["action"]
+    if action == "generation_status":
+        current = GENERATIONS.resolve()
+        return {"generation_id": current["generation_id"], "available_generations": GENERATIONS.available()}
+
+    if action != "activate_generation":
+        raise ValueError("Unknown generation action")
+    generation_id = args.get("generation_id")
+    if not generation_id:
+        raise ValueError("activate_generation requires generation_id")
+
+    with generation_lock:
+        previous_id = GENERATIONS.current_id()
+        target = GENERATIONS.resolve(generation_id)
+        if target["generation_id"] == previous_id:
+            return {"generation_id": previous_id, "previous_generation_id": previous_id, "changed": False}
+
+        stop_all()
+        GENERATIONS.activate(generation_id)
+        try:
+            smoke = child_for(entry).call("palette", {"code": "nothing", "view": "full"})
+            value = json.loads(smoke["content"][0]["text"])
+            if smoke.get("isError") or value.get("success") is False:
+                raise RuntimeError(value.get("error") or "new generation smoke call failed")
+            return {
+                "generation_id": generation_id,
+                "previous_generation_id": previous_id,
+                "changed": True,
+                "smoke_epoch": value.get("epoch"),
+                "lineage_id": entry.get("lineage_id"),
+            }
+        except Exception as exc:
+            stop_all()
+            GENERATIONS.activate(previous_id)
+            rollback_error = None
+            try:
+                child_for(entry).call("palette", {"code": "nothing", "view": "full"})
+            except Exception as rollback_exc:
+                rollback_error = f"{type(rollback_exc).__name__}: {rollback_exc}"
+            detail = f"generation activation failed and rolled back: {type(exc).__name__}: {exc}"
+            if rollback_error:
+                detail += f"; rollback restart also failed: {rollback_error}"
+            raise RuntimeError(detail) from exc
+
 def text_result(value, error=False):
     return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "isError": error}
 
 
 # Reuse the proven adapter schemas without importing its process-owning globals.
-PALETTE_SCHEMA = {"type": "object", "properties": {"code": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]}, "ephemeral": {"type": "boolean"}}, "required": ["code"], "additionalProperties": False}
-CONTROL_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart"]}, "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
-WORKSPACE_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]}, "attach": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
+PALETTE_SCHEMA = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]}, "ephemeral": {"type": "boolean"}}, "required": [], "additionalProperties": False}
+CONTROL_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "generation_status", "activate_generation"]}, "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "generation_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
+WORKSPACE_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]}, "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
 for schema in (PALETTE_SCHEMA, CONTROL_SCHEMA, WORKSPACE_SCHEMA, PATCH_SCHEMA):
     schema["properties"].update(workspace_id={"type": "string", "maxLength": 64}, context_id={"type": "string", "maxLength": 256})
 TOOLS = [{"name": name, "description": description, "inputSchema": schema, "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}} for name, description, schema in [
-    ("palette", "Persistent Julia world. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics.", PALETTE_SCHEMA),
+    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics.", PALETTE_SCHEMA),
     ("palette_control", "Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot.", CONTROL_SCHEMA),
-    ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.", WORKSPACE_SCHEMA),
+    ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.", WORKSPACE_SCHEMA),
     ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.", PATCH_SCHEMA)]]
 
 
@@ -368,7 +527,7 @@ def serve_stream(stdin, stdout):
             if method == "initialize":
                 capabilities = msg.get("params", {}).get("capabilities", {})
                 atomic_json(ROOT / "client-capabilities.json", {"elicitation": capabilities.get("elicitation"), "protocolVersion": msg.get("params", {}).get("protocolVersion")})
-                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.3.0"}, "instructions": "Select a logical workspace for each independent experiment. Unrouted calls share the legacy world. Context keys are supplied by callers, not authenticated thread identities."}
+                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.3.0"}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -381,17 +540,24 @@ def serve_stream(stdin, stdout):
                     if not tool:
                         raise ValueError("Unknown tool")
                     validate(args, tool["inputSchema"])
+                    if name == "palette":
+                        routed = {k: v for k, v in args.items() if k not in ("workspace_id", "context_id")}
+                        normalized = normalize_palette_call(routed)
+                        args = {**{k: v for k, v in args.items() if k in ("workspace_id", "context_id")}, **normalized}
                     if name == "palette_workspace":
                         result = text_result(workspace_control(args))
                     else:
                         entry = resolve(args)
                         if name == "palette_patch":
-                            result = text_result(broker.call(args, entry["workspace_id"], capabilities, stdin, stdout))
+                            result = text_result(broker.call(args, entry.get("lineage_id", entry["workspace_id"]), capabilities, stdin, stdout))
+                        elif name == "palette_control" and args["action"] in ("generation_status", "activate_generation"):
+                            result = text_result(generation_control(args, entry))
                         else:
                             forwarded = {k: v for k, v in args.items() if k not in ("workspace_id", "context_id")}
                             result = child_for(entry).call(name, forwarded)
                             value = json.loads(result["content"][0]["text"])
-                            value.update(workspace_id=entry["workspace_id"], workspace_scope=entry["scope"], legacy_shared=entry.get("legacy", False))
+                            child = child_for(entry)
+                            value.update(workspace_id=entry["workspace_id"], workspace_scope=entry["scope"], project_root_id=entry["project_root_id"], lineage_id=entry.get("lineage_id"), generation_id=child.generation_id or GENERATIONS.current_id(), workspace_dir=entry["workspace_dir"], legacy_shared=entry.get("legacy", False))
                             result["content"][0]["text"] = json.dumps(value)
                 except Exception as exc:
                     result = text_result({"success": False, "error": f"{type(exc).__name__}: {exc}"}, True)
