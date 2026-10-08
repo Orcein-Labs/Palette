@@ -103,6 +103,16 @@ The tracked root has five folders: the three SDK directories above, `.github/`
 for CI, and `.agents/` for the plugin marketplace. Public docs and the plugin
 package live under `runtime/docs/` and `runtime/plugins/`.
 
+Rust builds Palette's host; Python supports its adapters. Additional language
+kernels and SDKs are provisioned by deployments, rather than bundled with Palette.
+
+Models and additional toolchains use operator-configured provisioning and the
+host-command broker. Their artifacts, input format and execution limits belong
+to deployment configuration.
+
+The optional [Gesso integration](runtime/integrations/gesso/README.md) exposes its
+existing tokenizer, CPU inference, fork and profiling through runtime capabilities.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, verification, and research archival.
