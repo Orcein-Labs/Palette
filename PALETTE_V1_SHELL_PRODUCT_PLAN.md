@@ -4,9 +4,57 @@
 **Recorded:** 2026-10-11  
 **Intended handoff:** Luna for scoped implementation, with human review and independent test evidence  
 **Target:** Palette repository, on a documentation-only planning branch  
-**Decision origin:** Review of Gemini's Bash-replacement proposal, reconciled with Palette's existing Julia kernel, Rust host, capability architecture, and revival behavior
+**Decision origin:** Review of Gemini's Bash-replacement proposal, reconciled with Palette's existing Julia kernel, Rust host, capability architecture, and revival behavior; refined with a Rust/Julia core-runtime architecture decision
 
 > **North star:** Palette becomes a shell you can live in: ordinary host commands, persistent Julia computation, inspectable execution results, recoverability evidence, and intentionally separated authority for humans and agents. Replace Bash as the default interactive workflow **without** pretending to replace every Bash script in the ecosystem.
+
+
+## Architecture amendment — Rust/Julia core and justified Python exceptions (2026-10-11)
+
+**Decision:** Target **two required implementation-language runtimes for ordinary Palette use: Rust and Julia**. This is a **runtime/deployment goal**, not a ban on Python, JavaScript, shell scripts, or languages invoked as external user programs. Do not rewrite correct code merely to achieve a language-count metric.
+
+### Responsibilities and single ownership
+
+| Concern | Authoritative owner | Existing implementation and migration notes |
+| --- | --- | --- |
+| CLI entrypoint, interactive shell grammar, prompt, line editor, PTY, job control, signals | **Rust** | New frontend built around the existing Rust host; do not introduce a second independently authoritative supervisor. |
+| Trusted host process supervision, OS process groups, execution/terminal lifecycle, namespace/sandbox management | **Rust** | Extend existing `runtime/host/src/` semantics instead of embedding Bash. |
+| MCP and stdio transport, workspace routing, service lifecycle, capability/patch control-plane enforcement | **Rust, target** | Some responsibilities currently live in Python under `runtime/security/`. Migrate incrementally only with behavioral parity, saved-state compatibility, security review and test coverage. |
+| Julia evaluation, session bindings, packages, representations, source provenance, supported revival | **Julia** | Preserve existing Julia kernel responsibilities and documented `restored/rebuilt/stale/lost/uncertain` reporting. |
+| External-command calls initiated **inside** an authorized Julia worker | **Julia `Cmd` as an adapter**, still bounded by OS sandbox | Rust owns the overall execution policy and privileged broker. Julia may launch subprocesses inside its existing authority envelope; no redundant Rust roundtrip is required for every local process. |
+| Optional integration scripts, tests, installer helpers, isolated adapters | **Python/Node/shell where justified** | Must not create a second orchestration authority or become mandatory for the daily-driver shell unless an explicit exception is approved. |
+
+**Important distinction:** The **shared protocol** (typed arguments/results, authority, receipts, cancellation semantics) is canonical, **not one programming language's `Cmd` class**. Rust is the preferred terminal/host executor; Julia's native `Cmd` remains valid within its permitted sandbox. Align the schemas and behavior without forcing all worker-local subprocesses through a privileged host broker.
+
+### Migration rule: preserve functionality, reduce boundaries
+
+1. Inventory Python and JavaScript code by role, dependency surface, system privileges and whether required at **runtime**, **installation**, **CI**, or **optional integration**.
+2. For each candidate, capture the existing input/output protocol, saved state formats, success/error semantics, capability checks, logs/receipts and integration tests **before** porting.
+3. Port Rust-natural control-plane tasks first: shell/PTY, session lifecycle, routing and process/broker glue. Treat patch authorization, registry persistence and recovery as **high-risk** changes requiring dual-run or equivalence tests, negative security tests and a reviewed cutover.
+4. Keep a tiny standalone Python helper if its maintenance value outweighs adding a dependency **and** it does not become another authoritative supervisor. A documented justified exception is preferable to a fragile rewrite.
+5. Do not assume Node is unused: audit CI, bundling and SDK/client needs. Aim to avoid Node as a **mandatory shell-runtime** dependency, not to forbid it in plugin tooling.
+6. Remove legacy Python paths only after a Rust replacement passes the existing regressions, state migration tests, agent-sandbox checks and rollback drill.
+7. Do not replace system `/bin/sh`, remove compatibility for external scripts, or change the user's login shell as part of dependency cleanup.
+
+### Contract and packaging acceptance
+
+- A clean release installation launches the standard `palette` shell via a Rust binary plus a pinned Julia runtime, with **no mandatory Python, Node or Bash interpreter in Palette's own normal command path**. Verify with a dependency/process audit rather than merely counting source files.
+- External binaries and scripts are allowed to invoke whatever interpreters they require; that is not a Palette core-runtime dependency.
+- Authenticated/approved host authority is enforced outside untrusted Julia; a session-mode flag cannot upgrade privileges.
+- There is one defined owner for process lifecycle and one source of truth for trusted capability checks; avoid duplicate Python/Rust supervisors.
+- Julia package APIs, existing MCP client behavior, workspace routing, snapshots, receipts and approved patch contracts remain compatible or are migrated explicitly with rollback.
+- Measure build artifacts, cold start, command latency, dependency count and test burden **before and after** each migration.
+- No existing Python security code may be removed solely for aesthetic reasons.
+
+### Required change to Luna's first assignment (M0 / P0)
+
+Add a **language and runtime dependency map** to P0: enumerate Python scripts in `runtime/security/`, tests, installers and adapters; Rust `runtime/host/src/`; Julia kernel; Node CI/plugin tooling; and Bash scripts/execution doors. For each, record whether it is production-critical, replaceable, difficult/security-sensitive, or intentionally retained. Provide a proposed migration sequence, a per-component proof-of-parity test, and an explicit *do-not-port-yet* list. **Do not implement the full port in P0.**
+
+### Reconciliation with earlier plan text
+
+Earlier sections emphasize Julia's native `Cmd` as the first subprocess building block and advise deferring wholesale Python/Node rewrites. Both remain true **for Julia-worker local execution and migration risk**, respectively. This amendment decides the **host/terminal ownership** and the **long-term production dependency target**. If the two statements conflict, this amendment governs, and the next design PR should update shared interface descriptions accordingly.
+
+---
 
 ## 0. Executive decision record
 
