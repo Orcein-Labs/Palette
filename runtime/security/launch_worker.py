@@ -71,13 +71,94 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
     filesystem-specific special case).
     """
     dest = tempfile.mkdtemp(dir=clone_root, prefix="depot-")
-    shutil.rmtree(dest)  # cp needs the destination to not exist yet
     try:
+        record = _clone_owner_record()
+        if record is not None:
+            Path(dest + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
+        shutil.rmtree(dest)  # cp needs the destination to not exist yet
         subprocess.run(["cp", "-a", "--reflink=auto", real_depot, dest], check=True, stdin=subprocess.DEVNULL)
     except BaseException:
-        shutil.rmtree(dest, ignore_errors=True)
+        remove_session_depot(dest)
         raise
     return dest
+
+
+# Every clone `depot-XXXXXXXX` has a sidecar `depot-XXXXXXXX.owner` naming the
+# process that made it as "<pid namespace> <pid> <start time>". Owners remove
+# their clone when they finish; the sidecar lets a later session remove the
+# clones of owners that were killed first. The Rust host writes the same record.
+CLONE_OWNER_SUFFIX = ".owner"
+
+
+def _process_start_time(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat, counted after the parenthesized command name."""
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    fields = stat_line[stat_line.rfind(")") + 1:].split()
+    return fields[19] if len(fields) > 19 else None
+
+
+def _pid_namespace() -> str | None:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
+def _clone_owner_record() -> str | None:
+    namespace, start = _pid_namespace(), _process_start_time(os.getpid())
+    if namespace is None or start is None:
+        return None
+    return f"{namespace} {os.getpid()} {start}\n"
+
+
+def _clone_owner_alive(record: str) -> bool:
+    """False only for a well-formed record from this pid namespace whose
+    process has exited or whose pid now belongs to a different process."""
+    fields = record.split()
+    if len(fields) != 3 or not fields[1].isdigit():
+        return True
+    namespace, pid, start = fields
+    if _pid_namespace() != namespace:
+        return True
+    return _process_start_time(int(pid)) == start
+
+
+def sweep_orphaned_depot_clones(clone_root: str) -> None:
+    """Remove the clones in `clone_root` whose owner has died. A clone without
+    a readable owner record, or one that is not a plain directory, is left alone."""
+    try:
+        entries = list(os.scandir(clone_root))
+    except OSError:
+        return
+    for entry in entries:
+        clone_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
+        if not clone_name or not clone_name.startswith("depot-") or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            record = Path(entry.path).read_text(encoding="ascii")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _clone_owner_alive(record):
+            continue
+        clone = os.path.join(clone_root, clone_name)
+        try:
+            mode = os.lstat(clone).st_mode
+        except FileNotFoundError:
+            Path(entry.path).unlink(missing_ok=True)
+            continue
+        except OSError:
+            continue
+        if stat.S_ISDIR(mode):
+            remove_session_depot(clone)
+
+
+def remove_session_depot(clone: str) -> None:
+    """Remove a session depot clone and then its owner record."""
+    shutil.rmtree(clone, ignore_errors=True)
+    Path(clone + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
 
 
 def resolve_real_julia_binary() -> str:
@@ -549,10 +630,12 @@ def package_store_paths(
 
 
 def create_session_depot(real_depot: str | None = None, clone_root: str | None = None) -> str:
-    """Create the private writable prewarmed depot used for worker caches."""
+    """Create the private writable prewarmed depot used for worker caches.
+    Callers release it with remove_session_depot."""
     depot = real_depot or default_depot()
     root = clone_root or str(Path(depot).parent / ".palette-depot-clones")
     Path(root).mkdir(parents=True, exist_ok=True)
+    sweep_orphaned_depot_clones(root)
     return _clone_depot(depot, root)
 
 
@@ -609,7 +692,7 @@ def run_worker(
         return subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     finally:
         if owns_clone:
-            shutil.rmtree(depot_clone_dir, ignore_errors=True)
+            remove_session_depot(depot_clone_dir)
 
 
 if __name__ == "__main__":
