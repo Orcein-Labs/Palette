@@ -81,7 +81,10 @@ struct PaletteCleanser {
 
 impl PaletteCleanser {
     fn cleanse(&mut self) {
-        for p in [self.depot_clone.take(), self.tmp_root.take(), self.short_sock_dir.take()].into_iter().flatten() {
+        if let Some(p) = self.depot_clone.take() {
+            sandbox::remove_session_depot(&p);
+        }
+        for p in [self.tmp_root.take(), self.short_sock_dir.take()].into_iter().flatten() {
             let _ = fs::remove_dir_all(p);
         }
     }

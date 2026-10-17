@@ -441,26 +441,108 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     Ok(PackageStore { root, depot, environment })
 }
 
+/// Every clone `depot-XXXXXXXX` has a sidecar `depot-XXXXXXXX.owner` naming the
+/// process that made it as "<pid namespace> <pid> <start time>". Owners remove
+/// their clone when they finish; the sidecar lets a later session remove the
+/// clones of owners that were killed first. The Python launcher writes the same
+/// record.
+const CLONE_OWNER_SUFFIX: &str = ".owner";
+
+fn clone_owner_path(clone: &Path) -> PathBuf {
+    let mut path = clone.as_os_str().to_owned();
+    path.push(CLONE_OWNER_SUFFIX);
+    PathBuf::from(path)
+}
+
+/// Field 22 of /proc/<pid>/stat, counted after the parenthesized command name.
+fn process_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..].split_whitespace().nth(19).map(str::to_string)
+}
+
+fn pid_namespace() -> Option<String> {
+    fs::read_link("/proc/self/ns/pid").ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+fn clone_owner_record() -> Option<String> {
+    let pid = std::process::id();
+    Some(format!("{} {pid} {}\n", pid_namespace()?, process_start_time(pid)?))
+}
+
+/// False only for a well-formed record from this pid namespace whose process
+/// has exited or whose pid now belongs to a different process.
+fn clone_owner_alive(record: &str) -> bool {
+    let fields: Vec<&str> = record.split_whitespace().collect();
+    let [namespace, pid, start] = fields[..] else { return true };
+    let Ok(pid) = pid.parse::<u32>() else { return true };
+    if pid_namespace().as_deref() != Some(namespace) {
+        return true;
+    }
+    process_start_time(pid).as_deref() == Some(start)
+}
+
+/// Removes the clones in `root` whose owner has died. A clone without a
+/// readable owner record, or one that is not a plain directory, is left alone.
+fn sweep_orphaned_depot_clones(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(clone_name) = name.to_str().and_then(|n| n.strip_suffix(CLONE_OWNER_SUFFIX)) else { continue };
+        if !clone_name.starts_with("depot-") || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let Ok(record) = fs::read_to_string(entry.path()) else { continue };
+        if clone_owner_alive(&record) {
+            continue;
+        }
+        let clone = root.join(clone_name);
+        match fs::symlink_metadata(&clone) {
+            Ok(meta) if meta.is_dir() => remove_session_depot(&clone),
+            Ok(_) => {}
+            Err(_) => { let _ = fs::remove_file(entry.path()); }
+        }
+    }
+}
+
+/// Removes a session depot clone and then its owner record.
+pub fn remove_session_depot(clone: &Path) {
+    let _ = fs::remove_dir_all(clone);
+    let _ = fs::remove_file(clone_owner_path(clone));
+}
+
 /// One private, writable prepared-depot clone for a session's worker caches.
 /// Broker-authorized package installs live in the separate durable package store.
+/// Callers release it with `remove_session_depot`.
 pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String> {
     let depot = real_depot.map(str::to_string).unwrap_or_else(default_depot);
     let root = Path::new(&depot).parent().unwrap_or(Path::new("/")).join(".palette-depot-clones");
     fs::create_dir_all(&root).map_err(|e| format!("creating {}: {e}", root.display()))?;
+    sweep_orphaned_depot_clones(&root);
     let dest = util::mkdtemp_in(&root, "depot-").map_err(|e| e.to_string())?;
+    if let Some(record) = clone_owner_record() {
+        if let Err(e) = fs::write(clone_owner_path(&dest), record) {
+            remove_session_depot(&dest);
+            return Err(format!("recording the owner of {}: {e}", dest.display()));
+        }
+    }
     let _ = fs::remove_dir(&dest); // cp wants a destination that does not exist yet
     let status = Command::new("cp")
         .args(["-a", "--reflink=auto"])
         .arg(&depot)
         .arg(&dest)
         .stdin(Stdio::null())
-        .status()
-        .map_err(|e| format!("cp: {e}"))?;
-    if !status.success() {
-        let _ = fs::remove_dir_all(&dest);
-        return Err(format!("cloning the depot {depot} failed"));
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(dest),
+        Ok(_) => {
+            remove_session_depot(&dest);
+            Err(format!("cloning the depot {depot} failed"))
+        }
+        Err(e) => {
+            remove_session_depot(&dest);
+            Err(format!("cp: {e}"))
+        }
     }
-    Ok(dest)
 }
 
 /// A benchmark's toolchain activation (KEY=VALUE lines), given to the kernel
@@ -1015,6 +1097,65 @@ mod tests {
         assert!(error.contains("overlaps protected host path"), "{error}");
         assert!(!root.exists(), "rejected protected path was created");
     }
+
+    #[test]
+    fn depot_clones_record_their_owner_and_dead_owners_are_swept() {
+        let root = util::mkdtemp("palette-depot-clones-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "warm").unwrap();
+        let clones = root.join(".palette-depot-clones");
+
+        let live = create_session_depot(depot.to_str()).unwrap();
+        assert_eq!(fs::read_to_string(live.join("cache")).unwrap(), "warm");
+        let record = fs::read_to_string(clone_owner_path(&live)).unwrap();
+        assert!(clone_owner_alive(&record), "own record judged dead: {record}");
+
+        let namespace = pid_namespace().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        let orphan = |name: &str, record: String| {
+            let clone = dir(&clones, name);
+            fs::write(clone.join("cache"), "stale").unwrap();
+            fs::write(clone_owner_path(&clone), record).unwrap();
+            clone
+        };
+        let exited = orphan("depot-exited", format!("{namespace} {reaped} 1\n"));
+        let reused = orphan("depot-reused", format!("{namespace} {} 0\n", std::process::id()));
+        let foreign = orphan("depot-foreign", format!("pid:[1] {reaped} 1\n"));
+        let garbled = orphan("depot-garbled", "not a record".into());
+        let unrecorded = dir(&clones, "depot-unrecorded");
+        let lone_record = clones.join("depot-gone.owner");
+        fs::write(&lone_record, format!("{namespace} {reaped} 1\n")).unwrap();
+        let target = dir(&root, "elsewhere");
+        let link = clones.join("depot-link");
+        symlink(&target, &link).unwrap();
+        fs::write(clone_owner_path(&link), format!("{namespace} {reaped} 1\n")).unwrap();
+
+        let second = create_session_depot(depot.to_str()).unwrap();
+        for gone in [&exited, &reused, &lone_record] {
+            assert!(fs::symlink_metadata(gone).is_err(), "{} survived the sweep", gone.display());
+        }
+        assert!(!clone_owner_path(&exited).exists() && !clone_owner_path(&reused).exists());
+        for kept in [&live, &second, &foreign, &garbled, &unrecorded, &target] {
+            assert!(kept.is_dir(), "{} was swept", kept.display());
+        }
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+
+        remove_session_depot(&live);
+        assert!(fs::symlink_metadata(&live).is_err() && fs::symlink_metadata(clone_owner_path(&live)).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_depot_clone_leaves_no_owner_record() {
+        let root = util::mkdtemp("palette-depot-clone-failure-").unwrap();
+        let missing = root.join("no-such-depot");
+        assert!(create_session_depot(missing.to_str()).is_err());
+        let clones = root.join(".palette-depot-clones");
+        assert_eq!(fs::read_dir(&clones).unwrap().count(), 0, "a failed clone left residue");
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
 
 pub struct WorkerResult {
@@ -1271,7 +1412,7 @@ pub fn run_worker(r: &RunWorker) -> Result<WorkerResult, String> {
         run_captured(&argv, None, r.timeout)
     })();
     if let Some(p) = owned {
-        let _ = fs::remove_dir_all(p);
+        remove_session_depot(&p);
     }
     result
 }

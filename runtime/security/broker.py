@@ -52,7 +52,7 @@ from typing import Any
 
 from launch_worker import (
     build_package_installer_argv, create_session_depot, default_depot, package_store_lock, package_store_paths,
-    resolve_real_julia_binary, run_worker,
+    remove_session_depot, resolve_real_julia_binary, run_worker,
 )
 from provisioning import protected_host_paths
 
@@ -527,7 +527,7 @@ class Broker:
             shutil.rmtree(child_sock_dir, ignore_errors=True)
             shutil.rmtree(child_workspace, ignore_errors=True)
             if child_depot_dir:
-                shutil.rmtree(child_depot_dir, ignore_errors=True)
+                remove_session_depot(child_depot_dir)
         return {
             "returncode": result.returncode,
             "stdout": result.stdout[-4000:],

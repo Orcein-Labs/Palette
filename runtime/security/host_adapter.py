@@ -28,6 +28,7 @@ import launch_worker as _launch  # noqa: E402
 from session import PaletteSession as _PythonSession, SessionDeadError as _PythonSessionDeadError  # noqa: E402
 
 create_session_depot = _launch.create_session_depot
+remove_session_depot = _launch.remove_session_depot
 
 
 def scratch_root() -> str:

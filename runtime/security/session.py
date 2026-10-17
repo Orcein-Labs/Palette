@@ -37,7 +37,8 @@ import threading
 import uuid
 from pathlib import Path
 
-from launch_worker import resolve_real_julia_binary, build_bwrap_argv, create_session_depot, package_store_paths
+from launch_worker import (resolve_real_julia_binary, build_bwrap_argv, create_session_depot, package_store_paths,
+                           remove_session_depot)
 from filesystem_layout import require_disjoint
 
 import broker as _broker
@@ -405,7 +406,7 @@ class PaletteSession:
             except Exception:
                 pass
         if hasattr(self, "depot_clone_dir"):
-            shutil.rmtree(self.depot_clone_dir, ignore_errors=True)
+            remove_session_depot(self.depot_clone_dir)
         if hasattr(self, "_tmp_root"):
             shutil.rmtree(self._tmp_root, ignore_errors=True)
         if hasattr(self, "_short_sock_dir"):

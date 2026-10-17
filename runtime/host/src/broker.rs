@@ -376,7 +376,7 @@ impl Broker {
         let _ = fs::remove_dir_all(&sock_dir);
         let _ = fs::remove_dir_all(&ws);
         if let Some(d) = child_depot {
-            let _ = fs::remove_dir_all(d);
+            sandbox::remove_session_depot(&d);
         }
         result
     }
