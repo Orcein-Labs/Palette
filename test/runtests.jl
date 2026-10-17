@@ -557,6 +557,30 @@ end
     @test get_kernel_state().receipt_log[end].result.data === nothing
 end
 
+@testset "Revival checks see definitions made earlier in the same call" begin
+    # Revival rebuilds definitions and checks them in one call, from a world
+    # older than the new bindings. Julia 1.12 only warns about such reads and
+    # later versions refuse them; --depwarn=error gives that stricter rule
+    # today, under which the checks reported every rebuilt definition lost.
+    script = """
+    using Palette
+    function define_then_check()
+        m = Module(:RevivalWorldAge)
+        Core.eval(m, :(struct Probe; x::Int; end))
+        Core.eval(m, :(probe_f(x::Int) = x))
+        (Palette.type_fingerprint(m, "Probe"), Palette.method_set(m, "probe_f"),
+         Palette.current_definition(Base.invokelatest(getglobal, m, :Probe)))
+    end
+    fingerprint, methods_now, current = define_then_check()
+    fingerprint == "Probe{}:x::Int64" || error("fingerprint: ", repr(fingerprint))
+    methods_now isa Vector && length(methods_now) == 1 || error("methods: ", repr(methods_now))
+    current || error("current_definition was false")
+    print("ok")
+    """
+    cmd = `$(Base.julia_cmd()) --startup-file=no --depwarn=error --project=$(dirname(@__DIR__)) -e $script`
+    @test readchomp(pipeline(cmd; stderr=stderr)) == "ok"
+end
+
 @testset "Snapshot of a large value stays fast (seam S-2)" begin
     # A non-empty workspace root is what made `check_type` scan every loaded
     # module once per walked object (77 s for 100k objects); ephemeral
