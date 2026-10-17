@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -680,6 +680,27 @@ fn py_repr(v: &Value) -> String {
 /// A worker holding unbounded power inside its sandbox is still an untrusted
 /// client of this host process: an unterminated stream must not buffer forever.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
+/// How many connections the broker serves at once. Each one holds a host
+/// thread, so an idle or flooding worker must not be able to hold them all.
+/// Nested child workers each hold one while they run, well below this.
+const MAX_CONNECTIONS: usize = 64;
+/// How long a connection may take to send its request line, and the
+/// broker to send its reply. Handling the request itself is not limited.
+const CONN_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Holds one of the MAX_CONNECTIONS slots until dropped.
+struct ConnSlot(Arc<AtomicUsize>);
+impl ConnSlot {
+    fn take(active: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        active.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).ok()?;
+        Some(ConnSlot(active.clone()))
+    }
+}
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub struct BrokerServer {
     path: PathBuf,
@@ -717,14 +738,24 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
     fs::set_permissions(sock_path, fs::Permissions::from_mode(0o666)).map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let active = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for conn in listener.incoming() {
             if stop2.load(Ordering::SeqCst) {
                 break;
             }
-            let Ok(conn) = conn else { continue };
+            let Ok(mut conn) = conn else { continue };
+            let _ = conn.set_read_timeout(Some(CONN_IO_TIMEOUT));
+            let _ = conn.set_write_timeout(Some(CONN_IO_TIMEOUT));
+            let Some(slot) = ConnSlot::take(&active) else {
+                let _ = writeln!(conn, "{}", json!({"approved": false, "reason": "broker busy: too many open connections"}));
+                continue;
+            };
             let b = broker.clone();
-            std::thread::spawn(move || handle_conn(conn, &b));
+            std::thread::spawn(move || {
+                let _slot = slot;
+                handle_conn(conn, &b)
+            });
         }
     });
     Ok(BrokerServer { path: sock_path.to_path_buf(), stop, thread: Some(thread) })
@@ -1000,6 +1031,43 @@ mod tests {
             d[abc.to_str().unwrap()]["sha256"],
             json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    #[test]
+    fn idle_connections_cannot_hold_every_broker_thread() {
+        let t = tmpdir("conn-cap");
+        let sock = t.0.join("b.sock");
+        let server = serve(&sock, Arc::new(broker(json!({}), &t.0.join("receipts.jsonl")))).unwrap();
+        // Fill every slot with a connection that never sends a request.
+        let idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let busy = loop {
+            let mut extra = UnixStream::connect(&sock).unwrap();
+            extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = writeln!(extra, "{}", json!({"id": "x", "category": "nope"}));
+            let mut reply = String::new();
+            let _ = BufReader::new(extra).read_line(&mut reply);
+            if reply.contains("broker busy") || std::time::Instant::now() > deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(busy.contains("broker busy"), "connection past the cap was served: {busy:?}");
+        // Freeing a slot lets the next request through.
+        drop(idle);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let served = loop {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+            let mut reply = String::new();
+            BufReader::new(c).read_line(&mut reply).unwrap();
+            if reply.contains("unknown capability") || std::time::Instant::now() > deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(served.contains("unknown capability"), "{served:?}");
+        server.shutdown();
     }
 
     #[test]

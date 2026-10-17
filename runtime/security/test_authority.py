@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sys
 import subprocess
 import tempfile
@@ -370,6 +371,52 @@ class TestReceiptsFailClosed(unittest.TestCase):
         # The Python broker names the log; the Rust one never prints READY.
         with self.assertRaisesRegex(RuntimeError, "receipt log|did not start"):
             B.Broker({}, receipts, "test-session")
+
+
+class TestBrokerConnectionCap(unittest.TestCase):
+    """Idle connections cannot hold every broker thread."""
+
+    def test_connections_past_the_cap_are_refused_until_one_closes(self):
+        sock_dir = tempfile.mkdtemp(prefix="njl-cap-")
+        self.addCleanup(shutil.rmtree, sock_dir, True)
+        sock = os.path.join(sock_dir, "broker.sock")
+        stop = threading.Event()
+        thread = threading.Thread(target=B.serve, args=(sock, {}, os.path.join(sock_dir, "receipts.jsonl"),
+                                                        "test-session", stop), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        self.addCleanup(stop.set)
+        deadline = time.time() + 30
+        while not os.path.exists(sock) and time.time() < deadline:
+            time.sleep(0.05)
+
+        def ask(req_id):
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(sock)
+                s.settimeout(10)
+                s.sendall((json.dumps({"id": req_id, "category": "nope"}) + "\n").encode())
+                with s.makefile() as reply:
+                    return reply.readline()
+
+        idle = []
+        try:
+            for _ in range(64):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(sock)
+                idle.append(c)
+            reply = ""
+            while "broker busy" not in reply and time.time() < deadline:
+                reply = ask("over")
+                time.sleep(0.05)
+            self.assertIn("broker busy", reply)
+        finally:
+            for c in idle:
+                c.close()
+        reply = ""
+        while "unknown capability" not in reply and time.time() < deadline:
+            reply = ask("after")
+            time.sleep(0.05)
+        self.assertIn("unknown capability", reply)
 
 
 class TestCeilingSubset(unittest.TestCase):

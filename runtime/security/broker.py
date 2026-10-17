@@ -774,9 +774,18 @@ _MAX_REQUEST_BYTES = 1 << 20  # 1 MiB -- a worker holding unbounded power inside
 # buffer forever and exhaust the broker's own memory.
 
 
+# How many connections the broker serves at once, and how long one may take
+# to send its request line or receive its reply; the Rust broker uses the same
+# limits. Each connection holds a host thread, so an idle or flooding worker
+# must not be able to hold them all. Handling the request itself is not limited.
+_MAX_CONNECTIONS = 64
+_CONN_IO_TIMEOUT = 30.0
+
+
 class _ConnHandler(socketserver.BaseRequestHandler):
     def handle(self):
         broker: Broker = self.server.broker  # type: ignore[attr-defined]
+        self.request.settimeout(_CONN_IO_TIMEOUT)
         f = self.request.makefile("rwb")
         try:
             line = f.readline(_MAX_REQUEST_BYTES)
@@ -800,6 +809,33 @@ class _ConnHandler(socketserver.BaseRequestHandler):
 
 class _UnixSocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+    request_queue_size = 128  # the Rust listener's backlog
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(_CONN_IO_TIMEOUT)
+                request.sendall((json.dumps({"approved": False,
+                                             "reason": "broker busy: too many open connections"}) + "\n").encode())
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def serve(
