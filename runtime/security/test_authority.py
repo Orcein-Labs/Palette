@@ -396,6 +396,42 @@ class TestExternalWriteNoFollow(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
 
+class TestExternalWriteRootsPinned(unittest.TestCase):
+    """allowed_dirs resolve once, at broker start, on either backend."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="palette-fs-pin-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+
+    def _write(self, broker, path):
+        return broker.handle_request({"id": "w", "category": "external_fs_write",
+                                      "params": {"path": str(path), "content": "x"}})
+
+    def test_an_allowed_dir_swapped_for_a_symlink_after_start_is_refused(self):
+        allowed, later, outside = self.base / "allowed", self.base / "later", self.base / "outside"
+        allowed.mkdir()
+        outside.mkdir()
+        receipts = self.base / "receipts" / "receipts.jsonl"
+        broker = B.Broker({"external_fs_write": {"allowed_dirs": [str(allowed), str(later)]}},
+                          str(receipts), "test-session")
+        self.addCleanup(getattr(broker, "close", lambda: None))
+        self.assertTrue(self._write(broker, allowed / "a.txt")["approved"])
+        # A worker that can write where the allowed dirs live swaps one for a
+        # symlink, and creates the other (missing at start) as one.
+        shutil.rmtree(allowed)
+        allowed.symlink_to(outside)
+        later.symlink_to(outside)
+        for path in (allowed / "b.txt", later / "c.txt"):
+            with self.subTest(path=path):
+                self.assertFalse(self._write(broker, path)["approved"])
+        self.assertEqual(list(outside.iterdir()), [], "a write followed a swapped-in symlink")
+
+    def test_an_allowed_dir_that_reaches_the_receipt_log_never_starts(self):
+        receipts = self.base / "receipts" / "receipts.jsonl"
+        with self.assertRaisesRegex(RuntimeError, "overlaps the protected host path|did not start"):
+            B.Broker({"external_fs_write": {"allowed_dirs": [str(self.base)]}}, str(receipts), "test-session")
+
+
 class TestBrokerConnectionCap(unittest.TestCase):
     """Idle connections cannot hold every broker thread."""
 

@@ -134,6 +134,8 @@ pub struct Broker {
     ceiling: Value,
     receipt_log_path: PathBuf,
     session_id: String,
+    // external_fs_write's allowed_dirs, resolved once when the broker starts.
+    write_roots: Vec<PathBuf>,
     // Trusted paths fixed when the session starts; never taken from a request.
     package_depot_dir: Option<String>,
     package_environment_dir: Option<String>,
@@ -177,7 +179,7 @@ fn allowlist_host(u: &url::Url) -> String {
 }
 
 /// Writes `content` to `target`, which the caller has checked lies under
-/// `root`, without following a symlink anywhere below `root`. The checked
+/// `root`, without following a symlink anywhere on the path. The checked
 /// path is fully resolved, so a symlink met here was put there after the
 /// check, by whoever else can write the allowed directory; the write is
 /// refused instead of landing wherever it points.
@@ -199,25 +201,70 @@ fn write_beneath(root: &Path, target: &Path, content: &[u8]) -> Result<(), Fail>
         Some(libc::ELOOP) | Some(libc::ENOTDIR) => Denied(format!("refusing to write through a symlink at {}", what.display())),
         _ => Internal(format!("{}: {e}", what.display())),
     };
-    // The allowed directory itself comes from the operator's ceiling.
-    fs::create_dir_all(root).map_err(|e| Internal(format!("{}: {e}", root.display())))?;
-    let mut fd = open_at(libc::AT_FDCWD, &cstr(root.as_os_str())?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-        .map_err(|e| refused(e, root))?;
-    let mut here = root.to_path_buf();
-    for part in dirs {
+    // The root was resolved when the broker started, so the walk starts at
+    // `/` and follows no symlink on the way to it either: an allowed
+    // directory swapped for a symlink later, by a worker that can write
+    // where it lives, is refused instead of redirecting the write.
+    let mut fd = open_at(libc::AT_FDCWD, &cstr(std::ffi::OsStr::new("/"))?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        .map_err(|e| Internal(format!("/: {e}")))?;
+    let mut here = PathBuf::from("/");
+    let above: Vec<&std::ffi::OsStr> = root.components().filter_map(|c| match c {
+        std::path::Component::Normal(n) => Some(n),
+        _ => None,
+    }).collect();
+    for part in above.iter().chain(dirs.iter()) {
         here.push(part);
         let c = cstr(part)?;
-        if unsafe { libc::mkdirat(fd.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != ErrorKind::AlreadyExists {
-                return Err(Internal(format!("{}: {e}", here.display())));
+        let next = match open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if unsafe { libc::mkdirat(fd.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != ErrorKind::AlreadyExists {
+                        return Err(Internal(format!("{}: {e}", here.display())));
+                    }
+                }
+                open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0)
             }
-        }
-        fd = open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(|e| refused(e, &here))?;
+            other => other,
+        };
+        fd = next.map_err(|e| refused(e, &here))?;
     }
     let file = open_at(fd.as_raw_fd(), &cstr(name)?, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
         .map_err(|e| refused(e, target))?;
     fs::File::from(file).write_all(content).map_err(|e| Internal(format!("{}: {e}", target.display())))
+}
+
+/// external_fs_write's allowed_dirs, resolved once, when the broker starts.
+/// Each request is checked against these paths and walked to without
+/// following a symlink, so a directory that a worker can replace (one inside
+/// its workspace, say) cannot be turned into a symlink that moves the root.
+/// An allowed_dir may not reach a path the host trusts: the receipt log, the
+/// Palette checkout, the package store, the operator's config files and the
+/// host command paths. A write there would let the agent erase its receipts
+/// or widen its own next ceiling.
+fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
+    let cap = c.ceiling.get("external_fs_write").map(obj).unwrap_or_default();
+    let roots: Vec<PathBuf> = str_list(cap.get("allowed_dirs")).unwrap_or_default().iter()
+        .map(|d| util::resolve(Path::new(d))).collect();
+    if roots.is_empty() {
+        return Ok(roots);
+    }
+    let mut protected = vec![c.receipt_log_path.clone()];
+    protected.extend(c.repo_dir.iter().map(PathBuf::from));
+    protected.extend(c.package_depot_dir.as_deref().and_then(|d| Path::new(d).parent()).map(Path::to_path_buf));
+    protected.extend(util::installed_checkout());
+    for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR", "PALETTE_PACKAGE_DEPOT"] {
+        if let Ok(path) = std::env::var(key) {
+            if !path.is_empty() { protected.push(PathBuf::from(path)); }
+        }
+    }
+    protected.extend(sandbox::protected_command_paths(&c.ceiling));
+    for root in &roots {
+        if let Some(hit) = sandbox::protected_overlap(root, &protected) {
+            return Err(format!("external_fs_write allowed_dir {} overlaps the protected host path {}", root.display(), hit.display()));
+        }
+    }
+    Ok(roots)
 }
 
 impl Broker {
@@ -229,10 +276,12 @@ impl Broker {
         // gives is supposed to leave one.
         OpenOptions::new().create(true).append(true).open(&c.receipt_log_path)
             .map_err(|e| format!("cannot open the receipt log {}: {e}", c.receipt_log_path.display()))?;
+        let write_roots = write_roots(&c)?;
         Ok(Broker {
             ceiling: c.ceiling,
             receipt_log_path: c.receipt_log_path,
             session_id: c.session_id,
+            write_roots,
             package_depot_dir: c.package_depot_dir,
             package_environment_dir: c.package_environment_dir,
             project_dir: c.project_dir,
@@ -266,9 +315,9 @@ impl Broker {
             return Err(Internal("internal error handling request (not a policy denial): embedded null byte".into()));
         }
         let target = util::resolve(Path::new(path));
-        let allowed: Vec<PathBuf> = dirs.iter().map(|d| util::resolve(Path::new(d))).collect();
+        let allowed = &self.write_roots;
         let Some(root) = allowed.iter().find(|a| util::within(&target, a)) else {
-            return Err(Denied(format!("path {} is outside the ceiling's allowed_dirs {}", target.display(), qpaths(&allowed))));
+            return Err(Denied(format!("path {} is outside the ceiling's allowed_dirs {}", target.display(), qpaths(allowed))));
         };
         write_beneath(root, &target, content.as_bytes())?;
         Ok(json!({"path": target.to_string_lossy(), "bytes_written": content.len()}))
@@ -389,6 +438,12 @@ impl Broker {
         let (ok, reason) = ceiling_is_subset(&requested, &self.ceiling);
         if !ok {
             return Err(Denied(format!("requested child ceiling is not a subset of this session's ceiling: {reason}")));
+        }
+        // The subset check resolves both ceilings now; a child's directory must
+        // also lie within this broker's roots as they resolved at start.
+        let child_dirs = str_list(requested.get("external_fs_write").and_then(|c| c.get("allowed_dirs"))).unwrap_or_default();
+        if let Some(d) = child_dirs.iter().map(|d| util::resolve(Path::new(d))).find(|d| !self.write_roots.iter().any(|r| util::within(d, r))) {
+            return Err(Denied(format!("requested external_fs_write dir {} is not within this session's allowed_dirs {}", d.display(), qpaths(&self.write_roots))));
         }
         let (Some(project), Some(repo)) = (&self.project_dir, &self.repo_dir) else {
             return Err(Denied("no session project/repo is configured for this broker -- spawn_child_worker requires one".into()));
@@ -1133,6 +1188,44 @@ mod tests {
         let e = write_beneath(&root, &root.join("sub/f.txt"), b"x").unwrap_err();
         assert!(matches!(e, Denied(ref r) if r.contains("symlink")), "{e:?}");
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "a write escaped the allowed dir");
+    }
+
+    #[test]
+    fn allowed_dirs_are_pinned_at_start_and_kept_off_trusted_paths() {
+        let t = tmpdir("fs-write-pin");
+        let receipts = t.0.join("receipts/receipts.jsonl");
+        let allowed = t.0.join("allowed");
+        let later = t.0.join("later");
+        let outside = t.0.join("outside");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let ceiling = json!({"external_fs_write": {"allowed_dirs": [allowed.to_str().unwrap(), later.to_str().unwrap()]}});
+        let b = broker(ceiling, &receipts);
+        let write = |path: &Path| b.handle_request(&json!({"category": "external_fs_write",
+            "params": {"path": path.to_str().unwrap(), "content": "x"}}));
+        assert_eq!(write(&allowed.join("a.txt"))["approved"], json!(true));
+        // A worker that can write where the allowed dirs live swaps one for a
+        // symlink, and creates the other (missing at start) as one.
+        fs::remove_dir_all(&allowed).unwrap();
+        std::os::unix::fs::symlink(&outside, &allowed).unwrap();
+        std::os::unix::fs::symlink(&outside, &later).unwrap();
+        for path in [allowed.join("b.txt"), later.join("c.txt")] {
+            let r = write(&path);
+            assert_eq!(r["approved"], json!(false), "{r}");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "a write followed a swapped-in symlink");
+        // An allowed dir that reaches the receipt log never starts a broker.
+        let e = Broker::new(BrokerConfig {
+            ceiling: json!({"external_fs_write": {"allowed_dirs": [t.0.to_str().unwrap()]}}),
+            receipt_log_path: receipts.clone(),
+            session_id: "test".into(),
+            package_depot_dir: None,
+            package_environment_dir: None,
+            project_dir: None,
+            repo_dir: None,
+            child_timeout: Duration::from_secs(90),
+        }).err().expect("an allowed_dir holding the receipt log was accepted");
+        assert!(e.contains("overlaps the protected host path"), "{e}");
     }
 
     #[test]

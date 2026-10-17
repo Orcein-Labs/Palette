@@ -321,7 +321,7 @@ pub fn protected_command_paths(ceiling: &serde_json::Value) -> Vec<PathBuf> {
 /// An empty path names nothing and is skipped: resolving it would yield the
 /// current directory, which would make the check depend on where the host
 /// was started from.
-fn protected_overlap(root: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn protected_overlap(root: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
     protected.iter().filter(|c| !c.as_os_str().is_empty()).map(|c| util::resolve(c))
         .find(|c| root == c || root.starts_with(c) || c.starts_with(root))
 }

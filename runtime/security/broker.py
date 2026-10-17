@@ -239,30 +239,33 @@ class HostJob:
 
 def _write_beneath(root: Path, target: Path, data: bytes) -> None:
     """Write `data` to `target`, which the caller has checked lies under
-    `root`, without following a symlink anywhere below `root`. The checked
+    `root`, without following a symlink anywhere on the path. The checked
     path is fully resolved, so a symlink met here was put there after the
     check, by whoever else can write the allowed directory; the write is
-    refused instead of landing wherever it points. The Rust broker does the
-    same walk."""
+    refused instead of landing wherever it points. `root` was resolved when
+    the broker started, so the walk starts at `/`: an allowed directory
+    swapped for a symlink later, by a worker that can write where it lives,
+    is refused too. The Rust broker does the same walk."""
     parts = target.relative_to(root).parts
     if not parts:
         raise IsADirectoryError(str(target))
-    root.mkdir(parents=True, exist_ok=True)  # the allowed dir itself is the operator's
     nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
-    here = root
+    here = Path("/")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | nofollow)
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
-    except OSError as e:
-        raise _symlink_refusal(e, root)
-    try:
-        for part in parts[:-1]:
+        for part in (*root.parts[1:], *parts[:-1]):
             here = here / part
             try:
-                os.mkdir(part, 0o755, dir_fd=fd)
-            except FileExistsError:
-                pass
-            try:
                 next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                except OSError as e:
+                    raise _symlink_refusal(e, here)
             except OSError as e:
                 raise _symlink_refusal(e, here)
             os.close(fd)
@@ -349,6 +352,36 @@ class Broker:
             open(receipt_log_path, "a").close()
         except OSError as e:
             raise RuntimeError(f"cannot open the receipt log {receipt_log_path}: {e}") from e
+        self._write_roots = self._pinned_write_roots()
+
+    def _pinned_write_roots(self) -> list[Path]:
+        """external_fs_write's allowed_dirs, resolved once, when the broker
+        starts. Each request is checked against these paths and walked to
+        without following a symlink, so a directory a worker can replace (one
+        inside its workspace, say) cannot become a symlink that moves the
+        root. An allowed_dir may not reach a path the host trusts: the receipt
+        log, the Palette checkout, the package store, the operator's config
+        files and the host command paths. A write there would let the agent
+        erase its receipts or widen its own next ceiling. The Rust broker does
+        the same."""
+        cap = self.ceiling.get("external_fs_write") or {}
+        roots = [Path(d).resolve() for d in cap.get("allowed_dirs") or []]
+        if not roots:
+            return roots
+        protected = [Path(self.receipt_log_path)]
+        protected += [Path(p) for p in (self.repo_dir, os.environ.get("PALETTE_REPO_DIR")) if p]
+        if self.package_depot_dir:
+            protected.append(Path(self.package_depot_dir).parent)
+        checkout = Path(__file__).resolve().parents[2]
+        if (checkout / "runtime" / "scripts" / "session_loop.jl").is_file():
+            protected.append(checkout)
+        protected += protected_host_paths(self.ceiling)
+        for root in roots:
+            for path in protected:
+                path = path.resolve()
+                if root == path or path.is_relative_to(root) or root.is_relative_to(path):
+                    raise RuntimeError(f"external_fs_write allowed_dir {root} overlaps the protected host path {path}")
+        return roots
 
     def close(self):
         with self._jobs_lock:
@@ -373,7 +406,7 @@ class Broker:
         if not isinstance(path, str) or not isinstance(content, str):
             raise CapabilityDenied("external_fs_write requires string 'path' and 'content'")
         target = Path(path).resolve()
-        allowed = [Path(d).resolve() for d in cap["allowed_dirs"]]
+        allowed = self._write_roots
         root = next((a for a in allowed if target == a or a in target.parents), None)
         if root is None:
             raise CapabilityDenied(f"path {target} is outside the ceiling's allowed_dirs {allowed}")
@@ -534,6 +567,12 @@ class Broker:
         ok, reason = ceiling_is_subset(requested_ceiling, self.ceiling)
         if not ok:
             raise CapabilityDenied(f"requested child ceiling is not a subset of this session's ceiling: {reason}")
+        # The subset check resolves both ceilings now; a child's directory must
+        # also lie within this broker's roots as they resolved at start.
+        for d in (requested_ceiling.get("external_fs_write") or {}).get("allowed_dirs") or []:
+            d = Path(d).resolve()
+            if not any(d == r or r in d.parents for r in self._write_roots):
+                raise CapabilityDenied(f"requested external_fs_write dir {d} is not within this session's allowed_dirs {self._write_roots}")
         if self.project_dir is None or self.repo_dir is None:
             raise CapabilityDenied("no session project/repo is configured for this broker -- spawn_child_worker requires one")
         script = params.get("script")

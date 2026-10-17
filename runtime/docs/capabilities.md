@@ -41,6 +41,15 @@ host process. If that process is killed before its teardown runs, the next
 session started in the same pid namespace removes them. A caller-supplied
 scratch root is never swept.
 
+`external_fs_write.allowed_dirs` are resolved once, when the broker starts.
+Each write walks from `/` to its target without following a symlink, so a
+directory that is replaced by a symlink later is refused, not followed. This
+also covers a directory the worker can write. After such a swap, restart the
+session to use the new target. A broker refuses to start when an allowed
+directory contains or lies inside a path the host trusts. Those paths are the
+receipt log, the Palette checkout, the package store, the operator's
+configuration files and the host command paths.
+
 ```julia
 Api.runtime("discover")
 receipt = Api.request_capability("package_management", Dict("name" => "Parsers"))
