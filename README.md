@@ -6,7 +6,7 @@ ChatGPT Chat, Claude, Grok, and Codex talk. Palette holds the live world they wo
 
 Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives, and host-side effects go through a capability broker and leave a receipt.
 
-## ChatGPT Chat, October 2025
+## ChatGPT Chat, October 2026
 
 This is the default ChatGPT chat product. The UI labels it Chat.
 
@@ -17,7 +17,7 @@ This is the default ChatGPT chat product. The UI labels it Chat.
 
 The right-hand capture is ChatGPT Chat installing Metatheory.jl through Palette while the kernel stays up. Isolated research environment, Gesso's dependencies left alone.
 
-The workspace is `palette_os_lab_20261005`, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
+The workspace is a separate research world, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
 
 We've run long-horizon R&D spirals on this desk. Bugs showed up and they were able to be fixed from the inside. The World was still on disk after the kernel came back.
 
@@ -142,6 +142,6 @@ Core: **AGPL-3.0-only**. Identified client/plugin packages and public docs:
 **Apache-2.0**. Inherited MIT notices remain preserved. See
 [license boundaries](runtime/licenses/README.md) and [LICENSE](LICENSE).
 
-## ChatGPT ToS
+## Provider terms
 
-I combed OpenAI's Terms of Use. A local Palette kernel attached to ChatGPT Chat over the plugin/MCP path sits inside them. On a paid plan, Chat is unlimited usage. Those tokens get spent either way. Put them into actual work: work that survives the thread, persists into a new one, and lets ChatGPT (or whatever you attach) keep the world.
+Palette is a local tool you attach to a hosted model over its plugin or MCP path. Review your provider's current terms yourself before you do; this README is not a reading of them. Whatever usage your plan includes, Palette lets it go into work that survives the thread, persists into a new one, and lets ChatGPT (or whatever you attach) keep the world.
