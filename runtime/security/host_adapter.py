@@ -1,3 +1,6 @@
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 The host the tests run against. With PALETTE_HOST_BIN set, every entry point
 the tests use -- the session bridge, one-shot workers, the broker, the

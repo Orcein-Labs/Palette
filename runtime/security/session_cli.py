@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 Palette session bridge -- a thin, persistent stdio wrapper around
 `PaletteSession`, for a host process in a DIFFERENT language (Node, via

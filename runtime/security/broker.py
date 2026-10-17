@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 Palette host capability broker -- the second trust domain.
 

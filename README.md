@@ -134,6 +134,8 @@ python3 runtime/security/verify_operator.py --project-dir /absolute/path/to/test
 ```
 
 CI runs package, host, Jupyter integration, workspace/patch, and process gates.
+Pull requests run the process gates against the Rust host; both hosts run nightly.
+The Python host is scheduled for removal ([authority](runtime/docs/authority.md)).
 The package manifest declares Julia 1.10+; supervised development and CI are tested on Julia 1.12.
 
 ## License

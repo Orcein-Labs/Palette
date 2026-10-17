@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 jobs:
   test:
@@ -108,7 +111,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        implementation: [rust, python]
+        # Pull requests and pushes check the Rust host only. The Python host is
+        # the conformance oracle until it is removed (runtime/docs/authority.md)
+        # and runs nightly and on manual dispatch.
+        implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
 
     steps:
     - uses: actions/checkout@v7
