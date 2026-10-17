@@ -265,7 +265,7 @@ end
     @test fail_receipt.result.data["exit_code"] == 3
 end
 
-@testset "fs_digest broker request (FM-SLICE-A2)" begin
+@testset "fs_digest broker request" begin
     # Category-aware fake broker: with_fake_broker maps host_request-shaped
     # params; fs_digest needs the raw category, so this test runs its own
     # minimal broker over the same one-JSON-line protocol.
@@ -304,7 +304,7 @@ end
     end
 end
 
-@testset "ShellEscape typed errors + output digests (FM-SLICE-A1)" begin
+@testset "ShellEscape typed errors + output digests" begin
     reset_kernel_state()
 
     clean = execute(ShellEscape("exit 3"))
@@ -337,7 +337,7 @@ end
 end
 
 @testset "ShellEscape (signal death reports failure)" begin
-    # FM-RQ-A1 probe P13: Julia's Process.exitcode is 0 alongside a nonzero
+    # Julia's Process.exitcode is 0 alongside a nonzero
     # termsignal, so a SIGKILLed shell used to be reported as success with
     # exit_code 0. It must report failure with 128 + signal, like a shell.
     reset_kernel_state()

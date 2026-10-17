@@ -470,7 +470,7 @@ impl Broker {
         }
     }
 
-    /// Digest files with host privilege -- the independent eye (FM-SLICE-A2b),
+    /// Digest files with host privilege, as a check the sandbox cannot forge,
     /// mirroring runtime/security/broker.py's _handle_fs_digest: a digest computed
     /// inside the sandbox is the kernel grading its own writes, so this reads
     /// the requested paths OUTSIDE the sandbox, on the host, and the request
@@ -826,7 +826,7 @@ fn handle_conn(conn: UnixStream, broker: &Broker) {
 }
 
 // The host's first Rust test module: the fs_digest parity suite, mirroring
-// runtime/security/test_fs_digest.py check-for-check (FM-SLICE-A2b), plus the 64-path
+// runtime/security/test_fs_digest.py check-for-check, plus the 64-path
 // cap. Direct Broker construction -- no sockets.
 #[cfg(test)]
 mod tests {
@@ -970,7 +970,7 @@ mod tests {
         let dir = t.0.join("scoped");
         fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("a.txt");
-        fs::write(&f1, b"hello fm-slice-a2b\n").unwrap();
+        fs::write(&f1, b"hello digest\n").unwrap();
         let f2 = dir.join("b.bin");
         let big: Vec<u8> = (0..=255u8).cycle().take(256 * 100).collect();
         fs::write(&f2, &big).unwrap();

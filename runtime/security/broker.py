@@ -622,14 +622,14 @@ class Broker:
         return reply
 
     def _handle_fs_digest(self, params: dict) -> Any:
-        """Digest files with host privilege — the independent eye (FM-SLICE-A2).
+        """Digest files with host privilege, as a check the sandbox cannot forge.
 
         The sandboxed kernel can hash what it can see, but a digest computed
         inside the sandbox is the kernel grading its own writes. This handler
         reads the requested paths OUTSIDE the sandbox, on the host, and the
         request is receipted regardless of outcome — so a mutation claim can
-        be independently recomputed (FM-RQ-A2) and the receipt survives the
-        kernel, which kernel-side receipts do not (probe P15).
+        be independently recomputed and the receipt survives the kernel,
+        which kernel-side receipts do not.
 
         Ceiling shape: {"fs_digest": {"allowed_paths": ["/abs/dir", ...]}}.
         A requested path must resolve to an allowed path itself or sit under
