@@ -216,16 +216,45 @@ def read_task_env(path: str | None) -> dict[str, str]:
     return env
 
 
-def identity_files() -> Path:
-    """passwd and group files naming the sandbox's uid 1000, written once per host."""
-    etc = Path(tempfile.gettempdir()) / f"palette-etc-{os.getuid()}"
+def identity_files(base: str | Path | None = None) -> Path:
+    """passwd and group files naming the sandbox's uid 1000, written once per host.
+
+    The directory lives in a shared temp dir under a predictable name, so it
+    is trusted only if this user owns it, it is a real directory (not a
+    symlink), and nobody else can write to it. Otherwise another local user
+    could pre-create it and choose the sandbox's passwd, or plant a symlink
+    where the temp file is written.
+    """
+    uid = os.getuid()
+    etc = Path(base or tempfile.gettempdir()) / f"palette-etc-{uid}"
+    try:
+        os.mkdir(etc, 0o755)
+    except FileExistsError:
+        pass
+    st = os.lstat(etc)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        raise RuntimeError(
+            f"refusing sandbox identity dir {etc}: it must be a directory owned by uid {uid} "
+            "and writable only by its owner")
     passwd = f"{SANDBOX_USER}:x:1000:1000:Palette sandbox:/run/palette/home:/bin/bash\n"
     group = f"{SANDBOX_USER}:x:1000:\n"
-    if not (etc / "passwd").is_file() or (etc / "passwd").read_text() != passwd:
-        etc.mkdir(mode=0o755, exist_ok=True)
+
+    def current(name: str) -> str | None:
+        try:
+            return (etc / name).read_text()
+        except OSError:
+            return None
+
+    if current("passwd") != passwd or current("group") != group:
         for name, text in (("passwd", passwd), ("group", group)):
             tmp = etc / f".{name}.{os.getpid()}"
-            tmp.write_text(text)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
             os.chmod(tmp, 0o644)
             os.replace(tmp, etc / name)
     return etc

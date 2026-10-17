@@ -580,16 +580,41 @@ pub fn read_task_env(path: Option<&str>) -> Result<BTreeMap<String, String>, Str
 
 /// passwd and group files naming the sandbox's uid 1000, written once per host.
 fn identity_files() -> Result<PathBuf, String> {
+    identity_files_in(&util::temp_dir())
+}
+
+/// The directory lives in a shared temp dir under a predictable name, so it
+/// is trusted only if this user owns it, it is a real directory (not a
+/// symlink), and nobody else can write to it. Otherwise another local user
+/// could pre-create it and choose the sandbox's passwd, or plant a symlink
+/// where the temp file is written.
+fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     let uid = unsafe { libc::getuid() };
-    let etc = util::temp_dir().join(format!("palette-etc-{uid}"));
+    let etc = base.join(format!("palette-etc-{uid}"));
+    match fs::DirBuilder::new().mode(0o755).create(&etc) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("creating {}: {e}", etc.display())),
+    }
+    let meta = fs::symlink_metadata(&etc).map_err(|e| format!("checking {}: {e}", etc.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "refusing sandbox identity dir {}: it must be a directory owned by uid {uid} and writable only by its owner",
+            etc.display()
+        ));
+    }
     let passwd = format!("{SANDBOX_USER}:x:1000:1000:Palette sandbox:/run/palette/home:/bin/bash\n");
     let group = format!("{SANDBOX_USER}:x:1000:\n");
-    if fs::read_to_string(etc.join("passwd")).ok().as_deref() != Some(passwd.as_str()) {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let _ = fs::DirBuilder::new().mode(0o755).create(&etc);
+    let current = |name: &str| fs::read_to_string(etc.join(name)).ok();
+    if current("passwd").as_deref() != Some(passwd.as_str()) || current("group").as_deref() != Some(group.as_str()) {
         for (name, text) in [("passwd", &passwd), ("group", &group)] {
             let tmp = etc.join(format!(".{name}.{}", std::process::id()));
-            fs::write(&tmp, text).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&tmp);
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW).open(&tmp).map_err(|e| e.to_string())?;
+            f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
             fs::rename(&tmp, etc.join(name)).map_err(|e| e.to_string())?;
         }
@@ -1161,6 +1186,29 @@ mod tests {
         let clones = root.join(".palette-depot-clones");
         assert_eq!(fs::read_dir(&clones).unwrap().count(), 0, "a failed clone left residue");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn identity_dir_is_refused_unless_private_to_this_user() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Temp(PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let uid = unsafe { libc::getuid() };
+        let base = util::mkdtemp("palette-identity-test-").unwrap();
+        let _guard = Temp(base.clone());
+        let etc = identity_files_in(&base).unwrap();
+        assert!(fs::read_to_string(etc.join("passwd")).unwrap().contains(":x:1000:1000:"));
+        assert!(fs::read_to_string(etc.join("group")).unwrap().contains(":x:1000:"));
+        // Writable by others: another user could swap the files.
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(identity_files_in(&base).unwrap_err().contains("refusing"));
+        fs::remove_dir_all(&etc).unwrap();
+        // A symlink planted at the predictable name.
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.join(format!("palette-etc-{uid}"))).unwrap();
+        assert!(identity_files_in(&base).unwrap_err().contains("refusing"));
+        assert!(!elsewhere.join("passwd").exists(), "wrote through a planted symlink");
     }
 
     #[test]
