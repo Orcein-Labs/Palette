@@ -1347,7 +1347,13 @@ mod tests {
     fn the_running_checkout_is_found_at_run_time() {
         // The test binary runs from target/ inside the checkout, as an
         // installed host runs from its own checkout.
+        // With CARGO_TARGET_DIR outside the checkout there is nothing to find.
         let expected = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let exe = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        if !exe.starts_with(&expected) {
+            eprintln!("skipped: the test binary is outside the checkout");
+            return;
+        }
         assert_eq!(util::installed_checkout(), Some(expected));
     }
 

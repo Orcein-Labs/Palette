@@ -102,7 +102,7 @@ const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
 fn prewarm(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
     let project = std::fs::canonicalize(f.get("project-dir").ok_or("--project-dir is required")?).map_err(|e| e.to_string())?;
-    let repo = std::fs::canonicalize(f.get("repo-dir").cloned().unwrap_or_else(cli::default_repo_dir)).map_err(|e| e.to_string())?;
+    let repo = std::fs::canonicalize(f.get("repo-dir").cloned().map_or_else(cli::default_repo_dir, Ok)?).map_err(|e| e.to_string())?;
     let julia = sandbox::resolve_julia()?;
     let workspace = util::mkdtemp("palette-prewarm-").map_err(|e| e.to_string())?;
     let depot = sandbox::default_depot();

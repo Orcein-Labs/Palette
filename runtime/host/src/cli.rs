@@ -127,20 +127,24 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if a.project_dir.is_empty() {
         return Err("--project-dir is required".into());
     }
+    if a.repo_dir.is_none() {
+        a.repo_dir = Some(default_repo_dir()?);
+    }
     Ok(a)
 }
 
-/// The lab checkout: --repo-dir, PALETTE_REPO_DIR, or the checkout this binary was built in.
-pub fn default_repo_dir() -> String {
+/// The Palette checkout when --repo-dir is absent: PALETTE_REPO_DIR, or the
+/// checkout this binary runs from. Never the checkout it was built in, which
+/// may not exist on this machine or may be a different version.
+pub fn default_repo_dir() -> Result<String, String> {
     if let Ok(r) = std::env::var("PALETTE_REPO_DIR") {
         if !r.is_empty() {
-            return r;
+            return Ok(r);
         }
     }
-    if let Some(dir) = crate::util::installed_checkout() {
-        return dir.to_string_lossy().into_owned();
-    }
-    env!("CARGO_MANIFEST_DIR").trim_end_matches("/runtime/host").to_string()
+    crate::util::installed_checkout().map(|dir| dir.to_string_lossy().into_owned()).ok_or_else(|| {
+        "no Palette checkout found: this binary is not inside one, so pass --repo-dir or set PALETTE_REPO_DIR".into()
+    })
 }
 
 /// Text, or an object of named texts; anything else is dropped.
@@ -222,7 +226,7 @@ pub fn main(argv: &[String]) -> i32 {
     let turn_timeout = args.turn_timeout;
     let session = PaletteSession::start(SessionOptions {
         project_dir: args.project_dir.clone(),
-        repo_dir: args.repo_dir.clone().unwrap_or_else(default_repo_dir),
+        repo_dir: args.repo_dir.clone().unwrap_or_default(),
         ceiling,
         network_enabled: args.network,
         receipts_dir: args.receipts_dir.clone(),
