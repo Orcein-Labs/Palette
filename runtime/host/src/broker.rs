@@ -180,6 +180,10 @@ impl Broker {
         if let Some(parent) = c.receipt_log_path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // A broker that cannot keep receipts must not start: every answer it
+        // gives is supposed to leave one.
+        OpenOptions::new().create(true).append(true).open(&c.receipt_log_path)
+            .map_err(|e| format!("cannot open the receipt log {}: {e}", c.receipt_log_path.display()))?;
         Ok(Broker {
             ceiling: c.ceiling,
             receipt_log_path: c.receipt_log_path,
@@ -583,7 +587,13 @@ impl Broker {
                 (false, Value::Null, json!(r))
             }
         };
-        self.write_receipt(&req_id, &category, &params, approved, &result, &reason);
+        if let Err(e) = self.write_receipt(&req_id, &category, &params, approved, &result, &reason) {
+            // Fail closed, as the Python broker does: no result leaves the
+            // broker without its receipt. The effect may already have happened,
+            // so the operator hears about it as well as the worker.
+            eprintln!("palette-host: receipt for request {req_id} not recorded: {e}");
+            return json!({"id": req_id, "approved": false, "reason": format!("broker error: receipt not recorded: {e}")});
+        }
         let mut resp = json!({"id": req_id, "approved": approved});
         if approved {
             resp["result"] = result;
@@ -593,16 +603,16 @@ impl Broker {
         resp
     }
 
-    fn write_receipt(&self, req_id: &Value, category: &Value, params: &Value, approved: bool, result: &Value, reason: &Value) {
+    fn write_receipt(&self, req_id: &Value, category: &Value, params: &Value, approved: bool, result: &Value, reason: &Value)
+        -> std::io::Result<()> {
         let receipt = json!({
             "receipt_id": util::uuid4(), "request_id": req_id, "session_id": self.session_id,
             "timestamp": util::now_secs(), "category": category, "params": params,
             "approved": approved, "result": result, "reason": reason,
         });
         let _g = self.log_lock.lock().unwrap();
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.receipt_log_path) {
-            let _ = writeln!(f, "{receipt}");
-        }
+        let mut f = OpenOptions::new().create(true).append(true).open(&self.receipt_log_path)?;
+        writeln!(f, "{receipt}")
     }
 }
 
@@ -990,6 +1000,36 @@ mod tests {
             d[abc.to_str().unwrap()]["sha256"],
             json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    #[test]
+    fn a_receipt_that_cannot_be_written_denies_the_request() {
+        let t = tmpdir("receipt-fail");
+        let receipts = t.0.join("receipts.jsonl");
+        let dir = t.0.join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f"), "x").unwrap();
+        let b = broker(json!({"fs_digest": {"allowed_paths": [dir.to_str().unwrap()]}}), &receipts);
+        // Replace the log with a directory: opening it for append now fails.
+        fs::remove_file(&receipts).unwrap();
+        fs::create_dir(&receipts).unwrap();
+        let r = b.handle_request(&digest_req(&[dir.join("f").to_str().unwrap()]));
+        assert_eq!(r["approved"], json!(false), "{r}");
+        assert!(r["reason"].as_str().unwrap().contains("receipt not recorded"), "{r}");
+        assert!(r.get("result").is_none(), "a result left without its receipt: {r}");
+    }
+
+    #[test]
+    fn a_broker_that_cannot_open_its_receipt_log_does_not_start() {
+        let t = tmpdir("receipt-open");
+        let receipts = t.0.join("receipts.jsonl");
+        fs::create_dir(&receipts).unwrap();
+        let e = Broker::new(BrokerConfig {
+            ceiling: json!({}), receipt_log_path: receipts, session_id: "s".into(),
+            package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
+            child_timeout: Duration::from_secs(5),
+        }).err().expect("broker started without a receipt log");
+        assert!(e.contains("receipt log"), "{e}");
     }
 
     #[test]

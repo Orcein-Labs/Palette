@@ -343,6 +343,35 @@ class TestNetworkRedirectSafety(unittest.TestCase):
         self.assertEqual(self.hits, [], "a denied URL still reached the local server")
 
 
+class TestReceiptsFailClosed(unittest.TestCase):
+    """No answer leaves the broker without its receipt."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="palette-receipt-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.data = os.path.join(self.tmp, "data")
+        os.makedirs(self.data)
+        Path(self.data, "f").write_text("x")
+
+    def test_a_receipt_that_cannot_be_written_denies_the_request(self):
+        receipts = os.path.join(self.tmp, "receipts.jsonl")
+        broker = B.Broker({"fs_digest": {"allowed_paths": [self.data]}}, receipts, "test-session")
+        os.remove(receipts)
+        os.mkdir(receipts)  # opening the log for append now fails
+        resp = broker.handle_request({"id": "r1", "category": "fs_digest",
+                                      "params": {"paths": [os.path.join(self.data, "f")]}})
+        self.assertFalse(resp["approved"], resp)
+        self.assertIn("receipt not recorded", resp["reason"])
+        self.assertNotIn("result", resp)
+
+    def test_a_broker_that_cannot_open_its_receipt_log_does_not_start(self):
+        receipts = os.path.join(self.tmp, "receipts.jsonl")
+        os.mkdir(receipts)
+        # The Python broker names the log; the Rust one never prints READY.
+        with self.assertRaisesRegex(RuntimeError, "receipt log|did not start"):
+            B.Broker({}, receipts, "test-session")
+
+
 class TestCeilingSubset(unittest.TestCase):
     """Fast, no sandbox: the C_child ⊆ C_caller logic in isolation."""
 

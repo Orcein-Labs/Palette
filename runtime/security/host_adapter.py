@@ -152,6 +152,16 @@ class _BrokerNamespace:
                 raise RuntimeError(resp["reason"])
             return resp["result"]
 
+        def handle_request(self, req):
+            """One raw request and its raw reply, denials included."""
+            if self._b is not None:
+                return self._b.handle_request(req)
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(self._sock)
+                s.sendall((json.dumps(req) + "\n").encode())
+                with s.makefile() as reply:
+                    return json.loads(reply.readline())
+
         def _handle_network_access(self, params):
             if self._b is not None:
                 return self._b._handle_network_access(params)

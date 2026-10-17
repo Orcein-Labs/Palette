@@ -42,6 +42,7 @@ import shutil
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -295,6 +296,12 @@ class Broker:
         self._jobs: dict[str, HostJob] = {}
         self._jobs_lock = threading.Lock()
         Path(receipt_log_path).parent.mkdir(parents=True, exist_ok=True)
+        # A broker that cannot keep receipts must not start: every answer it
+        # gives is supposed to leave one.
+        try:
+            open(receipt_log_path, "a").close()
+        except OSError as e:
+            raise RuntimeError(f"cannot open the receipt log {receipt_log_path}: {e}") from e
 
     def close(self):
         with self._jobs_lock:
@@ -730,7 +737,13 @@ class Broker:
             # CapabilityDenied by category so a bug doesn't read as a
             # deliberate policy decision in the audit log.
             reason = f"internal error handling request (not a policy denial): {e}"
-        self._write_receipt(req_id, category, params, approved, result, reason)
+        try:
+            self._write_receipt(req_id, category, params, approved, result, reason)
+        except Exception as e:
+            # Fail closed: no result leaves the broker without its receipt. The
+            # effect may already have happened, so tell the operator too.
+            print(f"palette broker: receipt for request {req_id} not recorded: {e}", file=sys.stderr)
+            return {"id": req_id, "approved": False, "reason": f"broker error: receipt not recorded: {e}"}
         resp = {"id": req_id, "approved": approved}
         if approved:
             resp["result"] = result
