@@ -59,6 +59,24 @@ class ReadRootsTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 launch_worker.build_bwrap_argv(**kw)
 
+    def test_bind_sources_are_the_resolved_paths(self):
+        # A symlinked repo or project is mounted from the directory that passed
+        # the overlap checks, so retargeting the link later changes nothing.
+        julia_bin = self.tmp / "toolchain/bin/julia"
+        julia_bin.write_text("")
+        repo_link, project_link = self.tmp / "repo-link", self.tmp / "project-link"
+        repo_link.symlink_to(self.tmp / "repo")
+        project_link.symlink_to(self.tmp / "project")
+        kw = dict(workspace_dir=str(self.tmp / "ws"), broker_socket_dir=None, project_dir=str(project_link),
+                  repo_dir=str(repo_link), julia_bin=str(julia_bin), julia_depot=str(self.tmp / "home/depot"),
+                  network_enabled=False, state_dir=str(self.tmp / "state"))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PALETTE_READ_ROOTS", None)
+            argv = launch_worker.build_bwrap_argv(**kw)
+        for link, real in ((repo_link, self.tmp / "repo"), (project_link, self.tmp / "project")):
+            i = argv.index(str(link))
+            self.assertEqual(argv[i - 2:i + 1], ["--ro-bind", str(real), str(link)])
+
 
 if __name__ == "__main__":
     unittest.main()

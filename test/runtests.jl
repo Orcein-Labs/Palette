@@ -248,6 +248,10 @@ end
     receipt = execute(InvokeOperator("add_one"; args=Dict("n" => 41)))
     @test receipt.result.success
     @test receipt.result.data == 42
+    # the caller gets the value; the log keeps only the outcome
+    @test state.receipt_log[end].result.data === nothing
+    @test state.receipt_log[end].result.success
+    @test state.receipt_log[end].metadata["operator"] == "add_one"
 
     missing_receipt = execute(InvokeOperator("does_not_exist"))
     @test !missing_receipt.result.success
@@ -259,13 +263,16 @@ end
     @test receipt.result.success
     @test strip(receipt.result.data["stdout"]) == "hello"
     @test receipt.result.data["exit_code"] == 0
+    logged = get_kernel_state().receipt_log[end]
+    @test logged.result.data === nothing && logged.result.success
+    @test logged.metadata["command"] == "echo hello"
 
     fail_receipt = execute(ShellEscape("exit 3"))
     @test !fail_receipt.result.success
     @test fail_receipt.result.data["exit_code"] == 3
 end
 
-@testset "fs_digest broker request (FM-SLICE-A2)" begin
+@testset "fs_digest broker request" begin
     # Category-aware fake broker: with_fake_broker maps host_request-shaped
     # params; fs_digest needs the raw category, so this test runs its own
     # minimal broker over the same one-JSON-line protocol.
@@ -304,7 +311,7 @@ end
     end
 end
 
-@testset "ShellEscape typed errors + output digests (FM-SLICE-A1)" begin
+@testset "ShellEscape typed errors + output digests" begin
     reset_kernel_state()
 
     clean = execute(ShellEscape("exit 3"))
@@ -337,7 +344,7 @@ end
 end
 
 @testset "ShellEscape (signal death reports failure)" begin
-    # FM-RQ-A1 probe P13: Julia's Process.exitcode is 0 alongside a nonzero
+    # Julia's Process.exitcode is 0 alongside a nonzero
     # termsignal, so a SIGKILLed shell used to be reported as success with
     # exit_code 0. It must report failure with 128 + signal, like a shell.
     reset_kernel_state()
@@ -425,6 +432,14 @@ end
     @test r1.result.success
     @test r1.result.data == 42
     @test !isdefined(state.eval_module, :helper)
+    @test state.receipt_log[end].result.data === nothing
+    @test state.receipt_log[end].metadata["tool_id"] == r1.metadata["tool_id"]
+
+    # ephemeral code reaches authority through Palette, as turn code does,
+    # and nothing else of the package
+    @test execute(EphemeralTool("Palette.request_capability isa Function")).result.data === true
+    @test execute(EphemeralTool("Api === Palette")).result.data === true
+    @test !execute(EphemeralTool("Palette.reset_kernel_state()")).result.success
 
     # `import Mod: f` then a bare `function f(...)` is the confirmed real
     # way to permanently extend a foreign generic function -- must be
@@ -557,6 +572,30 @@ end
     @test get_kernel_state().receipt_log[end].result.data === nothing
 end
 
+@testset "Revival checks see definitions made earlier in the same call" begin
+    # Revival rebuilds definitions and checks them in one call, from a world
+    # older than the new bindings. Julia 1.12 only warns about such reads and
+    # later versions refuse them; --depwarn=error gives that stricter rule
+    # today, under which the checks reported every rebuilt definition lost.
+    script = """
+    using Palette
+    function define_then_check()
+        m = Module(:RevivalWorldAge)
+        Core.eval(m, :(struct Probe; x::Int; end))
+        Core.eval(m, :(probe_f(x::Int) = x))
+        (Palette.type_fingerprint(m, "Probe"), Palette.method_set(m, "probe_f"),
+         Palette.current_definition(Base.invokelatest(getglobal, m, :Probe)))
+    end
+    fingerprint, methods_now, current = define_then_check()
+    fingerprint == "Probe{}:x::Int64" || error("fingerprint: ", repr(fingerprint))
+    methods_now isa Vector && length(methods_now) == 1 || error("methods: ", repr(methods_now))
+    current || error("current_definition was false")
+    print("ok")
+    """
+    cmd = `$(Base.julia_cmd()) --startup-file=no --depwarn=error --project=$(dirname(@__DIR__)) -e $script`
+    @test readchomp(pipeline(cmd; stderr=stderr)) == "ok"
+end
+
 @testset "Snapshot of a large value stays fast (seam S-2)" begin
     # A non-empty workspace root is what made `check_type` scan every loaded
     # module once per walked object (77 s for 100k objects); ephemeral
@@ -566,7 +605,9 @@ end
     Palette.WORKSPACE_ROOT[] = mktempdir()
     Palette.STATE_DIR[] = mktempdir()
     try
-        @test execute(ExecuteCode("big = Any[Any[Float64(i), Float64(i + 1)] for i in 1:100_000]; length(big)")).result.data == 100_000
+        # Not `big`: Julia 1.10 binds a name that a top-level call reads to
+        # Base's export before the call runs, then refuses the assignment.
+        @test execute(ExecuteCode("rows = Any[Any[Float64(i), Float64(i + 1)] for i in 1:100_000]; length(rows)")).result.data == 100_000
         Palette.snapshot_state!(1)                       # compile once
         started = time()
         manifest = Palette.snapshot_state!(2)

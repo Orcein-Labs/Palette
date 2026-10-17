@@ -1,3 +1,6 @@
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 The host the tests run against. With PALETTE_HOST_BIN set, every entry point
 the tests use -- the session bridge, one-shot workers, the broker, the
@@ -152,14 +155,26 @@ class _BrokerNamespace:
                 raise RuntimeError(resp["reason"])
             return resp["result"]
 
+        def handle_request(self, req):
+            """One raw request and its raw reply, denials included."""
+            if self._b is not None:
+                return self._b.handle_request(req)
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(self._sock)
+                s.sendall((json.dumps(req) + "\n").encode())
+                with s.makefile() as reply:
+                    return json.loads(reply.readline())
+
         def _handle_network_access(self, params):
             if self._b is not None:
                 return self._b._handle_network_access(params)
             return self._call("network_access", params)
 
         def __del__(self):
-            if getattr(self, "_b", 1) is None:
-                self._server.shutdown()
+            # A broker that failed to start has no server to stop.
+            server = getattr(self, "_server", None)
+            if getattr(self, "_b", 1) is None and server is not None:
+                server.shutdown()
 
 
 B = _BrokerNamespace()

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 Palette contained worker launcher -- the first trust domain.
 
@@ -18,7 +21,8 @@ tried and, on this substrate, actively caused the cold-start problem it
 was meant to solve -- see _clone_depot's docstring for the root cause,
 found by direct reproduction). Each worker gets its own real, cheap
 (reflink) clone of the prepared depot, bound writable as the primary
-`JULIA_DEPOT_PATH` entry. A separate durable operator package store may be
+`JULIA_DEPOT_PATH` entry. The clone is copied from the newest snapshot that
+preparation published (see publish_depot_snapshot), not from the live depot. A separate durable operator package store may be
 present as a later read-only depot entry for broker-provisioned packages.
 
 Paths are bound at IDENTICAL guest paths to their host paths (no
@@ -37,12 +41,16 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import zipfile
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
 
 
-def _clone_depot(real_depot: str, clone_root: str) -> str:
+def _clone_depot(real_depot: str, clone_root: str, source: str | None = None,
+                 attempts: int | None = None) -> str:
     """Make a real, independent, cheap copy of the depot for one worker's
     exclusive writable use.
 
@@ -69,25 +77,32 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
     closed -- correctness first, worth revisiting if that path matters
     later, but not yet proven to be slow enough here to justify a
     filesystem-specific special case).
+
+    `source` is a snapshot of `real_depot` to copy instead of the live
+    depot; see publish_depot_snapshot.
     """
     dest = tempfile.mkdtemp(dir=clone_root, prefix="depot-")
     try:
         record = _clone_owner_record()
         if record is not None:
             Path(dest + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
-        shutil.rmtree(dest)  # cp needs the destination to not exist yet
-        subprocess.run(["cp", "-a", "--reflink=auto", real_depot, dest], check=True, stdin=subprocess.DEVNULL)
+        _copy_tree(source or real_depot, dest, attempts or DEPOT_CLONE_ATTEMPTS)
     except BaseException:
         remove_session_depot(dest)
         raise
     return dest
 
 
-# Every clone `depot-XXXXXXXX` has a sidecar `depot-XXXXXXXX.owner` naming the
-# process that made it as "<pid namespace> <pid> <start time>". Owners remove
-# their clone when they finish; the sidecar lets a later session remove the
-# clones of owners that were killed first. The Rust host writes the same record.
+# Every directory this host owns outside its own scratch root -- a depot clone
+# `depot-XXXXXXXX`, a default session root `palette-<id>`, a default receipts
+# directory -- has a sidecar `<dir>.owner` naming the process that made it as
+# "<pid namespace> <pid> <start time>". Owners remove their directory when they
+# finish; the sidecar lets a later session remove the directories of owners
+# that were killed first. The Rust host writes the same record.
 CLONE_OWNER_SUFFIX = ".owner"
+DEFAULT_RECEIPT_RETENTION_DAYS = 30
+# How many times a live depot clone is tried before the session gives up.
+DEPOT_CLONE_ATTEMPTS = 3
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -126,16 +141,47 @@ def _clone_owner_alive(record: str) -> bool:
     return _process_start_time(int(pid)) == start
 
 
-def sweep_orphaned_depot_clones(clone_root: str) -> None:
-    """Remove the clones in `clone_root` whose owner has died. A clone without
-    a readable owner record, or one that is not a plain directory, is left alone."""
+def record_owner(directory: str | os.PathLike) -> None:
+    """Write this process's owner record for `directory`."""
+    record = _clone_owner_record()
+    if record is not None:
+        Path(str(directory) + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
+
+
+def _last_modified(directory: str) -> float:
+    """The newest modification time of `directory` and its direct entries."""
+    newest = os.lstat(directory).st_mtime
     try:
-        entries = list(os.scandir(clone_root))
+        for entry in os.scandir(directory):
+            try:
+                newest = max(newest, entry.stat().st_mtime)
+            except OSError:
+                pass
     except OSError:
-        return
+        pass
+    return newest
+
+
+def sweep_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: float = 0.0) -> None:
+    """Remove the directories `<prefix>*` in `root` whose owner has died and
+    that nobody has written to for at least `min_age_seconds`. A directory
+    without a readable owner record, or one that is not a plain directory, is
+    left alone."""
+    for directory in _expired_orphaned_dirs(root, prefix, min_age_seconds):
+        remove_owned_dir(directory)
+
+
+def _expired_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: float) -> list[str]:
+    """The directories `sweep_orphaned_dirs` would remove. Owner records whose
+    directory is already gone are removed here."""
+    expired: list[str] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return expired
     for entry in entries:
-        clone_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
-        if not clone_name or not clone_name.startswith("depot-") or not entry.is_file(follow_symlinks=False):
+        dir_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
+        if not dir_name or not dir_name.startswith(prefix) or not entry.is_file(follow_symlinks=False):
             continue
         try:
             record = Path(entry.path).read_text(encoding="ascii")
@@ -143,22 +189,419 @@ def sweep_orphaned_depot_clones(clone_root: str) -> None:
             continue
         if _clone_owner_alive(record):
             continue
-        clone = os.path.join(clone_root, clone_name)
+        directory = os.path.join(root, dir_name)
         try:
-            mode = os.lstat(clone).st_mode
+            mode = os.lstat(directory).st_mode
         except FileNotFoundError:
             Path(entry.path).unlink(missing_ok=True)
             continue
         except OSError:
             continue
         if stat.S_ISDIR(mode):
-            remove_session_depot(clone)
+            try:
+                idle = time.time() - _last_modified(directory)
+            except OSError:
+                continue
+            if idle >= min_age_seconds:
+                expired.append(directory)
+    return sorted(expired)
+
+
+def sweep_orphaned_depot_clones(clone_root: str) -> None:
+    """Remove the clones in `clone_root` whose owner has died."""
+    sweep_orphaned_dirs(clone_root, "depot-")
+
+
+def remove_owned_dir(directory: str | os.PathLike) -> None:
+    """Remove an owned directory and then its owner record."""
+    shutil.rmtree(directory, ignore_errors=True)
+    Path(str(directory) + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
 
 
 def remove_session_depot(clone: str) -> None:
     """Remove a session depot clone and then its owner record."""
-    shutil.rmtree(clone, ignore_errors=True)
-    Path(clone + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
+    remove_owned_dir(clone)
+
+
+def _copy_tree(source: str, dest: str, attempts: int) -> None:
+    """`cp -a --reflink=auto source dest`, tried `attempts` times. A live
+    depot may be precompiling: a Julia process removes its temporary files,
+    and one removed between cp listing a directory and copying it fails the
+    copy. A later attempt copies the settled tree."""
+    try:
+        for attempt in range(attempts):
+            shutil.rmtree(dest, ignore_errors=True)  # cp needs the destination to not exist yet
+            if attempt:
+                time.sleep(0.2)
+            try:
+                subprocess.run(["cp", "-a", "--reflink=auto", source, dest], check=True,
+                               stdin=subprocess.DEVNULL)
+                return
+            except subprocess.CalledProcessError:
+                if attempt == attempts - 1:
+                    raise
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+# Snapshots of a prepared depot live in
+# `<depot parent>/.palette-depot-snapshots/<depot name>/snap-<sequence>`. A
+# successful prepare publishes one; no sandbox binds them, so no Julia process
+# writes them. Session clones copy the newest one while holding a shared flock
+# on its directory, and a snapshot is removed only once it is no longer the
+# newest and an exclusive flock on it succeeds without waiting. Publishing and
+# sweeping hold an exclusive flock on `.lock`. The Rust host uses the same
+# layout and locks.
+SNAPSHOT_PREFIX = "snap-"
+
+
+def depot_snapshot_root(depot: str) -> Path | None:
+    path = Path(os.path.normpath(depot))
+    if not path.name:
+        return None
+    return path.parent / ".palette-depot-snapshots" / path.name
+
+
+def _open_dir_nofollow(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _snapshot_names(root: Path) -> list[str]:
+    """The snapshot names in `root`, oldest first."""
+    names = [n for n in os.listdir(root)
+             if n.startswith(SNAPSHOT_PREFIX) and n[len(SNAPSHOT_PREFIX):].isdecimal()
+             and n[len(SNAPSHOT_PREFIX):].isascii()]
+    return sorted(names, key=lambda n: int(n[len(SNAPSHOT_PREFIX):]))
+
+
+@contextmanager
+def _hold_depot_snapshot(depot: str):
+    """Yields the newest snapshot of `depot` held under a shared flock, or
+    None when it has none."""
+    root = depot_snapshot_root(depot)
+    if root is None:
+        yield None
+        return
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            raise OSError(f"{root} is not a directory")
+    except FileNotFoundError:
+        yield None
+        return
+    # A sweep can take the chosen snapshot between listing and locking, but
+    # only after a newer one was published, so the next listing finds that.
+    for _ in range(8):
+        names = _snapshot_names(root)
+        if not names:
+            yield None
+            return
+        path = root / names[-1]
+        try:
+            fd = _open_dir_nofollow(path)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            held, named = os.fstat(fd), None
+            try:
+                named = os.lstat(path)
+            except OSError:
+                pass
+            if named is not None and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                yield path
+                return
+        finally:
+            os.close(fd)
+    raise OSError(f"the depot snapshots in {root} kept changing")
+
+
+def _snapshot_lock(root: Path) -> int:
+    return os.open(root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+
+def publish_depot_snapshot(depot: str) -> Path:
+    """Copy `depot` into a new snapshot, then sweep the older ones. Run it
+    only right after the depot was prepared, while nothing else prepares it."""
+    root = depot_snapshot_root(depot)
+    if root is None:
+        raise OSError(f"{depot} has no parent")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise OSError(f"{root} is not a directory")
+    lock = _snapshot_lock(root)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _remove_abandoned_snapshot_dirs(root)
+        names = _snapshot_names(root)
+        sequence = int(names[-1][len(SNAPSHOT_PREFIX):]) + 1 if names else 1
+        tmp = root / f"tmp-{os.urandom(4).hex()}"
+        # Prepare just finished, but a user's own Julia may share the depot.
+        _copy_tree(depot, str(tmp), DEPOT_CLONE_ATTEMPTS)
+        snapshot = root / f"{SNAPSHOT_PREFIX}{sequence:020d}"
+        try:
+            os.rename(tmp, snapshot)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        _sweep_depot_snapshots(root)
+        return snapshot
+    finally:
+        os.close(lock)
+
+
+def has_depot_snapshot(depot: str) -> bool:
+    root = depot_snapshot_root(depot)
+    try:
+        return root is not None and stat.S_ISDIR(os.lstat(root).st_mode) and bool(_snapshot_names(root))
+    except OSError:
+        return False
+
+
+def _remove_abandoned_snapshot_dirs(root: Path) -> None:
+    """A `tmp-` or `trash-` directory seen under the publish lock belongs to
+    a publish or sweep that died."""
+    for entry in os.scandir(root):
+        if entry.name.startswith(("tmp-", "trash-")) and entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _sweep_depot_snapshots(root: Path) -> None:
+    """Remove every snapshot but the newest that no clone holds. The caller
+    holds the publish lock."""
+    try:
+        names = _snapshot_names(root)[:-1]
+    except OSError:
+        return
+    for name in names:
+        try:
+            fd = _open_dir_nofollow(root / name)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        try:
+            # Renamed first, so no later clone can pick it while it is removed.
+            trash = root / f"trash-{name}"
+            os.rename(root / name, trash)
+            shutil.rmtree(trash, ignore_errors=True)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _try_sweep_depot_snapshots(depot: str) -> None:
+    """Sweep the snapshots of `depot` unless a publish or sweep is under way."""
+    root = depot_snapshot_root(depot)
+    try:
+        lock = _snapshot_lock(root)
+    except (OSError, TypeError):
+        return
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _sweep_depot_snapshots(root)
+    except OSError:
+        pass
+    finally:
+        os.close(lock)
+
+
+def receipt_retention_days(value: str | None) -> int:
+    """PALETTE_RECEIPT_RETENTION_DAYS: whole days, default 30; 0 keeps
+    receipts in the session scratch root, deleted with it."""
+    if value is None:
+        return DEFAULT_RECEIPT_RETENTION_DAYS
+    text = value.strip()
+    if not (text.isascii() and text.isdigit()) or int(text) > 36_500:
+        raise ValueError(f"PALETTE_RECEIPT_RETENTION_DAYS must be a whole number of days, got {value!r}")
+    return int(text)
+
+
+def default_receipts_root() -> tuple[Path, int] | None:
+    """Where a session's broker receipts go when the caller names no receipts
+    directory: `~/.palette/receipts/<session id>/`, kept after the session
+    closes. Once older than the retention, a later session moves them into
+    the monthly archive `~/.palette/docs/receipts/<YYYY-MM>.zip`. None when
+    the retention is 0."""
+    days = receipt_retention_days(os.environ.get("PALETTE_RECEIPT_RETENTION_DAYS"))
+    if days == 0:
+        return None
+    return Path.home() / ".palette" / "receipts", days
+
+
+def create_receipts_dir(root: str | os.PathLike, session_id: str, retention_days: float) -> Path:
+    """Create `<root>/<session id>/` for one session's receipts, after
+    archiving the receipts of closed sessions older than the retention.
+    Receipts that cannot be archived are kept, and a later session tries
+    again."""
+    root = Path(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    archive = receipt_archive_dir(root)
+    for expired in _expired_orphaned_dirs(root, "palette-", retention_days * 86_400):
+        try:
+            retire_receipts(expired, archive)
+        except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            print(f"palette-host: keeping the expired receipts {expired}: {exc}", file=sys.stderr)
+    directory = root / session_id
+    directory.mkdir(mode=0o700)
+    try:
+        record_owner(directory)
+    except BaseException:
+        directory.rmdir()
+        raise
+    return directory
+
+
+# Expired receipts are archived, not deleted: appended to
+# `~/.palette/docs/receipts/<YYYY-MM>.zip` (the UTC month of the directory's
+# last modification), named `<session dir>/<relative path>`, through a synced
+# temporary file renamed over the archive, under an exclusive lock on `.lock`
+# in the archive directory. The Rust host writes the same archive under the
+# same lock. Stored entries, no ZIP64.
+RECEIPT_ARCHIVE_LIMIT = 0xFFFFFFFF
+
+
+def receipt_archive_dir(receipts_root: str | os.PathLike) -> Path:
+    """Where expired receipts under `receipts_root` (~/.palette/receipts) are
+    archived: ~/.palette/docs/receipts."""
+    return Path(receipts_root).parent / "docs" / "receipts"
+
+
+def _receipt_files(directory: Path) -> list[tuple[str, Path]]:
+    """The regular files under `directory` as (archive name, path), sorted.
+    Symlinks and special files are refused."""
+    files: list[tuple[str, Path]] = []
+    pending = [(directory.name, directory)]
+    while pending:
+        prefix, path = pending.pop()
+        for entry in sorted(os.scandir(path), key=lambda e: e.name):
+            name = f"{prefix}/{entry.name}"
+            mode = entry.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                pending.append((name, Path(entry.path)))
+            elif stat.S_ISREG(mode):
+                files.append((name, Path(entry.path)))
+            else:
+                raise ValueError(f"refusing {entry.path}: not a regular file or directory")
+    return sorted(files)
+
+
+def _open_source(path: Path):
+    handle = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb")
+    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        handle.close()
+        raise ValueError(f"refusing {path}: not a regular file")
+    return handle
+
+
+def _crc_and_size(path: Path) -> tuple[int, int]:
+    crc, size = 0, 0
+    with _open_source(path) as handle:
+        while chunk := handle.read(1 << 16):
+            crc, size = zlib.crc32(chunk, crc), size + len(chunk)
+    return crc, size
+
+
+def _append_receipts(target: Path, directory: Path, limit: int) -> None:
+    """Append the files of `directory` to the archive `target`. Files already
+    archived with the same contents are skipped, so a retry after a crash
+    adds nothing twice."""
+    files = _receipt_files(directory)
+    try:
+        existing = os.fdopen(os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb")
+    except FileNotFoundError:
+        existing = None
+    archived: dict[str, tuple[int, int]] = {}
+    old_len = 0
+    if existing is not None:
+        with existing:
+            if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                raise ValueError(f"refusing {target}: not a regular file")
+            with zipfile.ZipFile(existing) as zf:
+                for info in zf.infolist():
+                    archived[info.filename] = (info.CRC, info.file_size)
+            old_len = os.fstat(existing.fileno()).st_size
+    fresh = []
+    for name, path in files:
+        crc, size = _crc_and_size(path)
+        if name in archived:
+            if archived[name] != (crc, size):
+                raise ValueError(f"{target} already holds a different {name}")
+            continue
+        fresh.append((name, path, size))
+    if not fresh:
+        return
+    projected = max(old_len, 22) + sum(76 + 2 * len(n.encode()) + size for n, _, size in fresh)
+    if projected > limit or len(archived) + len(fresh) >= 0xFFFF:
+        raise ValueError(f"{target} would pass 4 GiB or 65,534 entries, the limit without ZIP64")
+
+    tmp = target.parent / f".{target.name}.{os.urandom(8).hex()}.tmp"
+    out = os.fdopen(os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "r+b")
+    try:
+        with out:
+            if existing is not None:
+                with _open_source(target) as source:
+                    shutil.copyfileobj(source, out)
+                out.seek(0)
+            with zipfile.ZipFile(out, "a" if existing is not None else "w", zipfile.ZIP_STORED, allowZip64=False) as zf:
+                for name, path, size in fresh:
+                    with _open_source(path) as source:
+                        mtime = os.fstat(source.fileno()).st_mtime
+                        info = zipfile.ZipInfo(name, max(time.gmtime(mtime)[:6], (1980, 1, 1, 0, 0, 0)))
+                        info.create_system = 3
+                        info.external_attr = (os.fstat(source.fileno()).st_mode & 0xFFFF) << 16
+                        info.file_size = size
+                        with zf.open(info, "w") as member:
+                            shutil.copyfileobj(source, member)
+                    if info.file_size != size:
+                        raise ValueError(f"{path} changed while it was archived")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def retire_receipts(directory: str | os.PathLike, archive_dir: str | os.PathLike, limit: int = RECEIPT_ARCHIVE_LIMIT) -> None:
+    """Archive the expired receipts directory `directory` into `archive_dir`
+    and remove it. On any error the directory and its owner record are kept."""
+    directory, archive_dir = Path(directory), Path(archive_dir)
+    archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = os.lstat(archive_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError(f"refusing {archive_dir}: it must be a directory this user owns")
+    if info.st_mode & 0o777 != 0o700:
+        os.chmod(archive_dir, 0o700)
+    lock = os.open(archive_dir / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Another session may have archived and removed it while this one waited.
+        try:
+            if not stat.S_ISDIR(os.lstat(directory).st_mode):
+                raise ValueError(f"{directory} is not a directory")
+            os.lstat(str(directory) + CLONE_OWNER_SUFFIX)
+        except FileNotFoundError:
+            return
+        month = time.strftime("%Y-%m", time.gmtime(_last_modified(str(directory))))
+        _append_receipts(archive_dir / f"{month}.zip", directory, limit)
+        remove_owned_dir(directory)
+    finally:
+        os.close(lock)
 
 
 def resolve_real_julia_binary() -> str:
@@ -216,16 +659,77 @@ def read_task_env(path: str | None) -> dict[str, str]:
     return env
 
 
-def identity_files() -> Path:
-    """passwd and group files naming the sandbox's uid 1000, written once per host."""
-    etc = Path(tempfile.gettempdir()) / f"palette-etc-{os.getuid()}"
+def private_dir(path: str | os.PathLike) -> None:
+    """Create `path` and its parents and make it a directory only this user
+    can enter. A symlink, or a directory another user owns, is refused. The
+    broker's socket is world-connectable for the sandbox, so the directory
+    around it is what keeps other local users from reaching the broker."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise RuntimeError(f"refusing {path}: it must be a directory owned by uid {os.getuid()}")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def identity_base(runtime_dir: str | None) -> Path | None:
+    """`$XDG_RUNTIME_DIR` when it is an absolute path to a directory this
+    user owns that nobody else can enter."""
+    if not runtime_dir or not os.path.isabs(runtime_dir):
+        return None
+    try:
+        st = os.lstat(runtime_dir)
+    except OSError:
+        return None
+    if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+        return Path(runtime_dir)
+    return None
+
+
+def identity_files(base: str | Path | None = None) -> Path:
+    """passwd and group files naming the sandbox's uid 1000, written once per host.
+
+    They go in the user's private runtime directory when there is one, where
+    no other user can claim the name first, and in the temp directory otherwise.
+
+    The directory lives in a shared temp dir under a predictable name, so it
+    is trusted only if this user owns it, it is a real directory (not a
+    symlink), and nobody else can write to it. Otherwise another local user
+    could pre-create it and choose the sandbox's passwd, or plant a symlink
+    where the temp file is written.
+    """
+    uid = os.getuid()
+    base = base or identity_base(os.environ.get("XDG_RUNTIME_DIR")) or tempfile.gettempdir()
+    etc = Path(base) / f"palette-etc-{uid}"
+    try:
+        os.mkdir(etc, 0o755)
+    except FileExistsError:
+        pass
+    st = os.lstat(etc)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        raise RuntimeError(
+            f"refusing sandbox identity dir {etc}: it must be a directory owned by uid {uid} "
+            "and writable only by its owner")
     passwd = f"{SANDBOX_USER}:x:1000:1000:Palette sandbox:/run/palette/home:/bin/bash\n"
     group = f"{SANDBOX_USER}:x:1000:\n"
-    if not (etc / "passwd").is_file() or (etc / "passwd").read_text() != passwd:
-        etc.mkdir(mode=0o755, exist_ok=True)
+
+    def current(name: str) -> str | None:
+        try:
+            return (etc / name).read_text()
+        except OSError:
+            return None
+
+    if current("passwd") != passwd or current("group") != group:
         for name, text in (("passwd", passwd), ("group", group)):
             tmp = etc / f".{name}.{os.getpid()}"
-            tmp.write_text(text)
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
             os.chmod(tmp, 0o644)
             os.replace(tmp, etc / name)
     return etc
@@ -270,6 +774,11 @@ def build_bwrap_argv(
     read_roots = parse_read_roots(os.environ.get("PALETTE_READ_ROOTS"))
     require_read_roots(read_roots, writable, protected + ["/tmp", "/run"])
 
+    # Every bind source is the resolved path, not the raw string: a symlink
+    # swapped in after the checks above cannot redirect a mount. Guest-side
+    # targets keep their configured paths.
+    real = os.path.realpath
+
     argv = [
         "bwrap",
         "--unshare-user", "--uid", "1000", "--gid", "1000",
@@ -308,7 +817,7 @@ def build_bwrap_argv(
         "--symlink", "usr/bin", "/bin",
         "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
         # julia toolchain -- read-only
-        "--ro-bind", julia_toolchain_dir, julia_toolchain_dir,
+        "--ro-bind", real(julia_toolchain_dir), julia_toolchain_dir,
         # depot -- bound WRITABLE, at the depot's own real path (package
         # source paths are baked into precompiled caches as absolutes, so
         # the guest path must match, not just the content). The source is
@@ -317,30 +826,30 @@ def build_bwrap_argv(
         # JULIA_DEPOT_PATH build-id cascade below, without handing the
         # worker write access to every other session's cache. The separate
         # operator package store, when configured, follows read-only.
-        "--bind", depot_clone_dir or julia_depot, julia_depot,
+        "--bind", real(depot_clone_dir or julia_depot), julia_depot,
         # this repo's source (the Palette package) -- read-only, worker cannot modify it
-        "--ro-bind", repo_dir, repo_dir,
+        "--ro-bind", real(repo_dir), repo_dir,
         # the dev project (Project.toml/Manifest.toml naming Palette + IJulia + deps) -- read-only
-        "--ro-bind", project_dir, project_dir,
+        "--ro-bind", real(project_dir), project_dir,
         # bounded, writable workspace -- the sandbox-local effect envelope
         "--bind", workspace_dir, workspace_dir,
     ]
     if package_store_root:
         # Provisioned package sources and the broker-managed environment are
         # host-owned data. Workers can import them but cannot mutate them.
-        argv += ["--ro-bind", package_store_root, package_store_root]
+        argv += ["--ro-bind", real(package_store_root), package_store_root]
     # A benchmark runner can supply the task's own tools (the task image's
     # interpreter, bun, ...) as one read-only directory; it is mounted at the
     # same path and put first on PATH, as it is for every other contestant.
     if task_tools:
-        argv += ["--ro-bind", task_tools, task_tools]
+        argv += ["--ro-bind", real(task_tools), task_tools]
     for path in extra_ro_binds or []:
-        argv += ["--ro-bind", path, path]
+        argv += ["--ro-bind", real(path), path]
     # Host directories the operator lets the kernel read (PALETTE_READ_ROOTS).
     for path in read_roots:
         argv += ["--ro-bind", path, path]
     if broker_socket_dir:
-        argv += ["--ro-bind", broker_socket_dir, broker_socket_dir]
+        argv += ["--ro-bind", real(broker_socket_dir), broker_socket_dir]
     # A user the sandbox's uid resolves to: whoami, initdb, ssh and git's
     # identity lookups failed without one.
     etc = identity_files()
@@ -566,7 +1075,9 @@ def package_store_paths(
     from provisioning import operator_ceiling, protected_host_paths
     frozen_ceiling = operator_ceiling() if ceiling is None else ceiling
     protected = set(protected_host_paths(frozen_ceiling, include_package_depot=False))
-    protected.update(Path(p).expanduser().resolve(strict=False) for p in protected_paths)
+    # An empty or absent entry names nothing. Path("").resolve() is the cwd,
+    # which would make the overlap check depend on where the host started.
+    protected.update(Path(p).expanduser().resolve(strict=False) for p in protected_paths if p)
     protected.add(Path(__file__).resolve().parents[2])
     for item in protected:
         if path == item or path in item.parents or item in path.parents:
@@ -631,12 +1142,20 @@ def package_store_paths(
 
 def create_session_depot(real_depot: str | None = None, clone_root: str | None = None) -> str:
     """Create the private writable prewarmed depot used for worker caches.
-    Callers release it with remove_session_depot."""
+    The clone comes from the newest snapshot of the depot when one exists,
+    otherwise from the live depot. Callers release it with
+    remove_session_depot."""
     depot = real_depot or default_depot()
     root = clone_root or str(Path(depot).parent / ".palette-depot-clones")
     Path(root).mkdir(parents=True, exist_ok=True)
     sweep_orphaned_depot_clones(root)
-    return _clone_depot(depot, root)
+    with _hold_depot_snapshot(depot) as snapshot:
+        if snapshot is None:
+            return _clone_depot(depot, root)
+        # Nothing writes a snapshot, so one attempt copies it or fails for real.
+        clone = _clone_depot(depot, root, source=str(snapshot), attempts=1)
+    _try_sweep_depot_snapshots(depot)
+    return clone
 
 
 def run_worker(
@@ -659,7 +1178,7 @@ def run_worker(
     depot = julia_depot or default_depot()
     if package_store_root is None and package_depot_dir is None and package_environment_dir is None:
         package_store_root, package_depot_dir, package_environment_dir = package_store_paths(
-            protected_paths=[workspace_dir, project_dir, repo_dir, broker_socket_dir or ""])
+            protected_paths=[p for p in (workspace_dir, project_dir, repo_dir, broker_socket_dir) if p])
     Path(workspace_dir).mkdir(parents=True, exist_ok=True)
 
     # A session owner can reuse its private writable clone for warm worker

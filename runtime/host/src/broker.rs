@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use std::time::Duration;
 /// process that owns the session, never by a request.
 pub type HostBridge = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>;
 
+#[derive(Debug)]
 enum Fail {
     /// A policy decision.
     Denied(String),
@@ -133,11 +134,14 @@ pub struct Broker {
     ceiling: Value,
     receipt_log_path: PathBuf,
     session_id: String,
+    // external_fs_write's allowed_dirs, resolved once when the broker starts.
+    write_roots: Vec<PathBuf>,
     // Trusted paths fixed when the session starts; never taken from a request.
     package_depot_dir: Option<String>,
     package_environment_dir: Option<String>,
     project_dir: Option<String>,
     repo_dir: Option<String>,
+    trusted_files: Vec<PathBuf>,
     child_timeout: Duration,
     host_bridge: Mutex<Option<HostBridge>>,
     log_lock: Mutex<()>,
@@ -160,7 +164,112 @@ pub struct BrokerConfig {
     pub package_environment_dir: Option<String>,
     pub project_dir: Option<String>,
     pub repo_dir: Option<String>,
+    /// Host files this broker was configured from, such as a ceiling file
+    /// given on the command line. Protected like the operator's config files.
+    pub trusted_files: Vec<PathBuf>,
     pub child_timeout: Duration,
+}
+
+/// The host the HTTP client will connect to, in the form `allowed_hosts`
+/// entries are written: a lowercase domain, a dotted IPv4 address, or an IPv6
+/// address without brackets. Empty when the URL has no host.
+fn allowlist_host(u: &url::Url) -> String {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(a)) => a.to_string(),
+        Some(url::Host::Ipv6(a)) => a.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Writes `content` to `target`, which the caller has checked lies under
+/// `root`, without following a symlink anywhere on the path. The checked
+/// path is fully resolved, so a symlink met here was put there after the
+/// check, by whoever else can write the allowed directory; the write is
+/// refused instead of landing wherever it points.
+fn write_beneath(root: &Path, target: &Path, content: &[u8]) -> Result<(), Fail> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let rel = target.strip_prefix(root).map_err(|_| Internal(format!("{} is not under {}", target.display(), root.display())))?;
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(Internal(format!("{} is a directory", target.display())));
+    };
+    let cstr = |p: &std::ffi::OsStr| CString::new(p.as_bytes()).map_err(|e| Internal(e.to_string()));
+    let open_at = |dir: libc::c_int, p: &CString, flags: libc::c_int, mode: libc::c_uint| -> std::io::Result<OwnedFd> {
+        let fd = unsafe { libc::openat(dir, p.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
+        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    };
+    let refused = |e: std::io::Error, what: &Path| match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => Denied(format!("refusing to write through a symlink at {}", what.display())),
+        _ => Internal(format!("{}: {e}", what.display())),
+    };
+    // The root was resolved when the broker started, so the walk starts at
+    // `/` and follows no symlink on the way to it either: an allowed
+    // directory swapped for a symlink later, by a worker that can write
+    // where it lives, is refused instead of redirecting the write.
+    let mut fd = open_at(libc::AT_FDCWD, &cstr(std::ffi::OsStr::new("/"))?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        .map_err(|e| Internal(format!("/: {e}")))?;
+    let mut here = PathBuf::from("/");
+    let above: Vec<&std::ffi::OsStr> = root.components().filter_map(|c| match c {
+        std::path::Component::Normal(n) => Some(n),
+        _ => None,
+    }).collect();
+    for part in above.iter().chain(dirs.iter()) {
+        here.push(part);
+        let c = cstr(part)?;
+        let next = match open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if unsafe { libc::mkdirat(fd.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != ErrorKind::AlreadyExists {
+                        return Err(Internal(format!("{}: {e}", here.display())));
+                    }
+                }
+                open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+            }
+            other => other,
+        };
+        fd = next.map_err(|e| refused(e, &here))?;
+    }
+    let file = open_at(fd.as_raw_fd(), &cstr(name)?, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
+        .map_err(|e| refused(e, target))?;
+    fs::File::from(file).write_all(content).map_err(|e| Internal(format!("{}: {e}", target.display())))
+}
+
+/// external_fs_write's allowed_dirs, resolved once, when the broker starts.
+/// Each request is checked against these paths and walked to without
+/// following a symlink, so a directory that a worker can replace (one inside
+/// its workspace, say) cannot be turned into a symlink that moves the root.
+/// An allowed_dir may not reach a path the host trusts: the receipt log, the
+/// Palette checkout, the package store, the operator's config files and the
+/// host command paths. A write there would let the agent erase its receipts
+/// or widen its own next ceiling.
+fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
+    let cap = c.ceiling.get("external_fs_write").map(obj).unwrap_or_default();
+    let roots: Vec<PathBuf> = str_list(cap.get("allowed_dirs")).unwrap_or_default().iter()
+        .map(|d| util::resolve(Path::new(d))).collect();
+    if roots.is_empty() {
+        return Ok(roots);
+    }
+    let mut protected = vec![c.receipt_log_path.clone()];
+    protected.extend(c.repo_dir.iter().map(PathBuf::from));
+    protected.extend(c.package_depot_dir.as_deref().and_then(|d| Path::new(d).parent()).map(Path::to_path_buf));
+    protected.extend(util::installed_checkout());
+    protected.extend(c.trusted_files.iter().cloned());
+    for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR", "PALETTE_PACKAGE_DEPOT"] {
+        if let Ok(path) = std::env::var(key) {
+            if !path.is_empty() { protected.push(PathBuf::from(path)); }
+        }
+    }
+    protected.extend(sandbox::protected_command_paths(&c.ceiling));
+    for root in &roots {
+        if let Some(hit) = sandbox::protected_overlap(root, &protected) {
+            return Err(format!("external_fs_write allowed_dir {} overlaps the protected host path {}", root.display(), hit.display()));
+        }
+    }
+    Ok(roots)
 }
 
 impl Broker {
@@ -168,14 +277,21 @@ impl Broker {
         if let Some(parent) = c.receipt_log_path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        // A broker that cannot keep receipts must not start: every answer it
+        // gives is supposed to leave one.
+        OpenOptions::new().create(true).append(true).open(&c.receipt_log_path)
+            .map_err(|e| format!("cannot open the receipt log {}: {e}", c.receipt_log_path.display()))?;
+        let write_roots = write_roots(&c)?;
         Ok(Broker {
             ceiling: c.ceiling,
             receipt_log_path: c.receipt_log_path,
             session_id: c.session_id,
+            write_roots,
             package_depot_dir: c.package_depot_dir,
             package_environment_dir: c.package_environment_dir,
             project_dir: c.project_dir,
             repo_dir: c.repo_dir,
+            trusted_files: c.trusted_files,
             child_timeout: c.child_timeout,
             host_bridge: Mutex::new(None),
             log_lock: Mutex::new(()),
@@ -205,14 +321,11 @@ impl Broker {
             return Err(Internal("internal error handling request (not a policy denial): embedded null byte".into()));
         }
         let target = util::resolve(Path::new(path));
-        let allowed: Vec<PathBuf> = dirs.iter().map(|d| util::resolve(Path::new(d))).collect();
-        if !allowed.iter().any(|a| util::within(&target, a)) {
-            return Err(Denied(format!("path {} is outside the ceiling's allowed_dirs {}", target.display(), qpaths(&allowed))));
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| Internal(e.to_string()))?;
-        }
-        fs::write(&target, content).map_err(|e| Internal(e.to_string()))?;
+        let allowed = &self.write_roots;
+        let Some(root) = allowed.iter().find(|a| util::within(&target, a)) else {
+            return Err(Denied(format!("path {} is outside the ceiling's allowed_dirs {}", target.display(), qpaths(allowed))));
+        };
+        write_beneath(root, &target, content.as_bytes())?;
         Ok(json!({"path": target.to_string_lossy(), "bytes_written": content.len()}))
     }
 
@@ -224,28 +337,30 @@ impl Broker {
         let Some(url) = p.get("url").and_then(Value::as_str) else {
             return Err(Denied("network_access requires a string 'url'".into()));
         };
+        // Parse once, with the same WHATWG parser the HTTP client uses, and
+        // request exactly the parsed URL. A hand-written host split disagrees
+        // with that parser on inputs like `http://a\@b/` (the client treats
+        // the backslash as a path separator and connects to `a`), so the host
+        // that was checked must be the host that is connected to.
+        let parsed = url::Url::parse(url).map_err(|e| Denied(format!("network_access could not parse URL {}: {e}", q(url))))?;
         // A scheme allowlist: a network grant must not double as a host file read (file://).
-        let (scheme, rest) = url.split_once("://").unwrap_or(("", ""));
-        let scheme = scheme.to_ascii_lowercase();
+        let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
-            return Err(Denied(format!("network_access only permits http/https URLs, got scheme {}", q(&scheme))));
+            return Err(Denied(format!("network_access only permits http/https URLs, got scheme {}", q(scheme))));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Denied("network_access does not permit credentials (user@) in the URL".into()));
         }
         if let Some(hosts) = str_list(cap.get("allowed_hosts")) {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let hostport = authority.rsplit('@').next().unwrap_or("");
-            let host = if let Some(h) = hostport.strip_prefix('[') {
-                h.split(']').next().unwrap_or("").to_ascii_lowercase()
-            } else {
-                hostport.split(':').next().unwrap_or("").to_ascii_lowercase()
-            };
-            if !hosts.contains(&host) {
+            let host = allowlist_host(&parsed);
+            if !hosts.iter().any(|h| h.to_ascii_lowercase() == host) {
                 return Err(Denied(format!("host {host} is not in this session's allowed_hosts {}", ql(&hosts))));
             }
         }
         // No redirect-following: a redirect target is a URL the allowlist was
         // never asked about. A 3xx comes back as data.
         let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(5)).build();
-        let resp = match agent.get(url).call() {
+        let resp = match agent.request_url("GET", &parsed).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
             Err(e) => return Err(Internal(format!("internal error handling request (not a policy denial): {e}"))),
@@ -293,6 +408,7 @@ impl Broker {
         for path in [&self.project_dir, &self.repo_dir].into_iter().flatten() {
             protected_paths.push(PathBuf::from(path));
         }
+        protected_paths.extend(self.trusted_files.iter().cloned());
         for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT"] {
             if let Ok(path) = std::env::var(key) {
                 if !path.is_empty() { protected_paths.push(PathBuf::from(path)); }
@@ -330,6 +446,12 @@ impl Broker {
         if !ok {
             return Err(Denied(format!("requested child ceiling is not a subset of this session's ceiling: {reason}")));
         }
+        // The subset check resolves both ceilings now; a child's directory must
+        // also lie within this broker's roots as they resolved at start.
+        let child_dirs = str_list(requested.get("external_fs_write").and_then(|c| c.get("allowed_dirs"))).unwrap_or_default();
+        if let Some(d) = child_dirs.iter().map(|d| util::resolve(Path::new(d))).find(|d| !self.write_roots.iter().any(|r| util::within(d, r))) {
+            return Err(Denied(format!("requested external_fs_write dir {} is not within this session's allowed_dirs {}", d.display(), qpaths(&self.write_roots))));
+        }
         let (Some(project), Some(repo)) = (&self.project_dir, &self.repo_dir) else {
             return Err(Denied("no session project/repo is configured for this broker -- spawn_child_worker requires one".into()));
         };
@@ -352,6 +474,7 @@ impl Broker {
                 package_environment_dir: self.package_environment_dir.clone(),
                 project_dir: Some(project.clone()),
                 repo_dir: Some(repo.clone()),
+                trusted_files: self.trusted_files.clone(),
                 child_timeout: Duration::from_secs(90),
             }).map_err(Internal)?);
             let server = serve(&sock_dir.join("broker.sock"), child).map_err(Internal)?;
@@ -410,7 +533,7 @@ impl Broker {
         }
     }
 
-    /// Digest files with host privilege -- the independent eye (FM-SLICE-A2b),
+    /// Digest files with host privilege, as a check the sandbox cannot forge,
     /// mirroring runtime/security/broker.py's _handle_fs_digest: a digest computed
     /// inside the sandbox is the kernel grading its own writes, so this reads
     /// the requested paths OUTSIDE the sandbox, on the host, and the request
@@ -569,7 +692,13 @@ impl Broker {
                 (false, Value::Null, json!(r))
             }
         };
-        self.write_receipt(&req_id, &category, &params, approved, &result, &reason);
+        if let Err(e) = self.write_receipt(&req_id, &category, &params, approved, &result, &reason) {
+            // Fail closed, as the Python broker does: no result leaves the
+            // broker without its receipt. The effect may already have happened,
+            // so the operator hears about it as well as the worker.
+            eprintln!("palette-host: receipt for request {req_id} not recorded: {e}");
+            return json!({"id": req_id, "approved": false, "reason": format!("broker error: receipt not recorded: {e}")});
+        }
         let mut resp = json!({"id": req_id, "approved": approved});
         if approved {
             resp["result"] = result;
@@ -579,16 +708,16 @@ impl Broker {
         resp
     }
 
-    fn write_receipt(&self, req_id: &Value, category: &Value, params: &Value, approved: bool, result: &Value, reason: &Value) {
+    fn write_receipt(&self, req_id: &Value, category: &Value, params: &Value, approved: bool, result: &Value, reason: &Value)
+        -> std::io::Result<()> {
         let receipt = json!({
             "receipt_id": util::uuid4(), "request_id": req_id, "session_id": self.session_id,
             "timestamp": util::now_secs(), "category": category, "params": params,
             "approved": approved, "result": result, "reason": reason,
         });
         let _g = self.log_lock.lock().unwrap();
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.receipt_log_path) {
-            let _ = writeln!(f, "{receipt}");
-        }
+        let mut f = OpenOptions::new().create(true).append(true).open(&self.receipt_log_path)?;
+        writeln!(f, "{receipt}")
     }
 }
 
@@ -656,6 +785,27 @@ fn py_repr(v: &Value) -> String {
 /// A worker holding unbounded power inside its sandbox is still an untrusted
 /// client of this host process: an unterminated stream must not buffer forever.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
+/// How many connections the broker serves at once. Each one holds a host
+/// thread, so an idle or flooding worker must not be able to hold them all.
+/// Nested child workers each hold one while they run, well below this.
+const MAX_CONNECTIONS: usize = 64;
+/// How long a connection may take to send its request line, and the
+/// broker to send its reply. Handling the request itself is not limited.
+const CONN_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Holds one of the MAX_CONNECTIONS slots until dropped.
+struct ConnSlot(Arc<AtomicUsize>);
+impl ConnSlot {
+    fn take(active: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        active.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).ok()?;
+        Some(ConnSlot(active.clone()))
+    }
+}
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub struct BrokerServer {
     path: PathBuf,
@@ -693,14 +843,24 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
     fs::set_permissions(sock_path, fs::Permissions::from_mode(0o666)).map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let active = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for conn in listener.incoming() {
             if stop2.load(Ordering::SeqCst) {
                 break;
             }
-            let Ok(conn) = conn else { continue };
+            let Ok(mut conn) = conn else { continue };
+            let _ = conn.set_read_timeout(Some(CONN_IO_TIMEOUT));
+            let _ = conn.set_write_timeout(Some(CONN_IO_TIMEOUT));
+            let Some(slot) = ConnSlot::take(&active) else {
+                let _ = writeln!(conn, "{}", json!({"approved": false, "reason": "broker busy: too many open connections"}));
+                continue;
+            };
             let b = broker.clone();
-            std::thread::spawn(move || handle_conn(conn, &b));
+            std::thread::spawn(move || {
+                let _slot = slot;
+                handle_conn(conn, &b)
+            });
         }
     });
     Ok(BrokerServer { path: sock_path.to_path_buf(), stop, thread: Some(thread) })
@@ -729,7 +889,7 @@ fn handle_conn(conn: UnixStream, broker: &Broker) {
 }
 
 // The host's first Rust test module: the fs_digest parity suite, mirroring
-// runtime/security/test_fs_digest.py check-for-check (FM-SLICE-A2b), plus the 64-path
+// runtime/security/test_fs_digest.py check-for-check, plus the 64-path
 // cap. Direct Broker construction -- no sockets.
 #[cfg(test)]
 mod tests {
@@ -757,6 +917,7 @@ mod tests {
             package_environment_dir: None,
             project_dir: None,
             repo_dir: None,
+            trusted_files: vec![],
             child_timeout: Duration::from_secs(90),
         })
         .unwrap()
@@ -772,13 +933,108 @@ mod tests {
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    fn net_req(url: &str) -> Value {
+        json!({"category": "network_access", "params": {"url": url}})
+    }
+
+    /// A loopback listener that is never served: any connection to it means the
+    /// broker connected somewhere the allowlist did not approve.
+    fn idle_listener() -> (std::net::TcpListener, u16) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        (l, port)
+    }
+
+    fn assert_no_connection(l: &std::net::TcpListener) {
+        match l.accept() {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            other => panic!("broker connected to a host outside allowed_hosts: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_backslash_userinfo_cannot_smuggle_a_host() {
+        // Regression: the old hand split read this as host allowed.example,
+        // while the HTTP client connected to 127.0.0.1.
+        let t = tmpdir("net-bs");
+        let (l, port) = idle_listener();
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["allowed.example"]}}), &t.0.join("receipts.jsonl"));
+        for url in [
+            format!("http://127.0.0.1:{port}\\@allowed.example/"),
+            format!("http://127.0.0.1:{port}\\allowed.example/"),
+            format!("http://allowed.example@127.0.0.1:{port}/"),
+            format!("http://allowed.example:x@127.0.0.1:{port}/"),
+            format!("http://127.0.0.1:{port}#@allowed.example/"),
+            format!("http://127.0.0.1:{port}?@allowed.example/"),
+            format!("HTTP://127.0.0.1:{port}\\@allowed.example/"),
+        ] {
+            let resp = b.handle_request(&net_req(&url));
+            assert_eq!(resp["approved"], json!(false), "{url} was approved: {resp}");
+        }
+        assert_no_connection(&l);
+    }
+
+    #[test]
+    fn network_userinfo_is_denied_even_for_an_allowed_host() {
+        let t = tmpdir("net-ui");
+        let (l, port) = idle_listener();
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["127.0.0.1"]}}), &t.0.join("receipts.jsonl"));
+        let resp = b.handle_request(&net_req(&format!("http://user@127.0.0.1:{port}/")));
+        assert_eq!(resp["approved"], json!(false));
+        assert!(resp["reason"].as_str().unwrap().contains("credentials"), "{resp}");
+        assert_no_connection(&l);
+    }
+
+    #[test]
+    fn network_non_http_schemes_and_garbage_are_denied() {
+        let t = tmpdir("net-scheme");
+        let b = broker(json!({"network_access": {"allowed": true}}), &t.0.join("receipts.jsonl"));
+        for url in ["file:///etc/passwd", "ftp://allowed.example/", "not a url", "http//allowed.example"] {
+            let resp = b.handle_request(&net_req(url));
+            assert_eq!(resp["approved"], json!(false), "{url} was approved: {resp}");
+        }
+    }
+
+    #[test]
+    fn network_allowed_host_is_the_host_connected_to() {
+        use std::io::Write as _;
+        let t = tmpdir("net-ok");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = c.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
+            req
+        });
+        // Mixed case in both the ceiling and the URL still matches.
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["LocalHost", "127.0.0.1"]}}), &t.0.join("receipts.jsonl"));
+        let resp = b.handle_request(&net_req(&format!("http://127.0.0.1:{port}/probe")));
+        assert_eq!(resp["approved"], json!(true), "{resp}");
+        assert_eq!(resp["result"]["status"], json!(200));
+        assert_eq!(resp["result"]["body_prefix"], json!("hello"));
+        assert!(server.join().unwrap().starts_with("GET /probe "));
+    }
+
+    #[test]
+    fn allowlist_host_normalises_like_the_client() {
+        let h = |s: &str| allowlist_host(&url::Url::parse(s).unwrap());
+        assert_eq!(h("http://Allowed.Example/x"), "allowed.example");
+        assert_eq!(h("http://evil.example\\@allowed.example/"), "evil.example");
+        assert_eq!(h("http://[::1]:8080/"), "::1");
+        assert_eq!(h("http://0x7f000001/"), "127.0.0.1");
+    }
+
     #[test]
     fn digest_correct_for_files() {
         let t = tmpdir("ok");
         let dir = t.0.join("scoped");
         fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("a.txt");
-        fs::write(&f1, b"hello fm-slice-a2b\n").unwrap();
+        fs::write(&f1, b"hello digest\n").unwrap();
         let f2 = dir.join("b.bin");
         let big: Vec<u8> = (0..=255u8).cycle().take(256 * 100).collect();
         fs::write(&f2, &big).unwrap();
@@ -884,6 +1140,155 @@ mod tests {
     }
 
     #[test]
+    fn idle_connections_cannot_hold_every_broker_thread() {
+        let t = tmpdir("conn-cap");
+        let sock = t.0.join("b.sock");
+        let server = serve(&sock, Arc::new(broker(json!({}), &t.0.join("receipts.jsonl")))).unwrap();
+        // Fill every slot with a connection that never sends a request.
+        let idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let busy = loop {
+            let mut extra = UnixStream::connect(&sock).unwrap();
+            extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = writeln!(extra, "{}", json!({"id": "x", "category": "nope"}));
+            let mut reply = String::new();
+            let _ = BufReader::new(extra).read_line(&mut reply);
+            if reply.contains("broker busy") || std::time::Instant::now() > deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(busy.contains("broker busy"), "connection past the cap was served: {busy:?}");
+        // Freeing a slot lets the next request through.
+        drop(idle);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let served = loop {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+            let mut reply = String::new();
+            BufReader::new(c).read_line(&mut reply).unwrap();
+            if reply.contains("unknown capability") || std::time::Instant::now() > deadline {
+                break reply;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(served.contains("unknown capability"), "{served:?}");
+        server.shutdown();
+    }
+
+    #[test]
+    fn external_fs_write_never_follows_a_symlink_swapped_in_after_the_check() {
+        let t = tmpdir("fs-write");
+        let allowed = t.0.join("allowed");
+        let outside = t.0.join("outside");
+        fs::create_dir_all(allowed.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let root = util::resolve(&allowed);
+        // An ordinary write, creating a missing directory on the way.
+        write_beneath(&root, &root.join("new/dir/f.txt"), b"ok").unwrap();
+        assert_eq!(fs::read_to_string(allowed.join("new/dir/f.txt")).unwrap(), "ok");
+        // The path was checked while sub/ was a directory and f.txt absent;
+        // then each was swapped for a symlink out of the allowed dir.
+        std::os::unix::fs::symlink(outside.join("victim"), allowed.join("sub/f.txt")).unwrap();
+        let e = write_beneath(&root, &root.join("sub/f.txt"), b"x").unwrap_err();
+        assert!(matches!(e, Denied(ref r) if r.contains("symlink")), "{e:?}");
+        fs::remove_dir_all(allowed.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("sub")).unwrap();
+        let e = write_beneath(&root, &root.join("sub/f.txt"), b"x").unwrap_err();
+        assert!(matches!(e, Denied(ref r) if r.contains("symlink")), "{e:?}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "a write escaped the allowed dir");
+    }
+
+    #[test]
+    fn allowed_dirs_are_pinned_at_start_and_kept_off_trusted_paths() {
+        let t = tmpdir("fs-write-pin");
+        let receipts = t.0.join("receipts/receipts.jsonl");
+        let allowed = t.0.join("allowed");
+        let later = t.0.join("later");
+        let outside = t.0.join("outside");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let ceiling = json!({"external_fs_write": {"allowed_dirs": [allowed.to_str().unwrap(), later.to_str().unwrap()]}});
+        let b = broker(ceiling, &receipts);
+        let write = |path: &Path| b.handle_request(&json!({"category": "external_fs_write",
+            "params": {"path": path.to_str().unwrap(), "content": "x"}}));
+        assert_eq!(write(&allowed.join("a.txt"))["approved"], json!(true));
+        // A worker that can write where the allowed dirs live swaps one for a
+        // symlink, and creates the other (missing at start) as one.
+        fs::remove_dir_all(&allowed).unwrap();
+        std::os::unix::fs::symlink(&outside, &allowed).unwrap();
+        std::os::unix::fs::symlink(&outside, &later).unwrap();
+        for path in [allowed.join("b.txt"), later.join("c.txt")] {
+            let r = write(&path);
+            assert_eq!(r["approved"], json!(false), "{r}");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "a write followed a swapped-in symlink");
+        // An allowed dir that reaches the receipt log never starts a broker.
+        let e = Broker::new(BrokerConfig {
+            ceiling: json!({"external_fs_write": {"allowed_dirs": [t.0.to_str().unwrap()]}}),
+            receipt_log_path: receipts.clone(),
+            session_id: "test".into(),
+            package_depot_dir: None,
+            package_environment_dir: None,
+            project_dir: None,
+            repo_dir: None,
+            trusted_files: vec![],
+            child_timeout: Duration::from_secs(90),
+        }).err().expect("an allowed_dir holding the receipt log was accepted");
+        assert!(e.contains("overlaps the protected host path"), "{e}");
+    }
+
+    #[test]
+    fn a_receipt_that_cannot_be_written_denies_the_request() {
+        let t = tmpdir("receipt-fail");
+        let receipts = t.0.join("receipts.jsonl");
+        let dir = t.0.join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f"), "x").unwrap();
+        let b = broker(json!({"fs_digest": {"allowed_paths": [dir.to_str().unwrap()]}}), &receipts);
+        // Replace the log with a directory: opening it for append now fails.
+        fs::remove_file(&receipts).unwrap();
+        fs::create_dir(&receipts).unwrap();
+        let r = b.handle_request(&digest_req(&[dir.join("f").to_str().unwrap()]));
+        assert_eq!(r["approved"], json!(false), "{r}");
+        assert!(r["reason"].as_str().unwrap().contains("receipt not recorded"), "{r}");
+        assert!(r.get("result").is_none(), "a result left without its receipt: {r}");
+    }
+
+    #[test]
+    fn a_broker_that_cannot_open_its_receipt_log_does_not_start() {
+        let t = tmpdir("receipt-open");
+        let receipts = t.0.join("receipts.jsonl");
+        fs::create_dir(&receipts).unwrap();
+        let e = Broker::new(BrokerConfig {
+            ceiling: json!({}), receipt_log_path: receipts, session_id: "s".into(),
+            package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
+            trusted_files: vec![], child_timeout: Duration::from_secs(5),
+        }).err().expect("broker started without a receipt log");
+        assert!(e.contains("receipt log"), "{e}");
+    }
+
+    #[test]
+    fn an_allowed_dir_that_reaches_the_ceiling_file_never_starts() {
+        // A ceiling read from a file given on the command line is as trusted
+        // as PALETTE_CAPABILITY_CEILING: a write there widens the next ceiling.
+        let t = tmpdir("ceiling-file");
+        let config = t.0.join("config");
+        fs::create_dir(&config).unwrap();
+        let ceiling_file = config.join("ceiling.json");
+        fs::write(&ceiling_file, "{}").unwrap();
+        let start = |trusted: Vec<PathBuf>| Broker::new(BrokerConfig {
+            ceiling: json!({"external_fs_write": {"allowed_dirs": [config.to_str().unwrap()]}}),
+            receipt_log_path: t.0.join("receipts").join("receipts.jsonl"), session_id: "s".into(),
+            package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
+            trusted_files: trusted, child_timeout: Duration::from_secs(5),
+        });
+        assert!(start(vec![]).is_ok(), "the allowed dir alone should be accepted");
+        let e = start(vec![ceiling_file.clone()]).err().expect("an allowed_dir holding the ceiling file was accepted");
+        assert!(e.contains("overlaps the protected host path") && e.contains("ceiling.json"), "{e}");
+    }
+
+    #[test]
     fn receipt_written_regardless_of_outcome() {
         let t = tmpdir("receipt");
         let receipts = t.0.join("receipts.jsonl");
@@ -916,6 +1321,20 @@ mod tests {
     }
 
     /// Gone, or a zombie waiting for init: no longer running either way.
+    /// The pid a test command wrote, waiting for it: a fixed sleep raced the
+    /// shell under load and read a file that did not exist yet.
+    fn wait_for_pid(path: &Path) -> String {
+        for _ in 0..500 {
+            if let Ok(text) = fs::read_to_string(path) {
+                if text.ends_with('\n') {
+                    return text.trim().to_string();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{} was never written", path.display());
+    }
+
     fn pid_dead(pid: &str) -> bool {
         for _ in 0..100 {
             match fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -974,14 +1393,14 @@ mod tests {
         let d = tmpdir("hostcmd-timeout");
         let dir = d.0.to_string_lossy().into_owned();
         let b = cmd_broker(&d.0, json!({
-            "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": dir, "timeout_s": 0.5},
+            "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": dir, "timeout_s": 2.0},
         }));
         let started = std::time::Instant::now();
         let r = cmd(&b, json!({"name": "hang"}));
         assert_eq!(r["result"]["timed_out"], json!(true), "{r}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let helper = fs::read_to_string(d.0.join("helper.pid")).unwrap();
-        assert!(pid_dead(helper.trim()), "the backgrounded helper outlived the timeout");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let helper = wait_for_pid(&d.0.join("helper.pid"));
+        assert!(pid_dead(&helper), "the backgrounded helper outlived the timeout");
     }
 
     #[test]
@@ -1010,17 +1429,23 @@ mod tests {
         let id = r["result"]["job"].as_str().unwrap().to_string();
         assert_eq!(r["result"]["running"], json!(true));
         assert_eq!(cmd(&b, json!({"action": "poll", "job": id}))["result"]["running"], json!(true));
-        std::thread::sleep(Duration::from_millis(700));
-        let r = cmd(&b, json!({"action": "poll", "job": id}));
+        // Poll until the job finishes; a fixed sleep raced the job under load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let r = loop {
+            let r = cmd(&b, json!({"action": "poll", "job": id}));
+            if r["result"]["running"] != json!(true) || std::time::Instant::now() > deadline {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_eq!(r["result"]["running"], json!(false), "{r}");
         assert_eq!(r["result"]["stdout"], json!("done\n"));
         assert!(cmd(&b, json!({"action": "poll", "job": id}))["reason"].as_str().unwrap().contains("no running"));
         // A session that ends kills the jobs it started.
         cmd(&b, json!({"name": "long", "action": "start"}));
-        std::thread::sleep(Duration::from_millis(200));
-        let helper = fs::read_to_string(d.0.join("long.pid")).unwrap();
+        let helper = wait_for_pid(&d.0.join("long.pid"));
         drop(b);
-        assert!(pid_dead(helper.trim()), "a job outlived its session");
+        assert!(pid_dead(&helper), "a job outlived its session");
     }
 
     #[test]

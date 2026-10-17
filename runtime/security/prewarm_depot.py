@@ -11,7 +11,8 @@ built outside this environment, so the first `using Test` in
 a session took ~30s and `using Pkg` ~70-80s -- redone in every session,
 since each worker writes to a throwaway depot clone. Loading everything once
 here, in the worker's own sandbox with the real depot writable, leaves caches
-in the real depot that every later clone inherits. It has to be the sandbox:
+in the real depot, and a successful run publishes a snapshot of it that
+every later clone copies. It has to be the sandbox:
 a cache records the absolute source paths it was built from, and a prewarm
 that could see paths the worker cannot built caches every worker rejected.
 
@@ -35,7 +36,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from launch_worker import build_bwrap_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
+from launch_worker import (build_bwrap_argv, default_depot, has_depot_snapshot, package_store_paths,  # noqa: E402
+                           publish_depot_snapshot, resolve_real_julia_binary)
 
 PREWARM = Path(__file__).with_name("prewarm_workload.jl").read_text()
 
@@ -129,6 +131,8 @@ def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, st
         fcntl.flock(lock, fcntl.LOCK_EX)
         previous = preparation_status(identity, state_dir)
         if previous["state"] == "prepared" and not force:
+            if not has_depot_snapshot(identity["depot"]):
+                _publish_snapshot(identity["depot"])
             return {**previous, "reused": True}
         record = {"schema": "palette.preparation.v1", "state": "preparing", "identity": identity,
                   "pid": os.getpid(), "process_start": process_start(os.getpid()),
@@ -158,7 +162,19 @@ def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, st
         record["seconds"] = time.monotonic() - started
         record["finished_at"] = time.time()
         save(record)
+        # `palette-host prewarm` publishes its own snapshot.
+        if record["state"] == "prepared" and not host_bin:
+            _publish_snapshot(identity["depot"])
         return record
+
+
+def _publish_snapshot(depot: str) -> None:
+    """Sessions clone the snapshot, which no Julia process writes, instead of
+    the live depot. Without one they fall back to the live depot."""
+    try:
+        publish_depot_snapshot(depot)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"prewarm_depot: the depot snapshot was not published: {exc}", file=sys.stderr)
 
 
 def main() -> int:
