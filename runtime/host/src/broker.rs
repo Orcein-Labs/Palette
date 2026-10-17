@@ -25,6 +25,7 @@ use std::time::Duration;
 /// process that owns the session, never by a request.
 pub type HostBridge = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>;
 
+#[derive(Debug)]
 enum Fail {
     /// A policy decision.
     Denied(String),
@@ -175,6 +176,50 @@ fn allowlist_host(u: &url::Url) -> String {
     }
 }
 
+/// Writes `content` to `target`, which the caller has checked lies under
+/// `root`, without following a symlink anywhere below `root`. The checked
+/// path is fully resolved, so a symlink met here was put there after the
+/// check, by whoever else can write the allowed directory; the write is
+/// refused instead of landing wherever it points.
+fn write_beneath(root: &Path, target: &Path, content: &[u8]) -> Result<(), Fail> {
+    use std::ffi::CString;
+    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let rel = target.strip_prefix(root).map_err(|_| Internal(format!("{} is not under {}", target.display(), root.display())))?;
+    let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(Internal(format!("{} is a directory", target.display())));
+    };
+    let cstr = |p: &std::ffi::OsStr| CString::new(p.as_bytes()).map_err(|e| Internal(e.to_string()));
+    let open_at = |dir: libc::c_int, p: &CString, flags: libc::c_int, mode: libc::c_uint| -> std::io::Result<OwnedFd> {
+        let fd = unsafe { libc::openat(dir, p.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
+        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    };
+    let refused = |e: std::io::Error, what: &Path| match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => Denied(format!("refusing to write through a symlink at {}", what.display())),
+        _ => Internal(format!("{}: {e}", what.display())),
+    };
+    // The allowed directory itself comes from the operator's ceiling.
+    fs::create_dir_all(root).map_err(|e| Internal(format!("{}: {e}", root.display())))?;
+    let mut fd = open_at(libc::AT_FDCWD, &cstr(root.as_os_str())?, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+        .map_err(|e| refused(e, root))?;
+    let mut here = root.to_path_buf();
+    for part in dirs {
+        here.push(part);
+        let c = cstr(part)?;
+        if unsafe { libc::mkdirat(fd.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != ErrorKind::AlreadyExists {
+                return Err(Internal(format!("{}: {e}", here.display())));
+            }
+        }
+        fd = open_at(fd.as_raw_fd(), &c, libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(|e| refused(e, &here))?;
+    }
+    let file = open_at(fd.as_raw_fd(), &cstr(name)?, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
+        .map_err(|e| refused(e, target))?;
+    fs::File::from(file).write_all(content).map_err(|e| Internal(format!("{}: {e}", target.display())))
+}
+
 impl Broker {
     pub fn new(c: BrokerConfig) -> Result<Broker, String> {
         if let Some(parent) = c.receipt_log_path.parent() {
@@ -222,13 +267,10 @@ impl Broker {
         }
         let target = util::resolve(Path::new(path));
         let allowed: Vec<PathBuf> = dirs.iter().map(|d| util::resolve(Path::new(d))).collect();
-        if !allowed.iter().any(|a| util::within(&target, a)) {
+        let Some(root) = allowed.iter().find(|a| util::within(&target, a)) else {
             return Err(Denied(format!("path {} is outside the ceiling's allowed_dirs {}", target.display(), qpaths(&allowed))));
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| Internal(e.to_string()))?;
-        }
-        fs::write(&target, content).map_err(|e| Internal(e.to_string()))?;
+        };
+        write_beneath(root, &target, content.as_bytes())?;
         Ok(json!({"path": target.to_string_lossy(), "bytes_written": content.len()}))
     }
 
@@ -1068,6 +1110,29 @@ mod tests {
         };
         assert!(served.contains("unknown capability"), "{served:?}");
         server.shutdown();
+    }
+
+    #[test]
+    fn external_fs_write_never_follows_a_symlink_swapped_in_after_the_check() {
+        let t = tmpdir("fs-write");
+        let allowed = t.0.join("allowed");
+        let outside = t.0.join("outside");
+        fs::create_dir_all(allowed.join("sub")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let root = util::resolve(&allowed);
+        // An ordinary write, creating a missing directory on the way.
+        write_beneath(&root, &root.join("new/dir/f.txt"), b"ok").unwrap();
+        assert_eq!(fs::read_to_string(allowed.join("new/dir/f.txt")).unwrap(), "ok");
+        // The path was checked while sub/ was a directory and f.txt absent;
+        // then each was swapped for a symlink out of the allowed dir.
+        std::os::unix::fs::symlink(outside.join("victim"), allowed.join("sub/f.txt")).unwrap();
+        let e = write_beneath(&root, &root.join("sub/f.txt"), b"x").unwrap_err();
+        assert!(matches!(e, Denied(ref r) if r.contains("symlink")), "{e:?}");
+        fs::remove_dir_all(allowed.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("sub")).unwrap();
+        let e = write_beneath(&root, &root.join("sub/f.txt"), b"x").unwrap_err();
+        assert!(matches!(e, Denied(ref r) if r.contains("symlink")), "{e:?}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "a write escaped the allowed dir");
     }
 
     #[test]

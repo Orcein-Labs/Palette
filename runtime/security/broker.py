@@ -34,6 +34,7 @@ full category list and which remain NOT YET PROVEN.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -236,6 +237,52 @@ class HostJob:
         self.proc.wait()
 
 
+def _write_beneath(root: Path, target: Path, data: bytes) -> None:
+    """Write `data` to `target`, which the caller has checked lies under
+    `root`, without following a symlink anywhere below `root`. The checked
+    path is fully resolved, so a symlink met here was put there after the
+    check, by whoever else can write the allowed directory; the write is
+    refused instead of landing wherever it points. The Rust broker does the
+    same walk."""
+    parts = target.relative_to(root).parts
+    if not parts:
+        raise IsADirectoryError(str(target))
+    root.mkdir(parents=True, exist_ok=True)  # the allowed dir itself is the operator's
+    nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
+    here = root
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    except OSError as e:
+        raise _symlink_refusal(e, root)
+    try:
+        for part in parts[:-1]:
+            here = here / part
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+            except OSError as e:
+                raise _symlink_refusal(e, here)
+            os.close(fd)
+            fd = next_fd
+        try:
+            file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o644, dir_fd=fd)
+        except OSError as e:
+            raise _symlink_refusal(e, target)
+        with os.fdopen(file_fd, "wb") as f:
+            f.write(data)
+    finally:
+        os.close(fd)
+
+
+def _symlink_refusal(e: OSError, path: Path) -> Exception:
+    if e.errno in (errno.ELOOP, errno.ENOTDIR):
+        return CapabilityDenied(f"refusing to write through a symlink at {path}")
+    return e
+
+
 class Broker:
     def __init__(
         self,
@@ -327,10 +374,10 @@ class Broker:
             raise CapabilityDenied("external_fs_write requires string 'path' and 'content'")
         target = Path(path).resolve()
         allowed = [Path(d).resolve() for d in cap["allowed_dirs"]]
-        if not any(target == a or a in target.parents for a in allowed):
+        root = next((a for a in allowed if target == a or a in target.parents), None)
+        if root is None:
             raise CapabilityDenied(f"path {target} is outside the ceiling's allowed_dirs {allowed}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        _write_beneath(root, target, content.encode())
         return {"path": str(target), "bytes_written": len(content.encode())}
 
     class _NoRedirect(urllib.request.HTTPErrorProcessor):

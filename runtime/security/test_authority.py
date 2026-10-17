@@ -373,6 +373,29 @@ class TestReceiptsFailClosed(unittest.TestCase):
             B.Broker({}, receipts, "test-session")
 
 
+class TestExternalWriteNoFollow(unittest.TestCase):
+    """The Python broker's write walk; the Rust one has the same unit test."""
+
+    def test_a_symlink_swapped_in_after_the_check_is_never_followed(self):
+        import broker as python_broker
+        base = Path(tempfile.mkdtemp(prefix="palette-fs-write-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        allowed, outside = base / "allowed", base / "outside"
+        (allowed / "sub").mkdir(parents=True)
+        outside.mkdir()
+        root = allowed.resolve()
+        python_broker._write_beneath(root, root / "new" / "dir" / "f.txt", b"ok")
+        self.assertEqual((allowed / "new" / "dir" / "f.txt").read_text(), "ok")
+        (allowed / "sub" / "f.txt").symlink_to(outside / "victim")
+        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
+            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
+        shutil.rmtree(allowed / "sub")
+        (allowed / "sub").symlink_to(outside)
+        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
+            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
+        self.assertEqual(list(outside.iterdir()), [])
+
+
 class TestBrokerConnectionCap(unittest.TestCase):
     """Idle connections cannot hold every broker thread."""
 
