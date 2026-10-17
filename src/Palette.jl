@@ -121,6 +121,12 @@ struct OperationReceipt
     end
 end
 
+# The receipt log keeps the outcome, not the value: holding every call's value
+# kept each unassigned result alive for the whole session (two 400 MB results
+# left 800 MB that GC could never reclaim).
+_logged(r::OperationReceipt) = OperationReceipt(r.id, r.timestamp, r.operation_type,
+    OperationResult(nothing, r.result.success, r.result.error), r.duration_ms, r.kernel_id, r.metadata)
+
 """
     ReceiptLog
 
@@ -1048,12 +1054,7 @@ function execute(op::ExecuteCode)::OperationReceipt
         duration_ms,
         state.id
     )
-    # The log keeps the outcome, not the value: holding every call's value
-    # kept each unassigned result alive for the whole session (two 400 MB
-    # results left 800 MB that GC could never reclaim).
-    push!(state.receipt_log, OperationReceipt(receipt.id, receipt.timestamp, receipt.operation_type,
-                                              OperationResult(nothing, result.success, result.error),
-                                              duration_ms, state.id))
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end
@@ -1223,8 +1224,10 @@ function execute(op::EphemeralTool)::OperationReceipt
     # Same reasoning as KernelState's own eval_module: ephemeral code has
     # the SAME authority ceiling as durable code (broker-mediated, not
     # granted by which module happens to run it), so it needs the same
-    # reachable path to request_capability.
-    Core.eval(tool_module, :(const Palette = $(@__MODULE__)))
+    # reachable path to request_capability -- and, like it, only the turn
+    # API, never the whole package.
+    Core.eval(tool_module, :(const Palette = $(Api)))
+    Core.eval(tool_module, :(const Api = $(Api)))
     # Deliberately NOT given an `include` binding, unlike the persistent
     # eval_module: check_ephemeral_source! only inspects the source string
     # passed directly to EphemeralTool -- it cannot see inside a file that
@@ -1254,7 +1257,7 @@ function execute(op::EphemeralTool)::OperationReceipt
         kernel_state.id,
         Dict{String,Any}("tool_id" => op.tool_id)
     )
-    push!(kernel_state.receipt_log, receipt)
+    push!(kernel_state.receipt_log, _logged(receipt))
     record_tool_capsule(op.tool_id, op.code, result, duration_ms)
 
     return receipt
@@ -1339,7 +1342,7 @@ function execute(op::InvokeOperator)::OperationReceipt
         state.id,
         Dict{String,Any}("operator" => op.operator_name)
     )
-    push!(state.receipt_log, receipt)
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end
@@ -1470,7 +1473,7 @@ function execute(op::ShellEscape)::OperationReceipt
         Dict{String,Any}("command" => op.command, "working_dir" => op.working_dir,
                          "error_class" => result.data isa AbstractDict ? get(result.data, "error_class", nothing) : nothing)
     )
-    push!(state.receipt_log, receipt)
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end

@@ -248,6 +248,10 @@ end
     receipt = execute(InvokeOperator("add_one"; args=Dict("n" => 41)))
     @test receipt.result.success
     @test receipt.result.data == 42
+    # the caller gets the value; the log keeps only the outcome
+    @test state.receipt_log[end].result.data === nothing
+    @test state.receipt_log[end].result.success
+    @test state.receipt_log[end].metadata["operator"] == "add_one"
 
     missing_receipt = execute(InvokeOperator("does_not_exist"))
     @test !missing_receipt.result.success
@@ -259,6 +263,9 @@ end
     @test receipt.result.success
     @test strip(receipt.result.data["stdout"]) == "hello"
     @test receipt.result.data["exit_code"] == 0
+    logged = get_kernel_state().receipt_log[end]
+    @test logged.result.data === nothing && logged.result.success
+    @test logged.metadata["command"] == "echo hello"
 
     fail_receipt = execute(ShellEscape("exit 3"))
     @test !fail_receipt.result.success
@@ -425,6 +432,14 @@ end
     @test r1.result.success
     @test r1.result.data == 42
     @test !isdefined(state.eval_module, :helper)
+    @test state.receipt_log[end].result.data === nothing
+    @test state.receipt_log[end].metadata["tool_id"] == r1.metadata["tool_id"]
+
+    # ephemeral code reaches authority through Palette, as turn code does,
+    # and nothing else of the package
+    @test execute(EphemeralTool("Palette.request_capability isa Function")).result.data === true
+    @test execute(EphemeralTool("Api === Palette")).result.data === true
+    @test !execute(EphemeralTool("Palette.reset_kernel_state()")).result.success
 
     # `import Mod: f` then a bare `function f(...)` is the confirmed real
     # way to permanently extend a foreign generic function -- must be
