@@ -81,6 +81,11 @@ the user, and under `$TMPDIR` or `/tmp` otherwise, where another user who
 creates that name first can stop sessions from starting but cannot change the
 files.
 
+Production entry points start sessions and brokers through the Rust host,
+`palette-host`. The Python session, broker and `session_cli.py` are a reference
+implementation for the conformance suites (`verify_operator.py --implementation
+python`); no production entry point imports them.
+
 The host trusts the operating system's namespace, filesystem, and Landlock
 mechanisms. Unmanaged host writers do not participate in Palette's patch lock.
 Multi-file patches can complete partially; receipts identify the committed files.
