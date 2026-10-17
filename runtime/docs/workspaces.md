@@ -26,7 +26,7 @@ Credential and secret paths cannot be read or patched through this interface,
 including requests approved before the current policy. Disposable repair stages
 omit these files so candidate code cannot return their contents through test output.
 
-Use action=apply with request_id in the same logical workspace. When the client advertises MCP form elicitation, the broker asks the client to present an explicit confirmation for the exact digest and review diff. Accepting that form authorizes one attempt. Client-confirmed approval is not proof of a named human's identity; this relies on a trusted MCP client honoring user interaction. Julia and model-supplied tool arguments cannot mint grants.
+Use action=apply with request_id in the same logical workspace. When the client advertises MCP form elicitation, the broker asks the client to present an explicit confirmation for the exact digest and review diff. Accepting that form authorizes one attempt. Client-confirmed approval is not proof of a named human's identity; this relies on a trusted MCP client honoring user interaction. Julia and model-supplied tool arguments cannot mint grants. The router accepts any client running as your user, so a client that auto-accepts forms, or an agent that drives the client and answers the form itself, approves without a human. When a change needs a human decision, use a client that shows the form to you, or the local administrator commands below.
 
 If the client does not support confirmation, the request remains pending. An explicitly authorized local administrator can inspect and approve it:
 
