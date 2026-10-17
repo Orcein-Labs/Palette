@@ -163,6 +163,18 @@ pub struct BrokerConfig {
     pub child_timeout: Duration,
 }
 
+/// The host the HTTP client will connect to, in the form `allowed_hosts`
+/// entries are written: a lowercase domain, a dotted IPv4 address, or an IPv6
+/// address without brackets. Empty when the URL has no host.
+fn allowlist_host(u: &url::Url) -> String {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
+        Some(url::Host::Ipv4(a)) => a.to_string(),
+        Some(url::Host::Ipv6(a)) => a.to_string(),
+        None => String::new(),
+    }
+}
+
 impl Broker {
     pub fn new(c: BrokerConfig) -> Result<Broker, String> {
         if let Some(parent) = c.receipt_log_path.parent() {
@@ -224,28 +236,30 @@ impl Broker {
         let Some(url) = p.get("url").and_then(Value::as_str) else {
             return Err(Denied("network_access requires a string 'url'".into()));
         };
+        // Parse once, with the same WHATWG parser the HTTP client uses, and
+        // request exactly the parsed URL. A hand-written host split disagrees
+        // with that parser on inputs like `http://a\@b/` (the client treats
+        // the backslash as a path separator and connects to `a`), so the host
+        // that was checked must be the host that is connected to.
+        let parsed = url::Url::parse(url).map_err(|e| Denied(format!("network_access could not parse URL {}: {e}", q(url))))?;
         // A scheme allowlist: a network grant must not double as a host file read (file://).
-        let (scheme, rest) = url.split_once("://").unwrap_or(("", ""));
-        let scheme = scheme.to_ascii_lowercase();
+        let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
-            return Err(Denied(format!("network_access only permits http/https URLs, got scheme {}", q(&scheme))));
+            return Err(Denied(format!("network_access only permits http/https URLs, got scheme {}", q(scheme))));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Denied("network_access does not permit credentials (user@) in the URL".into()));
         }
         if let Some(hosts) = str_list(cap.get("allowed_hosts")) {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let hostport = authority.rsplit('@').next().unwrap_or("");
-            let host = if let Some(h) = hostport.strip_prefix('[') {
-                h.split(']').next().unwrap_or("").to_ascii_lowercase()
-            } else {
-                hostport.split(':').next().unwrap_or("").to_ascii_lowercase()
-            };
-            if !hosts.contains(&host) {
+            let host = allowlist_host(&parsed);
+            if !hosts.iter().any(|h| h.to_ascii_lowercase() == host) {
                 return Err(Denied(format!("host {host} is not in this session's allowed_hosts {}", ql(&hosts))));
             }
         }
         // No redirect-following: a redirect target is a URL the allowlist was
         // never asked about. A 3xx comes back as data.
         let agent = ureq::AgentBuilder::new().redirects(0).timeout(Duration::from_secs(5)).build();
-        let resp = match agent.get(url).call() {
+        let resp = match agent.request_url("GET", &parsed).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
             Err(e) => return Err(Internal(format!("internal error handling request (not a policy denial): {e}"))),
@@ -770,6 +784,101 @@ mod tests {
         let mut h = Sha256::new();
         h.update(fs::read(path).unwrap());
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn net_req(url: &str) -> Value {
+        json!({"category": "network_access", "params": {"url": url}})
+    }
+
+    /// A loopback listener that is never served: any connection to it means the
+    /// broker connected somewhere the allowlist did not approve.
+    fn idle_listener() -> (std::net::TcpListener, u16) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        (l, port)
+    }
+
+    fn assert_no_connection(l: &std::net::TcpListener) {
+        match l.accept() {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            other => panic!("broker connected to a host outside allowed_hosts: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_backslash_userinfo_cannot_smuggle_a_host() {
+        // Regression: the old hand split read this as host allowed.example,
+        // while the HTTP client connected to 127.0.0.1.
+        let t = tmpdir("net-bs");
+        let (l, port) = idle_listener();
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["allowed.example"]}}), &t.0.join("receipts.jsonl"));
+        for url in [
+            format!("http://127.0.0.1:{port}\\@allowed.example/"),
+            format!("http://127.0.0.1:{port}\\allowed.example/"),
+            format!("http://allowed.example@127.0.0.1:{port}/"),
+            format!("http://allowed.example:x@127.0.0.1:{port}/"),
+            format!("http://127.0.0.1:{port}#@allowed.example/"),
+            format!("http://127.0.0.1:{port}?@allowed.example/"),
+            format!("HTTP://127.0.0.1:{port}\\@allowed.example/"),
+        ] {
+            let resp = b.handle_request(&net_req(&url));
+            assert_eq!(resp["approved"], json!(false), "{url} was approved: {resp}");
+        }
+        assert_no_connection(&l);
+    }
+
+    #[test]
+    fn network_userinfo_is_denied_even_for_an_allowed_host() {
+        let t = tmpdir("net-ui");
+        let (l, port) = idle_listener();
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["127.0.0.1"]}}), &t.0.join("receipts.jsonl"));
+        let resp = b.handle_request(&net_req(&format!("http://user@127.0.0.1:{port}/")));
+        assert_eq!(resp["approved"], json!(false));
+        assert!(resp["reason"].as_str().unwrap().contains("credentials"), "{resp}");
+        assert_no_connection(&l);
+    }
+
+    #[test]
+    fn network_non_http_schemes_and_garbage_are_denied() {
+        let t = tmpdir("net-scheme");
+        let b = broker(json!({"network_access": {"allowed": true}}), &t.0.join("receipts.jsonl"));
+        for url in ["file:///etc/passwd", "ftp://allowed.example/", "not a url", "http//allowed.example"] {
+            let resp = b.handle_request(&net_req(url));
+            assert_eq!(resp["approved"], json!(false), "{url} was approved: {resp}");
+        }
+    }
+
+    #[test]
+    fn network_allowed_host_is_the_host_connected_to() {
+        use std::io::Write as _;
+        let t = tmpdir("net-ok");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = c.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
+            req
+        });
+        // Mixed case in both the ceiling and the URL still matches.
+        let b = broker(json!({"network_access": {"allowed": true, "allowed_hosts": ["LocalHost", "127.0.0.1"]}}), &t.0.join("receipts.jsonl"));
+        let resp = b.handle_request(&net_req(&format!("http://127.0.0.1:{port}/probe")));
+        assert_eq!(resp["approved"], json!(true), "{resp}");
+        assert_eq!(resp["result"]["status"], json!(200));
+        assert_eq!(resp["result"]["body_prefix"], json!("hello"));
+        assert!(server.join().unwrap().starts_with("GET /probe "));
+    }
+
+    #[test]
+    fn allowlist_host_normalises_like_the_client() {
+        let h = |s: &str| allowlist_host(&url::Url::parse(s).unwrap());
+        assert_eq!(h("http://Allowed.Example/x"), "allowed.example");
+        assert_eq!(h("http://evil.example\\@allowed.example/"), "evil.example");
+        assert_eq!(h("http://[::1]:8080/"), "::1");
+        assert_eq!(h("http://0x7f000001/"), "127.0.0.1");
     }
 
     #[test]

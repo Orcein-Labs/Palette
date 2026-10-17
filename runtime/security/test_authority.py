@@ -279,8 +279,11 @@ class TestNetworkRedirectSafety(unittest.TestCase):
     url."""
 
     def setUp(self):
+        hits = self.hits = []
+
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(handler_self):
+                hits.append(handler_self.path)
                 if handler_self.path == "/redirect":
                     handler_self.send_response(302)
                     handler_self.send_header(
@@ -316,6 +319,28 @@ class TestNetworkRedirectSafety(unittest.TestCase):
         result = broker._handle_network_access({"url": f"http://127.0.0.1:{self.port}/redirect"})
         self.assertEqual(result["status"], 302)
         self.assertNotIn("SECRET", result["body_prefix"])
+
+
+    def test_userinfo_and_backslash_cannot_smuggle_a_host(self):
+        # Regression for a reproduced bypass in the Rust host: its hand-written
+        # split read `http://127.0.0.1:PORT\@allowed.example/` as host
+        # allowed.example, while the HTTP client connected to 127.0.0.1.
+        # Both hosts must deny every one of these and never reach the server.
+        broker = B.Broker(
+            {"network_access": {"allowed": True, "allowed_hosts": ["allowed.example"]}},
+            os.path.join(tempfile.mkdtemp(), "receipts.jsonl"), "smuggle-test",
+        )
+        p = self.port
+        for url in (f"http://127.0.0.1:{p}\\@allowed.example/",
+                    f"http://127.0.0.1:{p}\\allowed.example/",
+                    f"http://allowed.example@127.0.0.1:{p}/",
+                    f"http://allowed.example:x@127.0.0.1:{p}/",
+                    f"http://127.0.0.1:{p}#@allowed.example/",
+                    f"http://127.0.0.1:{p}?@allowed.example/"):
+            with self.subTest(url=url):
+                with self.assertRaises(Exception):
+                    broker._handle_network_access({"url": url})
+        self.assertEqual(self.hits, [], "a denied URL still reached the local server")
 
 
 class TestCeilingSubset(unittest.TestCase):

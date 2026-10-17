@@ -366,10 +366,20 @@ class Broker:
         if parsed.scheme not in ("http", "https"):
             raise CapabilityDenied(f"network_access only permits http/https URLs, got scheme {parsed.scheme!r}")
 
+        # The host checked must be the host connected to. urlparse and
+        # urllib's own request parsing split the authority differently for
+        # inputs carrying userinfo, backslashes or percent-escapes (the Rust
+        # host had a reproduced bypass with `http://a\@b/`), so refuse
+        # those authority shapes outright instead of trusting either parse.
+        netloc = parsed.netloc
+        if "@" in netloc or parsed.username is not None or parsed.password is not None:
+            raise CapabilityDenied("network_access does not permit credentials (user@) in the URL")
+        if any(c in netloc for c in "\\%") or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+            raise CapabilityDenied(f"network_access refuses an ambiguous URL authority {netloc!r}")
         allowed_hosts = cap.get("allowed_hosts")
         if allowed_hosts is not None:
-            host = parsed.hostname
-            if host not in allowed_hosts:
+            host = (parsed.hostname or "").lower()
+            if host not in [str(h).lower() for h in allowed_hosts]:
                 raise CapabilityDenied(f"host {host} is not in this session's allowed_hosts {allowed_hosts}")
         # The broker performs the request itself, on the host, with the
         # host's real network namespace -- the worker never does. No
