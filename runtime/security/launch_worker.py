@@ -299,6 +299,11 @@ def build_bwrap_argv(
     read_roots = parse_read_roots(os.environ.get("PALETTE_READ_ROOTS"))
     require_read_roots(read_roots, writable, protected + ["/tmp", "/run"])
 
+    # Every bind source is the resolved path, not the raw string: a symlink
+    # swapped in after the checks above cannot redirect a mount. Guest-side
+    # targets keep their configured paths.
+    real = os.path.realpath
+
     argv = [
         "bwrap",
         "--unshare-user", "--uid", "1000", "--gid", "1000",
@@ -337,7 +342,7 @@ def build_bwrap_argv(
         "--symlink", "usr/bin", "/bin",
         "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
         # julia toolchain -- read-only
-        "--ro-bind", julia_toolchain_dir, julia_toolchain_dir,
+        "--ro-bind", real(julia_toolchain_dir), julia_toolchain_dir,
         # depot -- bound WRITABLE, at the depot's own real path (package
         # source paths are baked into precompiled caches as absolutes, so
         # the guest path must match, not just the content). The source is
@@ -346,30 +351,30 @@ def build_bwrap_argv(
         # JULIA_DEPOT_PATH build-id cascade below, without handing the
         # worker write access to every other session's cache. The separate
         # operator package store, when configured, follows read-only.
-        "--bind", depot_clone_dir or julia_depot, julia_depot,
+        "--bind", real(depot_clone_dir or julia_depot), julia_depot,
         # this repo's source (the Palette package) -- read-only, worker cannot modify it
-        "--ro-bind", repo_dir, repo_dir,
+        "--ro-bind", real(repo_dir), repo_dir,
         # the dev project (Project.toml/Manifest.toml naming Palette + IJulia + deps) -- read-only
-        "--ro-bind", project_dir, project_dir,
+        "--ro-bind", real(project_dir), project_dir,
         # bounded, writable workspace -- the sandbox-local effect envelope
         "--bind", workspace_dir, workspace_dir,
     ]
     if package_store_root:
         # Provisioned package sources and the broker-managed environment are
         # host-owned data. Workers can import them but cannot mutate them.
-        argv += ["--ro-bind", package_store_root, package_store_root]
+        argv += ["--ro-bind", real(package_store_root), package_store_root]
     # A benchmark runner can supply the task's own tools (the task image's
     # interpreter, bun, ...) as one read-only directory; it is mounted at the
     # same path and put first on PATH, as it is for every other contestant.
     if task_tools:
-        argv += ["--ro-bind", task_tools, task_tools]
+        argv += ["--ro-bind", real(task_tools), task_tools]
     for path in extra_ro_binds or []:
-        argv += ["--ro-bind", path, path]
+        argv += ["--ro-bind", real(path), path]
     # Host directories the operator lets the kernel read (PALETTE_READ_ROOTS).
     for path in read_roots:
         argv += ["--ro-bind", path, path]
     if broker_socket_dir:
-        argv += ["--ro-bind", broker_socket_dir, broker_socket_dir]
+        argv += ["--ro-bind", real(broker_socket_dir), broker_socket_dir]
     # A user the sandbox's uid resolves to: whoami, initdb, ssh and git's
     # identity lookups failed without one.
     etc = identity_files()

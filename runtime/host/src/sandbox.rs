@@ -782,7 +782,16 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     let workspace = workspace.to_str().ok_or("workspace path is not valid UTF-8")?;
     let state_dir = state_dir.as_deref().map(|p| p.to_str().ok_or("state directory path is not valid UTF-8")).transpose()?;
     let toolchain = toolchain.to_string_lossy().into_owned();
-    let depot_source = s.depot_clone_dir.unwrap_or(s.julia_depot);
+    // Every bind source is the canonical path that was checked above, not the
+    // raw string: a symlink swapped in after the checks cannot redirect a mount.
+    // Guest-side targets keep their configured paths.
+    let utf8 = |p: &Path, what: &str| p.to_str().map(str::to_owned).ok_or(format!("{what} path is not valid UTF-8"));
+    let toolchain_src = utf8(&toolchain_root, "Julia toolchain")?;
+    let depot_source = utf8(depot_clone.as_deref().unwrap_or(&original_depot), "Julia depot")?;
+    let repo_src = utf8(&repo, "repository")?;
+    let project_src = utf8(&project, "project")?;
+    let task_tools_src = task_tools_root.as_deref().map(|p| utf8(p, "task tools")).transpose()?;
+    let broker_src = broker_root.as_deref().map(|p| utf8(p, "broker socket directory")).transpose()?;
 
     let mut a: Vec<String> = Vec::new();
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|x| x.to_string()));
@@ -800,21 +809,21 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
            // Preserve the host ELF loader layout (Ubuntu differs from Arch).
            "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
            "--symlink", "usr/bin", "/bin", "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
-           "--ro-bind", &toolchain, &toolchain,
+           "--ro-bind", &toolchain_src, &toolchain,
            // The primary depot, writable at its own real path; the source is
            // this worker's private clone, never the shared depot.
-           "--bind", depot_source, s.julia_depot,
-           "--ro-bind", s.repo_dir, s.repo_dir,
-           "--ro-bind", s.project_dir, s.project_dir,
+           "--bind", &depot_source, s.julia_depot,
+           "--ro-bind", &repo_src, s.repo_dir,
+           "--ro-bind", &project_src, s.project_dir,
            "--bind", workspace, workspace]);
-    if let Some(t) = task_tools {
-        push(&["--ro-bind", t, t]);
+    if let (Some(src), Some(t)) = (task_tools_src.as_deref(), task_tools) {
+        push(&["--ro-bind", src, t]);
     }
     for r in &read_roots {
         push(&["--ro-bind", r, r]);
     }
-    if let Some(d) = broker_socket_dir {
-        push(&["--ro-bind", d, d]);
+    if let (Some(src), Some(d)) = (broker_src.as_deref(), broker_socket_dir) {
+        push(&["--ro-bind", src, d]);
     }
     if let Some(root) = package_store.as_deref() {
         let root = root.to_str().ok_or("package store path is not valid UTF-8")?;
@@ -1230,6 +1239,36 @@ mod tests {
         assert_eq!(protected_overlap(&root, &[PathBuf::new()]), None);
         assert_eq!(protected_overlap(Path::new("/"), &[PathBuf::new()]), None);
         assert_eq!(protected_overlap(&root, &[PathBuf::new(), cwd.clone()]), Some(util::resolve(&cwd)));
+    }
+
+    #[test]
+    fn bind_sources_are_the_checked_canonical_paths() {
+        let root = util::mkdtemp("palette-bind-sources-").unwrap();
+        let real_repo = dir(&root, "real-repo");
+        let real_project = dir(&root, "real-project");
+        let depot = dir(&root, "depot");
+        let workspace = dir(&root, "workspace");
+        dir(&root, "toolchain/bin");
+        let repo_link = root.join("repo-link");
+        let project_link = root.join("project-link");
+        symlink(&real_repo, &repo_link).unwrap();
+        symlink(&real_project, &project_link).unwrap();
+        let s = |p: &Path| p.to_str().unwrap().to_owned();
+        let (repo_s, project_s, depot_s, ws_s) = (s(&repo_link), s(&project_link), s(&depot), s(&workspace));
+        let julia = s(&root.join("toolchain/bin/julia"));
+        let argv = build_bwrap_argv(&SandboxSpec {
+            workspace_dir: &ws_s, broker_socket_dir: None, project_dir: &project_s, repo_dir: &repo_s,
+            julia_bin: &julia, julia_depot: &depot_s, network_enabled: false, depot_clone_dir: None,
+            package_store_root: None, package_depot_dir: None, package_environment_dir: None, state_dir: None,
+        }).unwrap();
+        let bind_of = |target: &str| argv.windows(3)
+            .find(|w| w[0] == "--ro-bind" && w[2] == target).map(|w| w[1].clone());
+        // The guest still sees the configured path, but the host source is the
+        // resolved directory that passed the overlap checks, so retargeting the
+        // link afterwards cannot change what is mounted.
+        assert_eq!(bind_of(&repo_s).as_deref(), Some(s(&fs::canonicalize(&real_repo).unwrap()).as_str()));
+        assert_eq!(bind_of(&project_s).as_deref(), Some(s(&fs::canonicalize(&real_project).unwrap()).as_str()));
+        let _ = fs::remove_dir_all(root);
     }
 }
 
