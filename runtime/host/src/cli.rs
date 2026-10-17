@@ -13,7 +13,7 @@
 //! ceiling names. Stdin is read on its own thread so a reply lands mid-call; a
 //! reply for an unknown or finished request is dropped, and stdin closing fails
 //! every waiting request. This process exits when stdin closes, when the kernel
-//! dies, or on SIGTERM/SIGHUP (after tearing the session down).
+//! dies, or on SIGTERM/SIGHUP/SIGINT (after tearing the session down).
 
 use crate::session::{PaletteSession, SessionError, SessionOptions, Turn};
 use crate::util;
@@ -152,7 +152,8 @@ fn payload(v: Option<&Value>) -> Option<Value> {
     }
 }
 
-/// Blocks SIGTERM and SIGHUP in every thread and waits for them on one, so a
+/// Blocks SIGTERM, SIGHUP and SIGINT in every thread and waits for them on one,
+/// so Ctrl-C tears the session down like any other stop request, and a
 /// signal never lands mid-write; returns the flag it sets and the signal seen.
 fn signal_thread(wake: Sender<Incoming>) -> (Arc<AtomicBool>, Arc<AtomicI32>) {
     let stop = Arc::new(AtomicBool::new(false));
@@ -162,6 +163,7 @@ fn signal_thread(wake: Sender<Incoming>) -> (Arc<AtomicBool>, Arc<AtomicI32>) {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGINT);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         let (stop2, signum2) = (stop.clone(), signum.clone());
         std::thread::spawn(move || {
