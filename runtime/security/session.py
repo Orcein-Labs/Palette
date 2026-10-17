@@ -218,7 +218,7 @@ class PaletteSession:
                 project_dir=self.project_dir,
                 repo_dir=self.repo_dir,
                 julia_bin=julia_bin,
-                julia_depot=os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia")).split(":")[-1],
+                julia_depot=default_depot(),
                 depot_clone_dir=self.depot_clone_dir,
                 package_store_root=package_root,
                 package_depot_dir=package_depot,
