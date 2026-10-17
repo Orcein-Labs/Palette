@@ -40,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 # The broker and worker launcher under test: the Rust host when PALETTE_HOST_BIN is set.
-from host_adapter import B, create_session_depot, run_worker  # noqa: E402
+from host_adapter import B, create_session_depot, remove_session_depot, run_worker  # noqa: E402
 from launch_worker import build_package_installer_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
 REPO_DIR = str(Path(__file__).resolve().parents[2])
@@ -581,7 +581,7 @@ class TestPackageManagement(SandboxTestCase):
             Path(archive, "failure.txt").write_text("Package authority test failed; see unittest output.\n",
                                                         encoding="utf-8")
             print(f"PRESERVED_PACKAGE_STORE: {archive}")
-        shutil.rmtree(self.depot_dir, ignore_errors=True)
+        remove_session_depot(self.depot_dir)
         shutil.rmtree(self.package_store, ignore_errors=True)
         if self._old_package_depot is None:
             os.environ.pop("PALETTE_PACKAGE_DEPOT", None)
