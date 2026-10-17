@@ -566,7 +566,9 @@ def package_store_paths(
     from provisioning import operator_ceiling, protected_host_paths
     frozen_ceiling = operator_ceiling() if ceiling is None else ceiling
     protected = set(protected_host_paths(frozen_ceiling, include_package_depot=False))
-    protected.update(Path(p).expanduser().resolve(strict=False) for p in protected_paths)
+    # An empty or absent entry names nothing. Path("").resolve() is the cwd,
+    # which would make the overlap check depend on where the host started.
+    protected.update(Path(p).expanduser().resolve(strict=False) for p in protected_paths if p)
     protected.add(Path(__file__).resolve().parents[2])
     for item in protected:
         if path == item or path in item.parents or item in path.parents:
@@ -659,7 +661,7 @@ def run_worker(
     depot = julia_depot or default_depot()
     if package_store_root is None and package_depot_dir is None and package_environment_dir is None:
         package_store_root, package_depot_dir, package_environment_dir = package_store_paths(
-            protected_paths=[workspace_dir, project_dir, repo_dir, broker_socket_dir or ""])
+            protected_paths=[p for p in (workspace_dir, project_dir, repo_dir, broker_socket_dir) if p])
     Path(workspace_dir).mkdir(parents=True, exist_ok=True)
 
     # A session owner can reuse its private writable clone for warm worker

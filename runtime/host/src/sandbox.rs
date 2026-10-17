@@ -317,6 +317,15 @@ pub fn protected_command_paths(ceiling: &serde_json::Value) -> Vec<PathBuf> {
     paths
 }
 
+/// The first protected path that `root` equals, sits inside, or contains.
+/// An empty path names nothing and is skipped: resolving it would yield the
+/// current directory, which would make the check depend on where the host
+/// was started from.
+fn protected_overlap(root: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
+    protected.iter().filter(|c| !c.as_os_str().is_empty()).map(|c| util::resolve(c))
+        .find(|c| root == c || root.starts_with(c) || c.starts_with(root))
+}
+
 /// Persistent broker-written packages live outside sessions and workspaces.
 /// Workers receive this tree read-only and keep their writable prewarmed depot
 /// first in `JULIA_DEPOT_PATH` for compiled caches.
@@ -357,11 +366,8 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     }
     if let Some(ceiling) = ceiling { protected.extend(protected_command_paths(ceiling)); }
     let root = util::resolve(&lexical_root);
-    for candidate in protected {
-        let candidate = util::resolve(&candidate);
-        if root == candidate || root.starts_with(&candidate) || candidate.starts_with(&root) {
-            return Err(format!("PALETTE_PACKAGE_DEPOT overlaps protected host path: {}", candidate.display()));
-        }
+    if let Some(candidate) = protected_overlap(&root, &protected) {
+        return Err(format!("PALETTE_PACKAGE_DEPOT overlaps protected host path: {}", candidate.display()));
     }
     let base_depot = fs::canonicalize(default_depot()).map_err(|e| format!("resolving Julia depot: {e}"))?;
     if root == base_depot || root.starts_with(&base_depot) || base_depot.starts_with(&root) {
@@ -1156,6 +1162,17 @@ mod tests {
         assert_eq!(fs::read_dir(&clones).unwrap().count(), 0, "a failed clone left residue");
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn an_absent_protected_path_does_not_protect_the_current_directory() {
+        // Regression: run-worker without --broker-socket-dir passed an empty
+        // path, which resolved to the cwd and refused every store under it.
+        let cwd = std::env::current_dir().unwrap();
+        let root = util::resolve(&cwd.join("store"));
+        assert_eq!(protected_overlap(&root, &[PathBuf::new()]), None);
+        assert_eq!(protected_overlap(Path::new("/"), &[PathBuf::new()]), None);
+        assert_eq!(protected_overlap(&root, &[PathBuf::new(), cwd.clone()]), Some(util::resolve(&cwd)));
+    }
 }
 
 pub struct WorkerResult {
@@ -1384,9 +1401,8 @@ pub fn run_worker(r: &RunWorker) -> Result<WorkerResult, String> {
     let julia = resolve_julia()?;
     let depot = default_depot();
     let package_store = package_store_paths(&[
-        PathBuf::from(r.workspace_dir), PathBuf::from(r.project_dir), PathBuf::from(r.repo_dir),
-        r.broker_socket_dir.map(PathBuf::from).unwrap_or_default(),
-    ], None)?;
+        Some(r.workspace_dir), Some(r.project_dir), Some(r.repo_dir), r.broker_socket_dir,
+    ].into_iter().flatten().map(PathBuf::from).collect::<Vec<_>>(), None)?;
     fs::create_dir_all(r.workspace_dir).map_err(|e| e.to_string())?;
     let owned = match r.depot_clone_dir {
         Some(_) => None,
