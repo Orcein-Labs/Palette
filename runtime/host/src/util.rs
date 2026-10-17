@@ -59,6 +59,15 @@ pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// The Palette checkout this binary is running from, found at run time by
+/// walking up from the executable to the directory that holds
+/// `runtime/scripts/session_loop.jl`. None for a binary installed outside a
+/// checkout.
+pub fn installed_checkout() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok().and_then(|p| fs::canonicalize(p).ok())?;
+    exe.ancestors().find(|d| d.join("runtime/scripts/session_loop.jl").is_file()).map(Path::to_path_buf)
+}
+
 /// Absolute, with symlinks resolved where the path exists and `..` applied
 /// after them, as Python's non-strict `Path.resolve()`. An allowlist check
 /// on the result cannot be escaped through a symlink or `..`.

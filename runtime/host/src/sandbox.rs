@@ -359,9 +359,11 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
         reject_symlink_tree(tree, "package store directory", true)?;
     }
     let mut protected = protected_paths.to_vec();
-    protected.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    // The checkout in use, found at run time. A compile-time path would name
+    // the build machine's checkout and leave a relocated install unprotected.
+    protected.extend(util::installed_checkout());
     protected.extend(parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?);
-    for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT"] {
+    for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR"] {
         if let Ok(path) = std::env::var(key) { if !path.is_empty() { protected.push(PathBuf::from(path)); } }
     }
     if let Some(ceiling) = ceiling { protected.extend(protected_command_paths(ceiling)); }
@@ -1209,6 +1211,14 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, base.join(format!("palette-etc-{uid}"))).unwrap();
         assert!(identity_files_in(&base).unwrap_err().contains("refusing"));
         assert!(!elsewhere.join("passwd").exists(), "wrote through a planted symlink");
+    }
+
+    #[test]
+    fn the_running_checkout_is_found_at_run_time() {
+        // The test binary runs from target/ inside the checkout, as an
+        // installed host runs from its own checkout.
+        let expected = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        assert_eq!(util::installed_checkout(), Some(expected));
     }
 
     #[test]
