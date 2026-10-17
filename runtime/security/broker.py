@@ -299,6 +299,7 @@ class Broker:
         project_dir: str | None = None,
         repo_dir: str | None = None,
         child_timeout: float = 90.0,
+        trusted_files: tuple[str, ...] | list[str] = (),
     ):
         # Deep-copied, not stored by reference: confirmed by direct testing
         # that a caller mutating the dict it passed in (e.g. appending to
@@ -324,6 +325,9 @@ class Broker:
         # view points.
         self.project_dir = project_dir
         self.repo_dir = repo_dir
+        # Host files this broker was configured from, such as a ceiling file
+        # given on the command line. Protected like the operator's config files.
+        self.trusted_files = [str(path) for path in trusted_files]
         # Host-set, never taken from a request. A persistent session sets it
         # below its own turn timeout, so a hung ephemeral child is killed
         # before the session gives up on the turn and kills the kernel too.
@@ -376,6 +380,7 @@ class Broker:
         checkout = Path(__file__).resolve().parents[2]
         if (checkout / "runtime" / "scripts" / "session_loop.jl").is_file():
             protected.append(checkout)
+        protected += [Path(path) for path in self.trusted_files]
         protected += protected_host_paths(self.ceiling)
         for root in roots:
             for path in protected:
@@ -522,6 +527,7 @@ class Broker:
         protected_paths = [str(path) for path in protected_host_paths(self.ceiling, include_package_depot=False)]
         protected_paths.append(self.receipt_log_path)
         protected_paths.extend(path for path in (self.project_dir, self.repo_dir) if path)
+        protected_paths.extend(self.trusted_files)
         installer_argv = build_package_installer_argv(
             julia_bin=julia, package_store_root=package_store_root,
             package_depot_dir=self.package_depot_dir,
@@ -609,6 +615,7 @@ class Broker:
             depot_dir=child_depot_dir,
             package_depot_dir=self.package_depot_dir,
             package_environment_dir=self.package_environment_dir,
+            trusted_files=self.trusted_files,
             project_dir=child_project,
             repo_dir=child_repo,
         )
@@ -937,6 +944,7 @@ def serve(
     project_dir: str | None = None,
     repo_dir: str | None = None,
     child_timeout: float = 90.0,
+    trusted_files: tuple[str, ...] | list[str] = (),
 ):
     if package_depot_dir is None and package_environment_dir is None:
         _, package_depot_dir, package_environment_dir = package_store_paths(
@@ -950,6 +958,7 @@ def serve(
         depot_dir=depot_dir, package_depot_dir=package_depot_dir,
         package_environment_dir=package_environment_dir,
         project_dir=project_dir, repo_dir=repo_dir, child_timeout=child_timeout,
+        trusted_files=trusted_files,
     )
     server = _UnixSocketServer(sock_path, _ConnHandler)
     server.broker = broker  # type: ignore[attr-defined]
@@ -983,4 +992,5 @@ if __name__ == "__main__":
 
     stop = threading.Event()
     print(f"[broker] listening on {args.socket}, session {args.session_id}")
-    serve(args.socket, ceiling, args.receipts, args.session_id, stop_event=stop)
+    serve(args.socket, ceiling, args.receipts, args.session_id, stop_event=stop,
+          trusted_files=[str(Path(args.ceiling).resolve())])

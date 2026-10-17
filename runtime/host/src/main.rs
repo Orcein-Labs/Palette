@@ -35,9 +35,12 @@ fn flags(argv: &[String], booleans: &[&str]) -> Result<HashMap<String, String>, 
     Ok(m)
 }
 
-fn ceiling_arg(s: &str) -> Result<Value, String> {
-    let text = if std::path::Path::new(s).is_file() { std::fs::read_to_string(s).map_err(|e| e.to_string())? } else { s.to_string() };
-    serde_json::from_str(&text).map_err(|e| format!("ceiling: {e}"))
+/// A ceiling given as JSON text or as a path to a JSON file, and the file it
+/// came from, which the broker protects.
+fn ceiling_arg(s: &str) -> Result<(Value, Option<PathBuf>), String> {
+    let file = sandbox::ceiling_file(s);
+    let text = match &file { Some(path) => std::fs::read_to_string(path).map_err(|e| e.to_string())?, None => s.to_string() };
+    Ok((serde_json::from_str(&text).map_err(|e| format!("ceiling: {e}"))?, file))
 }
 
 fn run_worker(argv: &[String]) -> Result<i32, String> {
@@ -61,7 +64,7 @@ fn run_worker(argv: &[String]) -> Result<i32, String> {
 fn run_broker(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
     let get = |k: &str| f.get(k).cloned().ok_or_else(|| format!("--{k} is required"));
-    let ceiling = ceiling_arg(&get("ceiling")?)?;
+    let (ceiling, ceiling_file) = ceiling_arg(&get("ceiling")?)?;
     let receipt_path = PathBuf::from(get("receipts")?);
     let mut protected = vec![receipt_path.clone(), PathBuf::from(get("socket")?)];
     for key in ["project", "repo"] { if let Some(path) = f.get(key) { protected.push(PathBuf::from(path)); } }
@@ -74,6 +77,7 @@ fn run_broker(argv: &[String]) -> Result<i32, String> {
         package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
         project_dir: f.get("project").cloned(),
         repo_dir: f.get("repo").cloned(),
+        trusted_files: ceiling_file.into_iter().collect(),
         child_timeout: Duration::from_secs_f64(f.get("child-timeout").map_or(Ok(90.0), |t| t.parse::<f64>()).map_err(|e| e.to_string())?),
     })?);
     let server = broker::serve(std::path::Path::new(&get("socket")?), b)?;

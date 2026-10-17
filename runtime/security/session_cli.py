@@ -178,12 +178,13 @@ def main() -> int:
     signal.signal(signal.SIGHUP, _terminate)
 
     ceiling_arg = args.ceiling
-    if Path(ceiling_arg).is_file():
-        ceiling = json.loads(Path(ceiling_arg).read_text())
+    ceiling_file = str(Path(ceiling_arg).resolve()) if Path(ceiling_arg).is_file() else None
+    if ceiling_file:
+        ceiling = json.loads(Path(ceiling_file).read_text())
     else:
         ceiling = json.loads(ceiling_arg)
 
-    kwargs = {"project_dir": args.project_dir, "ceiling": ceiling,
+    kwargs = {"project_dir": args.project_dir, "ceiling": ceiling, "ceiling_file": ceiling_file,
               "network_enabled": args.network, "turn_timeout": args.turn_timeout,
               "startup_timeout": args.startup_timeout, "task_workspace_dir": args.workspace_dir,
               "workspace_dir": args.scratch_root, "receipts_dir": args.receipts_dir}

@@ -113,6 +113,7 @@ class PaletteSession:
         task_workspace_dir: str | None = None,
         startup_timeout: float = 180.0,
         state_dir: str | None = None,
+        ceiling_file: str | None = None,
     ):
         """`workspace_dir` is this session's own scratch root: created here
         and deleted on close. The default, ~/.palette-sessions/<id>, carries
@@ -212,6 +213,8 @@ class PaletteSession:
                 # Leaves the child's own shutdown and the reply time to land
                 # inside the turn.
                 child_timeout=max(5.0, turn_timeout - 10.0),
+                # The file the ceiling came from, protected like the operator's config.
+                trusted_files=[ceiling_file] if ceiling_file else [],
             )
 
             julia_bin = resolve_real_julia_binary()

@@ -33,6 +33,9 @@ pub struct SessionOptions {
     pub project_dir: String,
     pub repo_dir: String,
     pub ceiling: Value,
+    /// The file the ceiling was read from, when it came from one. The broker
+    /// protects it from external_fs_write like the operator's config files.
+    pub ceiling_file: Option<PathBuf>,
     pub network_enabled: bool,
     pub receipts_dir: Option<String>,
     /// This session's own scratch root, created here and deleted on close.
@@ -257,6 +260,7 @@ impl PaletteSession {
             package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
             project_dir: Some(o.project_dir.clone()),
             repo_dir: Some(o.repo_dir.clone()),
+            trusted_files: o.ceiling_file.iter().cloned().collect(),
             // Leaves the child's own shutdown and the reply time to land inside the call.
             child_timeout: Duration::from_secs_f64((o.turn_timeout - 10.0).max(5.0)),
         }).map_err(err)?);

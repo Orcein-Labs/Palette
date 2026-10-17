@@ -168,8 +168,10 @@ class _BrokerNamespace:
             return self._call("network_access", params)
 
         def __del__(self):
-            if getattr(self, "_b", 1) is None:
-                self._server.shutdown()
+            # A broker that failed to start has no server to stop.
+            server = getattr(self, "_server", None)
+            if getattr(self, "_b", 1) is None and server is not None:
+                server.shutdown()
 
 
 B = _BrokerNamespace()

@@ -193,8 +193,9 @@ pub fn main(argv: &[String]) -> i32 {
     let (tx, rx) = mpsc::channel::<Incoming>();
     let (stop, signum) = signal_thread(tx.clone());
 
+    let ceiling_file = crate::sandbox::ceiling_file(&args.ceiling);
     let ceiling: Value = {
-        let text = if Path::new(&args.ceiling).is_file() { std::fs::read_to_string(&args.ceiling).unwrap_or_default() } else { args.ceiling.clone() };
+        let text = match &ceiling_file { Some(path) => std::fs::read_to_string(path).unwrap_or_default(), None => args.ceiling.clone() };
         match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
@@ -228,6 +229,7 @@ pub fn main(argv: &[String]) -> i32 {
         project_dir: args.project_dir.clone(),
         repo_dir: args.repo_dir.clone().unwrap_or_default(),
         ceiling,
+        ceiling_file,
         network_enabled: args.network,
         receipts_dir: args.receipts_dir.clone(),
         scratch_root: args.scratch_root.clone(),

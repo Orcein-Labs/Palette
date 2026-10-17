@@ -141,6 +141,7 @@ pub struct Broker {
     package_environment_dir: Option<String>,
     project_dir: Option<String>,
     repo_dir: Option<String>,
+    trusted_files: Vec<PathBuf>,
     child_timeout: Duration,
     host_bridge: Mutex<Option<HostBridge>>,
     log_lock: Mutex<()>,
@@ -163,6 +164,9 @@ pub struct BrokerConfig {
     pub package_environment_dir: Option<String>,
     pub project_dir: Option<String>,
     pub repo_dir: Option<String>,
+    /// Host files this broker was configured from, such as a ceiling file
+    /// given on the command line. Protected like the operator's config files.
+    pub trusted_files: Vec<PathBuf>,
     pub child_timeout: Duration,
 }
 
@@ -253,6 +257,7 @@ fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
     protected.extend(c.repo_dir.iter().map(PathBuf::from));
     protected.extend(c.package_depot_dir.as_deref().and_then(|d| Path::new(d).parent()).map(Path::to_path_buf));
     protected.extend(util::installed_checkout());
+    protected.extend(c.trusted_files.iter().cloned());
     for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR", "PALETTE_PACKAGE_DEPOT"] {
         if let Ok(path) = std::env::var(key) {
             if !path.is_empty() { protected.push(PathBuf::from(path)); }
@@ -286,6 +291,7 @@ impl Broker {
             package_environment_dir: c.package_environment_dir,
             project_dir: c.project_dir,
             repo_dir: c.repo_dir,
+            trusted_files: c.trusted_files,
             child_timeout: c.child_timeout,
             host_bridge: Mutex::new(None),
             log_lock: Mutex::new(()),
@@ -402,6 +408,7 @@ impl Broker {
         for path in [&self.project_dir, &self.repo_dir].into_iter().flatten() {
             protected_paths.push(PathBuf::from(path));
         }
+        protected_paths.extend(self.trusted_files.iter().cloned());
         for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT"] {
             if let Ok(path) = std::env::var(key) {
                 if !path.is_empty() { protected_paths.push(PathBuf::from(path)); }
@@ -467,6 +474,7 @@ impl Broker {
                 package_environment_dir: self.package_environment_dir.clone(),
                 project_dir: Some(project.clone()),
                 repo_dir: Some(repo.clone()),
+                trusted_files: self.trusted_files.clone(),
                 child_timeout: Duration::from_secs(90),
             }).map_err(Internal)?);
             let server = serve(&sock_dir.join("broker.sock"), child).map_err(Internal)?;
@@ -909,6 +917,7 @@ mod tests {
             package_environment_dir: None,
             project_dir: None,
             repo_dir: None,
+            trusted_files: vec![],
             child_timeout: Duration::from_secs(90),
         })
         .unwrap()
@@ -1223,6 +1232,7 @@ mod tests {
             package_environment_dir: None,
             project_dir: None,
             repo_dir: None,
+            trusted_files: vec![],
             child_timeout: Duration::from_secs(90),
         }).err().expect("an allowed_dir holding the receipt log was accepted");
         assert!(e.contains("overlaps the protected host path"), "{e}");
@@ -1253,9 +1263,29 @@ mod tests {
         let e = Broker::new(BrokerConfig {
             ceiling: json!({}), receipt_log_path: receipts, session_id: "s".into(),
             package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
-            child_timeout: Duration::from_secs(5),
+            trusted_files: vec![], child_timeout: Duration::from_secs(5),
         }).err().expect("broker started without a receipt log");
         assert!(e.contains("receipt log"), "{e}");
+    }
+
+    #[test]
+    fn an_allowed_dir_that_reaches_the_ceiling_file_never_starts() {
+        // A ceiling read from a file given on the command line is as trusted
+        // as PALETTE_CAPABILITY_CEILING: a write there widens the next ceiling.
+        let t = tmpdir("ceiling-file");
+        let config = t.0.join("config");
+        fs::create_dir(&config).unwrap();
+        let ceiling_file = config.join("ceiling.json");
+        fs::write(&ceiling_file, "{}").unwrap();
+        let start = |trusted: Vec<PathBuf>| Broker::new(BrokerConfig {
+            ceiling: json!({"external_fs_write": {"allowed_dirs": [config.to_str().unwrap()]}}),
+            receipt_log_path: t.0.join("receipts").join("receipts.jsonl"), session_id: "s".into(),
+            package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
+            trusted_files: trusted, child_timeout: Duration::from_secs(5),
+        });
+        assert!(start(vec![]).is_ok(), "the allowed dir alone should be accepted");
+        let e = start(vec![ceiling_file.clone()]).err().expect("an allowed_dir holding the ceiling file was accepted");
+        assert!(e.contains("overlaps the protected host path") && e.contains("ceiling.json"), "{e}");
     }
 
     #[test]

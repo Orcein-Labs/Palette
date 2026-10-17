@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 # The broker and worker launcher under test: the Rust host when PALETTE_HOST_BIN is set.
-from host_adapter import B, create_session_depot, remove_session_depot, run_worker  # noqa: E402
+from host_adapter import B, HOST_BIN, create_session_depot, remove_session_depot, run_worker  # noqa: E402
 from launch_worker import build_package_installer_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
 REPO_DIR = str(Path(__file__).resolve().parents[2])
@@ -431,6 +431,42 @@ class TestExternalWriteRootsPinned(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "overlaps the protected host path|did not start"):
             B.Broker({"external_fs_write": {"allowed_dirs": [str(self.base)]}}, str(receipts), "test-session")
 
+
+
+class TestCeilingFileProtected(unittest.TestCase):
+    """A ceiling given as a file can never be rewritten through the broker it configures."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="palette-ceiling-file-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.conf = self.base / "conf"
+        self.conf.mkdir()
+        self.ceiling = self.conf / "ceiling.json"
+        # The ceiling lets workers write to the directory the ceiling lives in.
+        self.ceiling.write_text(json.dumps({"external_fs_write": {"allowed_dirs": [str(self.conf)]}}))
+
+    def _refused(self, argv, timeout, stdin):
+        proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail(f"{argv[:2]} started with an allowed dir that holds its own ceiling file")
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("overlaps the protected host path", out)
+        self.assertIn("ceiling.json", out)
+
+    def test_a_broker_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
+        command = [HOST_BIN, "broker"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("broker.py"))]
+        self._refused(command + ["--socket", str(self.base / "b.sock"), "--ceiling", str(self.ceiling),
+                                 "--receipts", str(self.base / "receipts" / "receipts.jsonl")], 60, subprocess.PIPE)
+
+    def test_a_session_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
+        command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("session_cli.py"))]
+        self._refused(command + ["--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
+                                 "--scratch-root", str(self.base / "scratch"),
+                                 "--receipts-dir", str(self.base / "receipts")], 300, subprocess.DEVNULL)
 
 class TestBrokerConnectionCap(unittest.TestCase):
     """Idle connections cannot hold every broker thread."""

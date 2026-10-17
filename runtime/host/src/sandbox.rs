@@ -587,6 +587,13 @@ pub fn create_receipts_dir(root: &Path, session_id: &str, retention: Duration) -
     Ok(dir)
 }
 
+/// The resolved file a `--ceiling` argument names, or `None` when the argument
+/// is the ceiling's JSON text itself.
+pub fn ceiling_file(arg: &str) -> Option<PathBuf> {
+    let path = Path::new(arg);
+    path.is_file().then(|| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
 /// Creates `path` and its parents and makes it a directory only this user can
 /// enter. A symlink, or a directory another user owns, is refused. The broker's
 /// socket is world-connectable for the sandbox, so the directory around it is
