@@ -475,15 +475,10 @@ class TestBrokerConnectionCap(unittest.TestCase):
         sock_dir = tempfile.mkdtemp(prefix="njl-cap-")
         self.addCleanup(shutil.rmtree, sock_dir, True)
         sock = os.path.join(sock_dir, "broker.sock")
-        stop = threading.Event()
-        thread = threading.Thread(target=B.serve, args=(sock, {}, os.path.join(sock_dir, "receipts.jsonl"),
-                                                        "test-session", stop), daemon=True)
-        thread.start()
-        self.addCleanup(thread.join, 30)
-        self.addCleanup(stop.set)
-        deadline = time.time() + 30
-        while not os.path.exists(sock) and time.time() < deadline:
-            time.sleep(0.05)
+        # Without a stop event, serve returns once the socket accepts.
+        server, _ = B.serve(sock, {}, os.path.join(sock_dir, "receipts.jsonl"), "test-session")
+        self.addCleanup(getattr(server, "server_close", lambda: None))
+        self.addCleanup(server.shutdown)
 
         def ask(req_id):
             with socket.socket(socket.AF_UNIX) as s:
@@ -498,20 +493,28 @@ class TestBrokerConnectionCap(unittest.TestCase):
             for _ in range(64):
                 c = socket.socket(socket.AF_UNIX)
                 c.connect(sock)
+                c.settimeout(10)
                 idle.append(c)
-            reply = ""
-            while "broker busy" not in reply and time.time() < deadline:
-                reply = ask("over")
-                time.sleep(0.05)
-            self.assertIn("broker busy", reply)
+            # Both brokers take a connection's slot in the accept loop, in
+            # connection order, so the 65th finds all 64 taken.
+            self.assertIn("broker busy", ask("over"))
+            # A half-closed connection ends its handler; the server closing
+            # its end, which recv sees, comes just before the slot is freed.
+            for c in idle:
+                c.shutdown(socket.SHUT_WR)
+            for c in idle:
+                self.assertEqual(c.recv(1), b"")
         finally:
             for c in idle:
                 c.close()
-        reply = ""
-        while "unknown capability" not in reply and time.time() < deadline:
-            reply = ask("after")
-            time.sleep(0.05)
-        self.assertIn("unknown capability", reply)
+        # The slot is freed a few instructions after that close, so a request
+        # may still race it; a handful of attempts covers the gap.
+        replies = []
+        for _ in range(5):
+            replies.append(ask("after"))
+            if "unknown capability" in replies[-1]:
+                break
+        self.assertIn("unknown capability", replies[-1], replies)
 
 
 class TestCeilingSubset(unittest.TestCase):
