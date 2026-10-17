@@ -76,8 +76,20 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
         record = _clone_owner_record()
         if record is not None:
             Path(dest + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
-        shutil.rmtree(dest)  # cp needs the destination to not exist yet
-        subprocess.run(["cp", "-a", "--reflink=auto", real_depot, dest], check=True, stdin=subprocess.DEVNULL)
+        # The depot is live. A Julia process precompiling into it removes its
+        # temporary files, and one removed between cp listing a directory and
+        # copying it fails the copy. A later attempt copies the settled tree.
+        for attempt in range(DEPOT_CLONE_ATTEMPTS):
+            shutil.rmtree(dest, ignore_errors=True)  # cp needs the destination to not exist yet
+            if attempt:
+                time.sleep(0.2)
+            try:
+                subprocess.run(["cp", "-a", "--reflink=auto", real_depot, dest], check=True,
+                               stdin=subprocess.DEVNULL)
+                break
+            except subprocess.CalledProcessError:
+                if attempt == DEPOT_CLONE_ATTEMPTS - 1:
+                    raise
     except BaseException:
         remove_session_depot(dest)
         raise
@@ -92,6 +104,8 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
 # that were killed first. The Rust host writes the same record.
 CLONE_OWNER_SUFFIX = ".owner"
 DEFAULT_RECEIPT_RETENTION_DAYS = 30
+# How many times a depot clone is tried before the session gives up.
+DEPOT_CLONE_ATTEMPTS = 3
 
 
 def _process_start_time(pid: int) -> str | None:

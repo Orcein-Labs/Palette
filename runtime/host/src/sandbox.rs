@@ -626,25 +626,36 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
         remove_session_depot(&dest);
         return Err(e);
     }
-    let _ = fs::remove_dir(&dest); // cp wants a destination that does not exist yet
-    let status = Command::new("cp")
-        .args(["-a", "--reflink=auto"])
-        .arg(&depot)
-        .arg(&dest)
-        .stdin(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => Ok(dest),
-        Ok(_) => {
-            remove_session_depot(&dest);
-            Err(format!("cloning the depot {depot} failed"))
+    // The depot is live. A Julia process precompiling into it removes its
+    // temporary files, and one removed between cp listing a directory and
+    // copying it fails the copy. A later attempt copies the settled tree.
+    let mut failure = String::new();
+    for attempt in 0..DEPOT_CLONE_ATTEMPTS {
+        let _ = fs::remove_dir_all(&dest); // cp wants a destination that does not exist yet
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
         }
-        Err(e) => {
-            remove_session_depot(&dest);
-            Err(format!("cp: {e}"))
+        let status = Command::new("cp")
+            .args(["-a", "--reflink=auto"])
+            .arg(&depot)
+            .arg(&dest)
+            .stdin(Stdio::null())
+            .status();
+        match status {
+            Ok(status) if status.success() => return Ok(dest),
+            Ok(_) => failure = format!("cloning the depot {depot} failed"),
+            Err(e) => {
+                failure = format!("cp: {e}");
+                break;
+            }
         }
     }
+    remove_session_depot(&dest);
+    Err(failure)
 }
+
+/// How many times a depot clone is tried before the session gives up.
+const DEPOT_CLONE_ATTEMPTS: usize = 3;
 
 /// A benchmark's toolchain activation (KEY=VALUE lines), given to the kernel
 /// as the other contestants get it.
