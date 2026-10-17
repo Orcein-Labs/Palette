@@ -1198,6 +1198,20 @@ mod tests {
     }
 
     /// Gone, or a zombie waiting for init: no longer running either way.
+    /// The pid a test command wrote, waiting for it: a fixed sleep raced the
+    /// shell under load and read a file that did not exist yet.
+    fn wait_for_pid(path: &Path) -> String {
+        for _ in 0..500 {
+            if let Ok(text) = fs::read_to_string(path) {
+                if text.ends_with('\n') {
+                    return text.trim().to_string();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{} was never written", path.display());
+    }
+
     fn pid_dead(pid: &str) -> bool {
         for _ in 0..100 {
             match fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -1256,14 +1270,14 @@ mod tests {
         let d = tmpdir("hostcmd-timeout");
         let dir = d.0.to_string_lossy().into_owned();
         let b = cmd_broker(&d.0, json!({
-            "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": dir, "timeout_s": 0.5},
+            "hang": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > helper.pid; wait"], "cwd": dir, "timeout_s": 2.0},
         }));
         let started = std::time::Instant::now();
         let r = cmd(&b, json!({"name": "hang"}));
         assert_eq!(r["result"]["timed_out"], json!(true), "{r}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let helper = fs::read_to_string(d.0.join("helper.pid")).unwrap();
-        assert!(pid_dead(helper.trim()), "the backgrounded helper outlived the timeout");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        let helper = wait_for_pid(&d.0.join("helper.pid"));
+        assert!(pid_dead(&helper), "the backgrounded helper outlived the timeout");
     }
 
     #[test]
@@ -1292,17 +1306,23 @@ mod tests {
         let id = r["result"]["job"].as_str().unwrap().to_string();
         assert_eq!(r["result"]["running"], json!(true));
         assert_eq!(cmd(&b, json!({"action": "poll", "job": id}))["result"]["running"], json!(true));
-        std::thread::sleep(Duration::from_millis(700));
-        let r = cmd(&b, json!({"action": "poll", "job": id}));
+        // Poll until the job finishes; a fixed sleep raced the job under load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let r = loop {
+            let r = cmd(&b, json!({"action": "poll", "job": id}));
+            if r["result"]["running"] != json!(true) || std::time::Instant::now() > deadline {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_eq!(r["result"]["running"], json!(false), "{r}");
         assert_eq!(r["result"]["stdout"], json!("done\n"));
         assert!(cmd(&b, json!({"action": "poll", "job": id}))["reason"].as_str().unwrap().contains("no running"));
         // A session that ends kills the jobs it started.
         cmd(&b, json!({"name": "long", "action": "start"}));
-        std::thread::sleep(Duration::from_millis(200));
-        let helper = fs::read_to_string(d.0.join("long.pid")).unwrap();
+        let helper = wait_for_pid(&d.0.join("long.pid"));
         drop(b);
-        assert!(pid_dead(helper.trim()), "a job outlived its session");
+        assert!(pid_dead(&helper), "a job outlived its session");
     }
 
     #[test]
