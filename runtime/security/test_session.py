@@ -11,6 +11,7 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import os
 import select
 import shutil
@@ -176,6 +177,50 @@ class TestSessionLifecycle(SessionTestCase):
                 os.environ.pop("JULIA_DEPOT_PATH", None)
             else:
                 os.environ["JULIA_DEPOT_PATH"] = previous_depot
+
+
+class TestSessionScratchOwnership(SessionTestCase):
+    """A host killed before its teardown leaves its default session root and
+    depot clone behind; the next session in the same pid namespace removes
+    them. Receipts written without a receipts directory outlive the session."""
+
+    def _bridge(self):
+        command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("session_cli.py"))]
+        proc = subprocess.Popen(command + ["--project-dir", PROJECT_DIR, "--ceiling", "{}"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdin.close(), proc.stdout.close()))
+        hello = json.loads(proc.stdout.readline() or "{}")
+        self.assertEqual(hello.get("kind"), "HELLO", hello)
+        return proc, hello["session_id"]
+
+    @staticmethod
+    def _clones_owned_by(pid):
+        clones = Path(os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia")).split(":")[0]).parent / ".palette-depot-clones"
+        return [p for p in clones.glob("depot-*.owner") if p.read_text().split()[1:2] == [str(pid)]]
+
+    def test_a_killed_hosts_session_root_is_swept_and_receipts_are_kept(self):
+        sessions = Path.home() / ".palette-sessions"
+        receipts = Path.home() / ".palette" / "receipts"
+        killed, killed_id = self._bridge()
+        killed_root = sessions / killed_id
+        self.assertTrue(killed_root.is_dir() and Path(f"{killed_root}.owner").is_file())
+        self.assertTrue((receipts / killed_id).is_dir())
+        self.assertEqual(len(self._clones_owned_by(killed.pid)), 1)
+        killed.kill()
+        killed.wait()
+        self.assertTrue(killed_root.is_dir(), "the kill was not before teardown")
+
+        survivor, survivor_id = self._bridge()
+        self.assertFalse(os.path.lexists(killed_root) or os.path.lexists(f"{killed_root}.owner"),
+                         "the killed host's session root was not swept")
+        self.assertEqual(self._clones_owned_by(killed.pid), [], "the killed host's depot clone was not swept")
+        survivor.stdin.close()
+        self.assertEqual(survivor.wait(timeout=120), 0)
+        self.assertFalse(os.path.lexists(sessions / survivor_id) or os.path.lexists(f"{sessions / survivor_id}.owner"))
+        for session_id in (killed_id, survivor_id):
+            self.assertTrue((receipts / session_id).is_dir(), f"receipts of {session_id} did not outlive it")
+            shutil.rmtree(receipts / session_id)
+            Path(f"{receipts / session_id}.owner").unlink()
 
 
 

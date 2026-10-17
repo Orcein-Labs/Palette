@@ -1,16 +1,19 @@
-"""Session depot clones record their owner, and clones of dead owners are swept."""
+"""Session depot clones, default session roots and default receipts
+directories record their owner, and those of dead owners are swept."""
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from launch_worker import (  # noqa: E402
-    CLONE_OWNER_SUFFIX, _clone_owner_alive, _pid_namespace, create_session_depot, remove_session_depot,
+    CLONE_OWNER_SUFFIX, _clone_owner_alive, _clone_owner_record, _pid_namespace, create_receipts_dir,
+    create_session_depot, receipt_retention_days, remove_session_depot, sweep_orphaned_dirs,
 )
 
 
@@ -73,6 +76,61 @@ class DepotCloneOwnershipTest(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             create_session_depot(str(self.root / "no-such-depot"))
         self.assertEqual(list(self.clones.iterdir()), [], "a failed clone left residue")
+
+
+def _reaped_pid() -> int:
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
+class OwnedDirSweepTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="palette-owned-dirs-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def make(self, name, record, age_days):
+        directory = self.root / name
+        directory.mkdir()
+        receipts = directory / "receipts.jsonl"
+        receipts.write_text("{}\n")
+        when = time.time() - age_days * 86_400
+        os.utime(receipts, (when, when))
+        os.utime(directory, (when, when))
+        owner_path(directory).write_text(record)
+        return directory
+
+    def test_owned_dirs_are_swept_by_prefix_once_idle_long_enough(self):
+        dead = f"{_pid_namespace()} {_reaped_pid()} 1\n"
+        stale = self.make("palette-stale", dead, 40)
+        recent = self.make("palette-recent", dead, 2)
+        live = self.make("palette-live", _clone_owner_record(), 40)
+        other_prefix = self.make("depot-stale", dead, 40)
+
+        sweep_orphaned_dirs(self.root, "palette-", 30 * 86_400)
+        self.assertFalse(os.path.lexists(stale) or os.path.lexists(owner_path(stale)))
+        for kept in (recent, live, other_prefix):
+            self.assertTrue(kept.is_dir() and owner_path(kept).exists(), f"{kept} was swept")
+        sweep_orphaned_dirs(self.root, "palette-")
+        self.assertFalse(os.path.lexists(recent), "a dead owner's dir survived a zero-age sweep")
+        self.assertTrue(live.is_dir() and other_prefix.is_dir())
+
+    def test_receipts_dirs_are_private_owned_and_retention_is_parsed_strictly(self):
+        root = self.root / "receipts"
+        directory = create_receipts_dir(root, "palette-0123456789abcdef", 1)
+        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(_clone_owner_alive(owner_path(directory).read_text()))
+        with self.assertRaises(FileExistsError):
+            create_receipts_dir(root, "palette-0123456789abcdef", 0)
+        self.assertTrue(directory.is_dir(), "a live session's receipts were pruned")
+
+        self.assertEqual(receipt_retention_days(None), 30)
+        self.assertEqual(receipt_retention_days("7"), 7)
+        self.assertEqual(receipt_retention_days("0"), 0)
+        for bad in ("", "-1", "+7", "1.5", "\u0667", "forever", "99999999"):
+            with self.assertRaises(ValueError, msg=bad):
+                receipt_retention_days(bad)
 
 
 if __name__ == "__main__":

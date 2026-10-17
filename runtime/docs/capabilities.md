@@ -26,6 +26,21 @@ Broker decision and effect receipts are kept in the host-private sibling of the
 world's saved-state directory, named `<state directory>.receipts`. They survive
 worker refresh and restart and are outside the worker's writable mounts.
 
+A session started without a receipts directory (`palette-host session` or
+`run-worker` without `--receipts-dir`, or the Python `PaletteSession` without
+`receipts_dir`) keeps its receipts in `~/.palette/receipts/<session id>/`,
+which is private to the user and survives the session. A later session prunes
+the receipts of closed sessions that have not been written for
+`PALETTE_RECEIPT_RETENTION_DAYS` days (default 30). Setting it to `0` restores
+the earlier behavior: receipts live in the session's scratch root and are
+deleted when the session closes.
+
+A session's default scratch root, `~/.palette-sessions/<session id>`, and its
+depot clone in `.palette-depot-clones` each carry a `.owner` record naming the
+host process. If that process is killed before its teardown runs, the next
+session started in the same pid namespace removes them. A caller-supplied
+scratch root is never swept.
+
 ```julia
 Api.runtime("discover")
 receipt = Api.request_capability("package_management", Dict("name" => "Parsers"))

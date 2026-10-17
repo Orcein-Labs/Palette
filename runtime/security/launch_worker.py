@@ -37,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
@@ -83,11 +84,14 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
     return dest
 
 
-# Every clone `depot-XXXXXXXX` has a sidecar `depot-XXXXXXXX.owner` naming the
-# process that made it as "<pid namespace> <pid> <start time>". Owners remove
-# their clone when they finish; the sidecar lets a later session remove the
-# clones of owners that were killed first. The Rust host writes the same record.
+# Every directory this host owns outside its own scratch root -- a depot clone
+# `depot-XXXXXXXX`, a default session root `palette-<id>`, a default receipts
+# directory -- has a sidecar `<dir>.owner` naming the process that made it as
+# "<pid namespace> <pid> <start time>". Owners remove their directory when they
+# finish; the sidecar lets a later session remove the directories of owners
+# that were killed first. The Rust host writes the same record.
 CLONE_OWNER_SUFFIX = ".owner"
+DEFAULT_RECEIPT_RETENTION_DAYS = 30
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -126,16 +130,39 @@ def _clone_owner_alive(record: str) -> bool:
     return _process_start_time(int(pid)) == start
 
 
-def sweep_orphaned_depot_clones(clone_root: str) -> None:
-    """Remove the clones in `clone_root` whose owner has died. A clone without
-    a readable owner record, or one that is not a plain directory, is left alone."""
+def record_owner(directory: str | os.PathLike) -> None:
+    """Write this process's owner record for `directory`."""
+    record = _clone_owner_record()
+    if record is not None:
+        Path(str(directory) + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
+
+
+def _last_modified(directory: str) -> float:
+    """The newest modification time of `directory` and its direct entries."""
+    newest = os.lstat(directory).st_mtime
     try:
-        entries = list(os.scandir(clone_root))
+        for entry in os.scandir(directory):
+            try:
+                newest = max(newest, entry.stat().st_mtime)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return newest
+
+
+def sweep_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: float = 0.0) -> None:
+    """Remove the directories `<prefix>*` in `root` whose owner has died and
+    that nobody has written to for at least `min_age_seconds`. A directory
+    without a readable owner record, or one that is not a plain directory, is
+    left alone."""
+    try:
+        entries = list(os.scandir(root))
     except OSError:
         return
     for entry in entries:
-        clone_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
-        if not clone_name or not clone_name.startswith("depot-") or not entry.is_file(follow_symlinks=False):
+        dir_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
+        if not dir_name or not dir_name.startswith(prefix) or not entry.is_file(follow_symlinks=False):
             continue
         try:
             record = Path(entry.path).read_text(encoding="ascii")
@@ -143,22 +170,75 @@ def sweep_orphaned_depot_clones(clone_root: str) -> None:
             continue
         if _clone_owner_alive(record):
             continue
-        clone = os.path.join(clone_root, clone_name)
+        directory = os.path.join(root, dir_name)
         try:
-            mode = os.lstat(clone).st_mode
+            mode = os.lstat(directory).st_mode
         except FileNotFoundError:
             Path(entry.path).unlink(missing_ok=True)
             continue
         except OSError:
             continue
         if stat.S_ISDIR(mode):
-            remove_session_depot(clone)
+            try:
+                idle = time.time() - _last_modified(directory)
+            except OSError:
+                continue
+            if idle >= min_age_seconds:
+                remove_owned_dir(directory)
+
+
+def sweep_orphaned_depot_clones(clone_root: str) -> None:
+    """Remove the clones in `clone_root` whose owner has died."""
+    sweep_orphaned_dirs(clone_root, "depot-")
+
+
+def remove_owned_dir(directory: str | os.PathLike) -> None:
+    """Remove an owned directory and then its owner record."""
+    shutil.rmtree(directory, ignore_errors=True)
+    Path(str(directory) + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
 
 
 def remove_session_depot(clone: str) -> None:
     """Remove a session depot clone and then its owner record."""
-    shutil.rmtree(clone, ignore_errors=True)
-    Path(clone + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
+    remove_owned_dir(clone)
+
+
+def receipt_retention_days(value: str | None) -> int:
+    """PALETTE_RECEIPT_RETENTION_DAYS: whole days, default 30; 0 keeps
+    receipts in the session scratch root, deleted with it."""
+    if value is None:
+        return DEFAULT_RECEIPT_RETENTION_DAYS
+    text = value.strip()
+    if not (text.isascii() and text.isdigit()) or int(text) > 36_500:
+        raise ValueError(f"PALETTE_RECEIPT_RETENTION_DAYS must be a whole number of days, got {value!r}")
+    return int(text)
+
+
+def default_receipts_root() -> tuple[Path, int] | None:
+    """Where a session's broker receipts go when the caller names no receipts
+    directory: `~/.palette/receipts/<session id>/`, kept after the session
+    closes and pruned by a later session once older than the retention.
+    None when the retention is 0."""
+    days = receipt_retention_days(os.environ.get("PALETTE_RECEIPT_RETENTION_DAYS"))
+    if days == 0:
+        return None
+    return Path.home() / ".palette" / "receipts", days
+
+
+def create_receipts_dir(root: str | os.PathLike, session_id: str, retention_days: float) -> Path:
+    """Create `<root>/<session id>/` for one session's receipts, after pruning
+    the receipts of closed sessions older than the retention."""
+    root = Path(root)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sweep_orphaned_dirs(root, "palette-", retention_days * 86_400)
+    directory = root / session_id
+    directory.mkdir(mode=0o700)
+    try:
+        record_owner(directory)
+    except BaseException:
+        directory.rmdir()
+        raise
+    return directory
 
 
 def resolve_real_julia_binary() -> str:

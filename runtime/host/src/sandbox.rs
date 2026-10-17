@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const SANDBOX_USER: &str = "palette";
 /// The sandbox sets these itself; a task environment cannot move them.
@@ -449,11 +449,13 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     Ok(PackageStore { root, depot, environment })
 }
 
-/// Every clone `depot-XXXXXXXX` has a sidecar `depot-XXXXXXXX.owner` naming the
-/// process that made it as "<pid namespace> <pid> <start time>". Owners remove
-/// their clone when they finish; the sidecar lets a later session remove the
-/// clones of owners that were killed first. The Python launcher writes the same
-/// record.
+/// Every directory this host owns outside its own scratch root -- a depot
+/// clone `depot-XXXXXXXX`, a default session root `palette-<id>`, a default
+/// receipts directory -- has a sidecar `<dir>.owner` naming the process that
+/// made it as "<pid namespace> <pid> <start time>". Owners remove their
+/// directory when they finish; the sidecar lets a later session remove the
+/// directories of owners that were killed first. The Python launcher writes
+/// the same record.
 const CLONE_OWNER_SUFFIX: &str = ".owner";
 
 fn clone_owner_path(clone: &Path) -> PathBuf {
@@ -489,33 +491,100 @@ fn clone_owner_alive(record: &str) -> bool {
     process_start_time(pid).as_deref() == Some(start)
 }
 
-/// Removes the clones in `root` whose owner has died. A clone without a
+/// Writes this process's owner record for `dir`.
+pub(crate) fn record_owner(dir: &Path) -> Result<(), String> {
+    let Some(record) = clone_owner_record() else { return Ok(()) };
+    fs::write(clone_owner_path(dir), record).map_err(|e| format!("recording the owner of {}: {e}", dir.display()))
+}
+
+/// The newest modification time of `dir` and its direct entries.
+fn last_modified(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::symlink_metadata(dir).ok()?.modified().ok()?;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        if let Some(t) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
+            newest = newest.max(t);
+        }
+    }
+    Some(newest)
+}
+
+/// Removes the directories `<prefix>*` in `root` whose owner has died and
+/// that nobody has written to for at least `min_age`. A directory without a
 /// readable owner record, or one that is not a plain directory, is left alone.
-fn sweep_orphaned_depot_clones(root: &Path) {
+pub(crate) fn sweep_orphaned_dirs(root: &Path, prefix: &str, min_age: Duration) {
     let Ok(entries) = fs::read_dir(root) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(clone_name) = name.to_str().and_then(|n| n.strip_suffix(CLONE_OWNER_SUFFIX)) else { continue };
-        if !clone_name.starts_with("depot-") || !entry.file_type().is_ok_and(|t| t.is_file()) {
+        let Some(dir_name) = name.to_str().and_then(|n| n.strip_suffix(CLONE_OWNER_SUFFIX)) else { continue };
+        if !dir_name.starts_with(prefix) || !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
         let Ok(record) = fs::read_to_string(entry.path()) else { continue };
         if clone_owner_alive(&record) {
             continue;
         }
-        let clone = root.join(clone_name);
-        match fs::symlink_metadata(&clone) {
-            Ok(meta) if meta.is_dir() => remove_session_depot(&clone),
+        let dir = root.join(dir_name);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {
+                let idle = last_modified(&dir).and_then(|t| t.elapsed().ok()).unwrap_or(Duration::ZERO);
+                if idle >= min_age {
+                    remove_owned_dir(&dir);
+                }
+            }
             Ok(_) => {}
             Err(_) => { let _ = fs::remove_file(entry.path()); }
         }
     }
 }
 
+/// Removes an owned directory and then its owner record.
+pub fn remove_owned_dir(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_file(clone_owner_path(dir));
+}
+
 /// Removes a session depot clone and then its owner record.
 pub fn remove_session_depot(clone: &Path) {
-    let _ = fs::remove_dir_all(clone);
-    let _ = fs::remove_file(clone_owner_path(clone));
+    remove_owned_dir(clone);
+}
+
+/// Where a session's broker receipts go when the caller names no receipts
+/// directory: `~/.palette/receipts/<session id>/`, kept after the session
+/// closes. `PALETTE_RECEIPT_RETENTION_DAYS` (default 30) sets how long a
+/// closed session's receipts are kept before a later session prunes them;
+/// 0 restores the old behavior, receipts inside the session scratch root and
+/// deleted with it. Returns the root and the retention, or None for 0.
+pub fn default_receipts_root() -> Result<Option<(PathBuf, Duration)>, String> {
+    let retention = receipt_retention(std::env::var("PALETTE_RECEIPT_RETENTION_DAYS").ok().as_deref())?;
+    Ok(retention.map(|r| (util::home().join(".palette").join("receipts"), r)))
+}
+
+fn receipt_retention(days: Option<&str>) -> Result<Option<Duration>, String> {
+    let days = match days {
+        None => DEFAULT_RECEIPT_RETENTION_DAYS,
+        Some(v) => Some(v.trim()).filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|t| t.parse::<u64>().ok()).filter(|d| *d <= 36_500)
+            .ok_or(format!("PALETTE_RECEIPT_RETENTION_DAYS must be a whole number of days, got {v:?}"))?,
+    };
+    Ok((days > 0).then(|| Duration::from_secs(days * 86_400)))
+}
+
+pub const DEFAULT_RECEIPT_RETENTION_DAYS: u64 = 30;
+
+/// Creates `<root>/<session id>/` for one session's receipts, after pruning
+/// the receipts of closed sessions older than `retention`.
+pub fn create_receipts_dir(root: &Path, session_id: &str, retention: Duration) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(root)
+        .map_err(|e| format!("creating {}: {e}", root.display()))?;
+    sweep_orphaned_dirs(root, "palette-", retention);
+    let dir = root.join(session_id);
+    fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    if let Err(e) = record_owner(&dir) {
+        let _ = fs::remove_dir(&dir);
+        return Err(e);
+    }
+    Ok(dir)
 }
 
 /// One private, writable prepared-depot clone for a session's worker caches.
@@ -525,13 +594,11 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
     let depot = real_depot.map(str::to_string).unwrap_or_else(default_depot);
     let root = Path::new(&depot).parent().unwrap_or(Path::new("/")).join(".palette-depot-clones");
     fs::create_dir_all(&root).map_err(|e| format!("creating {}: {e}", root.display()))?;
-    sweep_orphaned_depot_clones(&root);
+    sweep_orphaned_dirs(&root, "depot-", Duration::ZERO);
     let dest = util::mkdtemp_in(&root, "depot-").map_err(|e| e.to_string())?;
-    if let Some(record) = clone_owner_record() {
-        if let Err(e) = fs::write(clone_owner_path(&dest), record) {
-            remove_session_depot(&dest);
-            return Err(format!("recording the owner of {}: {e}", dest.display()));
-        }
+    if let Err(e) = record_owner(&dest) {
+        remove_session_depot(&dest);
+        return Err(e);
     }
     let _ = fs::remove_dir(&dest); // cp wants a destination that does not exist yet
     let status = Command::new("cp")
@@ -1197,6 +1264,60 @@ mod tests {
         let clones = root.join(".palette-depot-clones");
         assert_eq!(fs::read_dir(&clones).unwrap().count(), 0, "a failed clone left residue");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn owned_dirs_are_swept_by_prefix_once_idle_long_enough() {
+        let root = util::mkdtemp("palette-owned-dirs-").unwrap();
+        let namespace = pid_namespace().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        let dead = format!("{namespace} {reaped} 1\n");
+        let make = |name: &str, record: &str, age_days: u64| {
+            let d = dir(&root, name);
+            let f = d.join("receipts.jsonl");
+            fs::write(&f, "{}\n").unwrap();
+            let when = SystemTime::now() - Duration::from_secs(age_days * 86_400);
+            File::options().write(true).open(&f).unwrap().set_modified(when).unwrap();
+            File::open(&d).unwrap().set_modified(when).unwrap();
+            fs::write(clone_owner_path(&d), record).unwrap();
+            d
+        };
+        let stale = make("palette-stale", &dead, 40);
+        let recent = make("palette-recent", &dead, 2);
+        let live = make("palette-live", &clone_owner_record().unwrap(), 40);
+        let other_prefix = make("depot-stale", &dead, 40);
+
+        sweep_orphaned_dirs(&root, "palette-", Duration::from_secs(30 * 86_400));
+        assert!(fs::symlink_metadata(&stale).is_err() && !clone_owner_path(&stale).exists());
+        for kept in [&recent, &live, &other_prefix] {
+            assert!(kept.is_dir() && clone_owner_path(kept).exists(), "{} was swept", kept.display());
+        }
+        sweep_orphaned_dirs(&root, "palette-", Duration::ZERO);
+        assert!(fs::symlink_metadata(&recent).is_err(), "a dead owner's dir survived a zero-age sweep");
+        assert!(live.is_dir() && other_prefix.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn receipts_dirs_are_private_owned_and_retention_is_parsed_strictly() {
+        let root = util::mkdtemp("palette-receipts-").unwrap().join("receipts");
+        let d = create_receipts_dir(&root, "palette-0123456789abcdef", Duration::from_secs(86_400)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(clone_owner_alive(&fs::read_to_string(clone_owner_path(&d)).unwrap()));
+        assert!(create_receipts_dir(&root, "palette-0123456789abcdef", Duration::ZERO).is_err(), "an existing receipts dir was reused");
+        assert!(d.is_dir(), "a live session's receipts were pruned");
+
+        assert_eq!(receipt_retention(None).unwrap(), Some(Duration::from_secs(30 * 86_400)));
+        assert_eq!(receipt_retention(Some("7")).unwrap(), Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(receipt_retention(Some("0")).unwrap(), None);
+        for bad in ["", "-1", "+7", "1.5", "forever", "99999999"] {
+            assert!(receipt_retention(Some(bad)).is_err(), "accepted {bad:?}");
+        }
+        fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[test]
