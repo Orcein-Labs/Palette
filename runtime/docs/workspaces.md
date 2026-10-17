@@ -28,6 +28,8 @@ omit these files so candidate code cannot return their contents through test out
 
 Use action=apply with request_id in the same logical workspace. When the client advertises MCP form elicitation, the broker asks the client to present an explicit confirmation for the exact digest and review diff. Accepting that form authorizes one attempt. Client-confirmed approval is not proof of a named human's identity; this relies on a trusted MCP client honoring user interaction. Julia and model-supplied tool arguments cannot mint grants. The router accepts any client running as your user, so a client that auto-accepts forms, or an agent that drives the client and answers the form itself, approves without a human. When a change needs a human decision, use a client that shows the form to you, or the local administrator commands below.
 
+To take the client out of approval entirely, set `PALETTE_PATCH_APPROVAL=administrator` in the operator environment. The broker then never sends a confirmation form, and every patch outside the auto-apply classes waits for the local administrator command below, even when the client supports forms. The default, `client`, keeps form confirmation. Any other value stops the adapter from starting. This mode removes the MCP channel, which an agent that drives its own client can answer. It does not stop a process that runs as your user and calls the administrator command itself, so on a machine where agents have a shell, keep that command behind the agent's own permission prompt.
+
 If the client does not support confirmation, the request remains pending. An explicitly authorized local administrator can inspect and approve it:
 
 ```

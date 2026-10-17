@@ -17,7 +17,7 @@ from source_transport import normalize_palette_call
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, protected_host_paths
 from runtime_registry import RuntimeRegistry
-from patch_broker import PatchBroker
+from patch_broker import PatchBroker, approval_mode
 from repair_broker import RepairBroker
 
 REPO = os.environ.get("PALETTE_REPO", str(Path(__file__).absolute().parents[2]))
@@ -54,7 +54,8 @@ try:
                                REPAIR_CONFIG.get("auto_apply_prefixes", {}),
                                protected_paths=PROTECTED_PATHS,
                                registry_root=RUNTIME_ROOT,
-                               sandbox_source_paths=REPAIR_CONFIG.get("sandbox_source_paths", {}))
+                               sandbox_source_paths=REPAIR_CONFIG.get("sandbox_source_paths", {}),
+                               approval=approval_mode(os.environ.get("PALETTE_PATCH_APPROVAL")))
     REPAIR_BROKER = RepairBroker(PATCH_BROKER, REPAIR_CONFIG.get("test_recipes", {}),
                                  REPAIR_CONFIG.get("auto_apply_prefixes", {}),
                                  protected_paths=PROTECTED_PATHS)
