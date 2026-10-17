@@ -605,7 +605,9 @@ end
     Palette.WORKSPACE_ROOT[] = mktempdir()
     Palette.STATE_DIR[] = mktempdir()
     try
-        @test execute(ExecuteCode("big = Any[Any[Float64(i), Float64(i + 1)] for i in 1:100_000]; length(big)")).result.data == 100_000
+        # Not `big`: Julia 1.10 binds a name that a top-level call reads to
+        # Base's export before the call runs, then refuses the assignment.
+        @test execute(ExecuteCode("rows = Any[Any[Float64(i), Float64(i + 1)] for i in 1:100_000]; length(rows)")).result.data == 100_000
         Palette.snapshot_state!(1)                       # compile once
         started = time()
         manifest = Palette.snapshot_state!(2)

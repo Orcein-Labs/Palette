@@ -355,6 +355,10 @@ Walk(mod::Module, seen, user, ids, checked, visits, give_way) =
 struct GaveWay <: Exception end
 const WALK_YIELD_EVERY = 4096
 
+# Containers whose elements the walk checks one by one. Julia 1.11 added
+# `Memory`, which backs `Array`; 1.10 (the compat floor) has only `Array`.
+const ELEMENT_CONTAINERS = isdefined(Core, :Memory) ? Union{Array, getfield(Core, :Memory)} : Array
+
 const REFUSED_TYPES = (Task, Channel, Condition, Threads.Condition, ReentrantLock, Threads.SpinLock, Timer,
                        Base.Process, Base.ProcessChain, Base.Libc.RawFD, WeakRef, Module, Core.MethodInstance,
                        Method, Core.CodeInfo, Base.Semaphore, Base.Event)
@@ -533,7 +537,7 @@ end
 
 function refusal_struct(w::Walk, @nospecialize(x))
     T = typeof(x)
-    x isa Union{Array, Memory} && return refusal_elements(w, x)
+    x isa ELEMENT_CONTAINERS && return refusal_elements(w, x)
     isbitstype(T) && return ptr_free(T) ? nothing : "it holds a pointer"
     for i in 1:nfields(x)
         isdefined(x, i) || continue
