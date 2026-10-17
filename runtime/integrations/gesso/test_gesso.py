@@ -120,7 +120,8 @@ class GessoInstallerTests(unittest.TestCase):
         self.assertEqual(manifest["requires"], [])
         self.assertIn(str(artifact_root.resolve()), code)
         self.assertNotIn("__PALETTE_GESSO_", code)
-        self.assertNotIn("/mnt/d/Code Projects/Gesso", code)
+        # No developer checkout path leaks into the deployed code.
+        self.assertNotRegex(code, r"/mnt/[a-z]/")
         self.assertIn(info["id"], code)
         self.assertTrue(version.startswith("0.1.0+"))
 

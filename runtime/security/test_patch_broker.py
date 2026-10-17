@@ -1,6 +1,7 @@
 """Real host file operations and one-shot administrator approval entry point."""
 import hashlib
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 import patch_broker as patch_broker_module
-from patch_broker import PatchBroker, request_digest
+from patch_broker import PatchBroker, approval_mode, request_digest
 from repair_broker import RepairBroker, normalize_recipe, run_isolated_test
 from prewarm_depot import resolve_real_julia_binary
 
@@ -161,6 +162,29 @@ class PatchTests(unittest.TestCase):
         self.assertEqual((self.root / "a.txt").read_text(), "before\n")
         with self.assertRaises(PermissionError):
             self.broker.approve(request["request_id"], "wrong digest", "local_administrator")
+
+    def test_administrator_mode_never_asks_the_client(self):
+        broker = PatchBroker(self.store, {"project": str(self.root)}, approval="administrator")
+        request = self.prepare()
+        sent = io.StringIO()
+        result = broker.call({"action": "apply", "request_id": request["request_id"]}, "world-a",
+                             {"elicitation": {"form": {}}}, None, sent)
+        self.assertEqual(result["status"], "approval_required", result)
+        self.assertEqual(sent.getvalue(), "", "a confirmation form was sent to the client")
+        self.assertEqual((self.root / "a.txt").read_text(), "before\n")
+        self.approve(request)
+        applied = broker.call({"action": "apply", "request_id": request["request_id"]}, "world-a", {}, None, sent)
+        self.assertEqual(applied["status"], "applied", applied)
+        self.assertEqual((self.root / "a.txt").read_text(), "after\n")
+
+    def test_approval_mode_is_parsed_strictly(self):
+        self.assertEqual(approval_mode(None), "client")
+        self.assertEqual(approval_mode("administrator"), "administrator")
+        for bad in ("", "Administrator", "none", "human"):
+            with self.assertRaises(ValueError, msg=bad):
+                approval_mode(bad)
+        with self.assertRaises(ValueError):
+            PatchBroker(self.store, {"project": str(self.root)}, approval="auto")
 
 
     def test_expired_and_tampered_requests(self):

@@ -39,16 +39,26 @@ function stress(cmd::AbstractString; n::Integer=200, jobs::Integer=8, seconds::R
     worker() = while true
         i = Threads.atomic_add!(next, 1) + 1
         (i > n || time() - started > seconds) && return
-        buf = IOBuffer()
-        p = run(pipeline(ignorestatus(addenv(`bash -c $cmd`, "STRESS_RUN" => string(i))); stdout=buf, stderr=buf))
-        code = p.exitcode
-        Base.@lock lock begin
-            outcomes[code] = get(outcomes, code, 0) + 1
-            done[] += 1
-            if code != 0 && (first_failure[] === nothing || i < first_failure[][1])
-                out = String(take!(buf))
-                first_failure[] = (i, code, last(out, 1500))
+        # One file takes both streams. Julia 1.10 stops an IOBuffer taking
+        # writes when the first of two pipes into it closes, so a buffer shared
+        # by stdout and stderr lost whatever the other stream wrote after that.
+        path, io = mktemp()
+        try
+            p = try
+                run(pipeline(ignorestatus(addenv(`bash -c $cmd`, "STRESS_RUN" => string(i))); stdout=io, stderr=io))
+            finally
+                close(io)
             end
+            code = p.exitcode
+            Base.@lock lock begin
+                outcomes[code] = get(outcomes, code, 0) + 1
+                done[] += 1
+                if code != 0 && (first_failure[] === nothing || i < first_failure[][1])
+                    first_failure[] = (i, code, last(read(path, String), 1500))
+                end
+            end
+        finally
+            rm(path; force=true)
         end
     end
     @sync for _ in 1:max(1, jobs)

@@ -224,9 +224,23 @@ def apply_files(record):
         os.close(root_fd)
 
 
+APPROVAL_MODES = ("client", "administrator")
+
+
+def approval_mode(value):
+    """Parse PALETTE_PATCH_APPROVAL. "client" (the default) lets a client that
+    shows MCP form elicitation confirm a patch; "administrator" accepts only
+    the local administrator command, so no MCP client can confirm anything."""
+    mode = "client" if value is None else value
+    if mode not in APPROVAL_MODES:
+        raise ValueError("PALETTE_PATCH_APPROVAL must be one of: " + ", ".join(APPROVAL_MODES))
+    return mode
+
+
 class PatchBroker:
     def __init__(self, storage, roots, auto_apply_prefixes=None, protected_paths=(),
-                 registry_root=None, sandbox_source_paths=None):
+                 registry_root=None, sandbox_source_paths=None, approval="client"):
+        self.approval = approval_mode(approval)
         self.storage = Path(storage).resolve()
         self.roots = {key: str(Path(path).resolve(strict=True)) for key, path in roots.items()}
         require_disjoint(self.roots.values(), [self.storage])
@@ -544,6 +558,8 @@ class PatchBroker:
             return record
         if record["status"] == "pending":
             self.reject_forbidden_changes(record)
+            if self.approval == "administrator":
+                return {"status": "approval_required", "request_id": record["request_id"], "patch_sha256": record["patch_sha256"], "reason": "This operator accepts patch approval only from the local administrator command; MCP client confirmation is turned off."}
             elicitation = capabilities.get("elicitation")
             if not isinstance(elicitation, dict) or elicitation and "form" not in elicitation:
                 return {"status": "approval_required", "request_id": record["request_id"], "patch_sha256": record["patch_sha256"], "reason": "Client does not advertise form elicitation. Local administrator must review and approve the exact pending request; Julia and MCP tool arguments cannot grant approval."}

@@ -70,6 +70,52 @@ Routing context keys prevent accidental conversation collisions. They are not
 an authenticated identity system. Project-scoped worlds can share files, and
 multiple worlds do not imply filesystem isolation from those shared project files.
 
+The broker's socket accepts connections from any local user, because the
+worker reaches it through a user namespace, and the broker does not check its
+peer. What keeps other users out is the directory around it: the session root,
+`~/.palette-sessions` and the socket's `broker` directory are created or
+tightened to mode 0700, and a session refuses to start if `broker` is a symlink
+or belongs to another user. The sandbox's passwd and group files are kept in
+`palette-etc-<uid>` under `$XDG_RUNTIME_DIR` when that directory is private to
+the user, and under `$TMPDIR` or `/tmp` otherwise, where another user who
+creates that name first can stop sessions from starting but cannot change the
+files.
+
+Production entry points start sessions and brokers through the Rust host,
+`palette-host`. The Python session, broker and `session_cli.py` are a reference
+implementation for the conformance suites (`verify_operator.py --implementation
+python`); no production entry point imports them.
+
+## Python host: scheduled for removal
+
+> **The Python host is kept for one more release, only as the conformance
+> oracle. It is deleted once the Rust host has its own conformance tests for
+> every category the oracle covers.** Do not add features to it.
+
+The Python host is `session.py`, `broker.py`, `launch_worker.py`,
+`session_cli.py` and the Python branch of `host_adapter.py`. Today it earns its
+place by running the same assertions as the Rust host, so a divergence between
+the two shows up as a failure on one side. That is how A3 and the D11 control
+were caught.
+
+The oracle covers these categories, one suite each, as run by
+`verify_operator.py --implementation python`:
+
+| Category | Suite |
+|---|---|
+| Authority: bind layout, read and write roots, network, credentials, broker ceilings | `test_authority.py` |
+| Session: persistent and ephemeral turns, kill detection, session roots, depot clones, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
+| Session bridge: the stdio protocol of `session_cli` / `palette-host session` | `test_session_cli.py` |
+| Revival: what a replacement kernel restores, rebuilds or reports lost | `test_revival.py` |
+| Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `test_host_bridge.py` |
+
+Delete the Python host when each row has Rust-side coverage that does not need
+the Python run to tell right from wrong. Then drop the `python` leg of the
+nightly CI matrix and the `--implementation` option.
+
+Pull-request and push CI run the Rust host only. The `[rust, python]` matrix
+runs nightly and on manual dispatch.
+
 The host trusts the operating system's namespace, filesystem, and Landlock
 mechanisms. Unmanaged host writers do not participate in Palette's patch lock.
 Multi-file patches can complete partially; receipts identify the committed files.

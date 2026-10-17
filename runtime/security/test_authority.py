@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sys
 import subprocess
 import tempfile
@@ -40,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 # The broker and worker launcher under test: the Rust host when PALETTE_HOST_BIN is set.
-from host_adapter import B, create_session_depot, remove_session_depot, run_worker  # noqa: E402
+from host_adapter import B, HOST_BIN, create_session_depot, remove_session_depot, run_worker  # noqa: E402
 from launch_worker import build_package_installer_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
 REPO_DIR = str(Path(__file__).resolve().parents[2])
@@ -279,8 +280,11 @@ class TestNetworkRedirectSafety(unittest.TestCase):
     url."""
 
     def setUp(self):
+        hits = self.hits = []
+
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(handler_self):
+                hits.append(handler_self.path)
                 if handler_self.path == "/redirect":
                     handler_self.send_response(302)
                     handler_self.send_header(
@@ -316,6 +320,201 @@ class TestNetworkRedirectSafety(unittest.TestCase):
         result = broker._handle_network_access({"url": f"http://127.0.0.1:{self.port}/redirect"})
         self.assertEqual(result["status"], 302)
         self.assertNotIn("SECRET", result["body_prefix"])
+
+
+    def test_userinfo_and_backslash_cannot_smuggle_a_host(self):
+        # Regression for a reproduced bypass in the Rust host: its hand-written
+        # split read `http://127.0.0.1:PORT\@allowed.example/` as host
+        # allowed.example, while the HTTP client connected to 127.0.0.1.
+        # Both hosts must deny every one of these and never reach the server.
+        broker = B.Broker(
+            {"network_access": {"allowed": True, "allowed_hosts": ["allowed.example"]}},
+            os.path.join(tempfile.mkdtemp(), "receipts.jsonl"), "smuggle-test",
+        )
+        p = self.port
+        for url in (f"http://127.0.0.1:{p}\\@allowed.example/",
+                    f"http://127.0.0.1:{p}\\allowed.example/",
+                    f"http://allowed.example@127.0.0.1:{p}/",
+                    f"http://allowed.example:x@127.0.0.1:{p}/",
+                    f"http://127.0.0.1:{p}#@allowed.example/",
+                    f"http://127.0.0.1:{p}?@allowed.example/"):
+            with self.subTest(url=url):
+                with self.assertRaises(Exception):
+                    broker._handle_network_access({"url": url})
+        self.assertEqual(self.hits, [], "a denied URL still reached the local server")
+
+
+class TestReceiptsFailClosed(unittest.TestCase):
+    """No answer leaves the broker without its receipt."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="palette-receipt-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.data = os.path.join(self.tmp, "data")
+        os.makedirs(self.data)
+        Path(self.data, "f").write_text("x")
+
+    def test_a_receipt_that_cannot_be_written_denies_the_request(self):
+        receipts = os.path.join(self.tmp, "receipts.jsonl")
+        broker = B.Broker({"fs_digest": {"allowed_paths": [self.data]}}, receipts, "test-session")
+        os.remove(receipts)
+        os.mkdir(receipts)  # opening the log for append now fails
+        resp = broker.handle_request({"id": "r1", "category": "fs_digest",
+                                      "params": {"paths": [os.path.join(self.data, "f")]}})
+        self.assertFalse(resp["approved"], resp)
+        self.assertIn("receipt not recorded", resp["reason"])
+        self.assertNotIn("result", resp)
+
+    def test_a_broker_that_cannot_open_its_receipt_log_does_not_start(self):
+        receipts = os.path.join(self.tmp, "receipts.jsonl")
+        os.mkdir(receipts)
+        # The Python broker names the log; the Rust one never prints READY.
+        with self.assertRaisesRegex(RuntimeError, "receipt log|did not start"):
+            B.Broker({}, receipts, "test-session")
+
+
+class TestExternalWriteNoFollow(unittest.TestCase):
+    """The Python broker's write walk; the Rust one has the same unit test."""
+
+    def test_a_symlink_swapped_in_after_the_check_is_never_followed(self):
+        import broker as python_broker
+        base = Path(tempfile.mkdtemp(prefix="palette-fs-write-"))
+        self.addCleanup(shutil.rmtree, base, True)
+        allowed, outside = base / "allowed", base / "outside"
+        (allowed / "sub").mkdir(parents=True)
+        outside.mkdir()
+        root = allowed.resolve()
+        python_broker._write_beneath(root, root / "new" / "dir" / "f.txt", b"ok")
+        self.assertEqual((allowed / "new" / "dir" / "f.txt").read_text(), "ok")
+        (allowed / "sub" / "f.txt").symlink_to(outside / "victim")
+        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
+            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
+        shutil.rmtree(allowed / "sub")
+        (allowed / "sub").symlink_to(outside)
+        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
+            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
+        self.assertEqual(list(outside.iterdir()), [])
+
+
+class TestExternalWriteRootsPinned(unittest.TestCase):
+    """allowed_dirs resolve once, at broker start, on either backend."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="palette-fs-pin-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+
+    def _write(self, broker, path):
+        return broker.handle_request({"id": "w", "category": "external_fs_write",
+                                      "params": {"path": str(path), "content": "x"}})
+
+    def test_an_allowed_dir_swapped_for_a_symlink_after_start_is_refused(self):
+        allowed, later, outside = self.base / "allowed", self.base / "later", self.base / "outside"
+        allowed.mkdir()
+        outside.mkdir()
+        receipts = self.base / "receipts" / "receipts.jsonl"
+        broker = B.Broker({"external_fs_write": {"allowed_dirs": [str(allowed), str(later)]}},
+                          str(receipts), "test-session")
+        self.addCleanup(getattr(broker, "close", lambda: None))
+        self.assertTrue(self._write(broker, allowed / "a.txt")["approved"])
+        # A worker that can write where the allowed dirs live swaps one for a
+        # symlink, and creates the other (missing at start) as one.
+        shutil.rmtree(allowed)
+        allowed.symlink_to(outside)
+        later.symlink_to(outside)
+        for path in (allowed / "b.txt", later / "c.txt"):
+            with self.subTest(path=path):
+                self.assertFalse(self._write(broker, path)["approved"])
+        self.assertEqual(list(outside.iterdir()), [], "a write followed a swapped-in symlink")
+
+    def test_an_allowed_dir_that_reaches_the_receipt_log_never_starts(self):
+        receipts = self.base / "receipts" / "receipts.jsonl"
+        with self.assertRaisesRegex(RuntimeError, "overlaps the protected host path|did not start"):
+            B.Broker({"external_fs_write": {"allowed_dirs": [str(self.base)]}}, str(receipts), "test-session")
+
+
+
+class TestCeilingFileProtected(unittest.TestCase):
+    """A ceiling given as a file can never be rewritten through the broker it configures."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="palette-ceiling-file-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.conf = self.base / "conf"
+        self.conf.mkdir()
+        self.ceiling = self.conf / "ceiling.json"
+        # The ceiling lets workers write to the directory the ceiling lives in.
+        self.ceiling.write_text(json.dumps({"external_fs_write": {"allowed_dirs": [str(self.conf)]}}))
+
+    def _refused(self, argv, timeout, stdin):
+        proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self.fail(f"{argv[:2]} started with an allowed dir that holds its own ceiling file")
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("overlaps the protected host path", out)
+        self.assertIn("ceiling.json", out)
+
+    def test_a_broker_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
+        command = [HOST_BIN, "broker"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("broker.py"))]
+        self._refused(command + ["--socket", str(self.base / "b.sock"), "--ceiling", str(self.ceiling),
+                                 "--receipts", str(self.base / "receipts" / "receipts.jsonl")], 60, subprocess.PIPE)
+
+    def test_a_session_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
+        command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("session_cli.py"))]
+        self._refused(command + ["--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
+                                 "--scratch-root", str(self.base / "scratch"),
+                                 "--receipts-dir", str(self.base / "receipts")], 300, subprocess.DEVNULL)
+
+class TestBrokerConnectionCap(unittest.TestCase):
+    """Idle connections cannot hold every broker thread."""
+
+    def test_connections_past_the_cap_are_refused_until_one_closes(self):
+        sock_dir = tempfile.mkdtemp(prefix="njl-cap-")
+        self.addCleanup(shutil.rmtree, sock_dir, True)
+        sock = os.path.join(sock_dir, "broker.sock")
+        # Without a stop event, serve returns once the socket accepts.
+        server, _ = B.serve(sock, {}, os.path.join(sock_dir, "receipts.jsonl"), "test-session")
+        self.addCleanup(getattr(server, "server_close", lambda: None))
+        self.addCleanup(server.shutdown)
+
+        def ask(req_id):
+            with socket.socket(socket.AF_UNIX) as s:
+                s.connect(sock)
+                s.settimeout(10)
+                s.sendall((json.dumps({"id": req_id, "category": "nope"}) + "\n").encode())
+                with s.makefile() as reply:
+                    return reply.readline()
+
+        idle = []
+        try:
+            for _ in range(64):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(sock)
+                c.settimeout(10)
+                idle.append(c)
+            # Both brokers take a connection's slot in the accept loop, in
+            # connection order, so the 65th finds all 64 taken.
+            self.assertIn("broker busy", ask("over"))
+            # A half-closed connection ends its handler; the server closing
+            # its end, which recv sees, comes just before the slot is freed.
+            for c in idle:
+                c.shutdown(socket.SHUT_WR)
+            for c in idle:
+                self.assertEqual(c.recv(1), b"")
+        finally:
+            for c in idle:
+                c.close()
+        # The slot is freed a few instructions after that close, so a request
+        # may still race it; a handful of attempts covers the gap.
+        replies = []
+        for _ in range(5):
+            replies.append(ask("after"))
+            if "unknown capability" in replies[-1]:
+                break
+        self.assertIn("unknown capability", replies[-1], replies)
 
 
 class TestCeilingSubset(unittest.TestCase):

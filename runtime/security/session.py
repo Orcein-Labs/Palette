@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 Palette persistent session -- "persistent mind, disposable machinery".
 
@@ -37,8 +40,9 @@ import threading
 import uuid
 from pathlib import Path
 
-from launch_worker import (resolve_real_julia_binary, build_bwrap_argv, create_session_depot, package_store_paths,
-                           remove_session_depot)
+from launch_worker import (resolve_real_julia_binary, build_bwrap_argv, create_receipts_dir, create_session_depot,
+                           default_depot, default_receipts_root, package_store_paths, private_dir, record_owner, remove_owned_dir,
+                           remove_session_depot, sweep_orphaned_dirs)
 from filesystem_layout import require_disjoint
 
 import broker as _broker
@@ -112,9 +116,16 @@ class PaletteSession:
         task_workspace_dir: str | None = None,
         startup_timeout: float = 180.0,
         state_dir: str | None = None,
+        ceiling_file: str | None = None,
     ):
         """`workspace_dir` is this session's own scratch root: created here
-        and deleted on close. `task_workspace_dir` is a directory the caller
+        and deleted on close. The default, ~/.palette-sessions/<id>, carries
+        an owner record so a later session removes it if this process is
+        killed before it can. Without `receipts_dir` the broker's receipts go
+        to ~/.palette/receipts/<id>/ and outlive the session; past the
+        retention (PALETTE_RECEIPT_RETENTION_DAYS, default 30) a later session
+        archives them into ~/.palette/docs/receipts/<YYYY-MM>.zip. 0 keeps
+        them in the scratch root, deleted on close. `task_workspace_dir` is a directory the caller
         owns (an agent's task checkout): bound writable as the worker's
         working directory and never deleted. Without it the worker works in
         a private scratch workspace under the scratch root."""
@@ -136,8 +147,10 @@ class PaletteSession:
         # fix. _teardown() is hasattr-guarded specifically so it's safe to
         # call here no matter how early the failure happened.
         try:
-            scratch = Path(workspace_dir or Path.home() / ".palette-sessions" / self.session_id).resolve()
-            planned_receipts_dir = receipts_dir or str(scratch / "broker")
+            sessions_root = Path.home() / ".palette-sessions"
+            scratch = Path(workspace_dir or sessions_root / self.session_id).resolve()
+            default_receipts = None if receipts_dir else default_receipts_root()
+            planned_receipts_dir = receipts_dir or str(default_receipts[0] if default_receipts else scratch / "broker")
             package_root, package_depot, package_environment = package_store_paths(
                 ceiling=ceiling,
                 protected_paths=[
@@ -154,8 +167,16 @@ class PaletteSession:
                     raise ValueError(f"task workspace is not a directory: {task_workspace}")
                 require_disjoint([task_workspace], [scratch])
                 self.workspace_dir = str(task_workspace)
+            if workspace_dir is None:
+                # Default session roots of hosts that were killed before their teardown ran.
+                sweep_orphaned_dirs(sessions_root, "palette-")
             self._tmp_root = scratch
+            self._tmp_root_owned = workspace_dir is None
             self._tmp_root.mkdir(parents=True, exist_ok=True)
+            if self._tmp_root_owned:
+                private_dir(sessions_root)
+                private_dir(self._tmp_root)
+                record_owner(self._tmp_root)
             if task_workspace_dir is None:
                 self.workspace_dir = str(self._tmp_root / "workspace")
                 Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
@@ -167,14 +188,22 @@ class PaletteSession:
             # session root pushed it past that and no kernel could start
             # ("AF_UNIX path too long"); the socket then gets a short private
             # directory of its own. Receipts stay in the session root.
+            # The socket accepts any local user, so its directory is private.
             broker_root = self._tmp_root / "broker"
-            broker_root.mkdir(parents=True, exist_ok=True)
+            private_dir(broker_root)
             if len(str(broker_root / "broker.sock").encode()) > 100:
                 self._short_sock_dir = tempfile.mkdtemp(prefix="nj-")
                 self._broker_sock_dir = self._short_sock_dir
             else:
                 self._broker_sock_dir = str(broker_root)
-            receipts_path = str(Path(receipts_dir or broker_root) / "receipts.jsonl")
+            if receipts_dir:
+                receipts_root = Path(receipts_dir)
+            elif default_receipts:
+                receipts_root = create_receipts_dir(default_receipts[0], self.session_id, default_receipts[1])
+            else:
+                receipts_root = broker_root
+            self.receipts_dir = str(receipts_root)
+            receipts_path = str(receipts_root / "receipts.jsonl")
             require_disjoint([self.workspace_dir] + ([state_dir] if state_dir else []),
                 [broker_root, Path(receipts_path).parent, self.depot_clone_dir, self.package_store_root])
             self._broker_server, self._broker = _broker.serve(
@@ -188,6 +217,8 @@ class PaletteSession:
                 # Leaves the child's own shutdown and the reply time to land
                 # inside the turn.
                 child_timeout=max(5.0, turn_timeout - 10.0),
+                # The file the ceiling came from, protected like the operator's config.
+                trusted_files=[ceiling_file] if ceiling_file else [],
             )
 
             julia_bin = resolve_real_julia_binary()
@@ -197,7 +228,7 @@ class PaletteSession:
                 project_dir=self.project_dir,
                 repo_dir=self.repo_dir,
                 julia_bin=julia_bin,
-                julia_depot=os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia")).split(":")[-1],
+                julia_depot=default_depot(),
                 depot_clone_dir=self.depot_clone_dir,
                 package_store_root=package_root,
                 package_depot_dir=package_depot,
@@ -408,7 +439,10 @@ class PaletteSession:
         if hasattr(self, "depot_clone_dir"):
             remove_session_depot(self.depot_clone_dir)
         if hasattr(self, "_tmp_root"):
-            shutil.rmtree(self._tmp_root, ignore_errors=True)
+            if getattr(self, "_tmp_root_owned", False):
+                remove_owned_dir(self._tmp_root)
+            else:
+                shutil.rmtree(self._tmp_root, ignore_errors=True)
         if hasattr(self, "_short_sock_dir"):
             shutil.rmtree(self._short_sock_dir, ignore_errors=True)
 

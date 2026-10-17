@@ -5,10 +5,18 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.10 is the [compat] lower bound; 1.12 is the release in use.
+        julia: ['1.10', '1.12']
 
     steps:
     - uses: actions/checkout@v7
@@ -16,7 +24,7 @@ jobs:
     - name: Setup Julia
       uses: julia-actions/setup-julia@v3
       with:
-        version: '1.12'
+        version: ${{ matrix.julia }}
 
     - name: Instantiate project
       run: julia --project=@. -e 'using Pkg; Pkg.instantiate()'
@@ -103,7 +111,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        implementation: [rust, python]
+        # Pull requests and pushes check the Rust host only. The Python host is
+        # the conformance oracle until it is removed (runtime/docs/authority.md)
+        # and runs nightly and on manual dispatch.
+        implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
 
     steps:
     - uses: actions/checkout@v7
@@ -185,4 +196,4 @@ jobs:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime test_depot_clones
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime test_depot_clones test_entry_points

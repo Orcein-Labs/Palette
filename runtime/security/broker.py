@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Scheduled for removal: the Python host is kept for one more release, only as
+# the conformance oracle. See "Python host: scheduled for removal" in
+# runtime/docs/authority.md.
 """
 Palette host capability broker -- the second trust domain.
 
@@ -34,6 +37,7 @@ full category list and which remain NOT YET PROVEN.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -42,6 +46,7 @@ import shutil
 import socket
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -177,10 +182,11 @@ class HostJob:
 
     def _read_tail(self, name, pipe, cap):
         kept = bytearray()
-        for chunk in iter(lambda: pipe.read1(8192), b""):
-            kept += chunk
-            if len(kept) > 2 * cap:
-                del kept[:len(kept) - cap]
+        with pipe:   # each reader owns its pipe and closes it at end of output
+            for chunk in iter(lambda: pipe.read1(8192), b""):
+                kept += chunk
+                if len(kept) > 2 * cap:
+                    del kept[:len(kept) - cap]
         self._tails[name] = bytes(kept[-cap:]).decode("utf-8", "replace")
 
     def _kill_group(self):
@@ -235,6 +241,55 @@ class HostJob:
         self.proc.wait()
 
 
+def _write_beneath(root: Path, target: Path, data: bytes) -> None:
+    """Write `data` to `target`, which the caller has checked lies under
+    `root`, without following a symlink anywhere on the path. The checked
+    path is fully resolved, so a symlink met here was put there after the
+    check, by whoever else can write the allowed directory; the write is
+    refused instead of landing wherever it points. `root` was resolved when
+    the broker started, so the walk starts at `/`: an allowed directory
+    swapped for a symlink later, by a worker that can write where it lives,
+    is refused too. The Rust broker does the same walk."""
+    parts = target.relative_to(root).parts
+    if not parts:
+        raise IsADirectoryError(str(target))
+    nofollow = os.O_NOFOLLOW | os.O_CLOEXEC
+    here = Path("/")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    try:
+        for part in (*root.parts[1:], *parts[:-1]):
+            here = here / part
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                try:
+                    next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                except OSError as e:
+                    raise _symlink_refusal(e, here)
+            except OSError as e:
+                raise _symlink_refusal(e, here)
+            os.close(fd)
+            fd = next_fd
+        try:
+            file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o644, dir_fd=fd)
+        except OSError as e:
+            raise _symlink_refusal(e, target)
+        with os.fdopen(file_fd, "wb") as f:
+            f.write(data)
+    finally:
+        os.close(fd)
+
+
+def _symlink_refusal(e: OSError, path: Path) -> Exception:
+    if e.errno in (errno.ELOOP, errno.ENOTDIR):
+        return CapabilityDenied(f"refusing to write through a symlink at {path}")
+    return e
+
+
 class Broker:
     def __init__(
         self,
@@ -247,6 +302,7 @@ class Broker:
         project_dir: str | None = None,
         repo_dir: str | None = None,
         child_timeout: float = 90.0,
+        trusted_files: tuple[str, ...] | list[str] = (),
     ):
         # Deep-copied, not stored by reference: confirmed by direct testing
         # that a caller mutating the dict it passed in (e.g. appending to
@@ -272,6 +328,9 @@ class Broker:
         # view points.
         self.project_dir = project_dir
         self.repo_dir = repo_dir
+        # Host files this broker was configured from, such as a ceiling file
+        # given on the command line. Protected like the operator's config files.
+        self.trusted_files = [str(path) for path in trusted_files]
         # Host-set, never taken from a request. A persistent session sets it
         # below its own turn timeout, so a hung ephemeral child is killed
         # before the session gives up on the turn and kills the kernel too.
@@ -295,6 +354,43 @@ class Broker:
         self._jobs: dict[str, HostJob] = {}
         self._jobs_lock = threading.Lock()
         Path(receipt_log_path).parent.mkdir(parents=True, exist_ok=True)
+        # A broker that cannot keep receipts must not start: every answer it
+        # gives is supposed to leave one.
+        try:
+            open(receipt_log_path, "a").close()
+        except OSError as e:
+            raise RuntimeError(f"cannot open the receipt log {receipt_log_path}: {e}") from e
+        self._write_roots = self._pinned_write_roots()
+
+    def _pinned_write_roots(self) -> list[Path]:
+        """external_fs_write's allowed_dirs, resolved once, when the broker
+        starts. Each request is checked against these paths and walked to
+        without following a symlink, so a directory a worker can replace (one
+        inside its workspace, say) cannot become a symlink that moves the
+        root. An allowed_dir may not reach a path the host trusts: the receipt
+        log, the Palette checkout, the package store, the operator's config
+        files and the host command paths. A write there would let the agent
+        erase its receipts or widen its own next ceiling. The Rust broker does
+        the same."""
+        cap = self.ceiling.get("external_fs_write") or {}
+        roots = [Path(d).resolve() for d in cap.get("allowed_dirs") or []]
+        if not roots:
+            return roots
+        protected = [Path(self.receipt_log_path)]
+        protected += [Path(p) for p in (self.repo_dir, os.environ.get("PALETTE_REPO_DIR")) if p]
+        if self.package_depot_dir:
+            protected.append(Path(self.package_depot_dir).parent)
+        checkout = Path(__file__).resolve().parents[2]
+        if (checkout / "runtime" / "scripts" / "session_loop.jl").is_file():
+            protected.append(checkout)
+        protected += [Path(path) for path in self.trusted_files]
+        protected += protected_host_paths(self.ceiling)
+        for root in roots:
+            for path in protected:
+                path = path.resolve()
+                if root == path or path.is_relative_to(root) or root.is_relative_to(path):
+                    raise RuntimeError(f"external_fs_write allowed_dir {root} overlaps the protected host path {path}")
+        return roots
 
     def close(self):
         with self._jobs_lock:
@@ -319,11 +415,11 @@ class Broker:
         if not isinstance(path, str) or not isinstance(content, str):
             raise CapabilityDenied("external_fs_write requires string 'path' and 'content'")
         target = Path(path).resolve()
-        allowed = [Path(d).resolve() for d in cap["allowed_dirs"]]
-        if not any(target == a or a in target.parents for a in allowed):
+        allowed = self._write_roots
+        root = next((a for a in allowed if target == a or a in target.parents), None)
+        if root is None:
             raise CapabilityDenied(f"path {target} is outside the ceiling's allowed_dirs {allowed}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        _write_beneath(root, target, content.encode())
         return {"path": str(target), "bytes_written": len(content.encode())}
 
     class _NoRedirect(urllib.request.HTTPErrorProcessor):
@@ -366,10 +462,20 @@ class Broker:
         if parsed.scheme not in ("http", "https"):
             raise CapabilityDenied(f"network_access only permits http/https URLs, got scheme {parsed.scheme!r}")
 
+        # The host checked must be the host connected to. urlparse and
+        # urllib's own request parsing split the authority differently for
+        # inputs carrying userinfo, backslashes or percent-escapes (the Rust
+        # host had a reproduced bypass with `http://a\@b/`), so refuse
+        # those authority shapes outright instead of trusting either parse.
+        netloc = parsed.netloc
+        if "@" in netloc or parsed.username is not None or parsed.password is not None:
+            raise CapabilityDenied("network_access does not permit credentials (user@) in the URL")
+        if any(c in netloc for c in "\\%") or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+            raise CapabilityDenied(f"network_access refuses an ambiguous URL authority {netloc!r}")
         allowed_hosts = cap.get("allowed_hosts")
         if allowed_hosts is not None:
-            host = parsed.hostname
-            if host not in allowed_hosts:
+            host = (parsed.hostname or "").lower()
+            if host not in [str(h).lower() for h in allowed_hosts]:
                 raise CapabilityDenied(f"host {host} is not in this session's allowed_hosts {allowed_hosts}")
         # The broker performs the request itself, on the host, with the
         # host's real network namespace -- the worker never does. No
@@ -424,6 +530,7 @@ class Broker:
         protected_paths = [str(path) for path in protected_host_paths(self.ceiling, include_package_depot=False)]
         protected_paths.append(self.receipt_log_path)
         protected_paths.extend(path for path in (self.project_dir, self.repo_dir) if path)
+        protected_paths.extend(self.trusted_files)
         installer_argv = build_package_installer_argv(
             julia_bin=julia, package_store_root=package_store_root,
             package_depot_dir=self.package_depot_dir,
@@ -470,6 +577,12 @@ class Broker:
         ok, reason = ceiling_is_subset(requested_ceiling, self.ceiling)
         if not ok:
             raise CapabilityDenied(f"requested child ceiling is not a subset of this session's ceiling: {reason}")
+        # The subset check resolves both ceilings now; a child's directory must
+        # also lie within this broker's roots as they resolved at start.
+        for d in (requested_ceiling.get("external_fs_write") or {}).get("allowed_dirs") or []:
+            d = Path(d).resolve()
+            if not any(d == r or r in d.parents for r in self._write_roots):
+                raise CapabilityDenied(f"requested external_fs_write dir {d} is not within this session's allowed_dirs {self._write_roots}")
         if self.project_dir is None or self.repo_dir is None:
             raise CapabilityDenied("no session project/repo is configured for this broker -- spawn_child_worker requires one")
         script = params.get("script")
@@ -505,6 +618,7 @@ class Broker:
             depot_dir=child_depot_dir,
             package_depot_dir=self.package_depot_dir,
             package_environment_dir=self.package_environment_dir,
+            trusted_files=self.trusted_files,
             project_dir=child_project,
             repo_dir=child_repo,
         )
@@ -558,14 +672,14 @@ class Broker:
         return reply
 
     def _handle_fs_digest(self, params: dict) -> Any:
-        """Digest files with host privilege — the independent eye (FM-SLICE-A2).
+        """Digest files with host privilege, as a check the sandbox cannot forge.
 
         The sandboxed kernel can hash what it can see, but a digest computed
         inside the sandbox is the kernel grading its own writes. This handler
         reads the requested paths OUTSIDE the sandbox, on the host, and the
         request is receipted regardless of outcome — so a mutation claim can
-        be independently recomputed (FM-RQ-A2) and the receipt survives the
-        kernel, which kernel-side receipts do not (probe P15).
+        be independently recomputed and the receipt survives the kernel,
+        which kernel-side receipts do not.
 
         Ceiling shape: {"fs_digest": {"allowed_paths": ["/abs/dir", ...]}}.
         A requested path must resolve to an allowed path itself or sit under
@@ -720,7 +834,13 @@ class Broker:
             # CapabilityDenied by category so a bug doesn't read as a
             # deliberate policy decision in the audit log.
             reason = f"internal error handling request (not a policy denial): {e}"
-        self._write_receipt(req_id, category, params, approved, result, reason)
+        try:
+            self._write_receipt(req_id, category, params, approved, result, reason)
+        except Exception as e:
+            # Fail closed: no result leaves the broker without its receipt. The
+            # effect may already have happened, so tell the operator too.
+            print(f"palette broker: receipt for request {req_id} not recorded: {e}", file=sys.stderr)
+            return {"id": req_id, "approved": False, "reason": f"broker error: receipt not recorded: {e}"}
         resp = {"id": req_id, "approved": approved}
         if approved:
             resp["result"] = result
@@ -751,9 +871,18 @@ _MAX_REQUEST_BYTES = 1 << 20  # 1 MiB -- a worker holding unbounded power inside
 # buffer forever and exhaust the broker's own memory.
 
 
+# How many connections the broker serves at once, and how long one may take
+# to send its request line or receive its reply; the Rust broker uses the same
+# limits. Each connection holds a host thread, so an idle or flooding worker
+# must not be able to hold them all. Handling the request itself is not limited.
+_MAX_CONNECTIONS = 64
+_CONN_IO_TIMEOUT = 30.0
+
+
 class _ConnHandler(socketserver.BaseRequestHandler):
     def handle(self):
         broker: Broker = self.server.broker  # type: ignore[attr-defined]
+        self.request.settimeout(_CONN_IO_TIMEOUT)
         f = self.request.makefile("rwb")
         try:
             line = f.readline(_MAX_REQUEST_BYTES)
@@ -777,6 +906,33 @@ class _ConnHandler(socketserver.BaseRequestHandler):
 
 class _UnixSocketServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+    request_queue_size = 128  # the Rust listener's backlog
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(_MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(_CONN_IO_TIMEOUT)
+                request.sendall((json.dumps({"approved": False,
+                                             "reason": "broker busy: too many open connections"}) + "\n").encode())
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def serve(
@@ -791,6 +947,7 @@ def serve(
     project_dir: str | None = None,
     repo_dir: str | None = None,
     child_timeout: float = 90.0,
+    trusted_files: tuple[str, ...] | list[str] = (),
 ):
     if package_depot_dir is None and package_environment_dir is None:
         _, package_depot_dir, package_environment_dir = package_store_paths(
@@ -804,6 +961,7 @@ def serve(
         depot_dir=depot_dir, package_depot_dir=package_depot_dir,
         package_environment_dir=package_environment_dir,
         project_dir=project_dir, repo_dir=repo_dir, child_timeout=child_timeout,
+        trusted_files=trusted_files,
     )
     server = _UnixSocketServer(sock_path, _ConnHandler)
     server.broker = broker  # type: ignore[attr-defined]
@@ -837,4 +995,5 @@ if __name__ == "__main__":
 
     stop = threading.Event()
     print(f"[broker] listening on {args.socket}, session {args.session_id}")
-    serve(args.socket, ceiling, args.receipts, args.session_id, stop_event=stop)
+    serve(args.socket, ceiling, args.receipts, args.session_id, stop_event=stop,
+          trusted_files=[str(Path(args.ceiling).resolve())])
