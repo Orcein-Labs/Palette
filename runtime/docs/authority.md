@@ -70,6 +70,17 @@ Routing context keys prevent accidental conversation collisions. They are not
 an authenticated identity system. Project-scoped worlds can share files, and
 multiple worlds do not imply filesystem isolation from those shared project files.
 
+The broker's socket accepts connections from any local user, because the
+worker reaches it through a user namespace, and the broker does not check its
+peer. What keeps other users out is the directory around it: the session root,
+`~/.palette-sessions` and the socket's `broker` directory are created or
+tightened to mode 0700, and a session refuses to start if `broker` is a symlink
+or belongs to another user. The sandbox's passwd and group files are kept in
+`palette-etc-<uid>` under `$XDG_RUNTIME_DIR` when that directory is private to
+the user, and under `$TMPDIR` or `/tmp` otherwise, where another user who
+creates that name first can stop sessions from starting but cannot change the
+files.
+
 The host trusts the operating system's namespace, filesystem, and Landlock
 mechanisms. Unmanaged host writers do not participate in Palette's patch lock.
 Multi-file patches can complete partially; receipts identify the committed files.

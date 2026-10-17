@@ -296,8 +296,39 @@ def read_task_env(path: str | None) -> dict[str, str]:
     return env
 
 
+def private_dir(path: str | os.PathLike) -> None:
+    """Create `path` and its parents and make it a directory only this user
+    can enter. A symlink, or a directory another user owns, is refused. The
+    broker's socket is world-connectable for the sandbox, so the directory
+    around it is what keeps other local users from reaching the broker."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise RuntimeError(f"refusing {path}: it must be a directory owned by uid {os.getuid()}")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def identity_base(runtime_dir: str | None) -> Path | None:
+    """`$XDG_RUNTIME_DIR` when it is an absolute path to a directory this
+    user owns that nobody else can enter."""
+    if not runtime_dir or not os.path.isabs(runtime_dir):
+        return None
+    try:
+        st = os.lstat(runtime_dir)
+    except OSError:
+        return None
+    if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+        return Path(runtime_dir)
+    return None
+
+
 def identity_files(base: str | Path | None = None) -> Path:
     """passwd and group files naming the sandbox's uid 1000, written once per host.
+
+    They go in the user's private runtime directory when there is one, where
+    no other user can claim the name first, and in the temp directory otherwise.
 
     The directory lives in a shared temp dir under a predictable name, so it
     is trusted only if this user owns it, it is a real directory (not a
@@ -306,7 +337,8 @@ def identity_files(base: str | Path | None = None) -> Path:
     where the temp file is written.
     """
     uid = os.getuid()
-    etc = Path(base or tempfile.gettempdir()) / f"palette-etc-{uid}"
+    base = base or identity_base(os.environ.get("XDG_RUNTIME_DIR")) or tempfile.gettempdir()
+    etc = Path(base) / f"palette-etc-{uid}"
     try:
         os.mkdir(etc, 0o755)
     except FileExistsError:

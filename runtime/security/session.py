@@ -38,7 +38,7 @@ import uuid
 from pathlib import Path
 
 from launch_worker import (resolve_real_julia_binary, build_bwrap_argv, create_receipts_dir, create_session_depot,
-                           default_depot, default_receipts_root, package_store_paths, record_owner, remove_owned_dir,
+                           default_depot, default_receipts_root, package_store_paths, private_dir, record_owner, remove_owned_dir,
                            remove_session_depot, sweep_orphaned_dirs)
 from filesystem_layout import require_disjoint
 
@@ -169,6 +169,8 @@ class PaletteSession:
             self._tmp_root_owned = workspace_dir is None
             self._tmp_root.mkdir(parents=True, exist_ok=True)
             if self._tmp_root_owned:
+                private_dir(sessions_root)
+                private_dir(self._tmp_root)
                 record_owner(self._tmp_root)
             if task_workspace_dir is None:
                 self.workspace_dir = str(self._tmp_root / "workspace")
@@ -181,8 +183,9 @@ class PaletteSession:
             # session root pushed it past that and no kernel could start
             # ("AF_UNIX path too long"); the socket then gets a short private
             # directory of its own. Receipts stay in the session root.
+            # The socket accepts any local user, so its directory is private.
             broker_root = self._tmp_root / "broker"
-            broker_root.mkdir(parents=True, exist_ok=True)
+            private_dir(broker_root)
             if len(str(broker_root / "broker.sock").encode()) > 100:
                 self._short_sock_dir = tempfile.mkdtemp(prefix="nj-")
                 self._broker_sock_dir = self._short_sock_dir

@@ -587,6 +587,25 @@ pub fn create_receipts_dir(root: &Path, session_id: &str, retention: Duration) -
     Ok(dir)
 }
 
+/// Creates `path` and its parents and makes it a directory only this user can
+/// enter. A symlink, or a directory another user owns, is refused. The broker's
+/// socket is world-connectable for the sandbox, so the directory around it is
+/// what keeps other local users from reaching the broker.
+pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fs::create_dir_all(path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("checking {}: {e}", path.display()))?;
+    let uid = unsafe { libc::getuid() };
+    if !meta.file_type().is_dir() || meta.uid() != uid {
+        return Err(format!("refusing {}: it must be a directory owned by uid {uid}", path.display()));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("restricting {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// One private, writable prepared-depot clone for a session's worker caches.
 /// Broker-authorized package installs live in the separate durable package store.
 /// Callers release it with `remove_session_depot`.
@@ -648,8 +667,21 @@ pub fn read_task_env(path: Option<&str>) -> Result<BTreeMap<String, String>, Str
 }
 
 /// passwd and group files naming the sandbox's uid 1000, written once per host.
+/// They go in the user's private runtime directory when there is one, where
+/// no other user can claim the name first, and in the temp directory otherwise.
 fn identity_files() -> Result<PathBuf, String> {
-    identity_files_in(&util::temp_dir())
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    identity_files_in(&identity_base(runtime.as_deref()).unwrap_or_else(util::temp_dir))
+}
+
+/// `$XDG_RUNTIME_DIR` when it is an absolute path to a directory this user
+/// owns that nobody else can enter.
+fn identity_base(runtime_dir: Option<&Path>) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = runtime_dir.filter(|d| d.is_absolute())?;
+    let meta = fs::symlink_metadata(dir).ok()?;
+    let private = meta.file_type().is_dir() && meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o077 == 0;
+    private.then(|| dir.to_path_buf())
 }
 
 /// The directory lives in a shared temp dir under a predictable name, so it
@@ -1341,6 +1373,53 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, base.join(format!("palette-etc-{uid}"))).unwrap();
         assert!(identity_files_in(&base).unwrap_err().contains("refusing"));
         assert!(!elsewhere.join("passwd").exists(), "wrote through a planted symlink");
+    }
+
+    #[test]
+    fn identity_files_prefer_a_private_runtime_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Temp(PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let base = util::mkdtemp("palette-runtime-test-").unwrap();
+        let _guard = Temp(base.clone());
+        assert_eq!(identity_base(Some(&base)), Some(base.clone()));
+        assert_eq!(identity_base(None), None);
+        assert_eq!(identity_base(Some(Path::new("relative/run"))), None);
+        assert_eq!(identity_base(Some(&base.join("missing"))), None);
+        // Others can enter it: another user could have made the name first.
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(identity_base(Some(&base)), None);
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.join("link");
+        let real = base.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(identity_base(Some(&link)), None);
+    }
+
+    #[test]
+    fn private_dir_is_closed_to_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Temp(PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let base = util::mkdtemp("palette-private-test-").unwrap();
+        let _guard = Temp(base.clone());
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let nested = base.join("a/b");
+        private_dir(&nested).unwrap();
+        assert_eq!(mode(&nested), 0o700);
+        // An existing, open directory is tightened.
+        let open = base.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
+        // A symlink is refused and its target left alone.
+        std::os::unix::fs::symlink(&open, base.join("link")).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_dir(&base.join("link")).unwrap_err().contains("refusing"));
+        assert_eq!(mode(&open), 0o755);
     }
 
     #[test]

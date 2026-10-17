@@ -15,6 +15,7 @@ import json
 import os
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -222,6 +223,34 @@ class TestSessionScratchOwnership(SessionTestCase):
             shutil.rmtree(receipts / session_id)
             Path(f"{receipts / session_id}.owner").unlink()
 
+
+
+    def test_the_broker_socket_directory_is_private_to_this_user(self):
+        """The broker's socket accepts any local user and the broker does not
+        check its peer, so the directories around it must be closed to others.
+        An existing, open sessions directory is tightened."""
+        sessions = Path.home() / ".palette-sessions"
+        receipts = Path.home() / ".palette" / "receipts"
+        sessions.mkdir(exist_ok=True)
+        sessions.chmod(0o755)
+        proc, session_id = self._bridge()
+        for directory in (sessions, sessions / session_id, sessions / session_id / "broker"):
+            self.assertEqual(stat.S_IMODE(os.lstat(directory).st_mode), 0o700, directory)
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=120), 0)
+        shutil.rmtree(receipts / session_id)
+        Path(f"{receipts / session_id}.owner").unlink()
+
+    def test_a_symlinked_broker_directory_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="palette-broker-link-") as tmp:
+            root, elsewhere = Path(tmp, "session"), Path(tmp, "elsewhere")
+            root.mkdir()
+            elsewhere.mkdir(mode=0o755)
+            (root / "broker").symlink_to(elsewhere)
+            with self.assertRaises(SessionDeadError if HOST_BIN else RuntimeError):
+                PaletteSession(project_dir=PROJECT_DIR, ceiling={}, workspace_dir=str(root))
+            self.assertEqual(list(elsewhere.iterdir()), [], "the broker used the symlink's target")
+            self.assertEqual(stat.S_IMODE(elsewhere.stat().st_mode), 0o755)
 
 
 class TestAuthorityUnderPersistence(SessionTestCase):

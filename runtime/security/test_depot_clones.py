@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from launch_worker import (  # noqa: E402
     CLONE_OWNER_SUFFIX, _clone_owner_alive, _clone_owner_record, _pid_namespace, create_receipts_dir,
-    create_session_depot, receipt_retention_days, remove_session_depot, sweep_orphaned_dirs,
+    create_session_depot, identity_base, identity_files, private_dir, receipt_retention_days, remove_session_depot,
+    sweep_orphaned_dirs,
 )
 
 
@@ -131,6 +132,57 @@ class OwnedDirSweepTest(unittest.TestCase):
         for bad in ("", "-1", "+7", "1.5", "\u0667", "forever", "99999999"):
             with self.assertRaises(ValueError, msg=bad):
                 receipt_retention_days(bad)
+
+
+class PrivateDirectoryTest(unittest.TestCase):
+    """The broker socket's directories and the sandbox identity files must be
+    out of other local users' reach."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="palette-private-dirs-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def mode(self, path):
+        return os.lstat(path).st_mode & 0o777
+
+    def test_private_dir_is_closed_to_other_users_and_refuses_a_symlink(self):
+        nested = self.root / "a" / "b"
+        private_dir(nested)
+        self.assertEqual(self.mode(nested), 0o700)
+        opened = self.root / "open"
+        opened.mkdir(mode=0o755)
+        opened.chmod(0o755)
+        private_dir(opened)
+        self.assertEqual(self.mode(opened), 0o700, "an existing open directory was not tightened")
+        opened.chmod(0o755)
+        (self.root / "link").symlink_to(opened)
+        with self.assertRaisesRegex(RuntimeError, "refusing"):
+            private_dir(self.root / "link")
+        self.assertEqual(self.mode(opened), 0o755, "the symlink's target was changed")
+
+    def test_identity_files_prefer_a_private_runtime_dir(self):
+        runtime = self.root / "run"
+        runtime.mkdir(mode=0o700)
+        self.assertEqual(identity_base(str(runtime)), runtime)
+        for bad in (None, "", "relative/run", str(self.root / "missing")):
+            self.assertIsNone(identity_base(bad), bad)
+        runtime.chmod(0o755)
+        self.assertIsNone(identity_base(str(runtime)), "a runtime dir others can enter was used")
+        runtime.chmod(0o700)
+        (self.root / "link").symlink_to(runtime)
+        self.assertIsNone(identity_base(str(self.root / "link")))
+
+        previous = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+        try:
+            etc = identity_files()
+        finally:
+            if previous is None:
+                os.environ.pop("XDG_RUNTIME_DIR")
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = previous
+        self.assertEqual(etc, runtime / f"palette-etc-{os.getuid()}")
+        self.assertIn(":x:1000:1000:", (etc / "passwd").read_text())
 
 
 if __name__ == "__main__":

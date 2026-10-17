@@ -204,6 +204,8 @@ impl PaletteSession {
         cleanser.tmp_root = Some(tmp_root.clone());
         if o.scratch_root.is_none() {
             cleanser.tmp_root_owned = true;
+            sandbox::private_dir(&sessions_root).map_err(err)?;
+            sandbox::private_dir(&tmp_root).map_err(err)?;
             sandbox::record_owner(&tmp_root).map_err(err)?;
         }
         let workspace = match task_workspace {
@@ -219,10 +221,11 @@ impl PaletteSession {
         let depot_clone = sandbox::create_session_depot(None).map_err(err)?;
         cleanser.depot_clone = Some(depot_clone.clone());
 
+        // The socket accepts any local user, so its directory is private.
         // A Unix socket path is limited to 108 bytes; under a long HOME the
         // socket gets a short private directory of its own.
         let broker_root = tmp_root.join("broker");
-        fs::create_dir_all(&broker_root).map_err(|e| err(e.to_string()))?;
+        sandbox::private_dir(&broker_root).map_err(err)?;
         let sock_dir = if broker_root.join("broker.sock").as_os_str().len() > 100 {
             let d = util::mkdtemp("nj-").map_err(|e| err(e.to_string()))?;
             cleanser.short_sock_dir = Some(d.clone());
