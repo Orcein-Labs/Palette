@@ -355,6 +355,10 @@ Walk(mod::Module, seen, user, ids, checked, visits, give_way) =
 struct GaveWay <: Exception end
 const WALK_YIELD_EVERY = 4096
 
+# Containers whose elements the walk checks one by one. Julia 1.11 added
+# `Memory`, which backs `Array`; 1.10 (the compat floor) has only `Array`.
+const ELEMENT_CONTAINERS = isdefined(Core, :Memory) ? Union{Array, getfield(Core, :Memory)} : Array
+
 const REFUSED_TYPES = (Task, Channel, Condition, Threads.Condition, ReentrantLock, Threads.SpinLock, Timer,
                        Base.Process, Base.ProcessChain, Base.Libc.RawFD, WeakRef, Module, Core.MethodInstance,
                        Method, Core.CodeInfo, Base.Semaphore, Base.Event)
@@ -379,7 +383,7 @@ function current_definition(T::DataType)
         Base.invokelatest(getglobal, parent, nameof(ancestor)) === ancestor || return false
         ancestor = parent
     end
-    isdefined(m, nameof(T)) || return false
+    Base.invokelatest(isdefined, m, nameof(T)) || return false
     b = Base.invokelatest(getglobal, m, nameof(T))
     b isa Type || return false
     return Base.unwrap_unionall(b) isa DataType && Base.unwrap_unionall(b).name === T.name
@@ -533,7 +537,7 @@ end
 
 function refusal_struct(w::Walk, @nospecialize(x))
     T = typeof(x)
-    x isa Union{Array, Memory} && return refusal_elements(w, x)
+    x isa ELEMENT_CONTAINERS && return refusal_elements(w, x)
     isbitstype(T) && return ptr_free(T) ? nothing : "it holds a pointer"
     for i in 1:nfields(x)
         isdefined(x, i) || continue
@@ -561,7 +565,7 @@ function type_fingerprint(mod::Module, name::String)
         length(loaded) == 1 || return nothing
         owner = only(loaded)
         for part in parts[2:end-1]
-            isdefined(owner, Symbol(part)) || return nothing
+            Base.invokelatest(isdefined, owner, Symbol(part)) || return nothing
             owner = Base.invokelatest(getglobal, owner, Symbol(part))
             owner isa Module || return nothing
         end
@@ -569,13 +573,13 @@ function type_fingerprint(mod::Module, name::String)
     end
     parts = split(name, '.')
     for part in parts[1:end-1]
-        isdefined(mod, Symbol(part)) || return nothing
+        Base.invokelatest(isdefined, mod, Symbol(part)) || return nothing
         owner = Base.invokelatest(getglobal, mod, Symbol(part))
         owner isa Module || return nothing
         mod = owner
     end
     name = String(parts[end])
-    isdefined(mod, Symbol(name)) || return nothing
+    Base.invokelatest(isdefined, mod, Symbol(name)) || return nothing
     t = Base.invokelatest(getglobal, mod, Symbol(name))
     t isa Function && return "function"
     u = Base.unwrap_unionall(t)
@@ -587,7 +591,7 @@ end
 
 # Every method of a kernel function, as text, to compare after a rebuild.
 function method_set(mod::Module, name::String)
-    isdefined(mod, Symbol(name)) || return nothing
+    Base.invokelatest(isdefined, mod, Symbol(name)) || return nothing
     f = Base.invokelatest(getglobal, mod, Symbol(name))
     f isa Function || return nothing
     return sort!([string(m.sig) for m in Base.invokelatest(methods, f) if m.module === mod])
@@ -1093,7 +1097,8 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
         cls = b["class"]
         if cls == "definition"
             now = b["check"] isa String && startswith(b["check"], "value:") ?
-                  (isdefined(mod, Symbol(n)) ? "value:" * repr(getglobal(mod, Symbol(n))) : nothing) :
+                  (Base.invokelatest(isdefined, mod, Symbol(n)) ?
+                   "value:" * Base.invokelatest(repr, Base.invokelatest(getglobal, mod, Symbol(n))) : nothing) :
                   startswith(b["type"], "function") ? method_set(mod, n) : type_fingerprint(mod, n)
             if haskey(errors, n) || now === nothing
                 push!(inexact, n)
@@ -1109,9 +1114,9 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
             end
         elseif cls == "import"
             changed = get(get(m, "workspace_packages", Dict()), n, nothing)
-            if !isdefined(mod, Symbol(n))
+            if !Base.invokelatest(isdefined, mod, Symbol(n))
                 push!(lost, "$n (module): its `using`/`import` was not found")
-            elseif changed !== nothing && Dict(k => Tuple(v) for (k, v) in changed) != source_snapshot(dirname(something(pathof(getglobal(mod, Symbol(n))), "/x/x")))
+            elseif changed !== nothing && Dict(k => Tuple(v) for (k, v) in changed) != source_snapshot(dirname(something(pathof(Base.invokelatest(getglobal, mod, Symbol(n))), "/x/x")))
                 push!(approx, "$n (module): loaded again from workspace sources that changed since")
             else
                 push!(rebuilt, "$n (module)")

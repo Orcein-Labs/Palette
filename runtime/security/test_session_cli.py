@@ -1157,5 +1157,24 @@ class TestSessionCli(unittest.TestCase):
         self.assertIn("kept running after being interrupted", r["error"])
 
 
+class TestRepoDirResolution(unittest.TestCase):
+    """A host binary outside any checkout, given no --repo-dir and no
+    PALETTE_REPO_DIR, refuses to start instead of protecting and loading the
+    checkout it happened to be built in."""
+
+    def test_a_binary_outside_a_checkout_needs_an_explicit_repo_dir(self):
+        from host_adapter import HOST_BIN
+        if not HOST_BIN:
+            raise unittest.SkipTest("Rust host only: the Python CLI is always inside its checkout")
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "palette-host"
+            shutil.copy2(HOST_BIN, binary)
+            env = {k: v for k, v in os.environ.items() if k != "PALETTE_REPO_DIR"}
+            result = subprocess.run([str(binary), "session", "--project-dir", tmp], env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("no Palette checkout found", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,9 +33,14 @@ pub struct SessionOptions {
     pub project_dir: String,
     pub repo_dir: String,
     pub ceiling: Value,
+    /// The file the ceiling was read from, when it came from one. The broker
+    /// protects it from external_fs_write like the operator's config files.
+    pub ceiling_file: Option<PathBuf>,
     pub network_enabled: bool,
     pub receipts_dir: Option<String>,
-    /// This session's own scratch root, created here and deleted on close. Default ~/.palette-sessions/<id>.
+    /// This session's own scratch root, created here and deleted on close.
+    /// Default ~/.palette-sessions/<id>, owner-recorded so a later session
+    /// removes it if this host is killed before it can.
     pub scratch_root: Option<String>,
     pub turn_timeout: f64,
     pub task_workspace_dir: Option<String>,
@@ -76,6 +81,8 @@ pub struct PaletteSession {
 struct PaletteCleanser {
     depot_clone: Option<PathBuf>,
     tmp_root: Option<PathBuf>,
+    /// The default session root carries an owner record; a caller's own scratch root does not.
+    tmp_root_owned: bool,
     short_sock_dir: Option<PathBuf>,
 }
 
@@ -84,7 +91,14 @@ impl PaletteCleanser {
         if let Some(p) = self.depot_clone.take() {
             sandbox::remove_session_depot(&p);
         }
-        for p in [self.tmp_root.take(), self.short_sock_dir.take()].into_iter().flatten() {
+        if let Some(p) = self.tmp_root.take() {
+            if std::mem::take(&mut self.tmp_root_owned) {
+                sandbox::remove_owned_dir(&p);
+            } else {
+                let _ = fs::remove_dir_all(p);
+            }
+        }
+        if let Some(p) = self.short_sock_dir.take() {
             let _ = fs::remove_dir_all(p);
         }
     }
@@ -117,7 +131,12 @@ impl PaletteSession {
     fn start_inner(o: &SessionOptions, session_id: &str, cleanser: &mut PaletteCleanser, stop: Arc<AtomicBool>)
         -> Result<PaletteSession, SessionError> {
         let err = |e: String| dead(e);
-        let tmp_root = o.scratch_root.as_deref().map(PathBuf::from).unwrap_or_else(|| util::home().join(".palette-sessions").join(session_id));
+        let sessions_root = util::home().join(".palette-sessions");
+        let tmp_root = o.scratch_root.as_deref().map(PathBuf::from).unwrap_or_else(|| sessions_root.join(session_id));
+        let default_receipts = match o.receipts_dir {
+            Some(_) => None,
+            None => sandbox::default_receipts_root().map_err(err)?,
+        };
         let task_workspace = match o.task_workspace_dir.as_deref() {
             Some(t) => {
                 let tw = fs::canonicalize(t).map_err(|e| err(format!("task workspace {t}: {e}")))?;
@@ -134,6 +153,10 @@ impl PaletteSession {
         ];
         for path in [o.state_dir.as_deref(), o.task_workspace_dir.as_deref(), o.receipts_dir.as_deref()].into_iter().flatten() {
             package_protection.push(PathBuf::from(path));
+        }
+        if let Some((root, _)) = &default_receipts {
+            package_protection.push(root.clone());
+            package_protection.push(crate::receipt_archive::archive_dir(root));
         }
         let package_store = sandbox::package_store_paths(&package_protection, Some(&o.ceiling)).map_err(err)?;
         if let Some(state) = state_dir.as_deref() {
@@ -153,6 +176,10 @@ impl PaletteSession {
                 &[("session scratch root", planned_root.as_path())],
                 &protected_layout,
             ).map_err(err)?;
+        }
+        if o.scratch_root.is_none() {
+            // Default session roots of hosts that were killed before their teardown ran.
+            sandbox::sweep_orphaned_dirs(&sessions_root, "palette-", Duration::ZERO);
         }
         let tmp_root_existed = fs::symlink_metadata(&tmp_root).is_ok();
         fs::create_dir_all(&tmp_root).map_err(|e| err(e.to_string()))?;
@@ -179,6 +206,12 @@ impl PaletteSession {
             }
         }
         cleanser.tmp_root = Some(tmp_root.clone());
+        if o.scratch_root.is_none() {
+            cleanser.tmp_root_owned = true;
+            sandbox::private_dir(&sessions_root).map_err(err)?;
+            sandbox::private_dir(&tmp_root).map_err(err)?;
+            sandbox::record_owner(&tmp_root).map_err(err)?;
+        }
         let workspace = match task_workspace {
             Some(tw) => tw,
             None => {
@@ -192,10 +225,11 @@ impl PaletteSession {
         let depot_clone = sandbox::create_session_depot(None).map_err(err)?;
         cleanser.depot_clone = Some(depot_clone.clone());
 
+        // The socket accepts any local user, so its directory is private.
         // A Unix socket path is limited to 108 bytes; under a long HOME the
         // socket gets a short private directory of its own.
         let broker_root = tmp_root.join("broker");
-        fs::create_dir_all(&broker_root).map_err(|e| err(e.to_string()))?;
+        sandbox::private_dir(&broker_root).map_err(err)?;
         let sock_dir = if broker_root.join("broker.sock").as_os_str().len() > 100 {
             let d = util::mkdtemp("nj-").map_err(|e| err(e.to_string()))?;
             cleanser.short_sock_dir = Some(d.clone());
@@ -203,7 +237,11 @@ impl PaletteSession {
         } else {
             broker_root.clone()
         };
-        let receipts_root = o.receipts_dir.as_deref().map(PathBuf::from).unwrap_or(broker_root.clone());
+        let receipts_root = match (o.receipts_dir.as_deref(), &default_receipts) {
+            (Some(dir), _) => PathBuf::from(dir),
+            (None, Some((root, retention))) => sandbox::create_receipts_dir(root, session_id, *retention).map_err(err)?,
+            (None, None) => broker_root.clone(),
+        };
         fs::create_dir_all(&receipts_root).map_err(|e| err(e.to_string()))?;
         let private_broker = fs::canonicalize(&broker_root).map_err(|e| err(e.to_string()))?;
         let private_receipts = fs::canonicalize(&receipts_root).map_err(|e| err(e.to_string()))?;
@@ -223,6 +261,7 @@ impl PaletteSession {
             package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
             project_dir: Some(o.project_dir.clone()),
             repo_dir: Some(o.repo_dir.clone()),
+            trusted_files: o.ceiling_file.iter().cloned().collect(),
             // Leaves the child's own shutdown and the reply time to land inside the call.
             child_timeout: Duration::from_secs_f64((o.turn_timeout - 10.0).max(5.0)),
         }).map_err(err)?);

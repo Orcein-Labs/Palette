@@ -121,6 +121,12 @@ struct OperationReceipt
     end
 end
 
+# The receipt log keeps the outcome, not the value: holding every call's value
+# kept each unassigned result alive for the whole session (two 400 MB results
+# left 800 MB that GC could never reclaim).
+_logged(r::OperationReceipt) = OperationReceipt(r.id, r.timestamp, r.operation_type,
+    OperationResult(nothing, r.result.success, r.result.error), r.duration_ms, r.kernel_id, r.metadata)
+
 """
     ReceiptLog
 
@@ -1048,12 +1054,7 @@ function execute(op::ExecuteCode)::OperationReceipt
         duration_ms,
         state.id
     )
-    # The log keeps the outcome, not the value: holding every call's value
-    # kept each unassigned result alive for the whole session (two 400 MB
-    # results left 800 MB that GC could never reclaim).
-    push!(state.receipt_log, OperationReceipt(receipt.id, receipt.timestamp, receipt.operation_type,
-                                              OperationResult(nothing, result.success, result.error),
-                                              duration_ms, state.id))
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end
@@ -1223,8 +1224,10 @@ function execute(op::EphemeralTool)::OperationReceipt
     # Same reasoning as KernelState's own eval_module: ephemeral code has
     # the SAME authority ceiling as durable code (broker-mediated, not
     # granted by which module happens to run it), so it needs the same
-    # reachable path to request_capability.
-    Core.eval(tool_module, :(const Palette = $(@__MODULE__)))
+    # reachable path to request_capability -- and, like it, only the turn
+    # API, never the whole package.
+    Core.eval(tool_module, :(const Palette = $(Api)))
+    Core.eval(tool_module, :(const Api = $(Api)))
     # Deliberately NOT given an `include` binding, unlike the persistent
     # eval_module: check_ephemeral_source! only inspects the source string
     # passed directly to EphemeralTool -- it cannot see inside a file that
@@ -1254,7 +1257,7 @@ function execute(op::EphemeralTool)::OperationReceipt
         kernel_state.id,
         Dict{String,Any}("tool_id" => op.tool_id)
     )
-    push!(kernel_state.receipt_log, receipt)
+    push!(kernel_state.receipt_log, _logged(receipt))
     record_tool_capsule(op.tool_id, op.code, result, duration_ms)
 
     return receipt
@@ -1339,7 +1342,7 @@ function execute(op::InvokeOperator)::OperationReceipt
         state.id,
         Dict{String,Any}("operator" => op.operator_name)
     )
-    push!(state.receipt_log, receipt)
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end
@@ -1429,15 +1432,14 @@ function execute(op::ShellEscape)::OperationReceipt
             # A process killed by a signal reports 128 + signal, as a shell
             # does. Julia's Process.exitcode is 0 alongside a nonzero
             # termsignal, so reading it raw reported success for a
-            # signal-killed command (found by FM-RQ-A1 probe P13; run_bash
-            # already mapped this correctly).
+            # signal-killed command (run_bash already mapped this correctly).
             exit_code = proc.termsignal > 0 ? 128 + proc.termsignal : proc.exitcode
             error_class = exit_code == 0 ? nothing :
                           proc.termsignal > 0 ? "signal_death" : "clean_failure"
             data = op.capture_output ? begin
                 out = String(take!(out_buf)); err = String(take!(err_buf))
-                # Output digests (FM-SLICE-A1): observer is the kernel itself
-                # (self-attested — the host-side independent eye is A2). They
+                # Output digests: the observer is the kernel itself
+                # (self-attested; the host-side check is Palette.fs_digest). They
                 # make captured output recomputable and detect tunnel corruption.
                 # Contract: error_class is ABSENT on success, not null.
                 d = Dict{String,Any}("stdout" => out, "stderr" => err,
@@ -1455,7 +1457,7 @@ function execute(op::ShellEscape)::OperationReceipt
         end
     catch e
         # Spawn-stage failures (vanished working_dir, ENOENT, …) get a typed
-        # class instead of prose-only errors (FM-SLICE-A1).
+        # class instead of prose-only errors.
         result = OperationResult(Dict("error_class" => "spawn_error"), false, sprint(showerror, e))
     end
 
@@ -1471,7 +1473,7 @@ function execute(op::ShellEscape)::OperationReceipt
         Dict{String,Any}("command" => op.command, "working_dir" => op.working_dir,
                          "error_class" => result.data isa AbstractDict ? get(result.data, "error_class", nothing) : nothing)
     )
-    push!(state.receipt_log, receipt)
+    push!(state.receipt_log, _logged(receipt))
 
     return receipt
 end
@@ -1736,12 +1738,12 @@ end
 """
     Palette.fs_digest(paths::Vector{String}) -> Dict
 
-Digest files with host privilege — the independent eye (FM-SLICE-A2). The
+Digest files with host privilege, as a check the sandbox cannot forge. The
 request goes through the capability broker like any other: the broker reads
 the paths OUTSIDE this sandbox, computes sha256 itself, and writes a receipt
 on the host regardless of outcome. A digest returned here is therefore not
-the kernel grading its own writes (probe P15: kernel receipts die with the
-kernel; host receipts do not). Broker-side ceiling shape:
+the kernel grading its own writes (kernel receipts die with the kernel;
+host receipts do not). Broker-side ceiling shape:
 `{"fs_digest": {"allowed_paths": ["/abs/dir", ...]}}`; a path outside every
 allowed path denies the whole request (policy), while per-path filesystem
 conditions (missing, directory, unreadable) come back as per-path

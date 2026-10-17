@@ -13,7 +13,7 @@
 //! ceiling names. Stdin is read on its own thread so a reply lands mid-call; a
 //! reply for an unknown or finished request is dropped, and stdin closing fails
 //! every waiting request. This process exits when stdin closes, when the kernel
-//! dies, or on SIGTERM/SIGHUP (after tearing the session down).
+//! dies, or on SIGTERM/SIGHUP/SIGINT (after tearing the session down).
 
 use crate::session::{PaletteSession, SessionError, SessionOptions, Turn};
 use crate::util;
@@ -127,23 +127,24 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if a.project_dir.is_empty() {
         return Err("--project-dir is required".into());
     }
+    if a.repo_dir.is_none() {
+        a.repo_dir = Some(default_repo_dir()?);
+    }
     Ok(a)
 }
 
-/// The lab checkout: --repo-dir, PALETTE_REPO_DIR, or the checkout this binary was built in.
-pub fn default_repo_dir() -> String {
+/// The Palette checkout when --repo-dir is absent: PALETTE_REPO_DIR, or the
+/// checkout this binary runs from. Never the checkout it was built in, which
+/// may not exist on this machine or may be a different version.
+pub fn default_repo_dir() -> Result<String, String> {
     if let Ok(r) = std::env::var("PALETTE_REPO_DIR") {
         if !r.is_empty() {
-            return r;
+            return Ok(r);
         }
     }
-    let exe = std::env::current_exe().ok().and_then(|p| std::fs::canonicalize(p).ok());
-    for dir in exe.iter().flat_map(|p| p.ancestors()) {
-        if dir.join("runtime/scripts/session_loop.jl").is_file() {
-            return dir.to_string_lossy().into_owned();
-        }
-    }
-    env!("CARGO_MANIFEST_DIR").trim_end_matches("/runtime/host").to_string()
+    crate::util::installed_checkout().map(|dir| dir.to_string_lossy().into_owned()).ok_or_else(|| {
+        "no Palette checkout found: this binary is not inside one, so pass --repo-dir or set PALETTE_REPO_DIR".into()
+    })
 }
 
 /// Text, or an object of named texts; anything else is dropped.
@@ -155,7 +156,8 @@ fn payload(v: Option<&Value>) -> Option<Value> {
     }
 }
 
-/// Blocks SIGTERM and SIGHUP in every thread and waits for them on one, so a
+/// Blocks SIGTERM, SIGHUP and SIGINT in every thread and waits for them on one,
+/// so Ctrl-C tears the session down like any other stop request, and a
 /// signal never lands mid-write; returns the flag it sets and the signal seen.
 fn signal_thread(wake: Sender<Incoming>) -> (Arc<AtomicBool>, Arc<AtomicI32>) {
     let stop = Arc::new(AtomicBool::new(false));
@@ -165,6 +167,7 @@ fn signal_thread(wake: Sender<Incoming>) -> (Arc<AtomicBool>, Arc<AtomicI32>) {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGHUP);
+        libc::sigaddset(&mut set, libc::SIGINT);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         let (stop2, signum2) = (stop.clone(), signum.clone());
         std::thread::spawn(move || {
@@ -190,8 +193,9 @@ pub fn main(argv: &[String]) -> i32 {
     let (tx, rx) = mpsc::channel::<Incoming>();
     let (stop, signum) = signal_thread(tx.clone());
 
+    let ceiling_file = crate::sandbox::ceiling_file(&args.ceiling);
     let ceiling: Value = {
-        let text = if Path::new(&args.ceiling).is_file() { std::fs::read_to_string(&args.ceiling).unwrap_or_default() } else { args.ceiling.clone() };
+        let text = match &ceiling_file { Some(path) => std::fs::read_to_string(path).unwrap_or_default(), None => args.ceiling.clone() };
         match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
@@ -223,8 +227,9 @@ pub fn main(argv: &[String]) -> i32 {
     let turn_timeout = args.turn_timeout;
     let session = PaletteSession::start(SessionOptions {
         project_dir: args.project_dir.clone(),
-        repo_dir: args.repo_dir.clone().unwrap_or_else(default_repo_dir),
+        repo_dir: args.repo_dir.clone().unwrap_or_default(),
         ceiling,
+        ceiling_file,
         network_enabled: args.network,
         receipts_dir: args.receipts_dir.clone(),
         scratch_root: args.scratch_root.clone(),

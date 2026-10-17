@@ -9,6 +9,7 @@
 
 mod broker;
 mod cli;
+mod receipt_archive;
 mod sandbox;
 mod session;
 mod util;
@@ -35,9 +36,12 @@ fn flags(argv: &[String], booleans: &[&str]) -> Result<HashMap<String, String>, 
     Ok(m)
 }
 
-fn ceiling_arg(s: &str) -> Result<Value, String> {
-    let text = if std::path::Path::new(s).is_file() { std::fs::read_to_string(s).map_err(|e| e.to_string())? } else { s.to_string() };
-    serde_json::from_str(&text).map_err(|e| format!("ceiling: {e}"))
+/// A ceiling given as JSON text or as a path to a JSON file, and the file it
+/// came from, which the broker protects.
+fn ceiling_arg(s: &str) -> Result<(Value, Option<PathBuf>), String> {
+    let file = sandbox::ceiling_file(s);
+    let text = match &file { Some(path) => std::fs::read_to_string(path).map_err(|e| e.to_string())?, None => s.to_string() };
+    Ok((serde_json::from_str(&text).map_err(|e| format!("ceiling: {e}"))?, file))
 }
 
 fn run_worker(argv: &[String]) -> Result<i32, String> {
@@ -61,7 +65,7 @@ fn run_worker(argv: &[String]) -> Result<i32, String> {
 fn run_broker(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
     let get = |k: &str| f.get(k).cloned().ok_or_else(|| format!("--{k} is required"));
-    let ceiling = ceiling_arg(&get("ceiling")?)?;
+    let (ceiling, ceiling_file) = ceiling_arg(&get("ceiling")?)?;
     let receipt_path = PathBuf::from(get("receipts")?);
     let mut protected = vec![receipt_path.clone(), PathBuf::from(get("socket")?)];
     for key in ["project", "repo"] { if let Some(path) = f.get(key) { protected.push(PathBuf::from(path)); } }
@@ -74,6 +78,7 @@ fn run_broker(argv: &[String]) -> Result<i32, String> {
         package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
         project_dir: f.get("project").cloned(),
         repo_dir: f.get("repo").cloned(),
+        trusted_files: ceiling_file.into_iter().collect(),
         child_timeout: Duration::from_secs_f64(f.get("child-timeout").map_or(Ok(90.0), |t| t.parse::<f64>()).map_err(|e| e.to_string())?),
     })?);
     let server = broker::serve(std::path::Path::new(&get("socket")?), b)?;
@@ -96,13 +101,14 @@ fn subset(argv: &[String]) -> Result<i32, String> {
 
 /// Precompile every stdlib and project dependency into the real depot, in the
 /// worker's own sandbox so the caches record the paths a worker sees. Run once
-/// per depot, and again after Palette or the project changes.
+/// per depot, and again after Palette or the project changes. A successful
+/// run publishes a snapshot of the depot for session clones.
 const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
 
 fn prewarm(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
     let project = std::fs::canonicalize(f.get("project-dir").ok_or("--project-dir is required")?).map_err(|e| e.to_string())?;
-    let repo = std::fs::canonicalize(f.get("repo-dir").cloned().unwrap_or_else(cli::default_repo_dir)).map_err(|e| e.to_string())?;
+    let repo = std::fs::canonicalize(f.get("repo-dir").cloned().map_or_else(cli::default_repo_dir, Ok)?).map_err(|e| e.to_string())?;
     let julia = sandbox::resolve_julia()?;
     let workspace = util::mkdtemp("palette-prewarm-").map_err(|e| e.to_string())?;
     let depot = sandbox::default_depot();
@@ -125,7 +131,15 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
     argv.extend(["--".into(), julia, "--startup-file=no".into(), "-e".into(), PREWARM.into()]);
     let status = std::process::Command::new(&argv[0]).args(&argv[1..]).stdin(std::process::Stdio::null()).status();
     let _ = std::fs::remove_dir_all(&workspace);
-    Ok(status.map_err(|e| e.to_string())?.code().unwrap_or(1))
+    let code = status.map_err(|e| e.to_string())?.code().unwrap_or(1);
+    // Sessions clone the snapshot, which no Julia process writes, instead of
+    // the live depot. Without one they fall back to the live depot.
+    if code == 0 {
+        if let Err(e) = sandbox::publish_depot_snapshot(std::path::Path::new(&depot)) {
+            eprintln!("palette-host: the depot snapshot was not published: {e}");
+        }
+    }
+    Ok(code)
 }
 
 fn main() {

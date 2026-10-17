@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-FM-SLICE-A2: the broker's fs_digest category — the independent eye.
+The broker's fs_digest category: a host-side digest the sandbox cannot forge.
 
 Direct Broker-class tests (no sockets): digest correctness, ceiling denial,
 path-scope denial, per-path filesystem conditions, and receipts written
-regardless of outcome (which is what makes this eye survive kernel death —
-probe P15: kernel receipts die with the kernel; host receipts do not).
+regardless of outcome (kernel receipts die with the kernel; host receipts
+do not).
 
 Run:
     python3 runtime/security/test_fs_digest.py
@@ -33,7 +33,7 @@ class FsDigestTests(unittest.TestCase):
         self.f1 = os.path.join(self.dir, "a.txt")
         self.f2 = os.path.join(self.dir, "b.bin")
         with open(self.f1, "wb") as fh:
-            fh.write(b"hello fm-slice-a2\n")
+            fh.write(b"hello digest\n")
         with open(self.f2, "wb") as fh:
             fh.write(bytes(range(256)) * 100)  # 25.6 KB — spans read chunks
         self.ceiling = {"fs_digest": {"allowed_paths": [self.dir]}}

@@ -26,6 +26,55 @@ Broker decision and effect receipts are kept in the host-private sibling of the
 world's saved-state directory, named `<state directory>.receipts`. They survive
 worker refresh and restart and are outside the worker's writable mounts.
 
+A session started without a receipts directory (`palette-host session` or
+`run-worker` without `--receipts-dir`, or the Python `PaletteSession` without
+`receipts_dir`) keeps its receipts in `~/.palette/receipts/<session id>/`,
+which is private to the user and survives the session. A closed session's
+receipts that have not been written for `PALETTE_RECEIPT_RETENTION_DAYS` days
+(default 30) are archived, not deleted. The next session to start appends them to
+`~/.palette/docs/receipts/<YYYY-MM>.zip`, where the month is the UTC month of
+the directory's last write. Each entry is named `<session id>/<file>`. Then
+the session removes the directory. The archive directory is `0700` and each
+archive is `0600`.
+
+The archive is a plain ZIP with stored entries, readable by `unzip` or Python
+`zipfile`. Each append writes a new archive beside the old one, syncs it and
+renames it over the old one, under a lock on `.lock` in the archive directory.
+Both hosts write the same format under the same lock. If a directory cannot be
+archived, it is kept, and a warning goes to the host's stderr. A later session
+tries again. This happens when the receipts hold a symlink or a special file,
+when the archive is damaged, or when it would pass 4 GiB, since there is no
+ZIP64. The Python host stops at the 2 GiB that `zipfile` allows without ZIP64.
+Retrying after a crash is safe: files already in the archive with the same
+contents are skipped.
+
+Setting the retention to `0` restores the earlier behavior: receipts live in
+the session's scratch root and are deleted when the session closes.
+
+A session's default scratch root, `~/.palette-sessions/<session id>`, and its
+depot clone in `.palette-depot-clones` each carry a `.owner` record naming the
+host process. If that process is killed before its teardown runs, the next
+session started in the same pid namespace removes them. A caller-supplied
+scratch root is never swept.
+
+A session's depot clone is copied from the newest snapshot of the prepared
+depot, in `.palette-depot-snapshots/<depot name>/snap-<sequence>` beside the
+depot. A successful preparation publishes the snapshot. Palette binds no
+snapshot into a sandbox, so no Julia process writes one, and the copy cannot race a
+precompile. The session holds a shared lock on the snapshot while it copies.
+Publishing removes the older snapshots that no session holds, and so does a
+later session. When no snapshot exists, the session clones the live depot and
+retries up to three times if a precompile changes the tree during the copy.
+
+`external_fs_write.allowed_dirs` are resolved once, when the broker starts.
+Each write walks from `/` to its target without following a symlink, so a
+directory that is replaced by a symlink later is refused, not followed. This
+also covers a directory the worker can write. After such a swap, restart the
+session to use the new target. A broker refuses to start when an allowed
+directory contains or lies inside a path the host trusts. Those paths are the
+receipt log, the Palette checkout, the package store, the operator's
+configuration files and the host command paths.
+
 ```julia
 Api.runtime("discover")
 receipt = Api.request_capability("package_management", Dict("name" => "Parsers"))

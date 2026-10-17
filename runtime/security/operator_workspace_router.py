@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 
-from patch_broker import PatchBroker, PATCH_SCHEMA
+from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode
 from filesystem_layout import require_disjoint
 from provisioning import operator_ceiling, protected_host_paths
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
@@ -51,7 +51,11 @@ def workspace_protected_paths():
                  Path(os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch")))]
     protected.extend(Path(root) for root in os.environ.get("PALETTE_READ_ROOTS", "").split(":") if root)
     protected.extend(protected_host_paths(operator_ceiling()))
-    depot = os.environ.get("JULIA_DEPOT_PATH", str(Path.home() / ".julia"))
+    # The default depot stays protected even when JULIA_DEPOT_PATH points
+    # elsewhere: it holds juliaup toolchains and config/startup.jl, which a
+    # host started without the override would still run.
+    protected.append(Path.home() / ".julia")
+    depot = os.environ.get("JULIA_DEPOT_PATH", "")
     protected.extend(Path(path) for path in depot.split(os.pathsep) if path)
     julia = os.environ.get("PALETTE_JULIA_BIN") or shutil.which("julia")
     if julia:
@@ -516,7 +520,8 @@ def serve_stream(stdin, stdout):
     broker = PatchBroker(ROOT / "patches", roots, auto_apply_prefixes,
                          protected_paths=[*protected_host_paths(ceiling, include_runtime_root=False), ROOT, LEGACY, LEGACY_RECEIPTS],
                          registry_root=runtime_root,
-                         sandbox_source_paths=repair_config.get("sandbox_source_paths", {}))
+                         sandbox_source_paths=repair_config.get("sandbox_source_paths", {}),
+                         approval=approval_mode(os.environ.get("PALETTE_PATCH_APPROVAL")))
     for raw in stdin:
         mid = None
         try:
