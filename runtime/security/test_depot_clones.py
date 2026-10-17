@@ -1,5 +1,6 @@
 """Session depot clones, default session roots and default receipts
-directories record their owner, and those of dead owners are swept."""
+directories record their owner, and those of dead owners are swept. Depot
+clones copy the newest published snapshot, which a sweep keeps while held."""
 import os
 import shutil
 import subprocess
@@ -13,9 +14,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from launch_worker import (  # noqa: E402
-    CLONE_OWNER_SUFFIX, _append_receipts, _clone_owner_alive, _clone_owner_record, _pid_namespace,
-    create_receipts_dir, create_session_depot, identity_base, identity_files, private_dir, receipt_archive_dir,
-    receipt_retention_days, remove_session_depot, retire_receipts, sweep_orphaned_dirs,
+    CLONE_OWNER_SUFFIX, _append_receipts, _clone_owner_alive, _clone_owner_record, _hold_depot_snapshot,
+    _pid_namespace, create_receipts_dir, create_session_depot, identity_base, identity_files, private_dir, receipt_archive_dir,
+    has_depot_snapshot, publish_depot_snapshot, receipt_retention_days, remove_session_depot, retire_receipts,
+    sweep_orphaned_dirs,
 )
 
 
@@ -78,6 +80,72 @@ class DepotCloneOwnershipTest(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             create_session_depot(str(self.root / "no-such-depot"))
         self.assertEqual(list(self.clones.iterdir()), [], "a failed clone left residue")
+
+
+class DepotSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="palette-depot-snapshots-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.depot = self.root / "depot"
+        self.depot.mkdir()
+        (self.depot / "cache").write_text("prepared")
+        self.snapshots = self.root / ".palette-depot-snapshots" / "depot"
+
+    def test_session_depots_clone_the_newest_snapshot_not_the_live_depot(self):
+        self.assertFalse(has_depot_snapshot(str(self.depot)))
+        first = publish_depot_snapshot(str(self.depot))
+        self.assertEqual(first.parent, self.snapshots)
+        self.assertTrue(has_depot_snapshot(str(self.depot)))
+
+        # A Julia process writing the live depot does not reach the clone.
+        (self.depot / "cache").write_text("churned")
+        clone = create_session_depot(str(self.depot))
+        self.assertEqual(Path(clone, "cache").read_text(), "prepared")
+        shutil.rmtree(self.depot)
+        without_live = create_session_depot(str(self.depot))
+        self.assertEqual(Path(without_live, "cache").read_text(), "prepared")
+
+        self.depot.mkdir()
+        (self.depot / "cache").write_text("reprepared")
+        second = publish_depot_snapshot(str(self.depot))
+        self.assertGreater(second.name, first.name)
+        newer = create_session_depot(str(self.depot))
+        self.assertEqual(Path(newer, "cache").read_text(), "reprepared")
+        self.assertEqual(sorted(self.snapshots.iterdir()), [self.snapshots / ".lock", second],
+                         "the unheld older snapshot was kept")
+
+    def test_a_held_snapshot_outlives_the_sweep_and_abandoned_publishes_are_removed(self):
+        (self.depot / "cache").write_text("first")
+        first = publish_depot_snapshot(str(self.depot))
+        dead_publish = self.snapshots / "tmp-0123abcd"
+        dead_sweep = self.snapshots / "trash-snap-00000000000000000000"
+        dead_publish.mkdir()
+        dead_sweep.mkdir()
+
+        with _hold_depot_snapshot(str(self.depot)) as held:
+            self.assertEqual(held, first)
+            (self.depot / "cache").write_text("second")
+            second = publish_depot_snapshot(str(self.depot))
+            self.assertTrue(first.is_dir(), "a held snapshot was swept")
+            self.assertFalse(dead_publish.exists() or dead_sweep.exists(), "abandoned dirs survived a publish")
+            self.assertEqual((held / "cache").read_text(), "first")
+
+        clone = create_session_depot(str(self.depot))
+        self.assertEqual(Path(clone, "cache").read_text(), "second")
+        self.assertFalse(first.exists(), "the released snapshot was not swept")
+        self.assertTrue(second.is_dir())
+
+    def test_a_snapshot_root_that_is_not_a_directory_fails_closed(self):
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        self.snapshots.parent.mkdir()
+        self.snapshots.symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            create_session_depot(str(self.depot))
+        with self.assertRaises(OSError):
+            publish_depot_snapshot(str(self.depot))
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(list((self.root / ".palette-depot-clones").iterdir()), [])
 
 
 def _reaped_pid() -> int:

@@ -57,6 +57,15 @@ host process. If that process is killed before its teardown runs, the next
 session started in the same pid namespace removes them. A caller-supplied
 scratch root is never swept.
 
+A session's depot clone is copied from the newest snapshot of the prepared
+depot, in `.palette-depot-snapshots/<depot name>/snap-<sequence>` beside the
+depot. A successful preparation publishes the snapshot. Palette binds no
+snapshot into a sandbox, so no Julia process writes one, and the copy cannot race a
+precompile. The session holds a shared lock on the snapshot while it copies.
+Publishing removes the older snapshots that no session holds, and so does a
+later session. When no snapshot exists, the session clones the live depot and
+retries up to three times if a precompile changes the tree during the copy.
+
 `external_fs_write.allowed_dirs` are resolved once, when the broker starts.
 Each write walks from `/` to its target without following a symlink, so a
 directory that is replaced by a symlink later is refused, not followed. This

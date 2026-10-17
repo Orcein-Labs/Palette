@@ -634,7 +634,8 @@ pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
 
 /// One private, writable prepared-depot clone for a session's worker caches.
 /// Broker-authorized package installs live in the separate durable package store.
-/// Callers release it with `remove_session_depot`.
+/// The clone comes from the newest snapshot of the depot when one exists,
+/// otherwise from the live depot. Callers release it with `remove_session_depot`.
 pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String> {
     let depot = real_depot.map(str::to_string).unwrap_or_else(default_depot);
     let root = Path::new(&depot).parent().unwrap_or(Path::new("/")).join(".palette-depot-clones");
@@ -645,36 +646,207 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
         remove_session_depot(&dest);
         return Err(e);
     }
-    // The depot is live. A Julia process precompiling into it removes its
-    // temporary files, and one removed between cp listing a directory and
-    // copying it fails the copy. A later attempt copies the settled tree.
+    let copied = match hold_depot_snapshot(Path::new(&depot)) {
+        // Nothing writes a snapshot, so one attempt copies it or fails for real.
+        Ok(Some(snapshot)) => {
+            let copied = copy_tree(&snapshot.path, &dest, 1);
+            drop(snapshot);
+            try_sweep_depot_snapshots(Path::new(&depot));
+            copied
+        }
+        // The live depot may be precompiling. A Julia process removes its
+        // temporary files, and one removed between cp listing a directory and
+        // copying it fails the copy. A later attempt copies the settled tree.
+        Ok(None) => copy_tree(Path::new(&depot), &dest, DEPOT_CLONE_ATTEMPTS),
+        Err(e) => Err(e),
+    };
+    match copied {
+        Ok(()) => Ok(dest),
+        Err(e) => {
+            remove_session_depot(&dest);
+            Err(e)
+        }
+    }
+}
+
+/// How many times a live depot clone is tried before the session gives up.
+const DEPOT_CLONE_ATTEMPTS: usize = 3;
+
+/// `cp -a --reflink=auto source dest`, tried `attempts` times.
+fn copy_tree(source: &Path, dest: &Path, attempts: usize) -> Result<(), String> {
     let mut failure = String::new();
-    for attempt in 0..DEPOT_CLONE_ATTEMPTS {
-        let _ = fs::remove_dir_all(&dest); // cp wants a destination that does not exist yet
+    for attempt in 0..attempts {
+        let _ = fs::remove_dir_all(dest); // cp wants a destination that does not exist yet
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(200));
         }
         let status = Command::new("cp")
             .args(["-a", "--reflink=auto"])
-            .arg(&depot)
-            .arg(&dest)
+            .arg(source)
+            .arg(dest)
             .stdin(Stdio::null())
             .status();
         match status {
-            Ok(status) if status.success() => return Ok(dest),
-            Ok(_) => failure = format!("cloning the depot {depot} failed"),
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => failure = format!("cloning the depot {} failed", source.display()),
             Err(e) => {
                 failure = format!("cp: {e}");
                 break;
             }
         }
     }
-    remove_session_depot(&dest);
+    let _ = fs::remove_dir_all(dest);
     Err(failure)
 }
 
-/// How many times a depot clone is tried before the session gives up.
-const DEPOT_CLONE_ATTEMPTS: usize = 3;
+/// Snapshots of a prepared depot live in
+/// `<depot parent>/.palette-depot-snapshots/<depot name>/snap-<sequence>`.
+/// A successful prewarm publishes one; no sandbox binds them, so no Julia
+/// process writes them. Session clones copy the newest one while holding a
+/// shared flock on its directory, and a snapshot is removed only once it is
+/// no longer the newest and an exclusive flock on it succeeds without
+/// waiting. Publishing and sweeping hold an exclusive flock on `.lock`.
+/// The Python launcher uses the same layout and locks.
+const SNAPSHOT_PREFIX: &str = "snap-";
+
+pub fn depot_snapshot_root(depot: &Path) -> Option<PathBuf> {
+    let name = depot.file_name()?;
+    Some(depot.parent()?.join(".palette-depot-snapshots").join(name))
+}
+
+/// A snapshot held open under a shared flock; dropping it releases the hold.
+struct HeldSnapshot {
+    path: PathBuf,
+    _hold: File,
+}
+
+fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)
+}
+
+fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The snapshot names in `root`, oldest first.
+fn snapshot_names(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = fs::read_dir(root)?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.strip_prefix(SNAPSHOT_PREFIX).is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
+        .collect();
+    names.sort_by_key(|n| n[SNAPSHOT_PREFIX.len()..].parse::<u128>().unwrap_or(0));
+    Ok(names)
+}
+
+/// The newest snapshot of `depot`, held, or None when it has none.
+fn hold_depot_snapshot(depot: &Path) -> Result<Option<HeldSnapshot>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(root) = depot_snapshot_root(depot) else { return Ok(None) };
+    match fs::symlink_metadata(&root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", root.display())),
+        Ok(meta) if !meta.is_dir() => return Err(format!("{} is not a directory", root.display())),
+        Ok(_) => {}
+    }
+    // A sweep can take the chosen snapshot between listing and locking, but
+    // only after a newer one was published, so the next listing finds that.
+    for _ in 0..8 {
+        let names = snapshot_names(&root).map_err(|e| format!("reading {}: {e}", root.display()))?;
+        let Some(name) = names.last() else { return Ok(None) };
+        let path = root.join(name);
+        let Ok(dir) = open_dir_nofollow(&path) else { continue };
+        flock(&dir, libc::LOCK_SH).map_err(|e| format!("holding {}: {e}", path.display()))?;
+        let (Ok(held), Ok(named)) = (dir.metadata(), fs::symlink_metadata(&path)) else { continue };
+        if (held.dev(), held.ino()) == (named.dev(), named.ino()) {
+            return Ok(Some(HeldSnapshot { path, _hold: dir }));
+        }
+    }
+    Err(format!("the depot snapshots in {} kept changing", root.display()))
+}
+
+fn snapshot_lock(root: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().create(true).read(true).write(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW).open(root.join(".lock"))
+}
+
+/// Copies `depot` into a new snapshot, then sweeps the older ones. Run it
+/// only right after the depot was prepared, while nothing else prepares it.
+pub fn publish_depot_snapshot(depot: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = depot_snapshot_root(depot).ok_or_else(|| format!("{} has no parent", depot.display()))?;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)
+        .map_err(|e| format!("creating {}: {e}", root.display()))?;
+    if !fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    let lock = snapshot_lock(&root).map_err(|e| format!("opening {}/.lock: {e}", root.display()))?;
+    flock(&lock, libc::LOCK_EX).map_err(|e| format!("locking {}/.lock: {e}", root.display()))?;
+    remove_abandoned_snapshot_dirs(&root);
+    let names = snapshot_names(&root).map_err(|e| format!("reading {}: {e}", root.display()))?;
+    let next = names.last().map_or(0, |n| n[SNAPSHOT_PREFIX.len()..].parse::<u128>().unwrap_or(0)) + 1;
+    let tmp = root.join(format!("tmp-{}", util::hex(8)));
+    // Prewarm just finished, but a user's own Julia may share the depot.
+    copy_tree(depot, &tmp, DEPOT_CLONE_ATTEMPTS)?;
+    let snapshot = root.join(format!("{SNAPSHOT_PREFIX}{next:020}"));
+    if let Err(e) = fs::rename(&tmp, &snapshot) {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("publishing {}: {e}", snapshot.display()));
+    }
+    if let Ok(dir) = File::open(&root) {
+        let _ = dir.sync_all();
+    }
+    sweep_depot_snapshots(&root);
+    Ok(snapshot)
+}
+
+/// A `tmp-` or `trash-` directory seen under the publish lock belongs to a
+/// publish or sweep that died.
+fn remove_abandoned_snapshot_dirs(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let abandoned = name.to_str().is_some_and(|n| n.starts_with("tmp-") || n.starts_with("trash-"));
+        if abandoned && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Removes every snapshot but the newest that no clone holds. The caller
+/// holds the publish lock.
+fn sweep_depot_snapshots(root: &Path) {
+    let Ok(mut names) = snapshot_names(root) else { return };
+    names.pop();
+    for name in names {
+        let path = root.join(&name);
+        let Ok(dir) = open_dir_nofollow(&path) else { continue };
+        if flock(&dir, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+            continue;
+        }
+        // Renamed first, so no later clone can pick it while it is removed.
+        let trash = root.join(format!("trash-{name}"));
+        if fs::rename(&path, &trash).is_ok() {
+            let _ = fs::remove_dir_all(&trash);
+        }
+    }
+}
+
+/// Sweeps the snapshots of `depot` unless a publish or sweep is under way.
+fn try_sweep_depot_snapshots(depot: &Path) {
+    let Some(root) = depot_snapshot_root(depot) else { return };
+    let Ok(lock) = snapshot_lock(&root) else { return };
+    if flock(&lock, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+        sweep_depot_snapshots(&root);
+    }
+}
 
 /// A benchmark's toolchain activation (KEY=VALUE lines), given to the kernel
 /// as the other contestants get it.
@@ -1332,6 +1504,75 @@ mod tests {
         assert!(create_session_depot(missing.to_str()).is_err());
         let clones = root.join(".palette-depot-clones");
         assert_eq!(fs::read_dir(&clones).unwrap().count(), 0, "a failed clone left residue");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_depots_clone_the_newest_snapshot_not_the_live_depot() {
+        let root = util::mkdtemp("palette-depot-snapshots-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "prepared").unwrap();
+        let first = publish_depot_snapshot(&depot).unwrap();
+        let snapshots = root.join(".palette-depot-snapshots").join("depot");
+        assert_eq!(first.parent().unwrap(), snapshots);
+
+        // A Julia process writing the live depot does not reach the clone.
+        fs::write(depot.join("cache"), "churned").unwrap();
+        let clone = create_session_depot(depot.to_str()).unwrap();
+        assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "prepared");
+        fs::remove_dir_all(&depot).unwrap();
+        let without_live = create_session_depot(depot.to_str()).unwrap();
+        assert_eq!(fs::read_to_string(without_live.join("cache")).unwrap(), "prepared");
+
+        fs::create_dir(&depot).unwrap();
+        fs::write(depot.join("cache"), "reprepared").unwrap();
+        let second = publish_depot_snapshot(&depot).unwrap();
+        assert!(second > first);
+        let newer = create_session_depot(depot.to_str()).unwrap();
+        assert_eq!(fs::read_to_string(newer.join("cache")).unwrap(), "reprepared");
+        let mut left: Vec<_> = fs::read_dir(&snapshots).unwrap().map(|e| e.unwrap().path()).collect();
+        left.sort();
+        assert_eq!(left, [snapshots.join(".lock"), second], "the unheld older snapshot was kept");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_held_snapshot_outlives_the_sweep_and_abandoned_publishes_are_removed() {
+        let root = util::mkdtemp("palette-depot-snapshot-hold-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "first").unwrap();
+        let first = publish_depot_snapshot(&depot).unwrap();
+        let snapshots = first.parent().unwrap().to_path_buf();
+        let dead_publish = dir(&snapshots, "tmp-0123abcd");
+        let dead_sweep = dir(&snapshots, "trash-snap-00000000000000000000");
+
+        let held = hold_depot_snapshot(&depot).unwrap().unwrap();
+        assert_eq!(held.path, first);
+        fs::write(depot.join("cache"), "second").unwrap();
+        let second = publish_depot_snapshot(&depot).unwrap();
+        assert!(first.is_dir(), "a held snapshot was swept");
+        assert!(!dead_publish.exists() && !dead_sweep.exists(), "abandoned dirs survived a publish");
+        assert_eq!(fs::read_to_string(held.path.join("cache")).unwrap(), "first");
+        drop(held);
+
+        let clone = create_session_depot(depot.to_str()).unwrap();
+        assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "second");
+        assert!(!first.exists(), "the released snapshot was not swept");
+        assert!(second.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_root_that_is_not_a_directory_fails_closed() {
+        let root = util::mkdtemp("palette-depot-snapshot-link-").unwrap();
+        let depot = dir(&root, "depot");
+        let elsewhere = dir(&root, "elsewhere");
+        fs::create_dir(root.join(".palette-depot-snapshots")).unwrap();
+        symlink(&elsewhere, root.join(".palette-depot-snapshots").join("depot")).unwrap();
+        assert!(create_session_depot(depot.to_str()).is_err());
+        assert!(publish_depot_snapshot(&depot).is_err());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(root.join(".palette-depot-clones")).unwrap().count(), 0);
         fs::remove_dir_all(&root).unwrap();
     }
 

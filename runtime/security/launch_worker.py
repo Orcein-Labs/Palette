@@ -21,7 +21,8 @@ tried and, on this substrate, actively caused the cold-start problem it
 was meant to solve -- see _clone_depot's docstring for the root cause,
 found by direct reproduction). Each worker gets its own real, cheap
 (reflink) clone of the prepared depot, bound writable as the primary
-`JULIA_DEPOT_PATH` entry. A separate durable operator package store may be
+`JULIA_DEPOT_PATH` entry. The clone is copied from the newest snapshot that
+preparation published (see publish_depot_snapshot), not from the live depot. A separate durable operator package store may be
 present as a later read-only depot entry for broker-provisioned packages.
 
 Paths are bound at IDENTICAL guest paths to their host paths (no
@@ -48,7 +49,8 @@ from pathlib import Path
 from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
 
 
-def _clone_depot(real_depot: str, clone_root: str) -> str:
+def _clone_depot(real_depot: str, clone_root: str, source: str | None = None,
+                 attempts: int | None = None) -> str:
     """Make a real, independent, cheap copy of the depot for one worker's
     exclusive writable use.
 
@@ -75,26 +77,16 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
     closed -- correctness first, worth revisiting if that path matters
     later, but not yet proven to be slow enough here to justify a
     filesystem-specific special case).
+
+    `source` is a snapshot of `real_depot` to copy instead of the live
+    depot; see publish_depot_snapshot.
     """
     dest = tempfile.mkdtemp(dir=clone_root, prefix="depot-")
     try:
         record = _clone_owner_record()
         if record is not None:
             Path(dest + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
-        # The depot is live. A Julia process precompiling into it removes its
-        # temporary files, and one removed between cp listing a directory and
-        # copying it fails the copy. A later attempt copies the settled tree.
-        for attempt in range(DEPOT_CLONE_ATTEMPTS):
-            shutil.rmtree(dest, ignore_errors=True)  # cp needs the destination to not exist yet
-            if attempt:
-                time.sleep(0.2)
-            try:
-                subprocess.run(["cp", "-a", "--reflink=auto", real_depot, dest], check=True,
-                               stdin=subprocess.DEVNULL)
-                break
-            except subprocess.CalledProcessError:
-                if attempt == DEPOT_CLONE_ATTEMPTS - 1:
-                    raise
+        _copy_tree(source or real_depot, dest, attempts or DEPOT_CLONE_ATTEMPTS)
     except BaseException:
         remove_session_depot(dest)
         raise
@@ -109,7 +101,7 @@ def _clone_depot(real_depot: str, clone_root: str) -> str:
 # that were killed first. The Rust host writes the same record.
 CLONE_OWNER_SUFFIX = ".owner"
 DEFAULT_RECEIPT_RETENTION_DAYS = 30
-# How many times a depot clone is tried before the session gives up.
+# How many times a live depot clone is tried before the session gives up.
 DEPOT_CLONE_ATTEMPTS = 3
 
 
@@ -229,6 +221,198 @@ def remove_owned_dir(directory: str | os.PathLike) -> None:
 def remove_session_depot(clone: str) -> None:
     """Remove a session depot clone and then its owner record."""
     remove_owned_dir(clone)
+
+
+def _copy_tree(source: str, dest: str, attempts: int) -> None:
+    """`cp -a --reflink=auto source dest`, tried `attempts` times. A live
+    depot may be precompiling: a Julia process removes its temporary files,
+    and one removed between cp listing a directory and copying it fails the
+    copy. A later attempt copies the settled tree."""
+    try:
+        for attempt in range(attempts):
+            shutil.rmtree(dest, ignore_errors=True)  # cp needs the destination to not exist yet
+            if attempt:
+                time.sleep(0.2)
+            try:
+                subprocess.run(["cp", "-a", "--reflink=auto", source, dest], check=True,
+                               stdin=subprocess.DEVNULL)
+                return
+            except subprocess.CalledProcessError:
+                if attempt == attempts - 1:
+                    raise
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+# Snapshots of a prepared depot live in
+# `<depot parent>/.palette-depot-snapshots/<depot name>/snap-<sequence>`. A
+# successful prepare publishes one; no sandbox binds them, so no Julia process
+# writes them. Session clones copy the newest one while holding a shared flock
+# on its directory, and a snapshot is removed only once it is no longer the
+# newest and an exclusive flock on it succeeds without waiting. Publishing and
+# sweeping hold an exclusive flock on `.lock`. The Rust host uses the same
+# layout and locks.
+SNAPSHOT_PREFIX = "snap-"
+
+
+def depot_snapshot_root(depot: str) -> Path | None:
+    path = Path(os.path.normpath(depot))
+    if not path.name:
+        return None
+    return path.parent / ".palette-depot-snapshots" / path.name
+
+
+def _open_dir_nofollow(path: Path) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _snapshot_names(root: Path) -> list[str]:
+    """The snapshot names in `root`, oldest first."""
+    names = [n for n in os.listdir(root)
+             if n.startswith(SNAPSHOT_PREFIX) and n[len(SNAPSHOT_PREFIX):].isdecimal()
+             and n[len(SNAPSHOT_PREFIX):].isascii()]
+    return sorted(names, key=lambda n: int(n[len(SNAPSHOT_PREFIX):]))
+
+
+@contextmanager
+def _hold_depot_snapshot(depot: str):
+    """Yields the newest snapshot of `depot` held under a shared flock, or
+    None when it has none."""
+    root = depot_snapshot_root(depot)
+    if root is None:
+        yield None
+        return
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            raise OSError(f"{root} is not a directory")
+    except FileNotFoundError:
+        yield None
+        return
+    # A sweep can take the chosen snapshot between listing and locking, but
+    # only after a newer one was published, so the next listing finds that.
+    for _ in range(8):
+        names = _snapshot_names(root)
+        if not names:
+            yield None
+            return
+        path = root / names[-1]
+        try:
+            fd = _open_dir_nofollow(path)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            held, named = os.fstat(fd), None
+            try:
+                named = os.lstat(path)
+            except OSError:
+                pass
+            if named is not None and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                yield path
+                return
+        finally:
+            os.close(fd)
+    raise OSError(f"the depot snapshots in {root} kept changing")
+
+
+def _snapshot_lock(root: Path) -> int:
+    return os.open(root / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+
+def publish_depot_snapshot(depot: str) -> Path:
+    """Copy `depot` into a new snapshot, then sweep the older ones. Run it
+    only right after the depot was prepared, while nothing else prepares it."""
+    root = depot_snapshot_root(depot)
+    if root is None:
+        raise OSError(f"{depot} has no parent")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise OSError(f"{root} is not a directory")
+    lock = _snapshot_lock(root)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _remove_abandoned_snapshot_dirs(root)
+        names = _snapshot_names(root)
+        sequence = int(names[-1][len(SNAPSHOT_PREFIX):]) + 1 if names else 1
+        tmp = root / f"tmp-{os.urandom(4).hex()}"
+        # Prepare just finished, but a user's own Julia may share the depot.
+        _copy_tree(depot, str(tmp), DEPOT_CLONE_ATTEMPTS)
+        snapshot = root / f"{SNAPSHOT_PREFIX}{sequence:020d}"
+        try:
+            os.rename(tmp, snapshot)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        _sweep_depot_snapshots(root)
+        return snapshot
+    finally:
+        os.close(lock)
+
+
+def has_depot_snapshot(depot: str) -> bool:
+    root = depot_snapshot_root(depot)
+    try:
+        return root is not None and stat.S_ISDIR(os.lstat(root).st_mode) and bool(_snapshot_names(root))
+    except OSError:
+        return False
+
+
+def _remove_abandoned_snapshot_dirs(root: Path) -> None:
+    """A `tmp-` or `trash-` directory seen under the publish lock belongs to
+    a publish or sweep that died."""
+    for entry in os.scandir(root):
+        if entry.name.startswith(("tmp-", "trash-")) and entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _sweep_depot_snapshots(root: Path) -> None:
+    """Remove every snapshot but the newest that no clone holds. The caller
+    holds the publish lock."""
+    try:
+        names = _snapshot_names(root)[:-1]
+    except OSError:
+        return
+    for name in names:
+        try:
+            fd = _open_dir_nofollow(root / name)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        try:
+            # Renamed first, so no later clone can pick it while it is removed.
+            trash = root / f"trash-{name}"
+            os.rename(root / name, trash)
+            shutil.rmtree(trash, ignore_errors=True)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _try_sweep_depot_snapshots(depot: str) -> None:
+    """Sweep the snapshots of `depot` unless a publish or sweep is under way."""
+    root = depot_snapshot_root(depot)
+    try:
+        lock = _snapshot_lock(root)
+    except (OSError, TypeError):
+        return
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _sweep_depot_snapshots(root)
+    except OSError:
+        pass
+    finally:
+        os.close(lock)
 
 
 def receipt_retention_days(value: str | None) -> int:
@@ -958,12 +1142,20 @@ def package_store_paths(
 
 def create_session_depot(real_depot: str | None = None, clone_root: str | None = None) -> str:
     """Create the private writable prewarmed depot used for worker caches.
-    Callers release it with remove_session_depot."""
+    The clone comes from the newest snapshot of the depot when one exists,
+    otherwise from the live depot. Callers release it with
+    remove_session_depot."""
     depot = real_depot or default_depot()
     root = clone_root or str(Path(depot).parent / ".palette-depot-clones")
     Path(root).mkdir(parents=True, exist_ok=True)
     sweep_orphaned_depot_clones(root)
-    return _clone_depot(depot, root)
+    with _hold_depot_snapshot(depot) as snapshot:
+        if snapshot is None:
+            return _clone_depot(depot, root)
+        # Nothing writes a snapshot, so one attempt copies it or fails for real.
+        clone = _clone_depot(depot, root, source=str(snapshot), attempts=1)
+    _try_sweep_depot_snapshots(depot)
+    return clone
 
 
 def run_worker(

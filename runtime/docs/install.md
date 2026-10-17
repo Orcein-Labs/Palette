@@ -26,6 +26,13 @@ runtime, and loaded-cache identity before reusing it. `--status` inspects the
 record without starting preparation. Preparation failures remain failures;
 raising a client's call timeout is not a substitute for a prepared installation.
 
+A successful preparation also publishes a snapshot of the depot in
+`<depot parent>/.palette-depot-snapshots/<depot name>/`. Sessions clone it
+instead of the live depot, so a Julia process that shares the depot cannot
+break a session's clone. A reused preparation publishes one when none exists.
+Until a snapshot exists, sessions clone the live depot. On a filesystem
+without reflinks the snapshot is a full copy of the depot.
+
 ## Local stdio plugin
 
 ```sh

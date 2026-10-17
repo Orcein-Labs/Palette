@@ -101,7 +101,8 @@ fn subset(argv: &[String]) -> Result<i32, String> {
 
 /// Precompile every stdlib and project dependency into the real depot, in the
 /// worker's own sandbox so the caches record the paths a worker sees. Run once
-/// per depot, and again after Palette or the project changes.
+/// per depot, and again after Palette or the project changes. A successful
+/// run publishes a snapshot of the depot for session clones.
 const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
 
 fn prewarm(argv: &[String]) -> Result<i32, String> {
@@ -130,7 +131,15 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
     argv.extend(["--".into(), julia, "--startup-file=no".into(), "-e".into(), PREWARM.into()]);
     let status = std::process::Command::new(&argv[0]).args(&argv[1..]).stdin(std::process::Stdio::null()).status();
     let _ = std::fs::remove_dir_all(&workspace);
-    Ok(status.map_err(|e| e.to_string())?.code().unwrap_or(1))
+    let code = status.map_err(|e| e.to_string())?.code().unwrap_or(1);
+    // Sessions clone the snapshot, which no Julia process writes, instead of
+    // the live depot. Without one they fall back to the live depot.
+    if code == 0 {
+        if let Err(e) = sandbox::publish_depot_snapshot(std::path::Path::new(&depot)) {
+            eprintln!("palette-host: the depot snapshot was not published: {e}");
+        }
+    }
+    Ok(code)
 }
 
 fn main() {
