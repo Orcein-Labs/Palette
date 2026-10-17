@@ -179,10 +179,11 @@ class HostJob:
 
     def _read_tail(self, name, pipe, cap):
         kept = bytearray()
-        for chunk in iter(lambda: pipe.read1(8192), b""):
-            kept += chunk
-            if len(kept) > 2 * cap:
-                del kept[:len(kept) - cap]
+        with pipe:   # each reader owns its pipe and closes it at end of output
+            for chunk in iter(lambda: pipe.read1(8192), b""):
+                kept += chunk
+                if len(kept) > 2 * cap:
+                    del kept[:len(kept) - cap]
         self._tails[name] = bytes(kept[-cap:]).decode("utf-8", "replace")
 
     def _kill_group(self):
