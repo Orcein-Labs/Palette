@@ -7,14 +7,15 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from launch_worker import (  # noqa: E402
-    CLONE_OWNER_SUFFIX, _clone_owner_alive, _clone_owner_record, _pid_namespace, create_receipts_dir,
-    create_session_depot, identity_base, identity_files, private_dir, receipt_retention_days, remove_session_depot,
-    sweep_orphaned_dirs,
+    CLONE_OWNER_SUFFIX, _append_receipts, _clone_owner_alive, _clone_owner_record, _pid_namespace,
+    create_receipts_dir, create_session_depot, identity_base, identity_files, private_dir, receipt_archive_dir,
+    receipt_retention_days, remove_session_depot, retire_receipts, sweep_orphaned_dirs,
 )
 
 
@@ -132,6 +133,124 @@ class OwnedDirSweepTest(unittest.TestCase):
         for bad in ("", "-1", "+7", "1.5", "\u0667", "forever", "99999999"):
             with self.assertRaises(ValueError, msg=bad):
                 receipt_retention_days(bad)
+
+
+# 2020-02-29T12:00:00Z: a leap day, years past any retention.
+LEAP_DAY = 1_582_977_600
+
+
+class ReceiptArchiveTest(unittest.TestCase):
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix="palette-receipt-archive-"))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.root = self.base / "receipts"
+        self.archive = receipt_archive_dir(self.root)
+        self.dead = f"{_pid_namespace()} {_reaped_pid()} 1\n"
+
+    def make(self, name, files, record, when, root=None):
+        """A closed session's receipts dir with `files`, owned by `record`,
+        all last modified at `when`."""
+        directory = (root or self.root) / name
+        directory.mkdir(parents=True)
+        for rel, data in files.items():
+            path = directory / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            os.utime(path, (when, when))
+            os.utime(path.parent, (when, when))
+        os.utime(directory, (when, when))
+        owner_path(directory).write_text(record)
+        return directory
+
+    def kept(self, directory):
+        return directory.is_dir() and owner_path(directory).exists()
+
+    def members(self, zip_path):
+        with zipfile.ZipFile(zip_path) as zf:
+            self.assertIsNone(zf.testzip())
+            return {info.filename: zf.read(info) for info in zf.infolist()}
+
+    def test_expired_receipts_are_zipped_by_month_and_then_removed(self):
+        self.assertEqual(self.archive, self.base / "docs" / "receipts")
+        blob = bytes(range(256)) * 300
+        first = self.make("palette-aaaa", {"receipts.jsonl": b'{"a":1}\n', "sub/blob.bin": blob}, self.dead, LEAP_DAY)
+        live = self.make("palette-live", {"receipts.jsonl": b"live\n"}, _clone_owner_record(), LEAP_DAY)
+        recent = self.make("palette-recent", {"receipts.jsonl": b"recent\n"}, self.dead, time.time() - 2 * 86_400)
+
+        session = create_receipts_dir(self.root, "palette-new1", 30)
+        zip_path = self.archive / "2020-02.zip"
+        self.assertFalse(os.path.lexists(first) or os.path.lexists(owner_path(first)))
+        for kept in (live, recent, session):
+            self.assertTrue(self.kept(kept), f"{kept} was touched")
+        self.assertEqual((recent / "receipts.jsonl").read_bytes(), b"recent\n")
+        self.assertEqual(self.archive.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(zip_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.members(zip_path),
+                         {"palette-aaaa/receipts.jsonl": b'{"a":1}\n', "palette-aaaa/sub/blob.bin": blob})
+        if shutil.which("unzip"):
+            self.assertEqual(subprocess.run(["unzip", "-tq", zip_path], capture_output=True).returncode, 0)
+
+        # A later session appends to the same month and starts a new one for another.
+        second = self.make("palette-bbbb", {"receipts.jsonl": b'{"b":2}\n'}, self.dead, LEAP_DAY + 43_199)
+        march = self.make("palette-cccc", {"receipts.jsonl": b'{"c":3}\n'}, self.dead, LEAP_DAY + 43_200)
+        create_receipts_dir(self.root, "palette-new2", 30)
+        self.assertFalse(os.path.lexists(second) or os.path.lexists(march))
+        self.assertEqual(self.members(zip_path), {"palette-aaaa/receipts.jsonl": b'{"a":1}\n',
+                                                  "palette-aaaa/sub/blob.bin": blob,
+                                                  "palette-bbbb/receipts.jsonl": b'{"b":2}\n'})
+        self.assertEqual(self.members(self.archive / "2020-03.zip"), {"palette-cccc/receipts.jsonl": b'{"c":3}\n'})
+        self.assertEqual(sorted(p.name for p in self.archive.iterdir()), [".lock", "2020-02.zip", "2020-03.zip"])
+
+    def test_an_archive_failure_keeps_the_receipts(self):
+        zip_path = self.archive / "2020-02.zip"
+        linked = self.make("palette-link", {"receipts.jsonl": b"x\n"}, self.dead, LEAP_DAY)
+        (linked / "elsewhere").symlink_to("/etc/hostname")
+        os.utime(linked, (LEAP_DAY, LEAP_DAY))
+        with self.assertRaisesRegex(ValueError, "not a regular file or directory"):
+            retire_receipts(linked, self.archive)
+        self.assertTrue(self.kept(linked) and not zip_path.exists())
+        (linked / "elsewhere").unlink()
+        os.utime(linked, (LEAP_DAY, LEAP_DAY))
+
+        zip_path.write_bytes(b"not a zip")
+        with self.assertRaises(zipfile.BadZipFile):
+            retire_receipts(linked, self.archive)
+        self.assertTrue(self.kept(linked) and zip_path.read_bytes() == b"not a zip")
+
+        zip_path.unlink()
+        zip_path.symlink_to(self.base / "decoy.zip")
+        with self.assertRaises(OSError):
+            retire_receipts(linked, self.archive)
+        self.assertTrue(self.kept(linked) and not (self.base / "decoy.zip").exists())
+        zip_path.unlink()
+
+        retire_receipts(self.make("palette-small", {"r": b"1\n"}, self.dead, LEAP_DAY), self.archive)
+        before = zip_path.read_bytes()
+        big = self.make("palette-big", {"r": bytes(4096)}, self.dead, LEAP_DAY)
+        with self.assertRaisesRegex(ValueError, "4 GiB"):
+            retire_receipts(big, self.archive, limit=2048)
+        self.assertTrue(self.kept(big) and zip_path.read_bytes() == before)
+
+        blocked = self.base / "blocked"
+        stuck = self.make("palette-stuck", {"r": b"1\n"}, self.dead, LEAP_DAY, root=blocked / "receipts")
+        (blocked / "docs").write_bytes(b"a file where the archive dir goes")
+        create_receipts_dir(blocked / "receipts", "palette-new", 1)
+        self.assertTrue(self.kept(stuck))
+        self.assertEqual((stuck / "r").read_bytes(), b"1\n")
+
+    def test_an_interrupted_retirement_is_not_archived_twice(self):
+        directory = self.make("palette-retry", {"r": b"1\n"}, self.dead, LEAP_DAY)
+        self.archive.mkdir(mode=0o700, parents=True)
+        zip_path = self.archive / "2020-02.zip"
+        _append_receipts(zip_path, directory, 0xFFFFFFFF)  # archived, then the host died before removing it
+        retire_receipts(directory, self.archive)
+        self.assertFalse(directory.exists())
+        self.assertEqual(self.members(zip_path), {"palette-retry/r": b"1\n"})
+
+        changed = self.make("palette-retry", {"r": b"2\n"}, self.dead, LEAP_DAY)
+        with self.assertRaisesRegex(ValueError, "already holds a different"):
+            retire_receipts(changed, self.archive)
+        self.assertTrue(changed.is_dir())
 
 
 class PrivateDirectoryTest(unittest.TestCase):

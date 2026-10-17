@@ -9,6 +9,7 @@
 
 mod broker;
 mod cli;
+mod receipt_archive;
 mod sandbox;
 mod session;
 mod util;

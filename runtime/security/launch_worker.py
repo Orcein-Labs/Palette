@@ -41,6 +41,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
@@ -173,10 +175,18 @@ def sweep_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: f
     that nobody has written to for at least `min_age_seconds`. A directory
     without a readable owner record, or one that is not a plain directory, is
     left alone."""
+    for directory in _expired_orphaned_dirs(root, prefix, min_age_seconds):
+        remove_owned_dir(directory)
+
+
+def _expired_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: float) -> list[str]:
+    """The directories `sweep_orphaned_dirs` would remove. Owner records whose
+    directory is already gone are removed here."""
+    expired: list[str] = []
     try:
         entries = list(os.scandir(root))
     except OSError:
-        return
+        return expired
     for entry in entries:
         dir_name = entry.name[:-len(CLONE_OWNER_SUFFIX)] if entry.name.endswith(CLONE_OWNER_SUFFIX) else None
         if not dir_name or not dir_name.startswith(prefix) or not entry.is_file(follow_symlinks=False):
@@ -201,7 +211,8 @@ def sweep_orphaned_dirs(root: str | os.PathLike, prefix: str, min_age_seconds: f
             except OSError:
                 continue
             if idle >= min_age_seconds:
-                remove_owned_dir(directory)
+                expired.append(directory)
+    return sorted(expired)
 
 
 def sweep_orphaned_depot_clones(clone_root: str) -> None:
@@ -234,8 +245,9 @@ def receipt_retention_days(value: str | None) -> int:
 def default_receipts_root() -> tuple[Path, int] | None:
     """Where a session's broker receipts go when the caller names no receipts
     directory: `~/.palette/receipts/<session id>/`, kept after the session
-    closes and pruned by a later session once older than the retention.
-    None when the retention is 0."""
+    closes. Once older than the retention, a later session moves them into
+    the monthly archive `~/.palette/docs/receipts/<YYYY-MM>.zip`. None when
+    the retention is 0."""
     days = receipt_retention_days(os.environ.get("PALETTE_RECEIPT_RETENTION_DAYS"))
     if days == 0:
         return None
@@ -243,11 +255,18 @@ def default_receipts_root() -> tuple[Path, int] | None:
 
 
 def create_receipts_dir(root: str | os.PathLike, session_id: str, retention_days: float) -> Path:
-    """Create `<root>/<session id>/` for one session's receipts, after pruning
-    the receipts of closed sessions older than the retention."""
+    """Create `<root>/<session id>/` for one session's receipts, after
+    archiving the receipts of closed sessions older than the retention.
+    Receipts that cannot be archived are kept, and a later session tries
+    again."""
     root = Path(root)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    sweep_orphaned_dirs(root, "palette-", retention_days * 86_400)
+    archive = receipt_archive_dir(root)
+    for expired in _expired_orphaned_dirs(root, "palette-", retention_days * 86_400):
+        try:
+            retire_receipts(expired, archive)
+        except (OSError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            print(f"palette-host: keeping the expired receipts {expired}: {exc}", file=sys.stderr)
     directory = root / session_id
     directory.mkdir(mode=0o700)
     try:
@@ -256,6 +275,149 @@ def create_receipts_dir(root: str | os.PathLike, session_id: str, retention_days
         directory.rmdir()
         raise
     return directory
+
+
+# Expired receipts are archived, not deleted: appended to
+# `~/.palette/docs/receipts/<YYYY-MM>.zip` (the UTC month of the directory's
+# last modification), named `<session dir>/<relative path>`, through a synced
+# temporary file renamed over the archive, under an exclusive lock on `.lock`
+# in the archive directory. The Rust host writes the same archive under the
+# same lock. Stored entries, no ZIP64.
+RECEIPT_ARCHIVE_LIMIT = 0xFFFFFFFF
+
+
+def receipt_archive_dir(receipts_root: str | os.PathLike) -> Path:
+    """Where expired receipts under `receipts_root` (~/.palette/receipts) are
+    archived: ~/.palette/docs/receipts."""
+    return Path(receipts_root).parent / "docs" / "receipts"
+
+
+def _receipt_files(directory: Path) -> list[tuple[str, Path]]:
+    """The regular files under `directory` as (archive name, path), sorted.
+    Symlinks and special files are refused."""
+    files: list[tuple[str, Path]] = []
+    pending = [(directory.name, directory)]
+    while pending:
+        prefix, path = pending.pop()
+        for entry in sorted(os.scandir(path), key=lambda e: e.name):
+            name = f"{prefix}/{entry.name}"
+            mode = entry.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                pending.append((name, Path(entry.path)))
+            elif stat.S_ISREG(mode):
+                files.append((name, Path(entry.path)))
+            else:
+                raise ValueError(f"refusing {entry.path}: not a regular file or directory")
+    return sorted(files)
+
+
+def _open_source(path: Path):
+    handle = os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb")
+    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        handle.close()
+        raise ValueError(f"refusing {path}: not a regular file")
+    return handle
+
+
+def _crc_and_size(path: Path) -> tuple[int, int]:
+    crc, size = 0, 0
+    with _open_source(path) as handle:
+        while chunk := handle.read(1 << 16):
+            crc, size = zlib.crc32(chunk, crc), size + len(chunk)
+    return crc, size
+
+
+def _append_receipts(target: Path, directory: Path, limit: int) -> None:
+    """Append the files of `directory` to the archive `target`. Files already
+    archived with the same contents are skipped, so a retry after a crash
+    adds nothing twice."""
+    files = _receipt_files(directory)
+    try:
+        existing = os.fdopen(os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb")
+    except FileNotFoundError:
+        existing = None
+    archived: dict[str, tuple[int, int]] = {}
+    old_len = 0
+    if existing is not None:
+        with existing:
+            if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                raise ValueError(f"refusing {target}: not a regular file")
+            with zipfile.ZipFile(existing) as zf:
+                for info in zf.infolist():
+                    archived[info.filename] = (info.CRC, info.file_size)
+            old_len = os.fstat(existing.fileno()).st_size
+    fresh = []
+    for name, path in files:
+        crc, size = _crc_and_size(path)
+        if name in archived:
+            if archived[name] != (crc, size):
+                raise ValueError(f"{target} already holds a different {name}")
+            continue
+        fresh.append((name, path, size))
+    if not fresh:
+        return
+    projected = max(old_len, 22) + sum(76 + 2 * len(n.encode()) + size for n, _, size in fresh)
+    if projected > limit or len(archived) + len(fresh) >= 0xFFFF:
+        raise ValueError(f"{target} would pass 4 GiB or 65,534 entries, the limit without ZIP64")
+
+    tmp = target.parent / f".{target.name}.{os.urandom(8).hex()}.tmp"
+    out = os.fdopen(os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "r+b")
+    try:
+        with out:
+            if existing is not None:
+                with _open_source(target) as source:
+                    shutil.copyfileobj(source, out)
+                out.seek(0)
+            with zipfile.ZipFile(out, "a" if existing is not None else "w", zipfile.ZIP_STORED, allowZip64=False) as zf:
+                for name, path, size in fresh:
+                    with _open_source(path) as source:
+                        mtime = os.fstat(source.fileno()).st_mtime
+                        info = zipfile.ZipInfo(name, max(time.gmtime(mtime)[:6], (1980, 1, 1, 0, 0, 0)))
+                        info.create_system = 3
+                        info.external_attr = (os.fstat(source.fileno()).st_mode & 0xFFFF) << 16
+                        info.file_size = size
+                        with zf.open(info, "w") as member:
+                            shutil.copyfileobj(source, member)
+                    if info.file_size != size:
+                        raise ValueError(f"{path} changed while it was archived")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def retire_receipts(directory: str | os.PathLike, archive_dir: str | os.PathLike, limit: int = RECEIPT_ARCHIVE_LIMIT) -> None:
+    """Archive the expired receipts directory `directory` into `archive_dir`
+    and remove it. On any error the directory and its owner record are kept."""
+    directory, archive_dir = Path(directory), Path(archive_dir)
+    archive_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = os.lstat(archive_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError(f"refusing {archive_dir}: it must be a directory this user owns")
+    if info.st_mode & 0o777 != 0o700:
+        os.chmod(archive_dir, 0o700)
+    lock = os.open(archive_dir / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Another session may have archived and removed it while this one waited.
+        try:
+            if not stat.S_ISDIR(os.lstat(directory).st_mode):
+                raise ValueError(f"{directory} is not a directory")
+            os.lstat(str(directory) + CLONE_OWNER_SUFFIX)
+        except FileNotFoundError:
+            return
+        month = time.strftime("%Y-%m", time.gmtime(_last_modified(str(directory))))
+        _append_receipts(archive_dir / f"{month}.zip", directory, limit)
+        remove_owned_dir(directory)
+    finally:
+        os.close(lock)
 
 
 def resolve_real_julia_binary() -> str:

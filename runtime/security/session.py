@@ -122,9 +122,10 @@ class PaletteSession:
         and deleted on close. The default, ~/.palette-sessions/<id>, carries
         an owner record so a later session removes it if this process is
         killed before it can. Without `receipts_dir` the broker's receipts go
-        to ~/.palette/receipts/<id>/ and outlive the session
-        (PALETTE_RECEIPT_RETENTION_DAYS, default 30; 0 keeps them in the
-        scratch root, deleted on close). `task_workspace_dir` is a directory the caller
+        to ~/.palette/receipts/<id>/ and outlive the session; past the
+        retention (PALETTE_RECEIPT_RETENTION_DAYS, default 30) a later session
+        archives them into ~/.palette/docs/receipts/<YYYY-MM>.zip. 0 keeps
+        them in the scratch root, deleted on close. `task_workspace_dir` is a directory the caller
         owns (an agent's task checkout): bound writable as the worker's
         working directory and never deleted. Without it the worker works in
         a private scratch workspace under the scratch root."""

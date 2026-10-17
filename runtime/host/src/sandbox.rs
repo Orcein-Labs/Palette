@@ -6,6 +6,7 @@
 //! read-only operator package depot exposes broker-installed packages; the
 //! full prepared clone remains first so Julia's cached stdlib build ids match.
 
+use crate::receipt_archive;
 use crate::util;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -458,7 +459,7 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
 /// the same record.
 const CLONE_OWNER_SUFFIX: &str = ".owner";
 
-fn clone_owner_path(clone: &Path) -> PathBuf {
+pub(crate) fn clone_owner_path(clone: &Path) -> PathBuf {
     let mut path = clone.as_os_str().to_owned();
     path.push(CLONE_OWNER_SUFFIX);
     PathBuf::from(path)
@@ -474,7 +475,7 @@ fn pid_namespace() -> Option<String> {
     fs::read_link("/proc/self/ns/pid").ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-fn clone_owner_record() -> Option<String> {
+pub(crate) fn clone_owner_record() -> Option<String> {
     let pid = std::process::id();
     Some(format!("{} {pid} {}\n", pid_namespace()?, process_start_time(pid)?))
 }
@@ -498,7 +499,7 @@ pub(crate) fn record_owner(dir: &Path) -> Result<(), String> {
 }
 
 /// The newest modification time of `dir` and its direct entries.
-fn last_modified(dir: &Path) -> Option<SystemTime> {
+pub(crate) fn last_modified(dir: &Path) -> Option<SystemTime> {
     let mut newest = fs::symlink_metadata(dir).ok()?.modified().ok()?;
     for entry in fs::read_dir(dir).ok()?.flatten() {
         if let Some(t) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
@@ -512,7 +513,16 @@ fn last_modified(dir: &Path) -> Option<SystemTime> {
 /// that nobody has written to for at least `min_age`. A directory without a
 /// readable owner record, or one that is not a plain directory, is left alone.
 pub(crate) fn sweep_orphaned_dirs(root: &Path, prefix: &str, min_age: Duration) {
-    let Ok(entries) = fs::read_dir(root) else { return };
+    for dir in expired_orphaned_dirs(root, prefix, min_age) {
+        remove_owned_dir(&dir);
+    }
+}
+
+/// The directories `sweep_orphaned_dirs` would remove. Owner records whose
+/// directory is already gone are removed here.
+pub(crate) fn expired_orphaned_dirs(root: &Path, prefix: &str, min_age: Duration) -> Vec<PathBuf> {
+    let mut expired = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else { return expired };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(dir_name) = name.to_str().and_then(|n| n.strip_suffix(CLONE_OWNER_SUFFIX)) else { continue };
@@ -528,13 +538,15 @@ pub(crate) fn sweep_orphaned_dirs(root: &Path, prefix: &str, min_age: Duration) 
             Ok(meta) if meta.is_dir() => {
                 let idle = last_modified(&dir).and_then(|t| t.elapsed().ok()).unwrap_or(Duration::ZERO);
                 if idle >= min_age {
-                    remove_owned_dir(&dir);
+                    expired.push(dir);
                 }
             }
             Ok(_) => {}
             Err(_) => { let _ = fs::remove_file(entry.path()); }
         }
     }
+    expired.sort();
+    expired
 }
 
 /// Removes an owned directory and then its owner record.
@@ -551,7 +563,8 @@ pub fn remove_session_depot(clone: &Path) {
 /// Where a session's broker receipts go when the caller names no receipts
 /// directory: `~/.palette/receipts/<session id>/`, kept after the session
 /// closes. `PALETTE_RECEIPT_RETENTION_DAYS` (default 30) sets how long a
-/// closed session's receipts are kept before a later session prunes them;
+/// closed session's receipts stay there before a later session moves them
+/// into the monthly archive `~/.palette/docs/receipts/<YYYY-MM>.zip`;
 /// 0 restores the old behavior, receipts inside the session scratch root and
 /// deleted with it. Returns the root and the retention, or None for 0.
 pub fn default_receipts_root() -> Result<Option<(PathBuf, Duration)>, String> {
@@ -571,13 +584,19 @@ fn receipt_retention(days: Option<&str>) -> Result<Option<Duration>, String> {
 
 pub const DEFAULT_RECEIPT_RETENTION_DAYS: u64 = 30;
 
-/// Creates `<root>/<session id>/` for one session's receipts, after pruning
-/// the receipts of closed sessions older than `retention`.
+/// Creates `<root>/<session id>/` for one session's receipts, after
+/// archiving the receipts of closed sessions older than `retention`. Receipts
+/// that cannot be archived are kept, and a later session tries again.
 pub fn create_receipts_dir(root: &Path, session_id: &str, retention: Duration) -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().recursive(true).mode(0o700).create(root)
         .map_err(|e| format!("creating {}: {e}", root.display()))?;
-    sweep_orphaned_dirs(root, "palette-", retention);
+    let archive = receipt_archive::archive_dir(root);
+    for expired in expired_orphaned_dirs(root, "palette-", retention) {
+        if let Err(e) = receipt_archive::retire(&expired, &archive) {
+            eprintln!("palette-host: keeping the expired receipts {}: {e}", expired.display());
+        }
+    }
     let dir = root.join(session_id);
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     if let Err(e) = record_owner(&dir) {

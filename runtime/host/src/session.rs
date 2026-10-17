@@ -156,6 +156,7 @@ impl PaletteSession {
         }
         if let Some((root, _)) = &default_receipts {
             package_protection.push(root.clone());
+            package_protection.push(crate::receipt_archive::archive_dir(root));
         }
         let package_store = sandbox::package_store_paths(&package_protection, Some(&o.ceiling)).map_err(err)?;
         if let Some(state) = state_dir.as_deref() {

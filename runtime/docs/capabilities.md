@@ -29,11 +29,27 @@ worker refresh and restart and are outside the worker's writable mounts.
 A session started without a receipts directory (`palette-host session` or
 `run-worker` without `--receipts-dir`, or the Python `PaletteSession` without
 `receipts_dir`) keeps its receipts in `~/.palette/receipts/<session id>/`,
-which is private to the user and survives the session. A later session prunes
-the receipts of closed sessions that have not been written for
-`PALETTE_RECEIPT_RETENTION_DAYS` days (default 30). Setting it to `0` restores
-the earlier behavior: receipts live in the session's scratch root and are
-deleted when the session closes.
+which is private to the user and survives the session. A closed session's
+receipts that have not been written for `PALETTE_RECEIPT_RETENTION_DAYS` days
+(default 30) are archived, not deleted. The next session to start appends them to
+`~/.palette/docs/receipts/<YYYY-MM>.zip`, where the month is the UTC month of
+the directory's last write. Each entry is named `<session id>/<file>`. Then
+the session removes the directory. The archive directory is `0700` and each
+archive is `0600`.
+
+The archive is a plain ZIP with stored entries, readable by `unzip` or Python
+`zipfile`. Each append writes a new archive beside the old one, syncs it and
+renames it over the old one, under a lock on `.lock` in the archive directory.
+Both hosts write the same format under the same lock. If a directory cannot be
+archived, it is kept, and a warning goes to the host's stderr. A later session
+tries again. This happens when the receipts hold a symlink or a special file,
+when the archive is damaged, or when it would pass 4 GiB, since there is no
+ZIP64. The Python host stops at the 2 GiB that `zipfile` allows without ZIP64.
+Retrying after a crash is safe: files already in the archive with the same
+contents are skipped.
+
+Setting the retention to `0` restores the earlier behavior: receipts live in
+the session's scratch root and are deleted when the session closes.
 
 A session's default scratch root, `~/.palette-sessions/<session id>`, and its
 depot clone in `.palette-depot-clones` each carry a `.owner` record naming the
