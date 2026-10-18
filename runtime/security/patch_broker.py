@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import selectors
+import shlex
 import stat
 import subprocess
 import sys
@@ -418,10 +419,23 @@ class PatchBroker:
             stream.flush()
             os.fsync(stream.fileno())
 
+    def unknown_target(self, target):
+        configured = ", ".join(sorted(self.roots)) or "none"
+        return PermissionError(f"{target!r} is not a patch target; the host configures them in PALETTE_PATCH_ROOTS "
+                               f"(configured: {configured})")
+
+    def approval_steps(self, record):
+        """What the local administrator runs; the agent's own calls cannot approve."""
+        command = ["python3", str(Path(__file__).resolve()), "--storage", str(self.storage)]
+        return {"status": "approval_required", "request_id": record["request_id"], "patch_sha256": record["patch_sha256"],
+                "review_command": shlex.join([*command, "review", record["request_id"]]),
+                "approve_command": shlex.join([*command, "approve", record["request_id"], "--digest", record["patch_sha256"]]),
+                "after_approval": "Call apply again with this request_id within 15 minutes of prepare; it applies the approved patch once."}
+
     def prepare(self, args, workspace):
         root = self.roots.get(args.get("target"))
         if root is None:
-            raise PermissionError("Target is not in the host-configured patch roots")
+            raise self.unknown_target(args.get("target"))
         changes = args.get("changes")
         if not isinstance(changes, list) or not 1 <= len(changes) <= 16:
             raise ValueError("Expected 1..16 exact file changes")
@@ -537,7 +551,7 @@ class PatchBroker:
         if action == "read":
             root = self.roots.get(args.get("target"))
             if root is None:
-                raise PermissionError("Target is not host-configured")
+                raise self.unknown_target(args.get("target"))
             classification = self.classify(args["target"], args.get("path"))
             if classification["class"] == "forbidden":
                 raise PermissionError("Credential and secret files cannot be read")
@@ -559,10 +573,10 @@ class PatchBroker:
         if record["status"] == "pending":
             self.reject_forbidden_changes(record)
             if self.approval == "administrator":
-                return {"status": "approval_required", "request_id": record["request_id"], "patch_sha256": record["patch_sha256"], "reason": "This operator accepts patch approval only from the local administrator command; MCP client confirmation is turned off."}
+                return {**self.approval_steps(record), "reason": "This operator accepts patch approval only from the local administrator command; MCP client confirmation is turned off."}
             elicitation = capabilities.get("elicitation")
             if not isinstance(elicitation, dict) or elicitation and "form" not in elicitation:
-                return {"status": "approval_required", "request_id": record["request_id"], "patch_sha256": record["patch_sha256"], "reason": "Client does not advertise form elicitation. Local administrator must review and approve the exact pending request; Julia and MCP tool arguments cannot grant approval."}
+                return {**self.approval_steps(record), "reason": "Client does not advertise form elicitation. Local administrator must review and approve the exact pending request; Julia and MCP tool arguments cannot grant approval."}
             rid = "approve-" + uuid.uuid4().hex
             request = {"jsonrpc": "2.0", "id": rid, "method": "elicitation/create", "params": {"mode": "form", "message": f"Apply exactly this one-shot patch to {record['root']} for workspace {workspace}? Digest {record['patch_sha256']}. Expires in 15 minutes.\n{record['preview']}", "requestedSchema": {"type": "object", "properties": {"confirm": {"type": "boolean", "title": "Approve this exact patch once"}}, "required": ["confirm"]}}}
             print(json.dumps(request), file=destination, flush=True)
