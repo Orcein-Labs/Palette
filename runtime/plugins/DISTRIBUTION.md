@@ -2,15 +2,27 @@
 
 These bundles contain the clean Palette SDK source and client integration. They
 do not contain preinstalled Julia, Rust, Python, extra kernels, credentials, or
-a hosted service. Initial preparation takes several minutes; do it once before
-connecting. This is a source-based installation, not a thirty-second binary installer.
+a hosted service. A runtime runs on Linux, or in WSL2 on Windows.
 
 ## 1. Prepare your runtime
 
-Use Linux with Julia 1.12, Python 3, Rust/Cargo, and bubblewrap installed.
-On Windows, use a WSL2 Linux distribution with those prerequisites; execute this
-step in that distribution. Native macOS and native Windows supervised runtimes
-are not currently supported. Cloud-only clients can connect to a Linux host.
+The quickest way is the one-command installer. It installs Julia if needed and
+a prebuilt host, prepares the sandbox, registers Claude Code, Codex and, on
+Windows, Claude Desktop, and checks one call:
+
+```sh
+curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+```
+
+On Windows run `install.ps1` instead; `sdk/runtime/docs/install.md` gives the
+command and the settings. The runtime is then in `~/.local/share/palette`, and
+the files mentioned below are in its `client/` folder.
+
+To prepare from this bundle instead, use Linux with Julia 1.10 or newer,
+Python 3, bubblewrap and Rust/Cargo (the bundle has no prebuilt host). On
+Windows, run this in a WSL2 distribution. Native macOS and native Windows
+supervised runtimes are not supported. Cloud-only clients can connect to a
+Linux host.
 
 Download one client archive. Upload `Palette-ChatGPT.zip` through ChatGPT Plugins
 **+**, or `Palette-Claude.zip` through Claude Customize > Plugins > Upload.
@@ -23,20 +35,22 @@ The `.mcpb` is itself ZIP format: extract a copy and run setup from its root.
 From the directory containing `setup.py`, run:
 
 ```sh
-python3 setup.py \
-  --output-dir "$HOME/.local/share/palette-client" \
-  --data-dir "$HOME/.local/share/palette-data" \
-  --depot-dir "$HOME/.local/share/palette-depot"
+python3 setup.py
 ```
 
-For Windows Claude Desktop add `--wsl-distribution YOUR_DISTRO_NAME` (the name
-shown by `wsl.exe --list --quiet`). Keep output, data and depot outside `sdk/`.
-The helper instantiates the Julia project, builds the locked Rust host, prewarms
-the real sandbox, and generates `palette-launch.json`, `generic-mcp.json`, a
-local portable plugin, and a `palette-mcp` stdio command. It never requests model
-API calls or automatically configures a tunnel. Linux must permit bubblewrap's
-user namespaces; an AppArmor denial is an administrator setup issue, not a
-reason to disable isolation. See `sdk/runtime/docs/install.md`.
+Configuration, data and the depot go to `~/.local/share/palette/` by default;
+`--output-dir`, `--data-dir` and `--depot-dir` choose other places outside
+`sdk/`. For Windows Claude Desktop add `--wsl-distribution YOUR_DISTRO_NAME`
+(the name shown by `wsl.exe --list --quiet`). The helper instantiates the Julia
+project, builds the locked Rust host, prewarms the real sandbox, and generates
+`palette-launch.json`, `generic-mcp.json`, a local portable plugin, and a
+`palette-mcp` stdio command. It registers that command with Claude Code and
+Codex when they are installed and have no `palette` server (`--no-register`
+skips this), then makes one test call (`--no-check` skips it). It never
+requests model API calls or automatically configures a tunnel. Linux must
+permit bubblewrap's user namespaces; `sdk/runtime/scripts/setup-sandbox-host.sh
+install`, run as root, installs what the sandbox needs without disabling
+isolation. See `sdk/runtime/docs/install.md`.
 
 For an existing, already built and prewarmed installation, use
 `--repo-dir /absolute/path/to/Palette --connect-only` with its existing depot.
@@ -114,8 +128,9 @@ cannot grant that approval simply by evaluating Julia.
 Keep the SDK at a stable path and retain the external data/depot directories.
 Setup preserves an existing generated plugin manifest; use a fresh output
 directory to adopt updated listing metadata without overwriting local edits.
-Stop the adapter, replace the SDK with the new source bundle, rebuild/prewarm,
-restart, and refresh client tool discovery if schemas changed. Do not copy an
+Installed with `install.sh`, run it again to update. Otherwise stop the
+adapter, replace the SDK with the new source bundle, rebuild/prewarm, restart,
+and refresh client tool discovery if schemas changed. Do not copy an
 old Manifest blindly into a new source release. Keep a prior source bundle for
 rollback; do not overwrite live runtime files during an active call.
 

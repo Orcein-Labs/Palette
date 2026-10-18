@@ -19,6 +19,7 @@ IDs below (P-xx, MT-xx, MP-xx) refer to it.
 |---|---|
 | Shell parity | An agent runs a full Luxel session through Palette with no Bash: cargo build and test, git, GPU renders under the shared GPU lock, profiling. |
 | Long work | Work over 60 s runs as a job or with a per-call deadline, with status, streamed output and cancel. |
+| Install | On a fresh Linux machine and on a fresh Windows machine with WSL2, one command goes from nothing to a working Claude Code call, with no flags and no Rust toolchain. |
 | CI | `security-suite` finishes in under 15 min and is green on 10 consecutive runs. Today it takes 50–90 min and sometimes hangs in sandbox prewarm. |
 | Speed | Warm calls take about 1 s or less. Cold start is well under today's 11 s. |
 | Honest reporting | The dogfood report's seams 2–8 are fixed. |
@@ -29,21 +30,28 @@ IDs below (P-xx, MT-xx, MP-xx) refer to it.
 ### A. Dogfood blockers
 
 1. **Long work.** Pass the host's `--turn-timeout` through the server, and add a per-call deadline. Add background jobs with status, streamed output and cancel.
-2. **Host commands and the GPU path.** Make allowed host commands discoverable. Fix the ceiling that protects the user's home directory and so blocks the package store inside it. Make GPU work run under the shared lock with a timeout.
-3. **Sandbox prewarm in CI.**
+2. **Install.** One command, no flags, everything local. The sandbox stays as it is; the steps around it go.
+   - Linux: `install.sh` installs Julia through juliaup when it is missing, and asks for sudo once to install bubblewrap, Python 3 and, where AppArmor restricts user namespaces, the pinned upstream bwrap profile (`setup-sandbox-host.sh`, shared with CI).
+   - It downloads a prebuilt `palette-host` and checks its checksum; Rust is needed only to build from source.
+   - It instantiates the Julia project, then prewarms with visible progress.
+   - Data, workspace and package store default under `~/.local/share/palette`, in places the protected-path ceiling accepts, so no profile or flag is needed.
+   - It registers the server with the clients it finds (Claude Code with `claude mcp add`, Claude Desktop, Codex) and ends with a real call, `1 + 1` returning 2, or names what failed.
+   - Windows: `install.ps1` enables WSL2 when needed, runs `install.sh` in the distribution, and writes Windows client configurations that launch through `wsl.exe`.
+   - CI builds the release on each tag: the host binary, checksums and the client bundles. The README leads with the install command.
+3. **Host commands and the GPU path.** Make allowed host commands discoverable. Make GPU work run under the shared lock with a timeout.
+4. **Sandbox prewarm in CI.**
    - Reuse the precompile caches instead of recompiling about 80 packages on every run.
    - Capture the real error when a package fails to precompile (ZMQ today).
    - Stop the prewarm output from being truncated.
-4. **Messages and bookkeeping** (dogfood seams 2–8):
+5. **Messages and bookkeeping** (dogfood seams 2–8):
    - Report a preparation failure as a preparation failure, not as a connection problem.
    - Clear a stale preparation state once a later prepare succeeds.
    - Make the kill message match what revival restores, and report the killed call.
    - Name the execution phase when a call times out.
    - Make patch targets discoverable, and print the approval command.
    - Give private instances their own package store by default.
-   - Make the prewarm instantiate before it precompiles.
    - Make `list` say when other thread workspaces exist.
-5. **Cold vs warm cost (MP-12).** Status and receipts report first-call cost separately from warm-call cost.
+6. **Cold vs warm cost (MP-12).** Status and receipts report first-call cost separately from warm-call cost.
 
 Exit: the Luxel L-10 workload (quality presets) runs entirely through Palette.
 
