@@ -25,34 +25,78 @@ print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[
 """
 
 
+WEIGHTS = Path(__file__).absolute().parent / "test-case-seconds.json"
+# Shard 1 also runs the shared gates, which took about this long in CI.
+SHARED_GATE_SECONDS = 90
+
+
+def case_key(case):
+    suite, _, test = case
+    return f"{suite.stem}:{test}"
+
+
 class Shard:
-    """Splits the test suites' cases round-robin across --shard I/N jobs."""
+    """Deals the test suites' cases across --shard I/N jobs, longest first to the least-loaded job.
+
+    The seconds come from test-case-seconds.json (refresh it with
+    runtime/scripts/record-test-case-seconds.py); a case with no record costs its suite's mean.
+    Both hosts share a case's record."""
 
     def __init__(self, spec):
         index, _, count = spec.partition("/")
-        self.index, self.count, self.position = int(index), int(count), 0
+        self.index, self.count = int(index), int(count)
         if not 1 <= self.index <= self.count:
             raise ValueError(f"shard {spec} is not of the form I/N with 1 <= I <= N")
 
-    def run_suite(self, suite, env):
-        if self.count == 1:
-            return run([sys.executable, suite, "-v"], env)
-        listed = subprocess.run([sys.executable, "-c", LIST_TESTS, suite.stem], cwd=suite.parent, env=env,
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
-        tests = json.loads(listed.stdout)
-        mine = [test for offset, test in enumerate(tests) if (self.position + offset) % self.count == self.index - 1]
-        self.position += len(tests)
-        if mine:
-            run([sys.executable, suite, "-v", *mine], env)
-        else:
-            print(f"\nverification: {suite.name} has no cases in shard {self.index}/{self.count}", flush=True)
+    def mine(self, runs):
+        cases = []
+        for suite, implementation, env in runs:
+            listed = subprocess.run([sys.executable, "-c", LIST_TESTS, suite.stem], cwd=suite.parent, env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+            cases += [(suite, implementation, test) for test in json.loads(listed.stdout)]
+        weights = json.loads(WEIGHTS.read_text())
+        means = {}
+        for key, seconds in weights.items():
+            means.setdefault(key.partition(":")[0], []).append(seconds)
+        fallback = sum(weights.values()) / max(len(weights), 1)
+
+        def seconds(case):
+            key = case_key(case)
+            recorded = means.get(key.partition(":")[0])
+            return weights.get(key, sum(recorded) / len(recorded) if recorded else fallback)
+
+        loads = [SHARED_GATE_SECONDS] + [0] * (self.count - 1)
+        mine = set()
+        for case in sorted(cases, key=lambda case: (-seconds(case), case_key(case))):
+            job = min(range(self.count), key=lambda job: (loads[job], job))
+            loads[job] += seconds(case)
+            if job == self.index - 1:
+                mine.add(case)
+        return [case for case in cases if case in mine]
+
+    def run(self, runs):
+        mine = None if self.count == 1 else self.mine(runs)
+        current = None
+        for suite, implementation, env in runs:
+            if implementation != current:
+                print(f"\noperator implementation: {implementation}", flush=True)
+                current = implementation
+            if mine is None:
+                run([sys.executable, suite, "-v"], env)
+                continue
+            tests = [test for case_suite, case_implementation, test in mine
+                     if (case_suite, case_implementation) == (suite, implementation)]
+            if tests:
+                run([sys.executable, suite, "-v", *tests], env)
+            else:
+                print(f"\nverification: {suite.name} has no cases in shard {self.index}/{self.count}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-dir", required=True, help="Test environment with Palette, JSON, CSV, DataFrames, EzXML and IJulia")
     parser.add_argument("--implementation", choices=("both", "rust", "python"), default="both")
-    parser.add_argument("--shard", default="1/1", help="run shard I of N: the shared gates on shard 1, every Nth test case on each")
+    parser.add_argument("--shard", default="1/1", help="run shard I of N: the shared gates on shard 1, and a share of the test cases by recorded seconds")
     args = parser.parse_args()
     try:
         shard = Shard(args.shard)
@@ -81,17 +125,16 @@ def main():
     host = ROOT / "runtime/host/target/release/palette-host"
     run([sys.executable, ROOT / "runtime/security/prewarm_depot.py", "--project-dir", project,
          "--repo-dir", ROOT, "--host-bin", host], env)
-    for suite in ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py"):
-        shard.run_suite(ROOT / "runtime/security" / suite, env)
-    shard.run_suite(ROOT / "runtime/integrations/gesso/test_gesso.py", env)
+    security = ROOT / "runtime/security"
+    runs = [(security / suite, None, env) for suite in
+            ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py")]
+    runs.append((ROOT / "runtime/integrations/gesso/test_gesso.py", None, env))
     implementations = ("rust", "python") if args.implementation == "both" else (args.implementation,)
     for implementation in implementations:
-        print(f"\noperator implementation: {implementation}", flush=True)
-        implementation_env = dict(env)
-        if implementation == "rust":
-            implementation_env["PALETTE_HOST_BIN"] = str(host)
-        for suite in ("test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py", "test_host_bridge.py"):
-            shard.run_suite(ROOT / "runtime/security" / suite, implementation_env)
+        implementation_env = {**env, "PALETTE_HOST_BIN": str(host)} if implementation == "rust" else env
+        runs += [(security / suite, implementation, implementation_env) for suite in
+                 ("test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py", "test_host_bridge.py")]
+    shard.run(runs)
     print(f"\nAll operator verification gates passed (shard {shard.index}/{shard.count}).", flush=True)
 
 
