@@ -2,6 +2,8 @@
 
 Palette gives any harness that accepts plugins, a Julia computer on your machine, and that computer is still running when the next message arrives.
 
+Note: Developed on CachyOS, tested on Windows 11 via QEMU. Xeon 2699 v3, RTX 5060 8GB, 32GB DDR4
+
 ChatGPT Chat, Claude, Grok, and Codex talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
 
 Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives, and host-side effects go through a capability broker and leave a receipt.
