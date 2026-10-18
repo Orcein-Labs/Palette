@@ -5,13 +5,13 @@
 On Linux, or inside WSL2:
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows (PowerShell or a command prompt):
 
 ```powershell
-powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.ps1'))"
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
 ```
 
 `install.sh` does the following, and running it again updates the install:

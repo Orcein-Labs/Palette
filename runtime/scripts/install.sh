@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 # Install Palette on Linux (or inside WSL2) and connect it to local clients:
-#   curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 # Run again to update. Settings, all optional:
 #   PALETTE_VERSION           release tag to install (default: the latest release)
 #   PALETTE_HOME              where everything goes (default: ~/.local/share/palette)
@@ -10,7 +10,7 @@
 #   PALETTE_WSL_DISTRIBUTION  set by install.ps1 so Windows clients launch through WSL
 set -eu
 
-repo=latentcollapse/Palette.jl
+repo=latentcollapse/Palette
 home=${PALETTE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/palette}
 asset=palette-linux-x86_64.tar.gz
 
