@@ -89,6 +89,16 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.router_stderr.flush()
         return Path(self.router_stderr.name).read_text(errors="replace")[-12000:]
 
+    def test_list_says_when_other_contexts_own_thread_workspaces(self):
+        self.call("palette_workspace", {"action":"create", "workspace_id":"hidden-a", "scope":"thread", "context_id":"ctx-hidden-a"})
+        listing = self.call("palette_workspace", {"action":"list"})
+        self.assertNotIn("hidden-a", [w["workspace_id"] for w in listing["workspaces"]])
+        self.assertEqual(listing["other_thread_workspaces"], 1)
+        self.assertIn("context_id", listing["note"])
+        own = self.call("palette_workspace", {"action":"list", "context_id":"ctx-hidden-a"})
+        self.assertIn("hidden-a", [w["workspace_id"] for w in own["workspaces"]])
+        self.assertNotIn("other_thread_workspaces", own)
+
     def call(self, name, arguments, *, error=False):
         request = {
             "jsonrpc": "2.0",
