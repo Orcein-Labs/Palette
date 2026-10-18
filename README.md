@@ -150,6 +150,9 @@ with this checkout plus JSON, CSV, DataFrames, EzXML, and IJulia, then run:
 python3 runtime/security/verify_operator.py --project-dir /absolute/path/to/test-env --implementation both
 ```
 
+`--shard I/N` runs the shared gates on shard 1 and every Nth test case on each
+shard; CI runs the process gates as four shards.
+
 CI runs package, host, Jupyter integration, workspace/patch, and process gates.
 Pull requests run the process gates against the Rust host; both hosts run nightly.
 The Python host is scheduled for removal ([authority](runtime/docs/authority.md)).

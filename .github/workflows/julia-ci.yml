@@ -107,7 +107,7 @@ jobs:
 
   security-suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -115,6 +115,9 @@ jobs:
         # the conformance oracle until it is removed (runtime/docs/authority.md)
         # and runs nightly and on manual dispatch.
         implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
+        # verify_operator.py runs the shared gates on shard 1 and every 4th
+        # test case on each shard.
+        shard: [1, 2, 3, 4]
 
     steps:
     - uses: actions/checkout@v7
@@ -142,6 +145,16 @@ jobs:
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
 
+    # The depot holds the packages and the caches prewarm_depot.py compiles;
+    # the gates still run prewarm, which only recompiles what changed.
+    - name: Restore the Julia depot
+      id: depot
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.julia
+        key: palette-depot-v1-${{ runner.os }}-julia1.12-${{ hashFiles('Project.toml', 'src/**', 'runtime/security/prewarm_workload.jl') }}
+        restore-keys: palette-depot-v1-${{ runner.os }}-julia1.12-
+
     - name: Instantiate the operator and its test environment
       run: |
         julia --project=@. -e 'using Pkg; Pkg.instantiate()'
@@ -158,6 +171,18 @@ jobs:
         python3 runtime/security/verify_operator.py
         --project-dir "$GITHUB_WORKSPACE/security-test-env"
         --implementation "${{ matrix.implementation }}"
+        --shard "${{ matrix.shard }}/4"
+
+    - name: Report the depot size sessions clone
+      if: always()
+      run: du -sh ~/.julia ~/.palette-depot-snapshots 2>/dev/null || true
+
+    - name: Save the Julia depot
+      if: always() && matrix.shard == 1 && matrix.implementation == 'rust' && steps.depot.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.julia
+        key: ${{ steps.depot.outputs.cache-primary-key }}
 
   operator-adapters:
     runs-on: ubuntu-24.04
