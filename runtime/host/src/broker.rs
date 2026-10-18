@@ -268,9 +268,9 @@ fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
             if !path.is_empty() { protected.push(PathBuf::from(path)); }
         }
     }
-    protected.extend(sandbox::protected_command_paths(&c.ceiling));
+    let commands = sandbox::protected_command_paths(&c.ceiling);
     for root in &roots {
-        if let Some(hit) = sandbox::protected_overlap(root, &protected) {
+        if let Some(hit) = sandbox::protected_overlap(root, &protected).or_else(|| sandbox::command_overlap(root, &commands)) {
             return Err(format!("external_fs_write allowed_dir {} overlaps the protected host path {}", root.display(), hit.display()));
         }
     }
@@ -419,7 +419,11 @@ impl Broker {
                 if !path.is_empty() { protected_paths.push(PathBuf::from(path)); }
             }
         }
-        protected_paths.extend(sandbox::protected_command_paths(&self.ceiling));
+        let commands = sandbox::protected_command_paths(&self.ceiling);
+        if let Some(hit) = sandbox::command_overlap(&util::resolve(store), &commands) {
+            return Err(Internal(format!("package store must be disjoint from protected host path {}", hit.display())));
+        }
+        protected_paths.extend(commands.paths);
         let argv = sandbox::package_installer_argv(
             &julia, store, Path::new(depot), Path::new(environment),
             Path::new(&sandbox::default_depot()),
@@ -605,13 +609,29 @@ impl Broker {
     /// Actions: "run" (default) waits for the result; "start" returns a job
     /// id at once, for commands longer than a turn; "poll" with that id
     /// returns {"running": true} and the output since the last poll, or the
-    /// result; "cancel" kills the job's process group and returns its
-    /// result; "list" names the jobs still held.
+    /// result; "list" names the jobs still held; "commands" names the
+    /// commands the ceiling allows. A command with a "lock" file runs under
+    /// an exclusive flock on it, shared with work outside Palette (a GPU
+    /// lock); waiting for the lock counts against its timeout.
     /// Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
-    ///   "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}
+    ///   "cwd": "/abs", "timeout_s": 600, "extra_args": false,
+    ///   "lock": "/abs/file", "description": "..."}}}}
     fn host_command(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
         let cap = self.cap("host_command").ok_or_else(|| Denied("host_command not in this session's ceiling".into()))?;
         let action = p.get("action").and_then(Value::as_str).unwrap_or("run");
+        if action == "commands" {
+            let commands = obj(cap.get("commands").unwrap_or(&Value::Null));
+            let listed: Vec<Value> = commands.iter().map(|(name, spec)| {
+                let mut v = json!({"name": name, "argv": spec.get("argv"), "cwd": spec.get("cwd"),
+                                   "timeout_s": spec.get("timeout_s").cloned().unwrap_or(json!(60.0)),
+                                   "extra_args": spec.get("extra_args").and_then(Value::as_bool).unwrap_or(false)});
+                for key in ["lock", "description"] {
+                    if let Some(x) = spec.get(key) { v[key] = x.clone(); }
+                }
+                v
+            }).collect();
+            return Ok(json!({"commands": listed}));
+        }
         if action == "list" {
             let jobs = self.jobs.lock().unwrap();
             let mut listed: Vec<(f64, Value)> = Vec::new();
@@ -646,7 +666,7 @@ impl Broker {
             return Ok(v);
         }
         if action != "run" && action != "start" {
-            return Err(Denied(format!("host_command action must be run, start, poll, cancel or list, not {}", q(action))));
+            return Err(Denied(format!("host_command action must be run, start, poll, cancel, list or commands, not {}", q(action))));
         }
         let name = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())
             .ok_or_else(|| Denied("host_command requires a non-empty string 'name'".into()))?;
@@ -685,6 +705,17 @@ impl Broker {
             return Err(Denied("host_command accepts at most 64 arguments of at most 4096 bytes, without NUL".into()));
         }
         argv.extend(args);
+        let lock = match spec.get("lock") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(l.as_str().map(PathBuf::from)
+                .filter(|l| l.is_absolute() && l.parent().is_some_and(Path::is_dir) && !l.is_dir())
+                .ok_or_else(|| misconfigured("'lock' must be an absolute file path in an existing directory"))?),
+        };
+        if let Some(lock) = &lock {
+            let flock = ["/usr/bin/flock", "/bin/flock"].into_iter().find(|f| Path::new(f).is_file())
+                .ok_or_else(|| misconfigured("'lock' needs flock(1) from util-linux, which is not installed"))?;
+            argv.splice(0..0, [flock.to_string(), "--exclusive".into(), lock.to_string_lossy().into_owned()]);
+        }
         let timeout = Duration::from_secs_f64(timeout_s);
         if action == "start" {
             let mut jobs = self.jobs.lock().unwrap();
@@ -694,12 +725,15 @@ impl Broker {
             let job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
             let id = util::hex(16);
             jobs.insert(id.clone(), HostJobEntry { name: name.to_string(), job });
-            return Ok(json!({"job": id, "name": name, "running": true}));
+            let mut v = json!({"job": id, "name": name, "running": true});
+            if let Some(lock) = &lock { v["lock"] = json!(lock); }
+            return Ok(v);
         }
         let mut job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
         let r = job.wait().map_err(Internal)?;
         let mut v = host_job_json(None, &r);
         v["name"] = json!(name);
+        if let Some(lock) = &lock { v["lock"] = json!(lock); }
         Ok(v)
     }
 
@@ -1431,7 +1465,7 @@ mod tests {
         assert!(reason(json!({"name": "relative"})).contains("absolute path"));
         assert!(reason(json!({"name": "nocwd"})).contains("'cwd'"));
         assert!(reason(json!({"name": "slow"})).contains("timeout_s"));
-        assert!(reason(json!({"name": "pwd", "action": "sudo"})).contains("run, start, poll, cancel or list"));
+        assert!(reason(json!({"name": "pwd", "action": "sudo"})).contains("run, start, poll, cancel, list or commands"));
         // A request may shorten a command's timeout, never extend it.
         assert!(reason(json!({"name": "pwd", "timeout_s": 61})).contains("(0, 60]"));
         assert!(reason(json!({"name": "pwd", "timeout_s": 0})).contains("timeout_s"));
@@ -1439,6 +1473,60 @@ mod tests {
         assert_eq!(reason(json!({"name": "pwd", "timeout_s": 5})), "APPROVED");
         let none = broker(json!({}), &d.0.join("r2.jsonl"));
         assert_eq!(cmd(&none, json!({"name": "pwd"}))["approved"], json!(false));
+    }
+
+    #[test]
+    fn host_command_lock_runs_the_command_holding_the_lock() {
+        let Some(flock) = ["/usr/bin/flock", "/bin/flock"].into_iter().find(|f| Path::new(f).is_file()) else {
+            eprintln!("skipped: flock(1) is not installed");
+            return;
+        };
+        let d = tmpdir("hostcmd-lock");
+        let dir = d.0.to_string_lossy().into_owned();
+        let lock = d.0.join("gpu.lock").to_string_lossy().into_owned();
+        // A nested non-blocking flock on the same file fails with 7 only if
+        // the command already holds the lock.
+        let probe = json!([flock, "--nonblock", "--conflict-exit-code", "7", lock, "/bin/true"]);
+        let b = cmd_broker(&d.0, json!({
+            "locked": {"argv": probe, "cwd": dir, "lock": lock, "description": "probe the lock"},
+            "unlocked": {"argv": probe, "cwd": dir},
+            "relative": {"argv": ["/bin/true"], "cwd": dir, "lock": "gpu.lock"},
+            "nodir": {"argv": ["/bin/true"], "cwd": dir, "lock": d.0.join("missing/gpu.lock")},
+            "isdir": {"argv": ["/bin/true"], "cwd": dir, "lock": dir},
+        }));
+        let r = cmd(&b, json!({"name": "locked"}));
+        assert_eq!(r["result"]["returncode"], json!(7), "{r}");
+        assert_eq!(r["result"]["lock"], json!(lock));
+        let r = cmd(&b, json!({"name": "unlocked"}));
+        assert_eq!(r["result"]["returncode"], json!(0), "{r}");
+        assert!(r["result"].get("lock").is_none());
+        for name in ["relative", "nodir", "isdir"] {
+            let r = cmd(&b, json!({"name": name}));
+            assert!(r["reason"].as_str().unwrap_or("").contains("'lock' must be"), "{name}: {r}");
+        }
+        let r = cmd(&b, json!({"name": "locked", "action": "start"}));
+        assert_eq!(r["result"]["lock"], json!(lock), "{r}");
+    }
+
+    #[test]
+    fn host_command_commands_lists_what_the_ceiling_allows() {
+        let d = tmpdir("hostcmd-commands");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "check": {"argv": ["/bin/true"], "cwd": dir, "extra_args": true, "timeout_s": 900, "description": "cargo check"},
+            "pwd": {"argv": ["/bin/pwd"], "cwd": dir},
+        }));
+        let r = cmd(&b, json!({"action": "commands"}));
+        assert_eq!(r["approved"], json!(true), "{r}");
+        let listed = r["result"]["commands"].as_array().unwrap();
+        let by = |n: &str| listed.iter().find(|c| c["name"] == json!(n)).unwrap().clone();
+        assert_eq!(by("check")["description"], json!("cargo check"));
+        assert_eq!(by("check")["extra_args"], json!(true));
+        assert_eq!(by("check")["timeout_s"], json!(900));
+        assert_eq!(by("pwd")["extra_args"], json!(false));
+        assert_eq!(by("pwd")["timeout_s"], json!(60.0));
+        assert_eq!(by("pwd")["cwd"], json!(dir));
+        assert!(by("pwd").get("description").is_none());
     }
 
     #[test]

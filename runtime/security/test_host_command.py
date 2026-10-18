@@ -46,6 +46,9 @@ def write_fifo(path, text="go"):
         f.write(text + "\n")
 
 
+FLOCK = next((f for f in ("/usr/bin/flock", "/bin/flock") if os.path.isfile(f)), None)
+
+
 class PythonBroker:
     def __init__(self, ceiling, tmp):
         self.b = Broker(ceiling, str(tmp / "receipts.jsonl"), "test")
@@ -82,7 +85,7 @@ class HostCommandParity:
         for fifo in ("go", "started", "long-ready"):
             os.mkfifo(self.tmp / fifo)
         d = str(self.tmp)
-        self.b = self.Broker({"host_command": {"commands": {
+        commands = {"host_command": {"commands": {
             "echo": {"argv": ["/bin/echo", "fixed"], "cwd": d, "extra_args": True},
             "pwd": {"argv": ["/bin/pwd"], "cwd": d},
             "relative": {"argv": ["sh", "-c", "true"], "cwd": d},
@@ -94,7 +97,20 @@ class HostCommandParity:
             "loud": {"argv": ["/bin/sh", "-c", "head -c 40000 /dev/zero | tr '\\0' x; echo"], "cwd": d},
             "sleep": {"argv": ["/bin/sleep", "300"], "cwd": d, "timeout_s": 600},
             "quick": {"argv": ["/bin/true"], "cwd": d},
-        }}}, self.tmp)
+        }}}
+        if FLOCK:
+            lock = str(self.tmp / "gpu.lock")
+            # A nested non-blocking flock on the same file exits 7 only if
+            # the command already holds the lock.
+            probe = [FLOCK, "--nonblock", "--conflict-exit-code", "7", lock, "/bin/true"]
+            commands["host_command"]["commands"].update({
+                "locked": {"argv": probe, "cwd": d, "lock": lock, "description": "probe the lock"},
+                "unlocked": {"argv": probe, "cwd": d},
+                "lock-relative": {"argv": ["/bin/true"], "cwd": d, "lock": "gpu.lock"},
+                "lock-nodir": {"argv": ["/bin/true"], "cwd": d, "lock": str(self.tmp / "missing" / "gpu.lock")},
+                "lock-isdir": {"argv": ["/bin/true"], "cwd": d, "lock": d},
+            })
+        self.b = self.Broker(commands, self.tmp)
 
     def tearDown(self):
         self.b.close()
@@ -113,7 +129,7 @@ class HostCommandParity:
         self.assertIn("takes no arguments", reason({"name": "pwd", "args": ["-P"]}))
         self.assertIn("list of strings", reason({"name": "pwd", "args": "-P"}))
         self.assertIn("absolute path", reason({"name": "relative"}))
-        self.assertIn("run, start, poll, cancel or list", reason({"name": "pwd", "action": "sudo"}))
+        self.assertIn("run, start, poll, cancel, list or commands", reason({"name": "pwd", "action": "sudo"}))
         # A request may shorten a command's timeout, never extend it.
         self.assertIn("(0, 60]", reason({"name": "pwd", "timeout_s": 61}))
         self.assertIn("timeout_s", reason({"name": "pwd", "timeout_s": 0}))
@@ -121,6 +137,35 @@ class HostCommandParity:
         self.assertIn("timeout_s", reason({"name": "pwd", "timeout_s": True}))
         self.assertEqual(reason({"name": "pwd", "timeout_s": 5}), "APPROVED")
         self.assertIn("cancel requires a string 'job'", reason({"action": "cancel"}))
+
+    def test_lock_runs_the_command_holding_the_lock(self):
+        if not FLOCK:
+            self.skipTest("flock(1) is not installed")
+        lock = str(self.tmp / "gpu.lock")
+        r = self.b({"name": "locked"})
+        self.assertEqual(r["result"]["returncode"], 7, r)
+        self.assertEqual(r["result"]["lock"], lock)
+        r = self.b({"name": "unlocked"})
+        self.assertEqual(r["result"]["returncode"], 0, r)
+        self.assertNotIn("lock", r["result"])
+        for name in ("lock-relative", "lock-nodir", "lock-isdir"):
+            self.assertIn("'lock' must be", self.b({"name": name}).get("reason", ""), name)
+        r = self.b({"name": "locked", "action": "start"})
+        self.assertEqual(r["result"]["lock"], lock, r)
+
+    def test_commands_lists_what_the_ceiling_allows(self):
+        r = self.b({"action": "commands"})
+        self.assertTrue(r["approved"], r)
+        by = {c["name"]: c for c in r["result"]["commands"]}
+        self.assertEqual(by["echo"]["extra_args"], True)
+        self.assertEqual(by["pwd"]["extra_args"], False)
+        self.assertEqual(by["pwd"]["timeout_s"], 60.0)
+        self.assertEqual(by["pwd"]["argv"], ["/bin/pwd"])
+        self.assertEqual(by["sleep"]["timeout_s"], 600)
+        self.assertNotIn("description", by["pwd"])
+        if FLOCK:
+            self.assertEqual(by["locked"]["description"], "probe the lock")
+            self.assertEqual(by["locked"]["lock"], str(self.tmp / "gpu.lock"))
 
     def test_timeout_kills_the_whole_group(self):
         started = time.monotonic()

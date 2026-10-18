@@ -729,6 +729,7 @@ host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette
 host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
 host_command_cancel(job::AbstractString) = Palette.host_command_cancel(job)
 host_jobs(; kwargs...) = Palette.host_jobs(; kwargs...)
+host_commands(; kwargs...) = Palette.host_commands(; kwargs...)
 fs_digest(paths::Vector{String}) = Palette.fs_digest(paths)
 reloads() = deepcopy(Palette.RELOAD_REPORTS)
 revival() = deepcopy(Palette.REVIVAL_OBSERVATION[])
@@ -1772,7 +1773,10 @@ directory and timeout; `timeout_s` may shorten that timeout for this call,
 never extend it. `args` are passed only to a command whose ceiling entry
 sets `extra_args`. Never a shell. Broker-side ceiling shape:
 `{"host_command": {"commands": {"render": {"argv": ["/abs/prog", ...],
-"cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`.
+"cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`. A command
+with `"lock": "/abs/file"` runs under an exclusive flock on that file, shared
+with work outside Palette (a GPU lock); the wait counts against its timeout.
+`host_commands()` lists the commands this session may run.
 
 With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
 KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
@@ -1838,6 +1842,16 @@ The host_command jobs this session holds, longest-running first, each with
 """
 host_jobs(; timeout_s::Real=320.0) =
     host_command_request(Dict{String,Any}("action" => "list"), "host_command list"; timeout_s)["jobs"]
+
+"""
+    Palette.host_commands(; timeout_s=320) -> Vector
+
+The commands this session's ceiling lets `host_command` run, each with
+`name`, `argv`, `cwd`, `timeout_s`, `extra_args` and, when set, `lock` and
+`description`.
+"""
+host_commands(; timeout_s::Real=320.0) =
+    host_command_request(Dict{String,Any}("action" => "commands"), "host_command commands"; timeout_s)["commands"]
 
 #==============================================================================
 PHASE 10: Integration Demo Helpers
@@ -1917,7 +1931,7 @@ export KernelState, ExecutionRecord
 export get_kernel_state, reset_kernel_state
 export OperatorType, OperatorVocabulary
 export CODE_EXECUTION_VOCAB, OPERATOR_INVOCATION_VOCAB, STATE_QUERY_VOCAB
-export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_cancel, host_jobs
+export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_cancel, host_jobs, host_commands
 export EphemeralTool, EphemeralToolViolation, check_ephemeral_source!, record_tool_capsule
 export register_operator!
 export OperationResult, StructuredResponse
