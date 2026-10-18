@@ -108,6 +108,11 @@ jobs:
   security-suite:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      # Runners are AMD or Intel at random. Package images built for one
+      # runner's native CPU are rejected on the other, and that shard then
+      # recompiled the whole depot, about 8 minutes. Both support x86-64-v3.
+      JULIA_CPU_TARGET: x86-64-v3
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +150,14 @@ jobs:
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
 
+    # The sandbox clears the environment; the task environment carries the
+    # CPU target to prewarm and the sessions, which compile in it.
+    - name: Pass the CPU target into the sandbox
+      run: |
+        grep -m1 "model name" /proc/cpuinfo
+        echo "JULIA_CPU_TARGET=$JULIA_CPU_TARGET" > "$RUNNER_TEMP/palette-task.env"
+        echo "PALETTE_TASK_ENV=$RUNNER_TEMP/palette-task.env" >> "$GITHUB_ENV"
+
     # The depot holds the packages and the caches prewarm_depot.py compiles;
     # the gates still run prewarm, which only recompiles what changed.
     - name: Restore the Julia depot
@@ -152,8 +165,8 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: ~/.julia
-        key: palette-depot-v1-${{ runner.os }}-julia1.12-${{ hashFiles('Project.toml', 'src/**', 'runtime/security/prewarm_workload.jl') }}
-        restore-keys: palette-depot-v1-${{ runner.os }}-julia1.12-
+        key: palette-depot-v2-${{ runner.os }}-julia1.12-${{ env.JULIA_CPU_TARGET }}-${{ hashFiles('Project.toml', 'src/**', 'runtime/security/prewarm_workload.jl') }}
+        restore-keys: palette-depot-v2-${{ runner.os }}-julia1.12-${{ env.JULIA_CPU_TARGET }}-
 
     - name: Instantiate the operator and its test environment
       run: |
