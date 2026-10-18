@@ -45,6 +45,8 @@ if MAX_LIVE < 1 or IDLE_SECONDS <= 0:
 require_disjoint([BASE], [REPO, ROOT, LEGACY, LEGACY_RECEIPTS, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
 require_disjoint([ROOT, LEGACY, LEGACY_RECEIPTS], [REPO])
 require_disjoint([LEGACY, LEGACY_RECEIPTS], [ROOT])
+# A missing default workspace failed the first call, not start-up.
+BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 def workspace_protected_paths():
@@ -102,7 +104,14 @@ def configured_project_roots():
             raise ValueError(f"Project root {identifier} is unavailable") from exc
         if not path.is_dir():
             raise ValueError(f"Project root {identifier} is not a directory")
-        require_disjoint([path], [*protected, *roots.values()])
+        try:
+            require_disjoint([path], [*protected, *roots.values()])
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Project root {identifier}: {exc}. Host-command directories and binaries, their parents, "
+                "and Palette's own install and config are protected, because a kernel that could write "
+                "them could change what the host runs. Give the kernel read access with PALETTE_READ_ROOTS "
+                "instead, and change the tree through host commands.") from exc
         roots[identifier] = path
     return roots
 
