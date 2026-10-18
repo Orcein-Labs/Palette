@@ -9,12 +9,12 @@ were the blocker it removes. Later items are built through Palette where it can.
 | Found in | Friction | Status |
 |---|---|---|
 | A1 | Session tests in a fresh worktree fail until the Julia project is instantiated by hand. | Fixed in A2: setup instantiates before it prewarms. |
-| A1 | The default package store under the home directory is refused by the protected-path ceiling, so tests need `PALETTE_PACKAGE_DEPOT` set elsewhere. | Fixed in A2 for installs: the store defaults to `~/.local/share/palette/data/packages`. A host command whose directory contains that path still blocks it (plan item A3). |
+| A1 | The default package store under the home directory is refused by the protected-path ceiling, so tests need `PALETTE_PACKAGE_DEPOT` set elsewhere. | Fixed in A2 for installs: the store defaults to `~/.local/share/palette/data/packages`. A host command whose directory contains that path still blocked it. Fixed in A3: a command path's parent refuses only roots that equal or contain it, so a store beside a command directory is allowed. |
 | A1 | A call stopped at its limit reports `Interrupted during completed`: the phase name is wrong. | Plan item A5 (name the execution phase on timeout). |
 | A1 | A scratch (`ephemeral`) call or spawned child stops at the session default less 10 s: the broker's child timeout is fixed per session. A scratch call with a shorter `timeout_s` killed the kernel waiting on it. | Hosts refuse `timeout_s` on a scratch call. Per-call child bounds are deferred and documented in `runtime/docs/authority.md`; long scratch work runs as a host command job. |
 | A1 | The jobs line prints at the start of a call, before its code runs, so a job started or cancelled in one call shows up in the next call's output. | Deferred: the line reports the state the call starts from. |
 | A1 | The server launcher's restricted environment dropped any limit set in the client environment. | Fixed: server profiles take `turn_timeout` and `max_turn_timeout`. |
-| A1 | A package store under `/tmp` is refused as overlapping a protected path when a host command's path is under `/tmp`, so the Rust host command tests fail with such a store. | Installs no longer default under `/tmp` (A2). Test runs still set the store outside it. |
+| A1 | A package store under `/tmp` is refused as overlapping a protected path when a host command's path is under `/tmp`, so the Rust host command tests fail with such a store. | Installs no longer default under `/tmp` (A2). Fixed in A3: a store and a command in sibling directories no longer overlap. |
 | A1 | Finishing a job held the jobs lock while it joined output readers, so a job whose grandchild kept a pipe open would stall every later call's jobs line. | Fixed: jobs finish outside the lock; the jobs line waits at most 10 s. |
 
 ## First-run friction
@@ -67,3 +67,11 @@ installed in the machine, so the Windows registration path is still untested.
 | After creating the Linux user, `wsl --install` leaves the user at an Ubuntu prompt, and the installer waits behind it with nothing saying so. | Fixed: the installer says to type `exit` at that prompt. |
 | Installing curl inside an existing distribution assumed apt. | Fixed: apt, dnf, pacman or zypper. |
 | `install.sh` printed its Linux closing message, including `rm -rf` removal steps, before the Windows one. | Fixed: under `install.ps1` only the Windows next steps print. |
+
+## A3: host commands
+
+| Friction | Status |
+|---|---|
+| A turn could not find out which host commands it may run; it had to be told the names. | Fixed: `Palette.host_commands()` lists them, with an optional `description` per command. The tool descriptions name it. |
+| GPU work through a host command did not take the machine's GPU lock (the converge3 render script takes none), so it could share the GPU with Codex jobs. | Fixed in the host: a command's `lock` file wraps it in `flock --exclusive`; the wait counts against its timeout. The live config gets the lock when this host is installed for the Phase A exit. |
+| A3 was built through Bash: building Palette through Palette needs host commands for `cargo test` and the Python suites in this worktree, and none are configured. | Open: configure dev host commands for the worktree before A4. |
