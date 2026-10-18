@@ -75,3 +75,18 @@ installed in the machine, so the Windows registration path is still untested.
 | A turn could not find out which host commands it may run; it had to be told the names. | Fixed: `Palette.host_commands()` lists them, with an optional `description` per command. The tool descriptions name it. |
 | GPU work through a host command did not take the machine's GPU lock (the converge3 render script takes none), so it could share the GPU with Codex jobs. | Fixed in the host: a command's `lock` file wraps it in `flock --exclusive`; the wait counts against its timeout. The live config gets the lock when this host is installed for the Phase A exit. |
 | A3 was built through Bash: building Palette through Palette needs host commands for `cargo test` and the Python suites in this worktree, and none are configured. | Open: configure dev host commands for the worktree before A4. |
+
+## A4: CI time
+
+Before this round, `security-suite` ran unsharded and took 50 to 90 min. One
+run hung for 90 min while preparing packages inside the sandbox, and one failed
+because ZMQ did not precompile there. Most of the time went to `test_session_cli`
+(11.1 min) and `test_revival` (11.0 min), where each test starts a fresh
+session, and to prewarm (4.4 min).
+
+| Friction | Status |
+|---|---|
+| `TestReadRoots` and `TestHostCommand` in `test_session.py` were defined after `unittest.main()`, so they had not run in CI since #22. | Fixed: the main block moved to the end, and `check-test-policy.mjs` refuses a test class defined after it. |
+| One job ran every suite in turn. | Fixed: four shards. Each took 17 to 23 min without a cache. |
+| Every shard prepared the package depot from nothing. | Fixed: shard 1 saves the prewarmed depot to the Actions cache, and every shard restores it. Shards then took 7 to 9 min, except shard 1 at 15.5 min. |
+| Shard 1 also runs the shared gates (Julia and Rust unit tests, test policy), which took its gates step to 14 min against 6 to 7 min on the others. | Fixed: `verify_operator.py` deals test cases across the shards by their recorded seconds (`test-case-seconds.json`, refreshed from CI logs by `record-test-case-seconds.py`), with shard 1 starting 90 s behind. The recorded test time per Rust shard is now about 500 s, against 740 s on the old shard 1. The gate (under 15 min, green on 10 consecutive runs) is measured after the next push. |
