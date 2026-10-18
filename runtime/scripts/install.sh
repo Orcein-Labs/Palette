@@ -89,6 +89,8 @@ set -- --repo-dir "$sdk" --output-dir "$home/client" --data-dir "$home/data" --d
 [ -n "${PALETTE_WSL_DISTRIBUTION:-}" ] && set -- "$@" --wsl-distribution "$PALETTE_WSL_DISTRIBUTION"
 python3 "$sdk/runtime/plugins/setup.py" "$@" || exit 1
 rm -rf "$home/sdk.previous"
+# Under install.ps1 the Windows side prints the next steps.
+[ -n "${PALETTE_WSL_DISTRIBUTION:-}" ] && exit 0
 cat <<EOF
 
 Palette is installed in $home.
