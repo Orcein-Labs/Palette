@@ -282,22 +282,32 @@ pub fn package_store_lock(package_depot: &str) -> Result<File, String> {
     Ok(file)
 }
 
-/// Extract operator-owned command paths once, shared by store initialization
-/// and installer namespace validation. These values only come from the frozen
-/// operator ceiling; runtime worker argv is never passed here.
-pub fn protected_command_paths(ceiling: &serde_json::Value) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Operator-owned host-command paths, taken from the frozen operator ceiling
+/// only (runtime worker argv is never passed here). A writable root may not
+/// overlap a command's cwd, program, path arguments or lock file, and may
+/// not be or contain the directory that holds one, where it could swap that
+/// entry for a symlink. A root beside one, inside the same directory, is fine.
+#[derive(Default)]
+pub struct CommandPaths {
+    pub paths: Vec<PathBuf>,
+    pub parents: Vec<PathBuf>,
+}
+
+pub fn protected_command_paths(ceiling: &serde_json::Value) -> CommandPaths {
+    let mut out = CommandPaths::default();
     let Some(commands) = ceiling.get("host_command").and_then(|v| v.get("commands")).and_then(serde_json::Value::as_object) else {
-        return paths;
+        return out;
     };
     let mut add = |path: &Path| {
         if path.is_absolute() {
-            paths.push(path.to_path_buf());
-            if let Some(parent) = path.parent() { paths.push(parent.to_path_buf()); }
+            out.paths.push(path.to_path_buf());
+            if let Some(parent) = path.parent() { out.parents.push(parent.to_path_buf()); }
         }
     };
     for spec in commands.values() {
-        if let Some(cwd) = spec.get("cwd").and_then(serde_json::Value::as_str) { add(Path::new(cwd)); }
+        for key in ["cwd", "lock"] {
+            if let Some(path) = spec.get(key).and_then(serde_json::Value::as_str) { add(Path::new(path)); }
+        }
         let Some(argv) = spec.get("argv").and_then(serde_json::Value::as_array) else { continue; };
         let mut tokens = Vec::<String>::new();
         let mut i = 0;
@@ -315,7 +325,7 @@ pub fn protected_command_paths(ceiling: &serde_json::Value) -> Vec<PathBuf> {
             if let Some((_, value)) = token.split_once('=') { add(Path::new(value)); }
         }
     }
-    paths
+    out
 }
 
 /// The first protected path that `root` equals, sits inside, or contains.
@@ -325,6 +335,14 @@ pub fn protected_command_paths(ceiling: &serde_json::Value) -> Vec<PathBuf> {
 pub(crate) fn protected_overlap(root: &Path, protected: &[PathBuf]) -> Option<PathBuf> {
     protected.iter().filter(|c| !c.as_os_str().is_empty()).map(|c| util::resolve(c))
         .find(|c| root == c || root.starts_with(c) || c.starts_with(root))
+}
+
+/// The first host-command path `root` overlaps, or command directory it is
+/// or contains (see [`CommandPaths`]).
+pub(crate) fn command_overlap(root: &Path, commands: &CommandPaths) -> Option<PathBuf> {
+    protected_overlap(root, &commands.paths).or_else(|| {
+        commands.parents.iter().map(|c| util::resolve(c)).find(|c| root == c || c.starts_with(root))
+    })
 }
 
 /// Persistent broker-written packages live outside sessions and workspaces.
@@ -367,9 +385,9 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR"] {
         if let Ok(path) = std::env::var(key) { if !path.is_empty() { protected.push(PathBuf::from(path)); } }
     }
-    if let Some(ceiling) = ceiling { protected.extend(protected_command_paths(ceiling)); }
+    let commands = ceiling.map(protected_command_paths).unwrap_or_default();
     let root = util::resolve(&lexical_root);
-    if let Some(candidate) = protected_overlap(&root, &protected) {
+    if let Some(candidate) = protected_overlap(&root, &protected).or_else(|| command_overlap(&root, &commands)) {
         return Err(format!("PALETTE_PACKAGE_DEPOT overlaps protected host path: {}", candidate.display()));
     }
     let base_depot = fs::canonicalize(default_depot()).map_err(|e| format!("resolving Julia depot: {e}"))?;
@@ -1723,6 +1741,29 @@ mod tests {
         assert_eq!(protected_overlap(&root, &[PathBuf::new()]), None);
         assert_eq!(protected_overlap(Path::new("/"), &[PathBuf::new()]), None);
         assert_eq!(protected_overlap(&root, &[PathBuf::new(), cwd.clone()]), Some(util::resolve(&cwd)));
+    }
+
+    #[test]
+    fn a_command_parent_refuses_only_roots_that_contain_it() {
+        // The parent of a command path is protected so the path cannot be
+        // swapped by renaming in it; a sibling root inside the parent cannot
+        // do that. Regression: a store under ~/.local refused when a command
+        // ran in ~/project.
+        let home = util::mkdtemp("palette-cmd-parent-").unwrap();
+        let project = dir(&home, "project");
+        let ceiling = serde_json::json!({"host_command": {"commands": {"c": {"argv": ["/bin/true"], "cwd": project.to_str().unwrap()}}}});
+        let commands = protected_command_paths(&ceiling);
+        let r = |p: &Path| util::resolve(p);
+        assert_eq!(command_overlap(&r(&home.join(".local/store")), &commands), None);
+        assert_eq!(command_overlap(&r(&home), &commands), Some(r(&project)));
+        assert_eq!(command_overlap(&r(home.parent().unwrap()), &commands), Some(r(&project)));
+        assert_eq!(command_overlap(&r(&project.join("sub")), &commands), Some(r(&project)));
+        // The home itself is the parent: refused even though it is not a
+        // command path, since a root there could rename `project`.
+        let only_parent = CommandPaths { paths: vec![], parents: vec![home.clone()] };
+        assert_eq!(command_overlap(&r(&home), &only_parent), Some(r(&home)));
+        assert_eq!(command_overlap(&r(&home.join("sibling")), &only_parent), None);
+        fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

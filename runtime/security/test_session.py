@@ -371,6 +371,8 @@ class TestHostCommand(SessionTestCase):
                 self.assertIn("takes no arguments", r["data"])
                 r = s.turn('try; Palette.host_command("sh"); catch e; sprint(showerror, e); end')
                 self.assertIn("not in this session's ceiling", r["data"])
+                r = s.turn('sort([c["name"] for c in Palette.host_commands()])')
+                self.assertEqual(r["data"], ["cat-marker", "echo", "gated", "long"])
                 s.turn('job = Palette.host_command("gated"; wait=false)["job"]')
                 with open(outside / "started") as f:      # the job is running, blocked on `go`
                     shell = int(f.read())
