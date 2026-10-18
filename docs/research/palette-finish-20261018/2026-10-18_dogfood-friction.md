@@ -118,5 +118,5 @@ build, test, render and git step goes through Palette.
 
 | Friction | Status |
 |---|---|
-| Luxel could not be both a writable project root and the directory its host commands run in. The refusal named only `/mnt/d/Code Projects` as the overlap, not why it was protected. | The refusal is right: a kernel that could write a host command's directory could change what the host runs, such as a `build.rs`. Fixed: the error names the project root, says why command directories are protected, and points to `PALETTE_READ_ROOTS`. |
+| Luxel could not be both a writable project root and the directory its host commands run in. The refusal named only the checkout's parent directory as the overlap, not why it was protected. | The refusal is right: a kernel that could write a host command's directory could change what the host runs, such as a `build.rs`. Fixed: the error names the project root, says why command directories are protected, and points to `PALETTE_READ_ROOTS`. |
 | A default workspace directory that did not exist failed the first call with `FileNotFoundError`, after start-up had succeeded. | Fixed: the router creates it once the layout checks pass. |
