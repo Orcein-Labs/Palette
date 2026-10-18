@@ -1,6 +1,7 @@
 """Session depot clones, default session roots and default receipts
 directories record their owner, and those of dead owners are swept. Depot
-clones copy the newest published snapshot, which a sweep keeps while held."""
+clones copy, or overlay, the newest published snapshot, which a sweep keeps
+while held."""
 import os
 import shutil
 import subprocess
@@ -14,7 +15,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from launch_worker import (  # noqa: E402
-    CLONE_OWNER_SUFFIX, _append_receipts, _clone_owner_alive, _clone_owner_record, _hold_depot_snapshot,
+    CLONE_OWNER_SUFFIX, OVERLAY_LOWER, OVERLAY_UPPER, OVERLAY_WORK, _append_receipts, _layer_overlay, _snapshot_holds,
+    build_bwrap_argv, overlay_depot_layers, _clone_owner_alive, _clone_owner_record, _hold_depot_snapshot,
     _pid_namespace, create_receipts_dir, create_session_depot, identity_base, identity_files, private_dir, receipt_archive_dir,
     has_depot_snapshot, publish_depot_snapshot, receipt_retention_days, remove_session_depot, retire_receipts,
     sweep_orphaned_dirs,
@@ -91,6 +93,9 @@ class DepotSnapshotTest(unittest.TestCase):
         (self.depot / "cache").write_text("prepared")
         self.snapshots = self.root / ".palette-depot-snapshots" / "depot"
 
+    def copied(self) -> str:
+        return create_session_depot(str(self.depot), overlay_supported=lambda _: False)
+
     def test_session_depots_clone_the_newest_snapshot_not_the_live_depot(self):
         self.assertFalse(has_depot_snapshot(str(self.depot)))
         first = publish_depot_snapshot(str(self.depot))
@@ -99,17 +104,17 @@ class DepotSnapshotTest(unittest.TestCase):
 
         # A Julia process writing the live depot does not reach the clone.
         (self.depot / "cache").write_text("churned")
-        clone = create_session_depot(str(self.depot))
+        clone = self.copied()
         self.assertEqual(Path(clone, "cache").read_text(), "prepared")
         shutil.rmtree(self.depot)
-        without_live = create_session_depot(str(self.depot))
+        without_live = self.copied()
         self.assertEqual(Path(without_live, "cache").read_text(), "prepared")
 
         self.depot.mkdir()
         (self.depot / "cache").write_text("reprepared")
         second = publish_depot_snapshot(str(self.depot))
         self.assertGreater(second.name, first.name)
-        newer = create_session_depot(str(self.depot))
+        newer = self.copied()
         self.assertEqual(Path(newer, "cache").read_text(), "reprepared")
         self.assertEqual(sorted(self.snapshots.iterdir()), [self.snapshots / ".lock", second],
                          "the unheld older snapshot was kept")
@@ -130,10 +135,71 @@ class DepotSnapshotTest(unittest.TestCase):
             self.assertFalse(dead_publish.exists() or dead_sweep.exists(), "abandoned dirs survived a publish")
             self.assertEqual((held / "cache").read_text(), "first")
 
-        clone = create_session_depot(str(self.depot))
+        clone = self.copied()
         self.assertEqual(Path(clone, "cache").read_text(), "second")
         self.assertFalse(first.exists(), "the released snapshot was not swept")
         self.assertTrue(second.is_dir())
+
+    def test_overlay_depots_hold_their_snapshot_until_removed(self):
+        (self.depot / "cache").write_text("first")
+        first = publish_depot_snapshot(str(self.depot))
+        overlay = create_session_depot(str(self.depot), overlay_supported=lambda _: True)
+        self.assertEqual(Path(overlay, OVERLAY_LOWER).readlink(), first)
+        self.assertTrue(Path(overlay, OVERLAY_UPPER).is_dir() and Path(overlay, OVERLAY_WORK).is_dir())
+        self.assertTrue(owner_path(overlay).is_file())
+
+        (self.depot / "cache").write_text("second")
+        second = publish_depot_snapshot(str(self.depot))
+        self.assertTrue(first.is_dir(), "a snapshot under a live overlay was swept")
+        remove_session_depot(overlay)
+        self.assertFalse(os.path.lexists(overlay) or os.path.lexists(owner_path(overlay)))
+        copy = self.copied()
+        self.assertFalse(first.exists(), "a removed overlay kept its snapshot held")
+        self.assertEqual(Path(copy, "cache").read_text(), "second")
+        self.assertTrue(second.is_dir())
+
+    def test_an_overlay_depot_mounts_writably_over_its_untouched_snapshot(self):
+        snapshot = publish_depot_snapshot(str(self.depot))
+        overlay = create_session_depot(str(self.depot))
+        self.addCleanup(remove_session_depot, overlay)
+        layers = overlay_depot_layers(overlay)
+        if layers is None:
+            self.skipTest("this bwrap or kernel does not mount unprivileged overlays")
+        lower, upper, work = layers
+        guest = str(self.depot)
+        script = 'test "$(cat "$1/cache")" = prepared && echo worker > "$1/cache" && rm "$1/cache" && mkdir "$1/compiled"'
+        subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "--overlay-src", lower,
+                        "--overlay", upper, work, guest, "--", "sh", "-c", script, "sh", guest], check=True)
+        self.assertEqual((snapshot / "cache").read_text(), "prepared", "a write reached the snapshot")
+        self.assertTrue(Path(upper, "compiled").is_dir())
+        remove_session_depot(overlay)
+        self.assertFalse(os.path.lexists(overlay), "the overlay's work dir blocked removal")
+
+    def test_a_failed_overlay_probe_falls_back_to_a_copy(self):
+        publish_depot_snapshot(str(self.depot))
+        copy = self.copied()
+        self.assertFalse(os.path.lexists(Path(copy, OVERLAY_LOWER)))
+        self.assertEqual(Path(copy, "cache").read_text(), "prepared")
+        self.assertNotIn(copy, _snapshot_holds, "a copied depot holds its snapshot")
+        remove_session_depot(copy)
+
+    def test_an_overlay_depot_is_mounted_as_an_overlay_at_the_depot_path(self):
+        for name in ("repo", "project", "workspace", "toolchain/bin", "snapshot/ws", "overlay"):
+            (self.root / name).mkdir(parents=True)
+        (self.root / "toolchain/bin/julia").write_text("")
+        _layer_overlay(self.root / "snapshot", str(self.root / "overlay"))
+        real = lambda name: os.path.realpath(self.root / name)  # noqa: E731
+        kw = dict(broker_socket_dir=None, project_dir=str(self.root / "project"), repo_dir=str(self.root / "repo"),
+                  julia_bin=str(self.root / "toolchain/bin/julia"), julia_depot=str(self.depot),
+                  network_enabled=False, depot_clone_dir=str(self.root / "overlay"))
+        argv = build_bwrap_argv(workspace_dir=str(self.root / "workspace"), **kw)
+        expected = ["--overlay-src", real("snapshot"), "--overlay", real("overlay/upper"), real("overlay/work"),
+                    str(self.depot)]
+        self.assertTrue(any(argv[i:i + 6] == expected for i in range(len(argv))), argv)
+        self.assertFalse(any(argv[i] == "--bind" and argv[i + 2] == str(self.depot) for i in range(len(argv) - 2)))
+        # The snapshot is protected: a workspace inside it is refused.
+        with self.assertRaises(PermissionError):
+            build_bwrap_argv(workspace_dir=str(self.root / "snapshot/ws"), **kw)
 
     def test_a_snapshot_root_that_is_not_a_directory_fails_closed(self):
         elsewhere = self.root / "elsewhere"
