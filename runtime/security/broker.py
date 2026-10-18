@@ -158,12 +158,45 @@ HOST_COMMAND_MAX_TIMEOUT_S = 4 * 3600.0
 HOST_COMMAND_OUTPUT = 16 * 1024
 
 
+def _num(x):
+    """A number as Rust's Display prints an f64: 60.0 as 60, 0.5 as 0.5."""
+    return str(int(x)) if float(x).is_integer() else repr(float(x))
+
+
+class _Tail:
+    """The last `cap` bytes a pipe produced, shared with the thread reading
+    it. `start` is the stream offset of kept[0], so a reader holding an
+    offset can tell what it has not seen and how much of that was dropped."""
+
+    def __init__(self):
+        self.kept = bytearray()
+        self.start = 0
+        self.lock = threading.Lock()
+
+    def read_since(self, seen, whole):
+        """(text, skipped bytes, new offset). While the command runs
+        (`whole` false) the text stops before a UTF-8 sequence still being
+        written, so a character is never split between two reads."""
+        with self.lock:
+            skipped = max(0, self.start - seen)
+            data = bytes(self.kept[max(seen, self.start) - self.start:])
+        if not whole:
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError as e:
+                if e.reason == "unexpected end of data":
+                    data = data[:e.start]
+        return data.decode("utf-8", "replace"), skipped, max(seen, self.start) + len(data)
+
+
 class HostJob:
     """An operator-named host command (host_command), in a process group of
     its own. A watchdog kills the whole group at the deadline whether or not
-    anyone is waiting; the group is always signalled before the command is
-    reaped, under one lock with the watchdog, so a signal never reaches a
-    reused pid. Mirrors runtime/host/src/sandbox.rs HostJob."""
+    anyone is waiting; cancelling or killing the job kills it too. The group
+    is always signalled before the command is reaped, under one lock with
+    the watchdog, so a signal never reaches a reused pid. Output is read
+    incrementally: each read_new() and the final result return only what
+    earlier reads did not. Mirrors runtime/host/src/sandbox.rs HostJob."""
 
     def __init__(self, argv, cwd, timeout_s, output_cap=HOST_COMMAND_OUTPUT):
         self.proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -172,22 +205,26 @@ class HostJob:
         self._lock = threading.Lock()
         self._finished = False
         self._timed_out = False
-        self._tails = {}
-        self._readers = [threading.Thread(target=self._read_tail, args=(name, pipe, output_cap), daemon=True)
+        self._cancelled = False
+        self._tails = {"stdout": _Tail(), "stderr": _Tail()}
+        self._seen = {"stdout": 0, "stderr": 0}
+        self._readers = [threading.Thread(target=self._read_tail, args=(self._tails[name], pipe, output_cap), daemon=True)
                          for name, pipe in (("stdout", self.proc.stdout), ("stderr", self.proc.stderr))]
         for t in self._readers:
             t.start()
         deadline = self.started + timeout_s
         threading.Thread(target=self._watchdog, args=(deadline,), daemon=True).start()
 
-    def _read_tail(self, name, pipe, cap):
-        kept = bytearray()
+    @staticmethod
+    def _read_tail(tail, pipe, cap):
         with pipe:   # each reader owns its pipe and closes it at end of output
             for chunk in iter(lambda: pipe.read1(8192), b""):
-                kept += chunk
-                if len(kept) > 2 * cap:
-                    del kept[:len(kept) - cap]
-        self._tails[name] = bytes(kept[-cap:]).decode("utf-8", "replace")
+                with tail.lock:
+                    tail.kept += chunk
+                    if len(tail.kept) > cap:
+                        drop = len(tail.kept) - cap
+                        del tail.kept[:drop]
+                        tail.start += drop
 
     def _kill_group(self):
         try:
@@ -210,13 +247,37 @@ class HostJob:
         flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
         return os.waitid(os.P_PID, self.proc.pid, flags) is not None
 
-    def poll(self):
-        """The result once the command has exited, None while it runs."""
-        return self._finish() if self._exited(False) else None
+    def seconds(self):
+        return time.monotonic() - self.started
+
+    def running(self):
+        return not self._exited(False)
 
     def wait(self):
         self._exited(True)
         return self._finish()
+
+    def cancel(self):
+        """Kills the command's whole group and returns its result, marked
+        cancelled unless it had already finished or timed out."""
+        with self._lock:
+            if not self._finished and not self._timed_out and self.running():
+                self._cancelled = True
+                self._kill_group()
+        return self.wait()
+
+    def _read(self, whole):
+        out = {}
+        for name, tail in self._tails.items():
+            text, skipped, self._seen[name] = tail.read_since(self._seen[name], whole)
+            out[name] = text
+            if skipped:
+                out[f"{name}_skipped_bytes"] = skipped
+        return out
+
+    def read_new(self):
+        """Output produced since the last read, while the command runs."""
+        return {**self._read(False), "seconds": round(self.seconds(), 3)}
 
     def _finish(self):
         with self._lock:
@@ -224,13 +285,12 @@ class HostJob:
             # Helpers left in the group go too: their open pipes would
             # otherwise keep the output readers waiting.
             self._kill_group()
-            timed_out = self._timed_out
+            timed_out, cancelled = self._timed_out, self._cancelled
         returncode = self.proc.wait()
         for t in self._readers:
             t.join()
-        return {"returncode": returncode, "timed_out": timed_out,
-                "seconds": round(time.monotonic() - self.started, 3),
-                "stdout": self._tails.get("stdout", ""), "stderr": self._tails.get("stderr", ""), "running": False}
+        return {"returncode": returncode, "timed_out": timed_out, "cancelled": cancelled,
+                "seconds": round(self.seconds(), 3), **self._read(True), "running": False}
 
     def kill(self):
         with self._lock:
@@ -351,7 +411,7 @@ class Broker:
         self.host_bridge = None
         # host_command jobs started with action "start"; close() kills any
         # still running when the session ends.
-        self._jobs: dict[str, HostJob] = {}
+        self._jobs: dict[str, tuple[str, HostJob]] = {}
         self._jobs_lock = threading.Lock()
         Path(receipt_log_path).parent.mkdir(parents=True, exist_ok=True)
         # A broker that cannot keep receipts must not start: every answer it
@@ -395,7 +455,7 @@ class Broker:
     def close(self):
         with self._jobs_lock:
             jobs, self._jobs = list(self._jobs.values()), {}
-        for job in jobs:
+        for _, job in jobs:
             job.kill()
 
     def __del__(self):
@@ -731,10 +791,13 @@ class Broker:
         outside the sandbox: the way a kernel reaches a GPU, a renderer or a
         build it cannot run itself. The ceiling fixes each command's argv
         (absolute program), cwd and timeout; a request only picks a command
-        by name, and passes arguments only to a command that allows them.
-        Never a shell. Actions: "run" (default) waits; "start" returns a job
-        id at once; "poll" with that id returns {"running": True} or the
-        result. Mirrors runtime/host/src/broker.rs host_command.
+        by name, may shorten (never extend) its timeout with `timeout_s`, and
+        passes arguments only to a command that allows them. Never a shell.
+        Actions: "run" (default) waits; "start" returns a job id at once;
+        "poll" with that id returns {"running": True} and the output since
+        the last poll, or the result; "cancel" kills the job's process group
+        and returns its result; "list" names the jobs still held. Mirrors
+        runtime/host/src/broker.rs host_command.
 
         Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
         "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}"""
@@ -742,21 +805,29 @@ class Broker:
         if cap is None:
             raise CapabilityDenied("host_command not in this session's ceiling")
         action = params.get("action", "run")
-        if action == "poll":
+        if action == "list":
+            with self._jobs_lock:
+                listed = [{"job": job_id, "name": name, "running": job.running(), "seconds": round(job.seconds(), 3)}
+                          for job_id, (name, job) in self._jobs.items()]
+            return {"jobs": sorted(listed, key=lambda j: -j["seconds"])}
+        if action in ("poll", "cancel"):
             job_id = params.get("job")
             if not isinstance(job_id, str):
-                raise CapabilityDenied("host_command poll requires a string 'job'")
+                raise CapabilityDenied(f"host_command {action} requires a string 'job'")
             with self._jobs_lock:
-                job = self._jobs.get(job_id)
-                if job is None:
+                entry = self._jobs.get(job_id)
+                if entry is None:
                     raise CapabilityDenied(f"no running host_command job {job_id!r}")
-                result = job.poll()
-                if result is None:
-                    return {"job": job_id, "running": True}
+                name, job = entry
+                if action == "poll" and job.running():
+                    return {"job": job_id, "name": name, "running": True, **job.read_new()}
                 del self._jobs[job_id]
-            return {**result, "job": job_id}
+            # Finishing joins the output readers, so it runs outside the lock
+            # that every other job call (and each turn's jobs line) takes.
+            result = job.cancel() if action == "cancel" else job.wait()
+            return {**result, "job": job_id, "name": name}
         if action not in ("run", "start"):
-            raise CapabilityDenied(f"host_command action must be run, start or poll, not {action!r}")
+            raise CapabilityDenied(f"host_command action must be run, start, poll, cancel or list, not {action!r}")
         name = params.get("name")
         if not isinstance(name, str) or not name:
             raise CapabilityDenied("host_command requires a non-empty string 'name'")
@@ -778,6 +849,12 @@ class Broker:
         timeout_s = spec.get("timeout_s", 60.0)
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 0 < timeout_s <= HOST_COMMAND_MAX_TIMEOUT_S:
             raise misconfigured("'timeout_s' must be a number in (0, 14400]")
+        requested = params.get("timeout_s")
+        if requested is not None:
+            if isinstance(requested, bool) or not isinstance(requested, (int, float)) or not 0 < requested <= timeout_s:
+                raise CapabilityDenied(f"host_command 'timeout_s' must be a number in (0, {_num(timeout_s)}], "
+                                       f"the ceiling's limit for {name!r}")
+            timeout_s = requested
         args = params.get("args")
         if args is None:
             args = []
@@ -790,9 +867,10 @@ class Broker:
         if action == "start":
             with self._jobs_lock:
                 if len(self._jobs) >= MAX_HOST_JOBS:
-                    raise CapabilityDenied(f"at most {MAX_HOST_JOBS} host_command jobs may run at once; poll one to completion first")
+                    raise CapabilityDenied(f"at most {MAX_HOST_JOBS} host_command jobs may run at once; "
+                                           "poll one to completion or cancel one first")
                 job_id = uuid.uuid4().hex[:16]
-                self._jobs[job_id] = HostJob(argv + args, cwd, float(timeout_s))
+                self._jobs[job_id] = (name, HostJob(argv + args, cwd, float(timeout_s)))
             return {"job": job_id, "name": name, "running": True}
         return {**HostJob(argv + args, cwd, float(timeout_s)).wait(), "name": name}
 

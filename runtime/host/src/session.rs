@@ -42,7 +42,10 @@ pub struct SessionOptions {
     /// Default ~/.palette-sessions/<id>, owner-recorded so a later session
     /// removes it if this host is killed before it can.
     pub scratch_root: Option<String>,
+    /// A call's limit when it names none.
     pub turn_timeout: f64,
+    /// The longest limit a call may name; reported to the kernel.
+    pub max_turn_timeout: f64,
     pub task_workspace_dir: Option<String>,
     pub startup_timeout: f64,
     pub state_dir: Option<String>,
@@ -55,6 +58,8 @@ pub struct Turn<'a> {
     pub payload: Option<Value>,
     pub include_map: bool,
     pub digest: bool,
+    /// This call's limit; the session's turn_timeout when None.
+    pub timeout_s: Option<f64>,
 }
 
 pub struct PaletteSession {
@@ -288,6 +293,7 @@ impl PaletteSession {
         let mut setenv = |k: &str, v: String| argv.extend(["--setenv".to_string(), k.to_string(), v]);
         setenv("PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette".into());
         setenv("PALETTE_TURN_TIMEOUT", util::fmt_g(o.turn_timeout));
+        setenv("PALETTE_MAX_TURN_TIMEOUT", util::fmt_g(o.max_turn_timeout));
         for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES"] {
             if let Ok(v) = std::env::var(name) {
                 setenv(name, v);
@@ -418,10 +424,13 @@ impl PaletteSession {
             return Err(dead(format!("session {} worker process exited (code {}) since epoch {} was issued",
                                     self.session_id, st.code().unwrap_or(-1), self.epoch)));
         }
+        // A scratch call's broker child is bounded by the session default, so
+        // it never runs under a different limit.
+        let limit = if t.ephemeral { self.turn_timeout } else { t.timeout_s.unwrap_or(self.turn_timeout) };
         self.next_request_id += 1;
         let request_id = self.next_request_id.to_string();
         let mut req = json!({"request_id": request_id, "kind": if t.ephemeral { "EPHEMERAL" } else { "EXECUTE" },
-                             "code": t.code, "timeout_s": self.turn_timeout});
+                             "code": t.code, "timeout_s": limit});
         if t.ephemeral {
             if let Some(c) = t.ephemeral_ceiling {
                 req["ceiling"] = c;
@@ -440,7 +449,7 @@ impl PaletteSession {
             writeln!(w, "{req}").and_then(|_| w.flush()).map_err(|e| dead(format!("session {} pipe broke: {e}", self.session_id)))
         });
         write?;
-        let line = match self.read_line(Duration::from_secs_f64(self.turn_timeout + HARD_TIMEOUT_MARGIN_S)) {
+        let line = match self.read_line(Duration::from_secs_f64(limit + HARD_TIMEOUT_MARGIN_S)) {
             Ok(l) => l,
             // The host is shutting down: the teardown that follows lets the
             // kernel save its state, as it would at any other exit.
@@ -452,7 +461,7 @@ impl PaletteSession {
                 let _ = self.child.wait();
                 return Err(dead(format!(
                     "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. Every binding is gone; files written to the workspace remain.",
-                    util::fmt_g(self.turn_timeout))));
+                    util::fmt_g(limit))));
             }
         };
         let Some(line) = line else {
