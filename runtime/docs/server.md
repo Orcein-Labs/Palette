@@ -60,7 +60,9 @@ or supply credentials. Transport credentials remain outside the worker runtime.
 
 The launcher uses a restricted environment. To authorize additional named host
 commands, put an absolute `host_commands` configuration path in the profile.
-`read_roots` is an optional list of narrowly scoped server directories. Ambient
+`read_roots` is an optional list of narrowly scoped server directories.
+`turn_timeout` (default 60) and `max_turn_timeout` (default 1800) set a call's
+default time limit and the longest one it may ask for in seconds. Ambient
 client environment variables do not become configuration or additional grants.
 
 For staged repair, add `patch_roots` (target names mapped to source directories)

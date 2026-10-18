@@ -55,11 +55,27 @@ GPU, a renderer, a build):
 Turn code runs one by name with `Palette.host_command("render", args...)`.
 The program is an absolute path and never a shell; arguments reach only a
 command whose entry sets `extra_args`. Each command runs in its own process
-group, killed whole at `timeout_s` (at most 4 hours); `wait=false` returns a
-job id for `Palette.host_command_poll`, and jobs still running when the
-session ends are killed. Commands run with the host process's privilege and
-environment, outside every mount rule above: list only commands you would
-let the model run unattended.
+group, killed whole at `timeout_s` (at most 4 hours; a call's own
+`timeout_s` may shorten it, never extend it). `wait=false` returns a job id:
+`Palette.host_command_poll(job)` returns the output written since the last
+poll, then the result; `Palette.host_command_cancel(job)` kills the group;
+`Palette.host_jobs()` lists the jobs held, and the turn's jobs line names the
+ones still running. Jobs still running when the session ends are killed.
+Commands run with the host process's privilege and environment, outside every
+mount rule above: list only commands you would let the model run unattended.
+
+Each call runs under a time limit. The host's `--turn-timeout` is the default
+and `--max-turn-timeout` (default: the same, at most 7 days) is the longest a
+call may name with its own `timeout_s`; a value outside that range is refused
+before the call runs. Past its limit a call is interrupted and the kernel keeps every
+binding; if it does not stop within a further 12 s, the kernel is killed and
+revived. The MCP adapters pass `PALETTE_TURN_TIMEOUT` (default 60) and
+`PALETTE_MAX_TURN_TIMEOUT` (default 1800) to the host, and a server profile
+sets them with `turn_timeout` and `max_turn_timeout`. The limit covers one
+call; work longer than any call runs as a host command job. A scratch
+(`ephemeral`) call runs in a broker child bounded by the session's default
+limit less 10 s, so it takes no `timeout_s`: the host refuses one. A spawned
+child has the same bound, whatever limit its parent call runs under.
 
 The routed MCP adapter can apply exact reviewed patches to trusted configured
 source roots. Approval binds a digest and world to one expiring attempt. It

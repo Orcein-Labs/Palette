@@ -359,6 +359,7 @@ class TestHostCommand(SessionTestCase):
             "cat-marker": {"argv": ["/bin/cat", "marker.txt"], "cwd": str(outside), "timeout_s": 10},
             "echo": {"argv": ["/bin/echo"], "cwd": str(outside), "extra_args": True},
             "gated": {"argv": ["/bin/sh", "-c", "echo $$ > started; read line < go; echo finished"], "cwd": str(outside)},
+            "long": {"argv": ["/bin/sleep", "300"], "cwd": str(outside)},
         }}}
         try:
             with PaletteSession(project_dir=PROJECT_DIR, ceiling=ceiling) as s:
@@ -384,5 +385,17 @@ class TestHostCommand(SessionTestCase):
                 r = s.turn('Palette.host_command_poll(job)')
                 self.assertIs(r["data"]["running"], False)
                 self.assertEqual(r["data"]["stdout"], "finished\n")
+                # The jobs line, printed before each turn's code runs, names
+                # a running job until it is cancelled; cancel kills it.
+                s.turn('long = Palette.host_command("long"; wait=false)["job"]')
+                r = s.turn('[j["name"] for j in Palette.host_jobs()]')
+                self.assertIn("[background jobs: running: host job `long` (Palette.host_command_poll(", r["output"])
+                self.assertEqual(r["data"], ["long"])
+                self.assertIs(s.turn('Palette.host_command_cancel(long)["cancelled"]')["data"], True)
+                r = s.turn('Palette.host_jobs()')
+                self.assertIn("[background jobs: nothing is running any more]", r["output"])
+                self.assertEqual(r["data"], [])
+                r = s.turn('try; Palette.host_command("long"; timeout_s=1e6); catch e; sprint(showerror, e); end')
+                self.assertIn("the ceiling's limit", r["data"])
         finally:
             shutil.rmtree(outside, ignore_errors=True)

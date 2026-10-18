@@ -1,5 +1,64 @@
 # Installation and MCP
 
+## One-command install
+
+On Linux, or inside WSL2:
+
+```sh
+curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
+```
+
+On Windows (PowerShell or a command prompt):
+
+```powershell
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
+```
+
+`install.sh` does the following, and running it again updates the install:
+
+1. Downloads the release archive, which holds the source and a prebuilt
+   x86_64 host (glibc 2.35 or newer), and checks it against `SHA256SUMS.txt`.
+   Where the prebuilt host does not run, setup builds it with Rust.
+2. Installs Python 3 and bubblewrap if they are missing and, where AppArmor
+   restricts user namespaces (Ubuntu 23.10 and newer), Ubuntu's recommended
+   upstream bubblewrap profile, pinned by revision and checksum. This is the
+   only step that needs root (`runtime/scripts/setup-sandbox-host.sh`); global
+   AppArmor and user-namespace policy is left as it is.
+3. Installs Julia with [juliaup](https://github.com/JuliaLang/juliaup) unless
+   Julia 1.10 or newer is on `PATH`.
+4. Runs `runtime/plugins/setup.py`, which instantiates the Julia project,
+   prepares the sandbox depot, writes the client configuration and the
+   `palette-mcp` stdio launcher, registers the server with Claude Code and Codex
+   when they are installed and have no server named `palette`, and makes one
+   test call, `1 + 1`, through the launcher.
+
+`install.ps1` installs WSL2 with Ubuntu when there is no WSL distribution
+(restart Windows if asked, create the Linux user, then run it again), installs
+step 2 as root inside WSL without a password, runs `install.sh` inside the
+distribution, and registers Claude Desktop, Claude Code and Codex on Windows.
+Each runs `wsl.exe --distribution <name> --exec <launcher>`. A WSL1
+distribution cannot run the sandbox; convert it with `wsl --set-version`.
+
+Settings, all optional environment variables:
+
+| Variable | Effect |
+|---|---|
+| `PALETTE_HOME` | Install location (default `~/.local/share/palette`): `sdk/`, `client/`, `data/` and `depot/` |
+| `PALETTE_VERSION` | Release tag to install. `releases/latest` skips prereleases, so a tag such as `v1.0.0-rc.1` needs this |
+| `PALETTE_RELEASE_URL` | Download from this base URL instead: a mirror, or `file:///path` for a local copy of the release assets |
+| `PALETTE_WSL_DISTRIBUTION` | On Windows, the WSL distribution to use instead of the default one |
+
+From a source checkout, `sh runtime/scripts/install.sh` uses the checkout as the SDK and
+builds the host with `cargo`. `python3 runtime/plugins/setup.py --help` lists
+the setup options, such as `--no-register` and `--no-check`, for running that
+step alone.
+
+To remove Palette: `claude mcp remove palette`, `codex mcp remove palette`,
+delete the `palette` entry from Claude Desktop's configuration on Windows, and
+delete `PALETTE_HOME`. Julia stays installed (`juliaup self uninstall` removes it).
+
+## Manual installation
+
 The Linux supervised runtime requires Julia, Python 3, bubblewrap, and a built
 Rust host. Julia dependencies are defined by `Project.toml`; Rust dependencies
 are locked in `runtime/host/Cargo.lock`. Instantiate the Julia project and build the host
@@ -8,7 +67,18 @@ host, not silently downloaded inside an offline worker.
 
 See the [portable plugin setup](../plugins/palette/README.md) for Agent Plugins manifests, a repository marketplace, and a generic MCP launcher.
 
-## Prepare before interactive use
+To run a host session directly after preparing it (below):
+
+```sh
+runtime/host/target/release/palette-host session --repo-dir "$PWD" --project-dir "$PWD" --workspace-dir /absolute/path/to/workspace --state-dir /absolute/path/to/state --ceiling '{}'
+```
+
+The session speaks newline-delimited JSON on stdin/stdout. After its startup
+message, send `{"request_id":"1","code":"x = 41"}` and then
+`{"request_id":"2","code":"x + 1"}`. Close stdin to stop it. Keep state outside
+the workspace.
+
+### Prepare before interactive use
 
 Cold preparation compiles standard libraries and project dependencies in the
 actual sandbox, with the same paths later sessions use. On a fresh depot this

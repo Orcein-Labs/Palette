@@ -148,7 +148,12 @@ pub struct Broker {
     depot_lock: Mutex<()>,
     // host_command jobs started with action "start"; dropping the broker
     // (the session ending) kills any still running.
-    jobs: Mutex<BTreeMap<String, sandbox::HostJob>>,
+    jobs: Mutex<BTreeMap<String, HostJobEntry>>,
+}
+
+struct HostJobEntry {
+    name: String,
+    job: sandbox::HostJob,
 }
 
 /// At most this many host_command jobs run at once per session.
@@ -595,29 +600,53 @@ impl Broker {
     /// the sandbox: the way a kernel reaches a GPU, a renderer or a build it
     /// cannot run itself. The ceiling fixes each command's argv (absolute
     /// program), cwd and timeout; a request only picks a command by name,
-    /// and passes arguments only to a command that allows them. Never a
-    /// shell. Actions: "run" (default) waits for the result; "start"
-    /// returns a job id at once, for commands longer than a turn; "poll"
-    /// with that id returns {"running": true} or the result.
+    /// may shorten (never extend) its timeout with `timeout_s`, and passes
+    /// arguments only to a command that allows them. Never a shell.
+    /// Actions: "run" (default) waits for the result; "start" returns a job
+    /// id at once, for commands longer than a turn; "poll" with that id
+    /// returns {"running": true} and the output since the last poll, or the
+    /// result; "cancel" kills the job's process group and returns its
+    /// result; "list" names the jobs still held.
     /// Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
     ///   "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}
     fn host_command(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
         let cap = self.cap("host_command").ok_or_else(|| Denied("host_command not in this session's ceiling".into()))?;
         let action = p.get("action").and_then(Value::as_str).unwrap_or("run");
-        if action == "poll" {
-            let id = p.get("job").and_then(Value::as_str).ok_or_else(|| Denied("host_command poll requires a string 'job'".into()))?;
-            let mut jobs = self.jobs.lock().unwrap();
-            let job = jobs.get_mut(id).ok_or_else(|| Denied(format!("no running host_command job {}", q(id))))?;
-            return match job.poll().map_err(Internal)? {
-                None => Ok(json!({"job": id, "running": true})),
-                Some(r) => {
-                    jobs.remove(id);
-                    Ok(host_job_json(Some(id), &r))
+        if action == "list" {
+            let jobs = self.jobs.lock().unwrap();
+            let mut listed: Vec<(f64, Value)> = Vec::new();
+            for (id, e) in jobs.iter() {
+                let seconds = e.job.seconds();
+                let running = e.job.running().map_err(Internal)?;
+                listed.push((seconds, json!({"job": id, "name": e.name, "running": running, "seconds": round_ms(seconds)})));
+            }
+            listed.sort_by(|a, b| b.0.total_cmp(&a.0));
+            return Ok(json!({"jobs": listed.into_iter().map(|(_, v)| v).collect::<Vec<_>>()}));
+        }
+        if action == "poll" || action == "cancel" {
+            let id = p.get("job").and_then(Value::as_str)
+                .ok_or_else(|| Denied(format!("host_command {action} requires a string 'job'")))?;
+            let mut e = {
+                let mut jobs = self.jobs.lock().unwrap();
+                let e = jobs.get_mut(id).ok_or_else(|| Denied(format!("no running host_command job {}", q(id))))?;
+                if action == "poll" && e.job.running().map_err(Internal)? {
+                    let o = e.job.read_new();
+                    let mut v = json!({"job": id, "name": e.name, "running": true, "seconds": round_ms(o.seconds),
+                                       "stdout": o.stdout, "stderr": o.stderr});
+                    add_skipped(&mut v, o.skipped);
+                    return Ok(v);
                 }
+                jobs.remove(id).unwrap()
             };
+            // Finishing joins the output readers, so it runs outside the lock
+            // that every other job call (and each turn's jobs line) takes.
+            let r = if action == "cancel" { e.job.cancel() } else { e.job.wait() }.map_err(Internal)?;
+            let mut v = host_job_json(Some(id), &r);
+            v["name"] = json!(e.name);
+            return Ok(v);
         }
         if action != "run" && action != "start" {
-            return Err(Denied(format!("host_command action must be run, start or poll, not {}", q(action))));
+            return Err(Denied(format!("host_command action must be run, start, poll, cancel or list, not {}", q(action))));
         }
         let name = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())
             .ok_or_else(|| Denied("host_command requires a non-empty string 'name'".into()))?;
@@ -633,6 +662,11 @@ impl Broker {
             .filter(|c| c.is_absolute() && c.is_dir()).ok_or_else(|| misconfigured("'cwd' must be an absolute directory"))?;
         let timeout_s = spec.get("timeout_s").map(|t| t.as_f64().filter(|t| *t > 0.0 && *t <= HOST_COMMAND_MAX_TIMEOUT_S))
             .unwrap_or(Some(60.0)).ok_or_else(|| misconfigured("'timeout_s' must be a number in (0, 14400]"))?;
+        let timeout_s = match p.get("timeout_s") {
+            None | Some(Value::Null) => timeout_s,
+            Some(t) => t.as_f64().filter(|t| *t > 0.0 && *t <= timeout_s).ok_or_else(|| Denied(format!(
+                "host_command 'timeout_s' must be a number in (0, {timeout_s}], the ceiling's limit for {}", q(name))))?,
+        };
         let args = match p.get("args") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(a)) => {
@@ -655,11 +689,11 @@ impl Broker {
         if action == "start" {
             let mut jobs = self.jobs.lock().unwrap();
             if jobs.len() >= MAX_HOST_JOBS {
-                return Err(Denied(format!("at most {MAX_HOST_JOBS} host_command jobs may run at once; poll one to completion first")));
+                return Err(Denied(format!("at most {MAX_HOST_JOBS} host_command jobs may run at once; poll one to completion or cancel one first")));
             }
             let job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
             let id = util::hex(16);
-            jobs.insert(id.clone(), job);
+            jobs.insert(id.clone(), HostJobEntry { name: name.to_string(), job });
             return Ok(json!({"job": id, "name": name, "running": true}));
         }
         let mut job = sandbox::HostJob::start(&argv, &cwd, timeout, HOST_COMMAND_OUTPUT).map_err(Internal)?;
@@ -723,9 +757,23 @@ impl Broker {
 
 /// Stream a file through SHA-256 in 1 MiB chunks, as the Python broker does,
 /// and report (hex, bytes, mtime in seconds since the epoch).
+fn round_ms(seconds: f64) -> f64 {
+    (seconds * 1000.0).round() / 1000.0
+}
+
+/// Notes output the 16 KiB tail dropped before anyone read it.
+fn add_skipped(v: &mut Value, skipped: [u64; 2]) {
+    for (key, n) in [("stdout_skipped_bytes", skipped[0]), ("stderr_skipped_bytes", skipped[1])] {
+        if n > 0 {
+            v[key] = json!(n);
+        }
+    }
+}
+
 fn host_job_json(job: Option<&str>, r: &sandbox::HostJobResult) -> Value {
-    let mut v = json!({"returncode": r.returncode, "timed_out": r.timed_out, "seconds": (r.seconds * 1000.0).round() / 1000.0,
-                       "stdout": r.stdout, "stderr": r.stderr, "running": false});
+    let mut v = json!({"returncode": r.returncode, "timed_out": r.timed_out, "cancelled": r.cancelled,
+                       "seconds": round_ms(r.seconds), "stdout": r.stdout, "stderr": r.stderr, "running": false});
+    add_skipped(&mut v, r.skipped);
     if let Some(id) = job {
         v["job"] = json!(id);
     }
@@ -1383,7 +1431,12 @@ mod tests {
         assert!(reason(json!({"name": "relative"})).contains("absolute path"));
         assert!(reason(json!({"name": "nocwd"})).contains("'cwd'"));
         assert!(reason(json!({"name": "slow"})).contains("timeout_s"));
-        assert!(reason(json!({"name": "pwd", "action": "sudo"})).contains("run, start or poll"));
+        assert!(reason(json!({"name": "pwd", "action": "sudo"})).contains("run, start, poll, cancel or list"));
+        // A request may shorten a command's timeout, never extend it.
+        assert!(reason(json!({"name": "pwd", "timeout_s": 61})).contains("(0, 60]"));
+        assert!(reason(json!({"name": "pwd", "timeout_s": 0})).contains("timeout_s"));
+        assert!(reason(json!({"name": "pwd", "timeout_s": "5"})).contains("timeout_s"));
+        assert_eq!(reason(json!({"name": "pwd", "timeout_s": 5})), "APPROVED");
         let none = broker(json!({}), &d.0.join("r2.jsonl"));
         assert_eq!(cmd(&none, json!({"name": "pwd"}))["approved"], json!(false));
     }
@@ -1446,6 +1499,105 @@ mod tests {
         let helper = wait_for_pid(&d.0.join("long.pid"));
         drop(b);
         assert!(pid_dead(&helper), "a job outlived its session");
+    }
+
+    fn poll_until(b: &Broker, id: &str, mut each: impl FnMut(&Value) -> bool) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = cmd(b, json!({"action": "poll", "job": id}));
+            if r["result"]["running"] != json!(true) || !each(&r) || std::time::Instant::now() > deadline {
+                return r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn host_command_poll_streams_output_since_the_last_poll() {
+        let d = tmpdir("hostcmd-stream");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "ticks": {"argv": ["/bin/sh", "-c", "echo one; while [ ! -e go ]; do sleep 0.05; done; echo two; echo err >&2"], "cwd": dir},
+        }));
+        let id = cmd(&b, json!({"name": "ticks", "action": "start"}))["result"]["job"].as_str().unwrap().to_string();
+        let mut seen = String::new();
+        let r = poll_until(&b, &id, |r| {
+            seen.push_str(r["result"]["stdout"].as_str().unwrap());
+            assert_eq!(r["result"]["name"], json!("ticks"), "{r}");
+            seen != "one\n"
+        });
+        assert_eq!(r["result"]["running"], json!(true), "{r}");
+        assert_eq!(seen, "one\n");
+        // Nothing new since: the next poll returns no output again.
+        assert_eq!(cmd(&b, json!({"action": "poll", "job": id}))["result"]["stdout"], json!(""));
+        fs::write(d.0.join("go"), "").unwrap();
+        let (mut rest, mut err) = (String::new(), String::new());
+        let mut take = |r: &Value| {
+            rest.push_str(r["result"]["stdout"].as_str().unwrap());
+            err.push_str(r["result"]["stderr"].as_str().unwrap());
+        };
+        let r = poll_until(&b, &id, |r| { take(r); true });
+        take(&r);
+        assert_eq!(r["result"]["running"], json!(false), "{r}");
+        assert_eq!(rest, "two\n", "the final result repeated output a poll had returned");
+        assert_eq!(err, "err\n");
+        assert_eq!(r["result"]["cancelled"], json!(false));
+    }
+
+    #[test]
+    fn host_command_cancel_kills_the_job_group_and_list_names_jobs() {
+        let d = tmpdir("hostcmd-cancel");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "long": {"argv": ["/bin/sh", "-c", "echo started; sleep 300 & echo $! > long.pid; wait"], "cwd": dir},
+            "quick": {"argv": ["/bin/true"], "cwd": dir},
+        }));
+        let id = cmd(&b, json!({"name": "long", "action": "start"}))["result"]["job"].as_str().unwrap().to_string();
+        let helper = wait_for_pid(&d.0.join("long.pid"));
+        let listed = cmd(&b, json!({"action": "list"}));
+        assert_eq!(listed["result"]["jobs"][0]["job"], json!(id), "{listed}");
+        assert_eq!(listed["result"]["jobs"][0]["name"], json!("long"));
+        assert_eq!(listed["result"]["jobs"][0]["running"], json!(true));
+        let r = cmd(&b, json!({"action": "cancel", "job": id}));
+        assert_eq!(r["result"]["cancelled"], json!(true), "{r}");
+        assert_eq!(r["result"]["running"], json!(false));
+        assert_eq!(r["result"]["timed_out"], json!(false));
+        assert_eq!(r["result"]["stdout"], json!("started\n"));
+        assert!(pid_dead(&helper), "a cancelled job's helper survived");
+        assert_eq!(cmd(&b, json!({"action": "list"}))["result"]["jobs"], json!([]));
+        assert!(cmd(&b, json!({"action": "cancel", "job": id}))["reason"].as_str().unwrap().contains("no running"));
+        // Cancelling a job that already finished reports it finished, not cancelled.
+        let id = cmd(&b, json!({"name": "quick", "action": "start"}))["result"]["job"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cmd(&b, json!({"action": "list"}))["result"]["jobs"][0]["running"] == json!(true) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let r = cmd(&b, json!({"action": "cancel", "job": id}));
+        assert_eq!((r["result"]["cancelled"].clone(), r["result"]["returncode"].clone()), (json!(false), json!(0)), "{r}");
+    }
+
+    #[test]
+    fn host_command_reports_output_the_tail_dropped() {
+        let d = tmpdir("hostcmd-skip");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({
+            "loud": {"argv": ["/bin/sh", "-c", "head -c 40000 /dev/zero | tr '\\0' x; echo"], "cwd": dir},
+        }));
+        let r = cmd(&b, json!({"name": "loud"}));
+        assert_eq!(r["result"]["stdout"].as_str().unwrap().len(), HOST_COMMAND_OUTPUT, "{}", r["result"]["returncode"]);
+        assert_eq!(r["result"]["stdout_skipped_bytes"], json!(40001 - HOST_COMMAND_OUTPUT));
+        assert!(r["result"].get("stderr_skipped_bytes").is_none());
+    }
+
+    #[test]
+    fn host_command_request_timeout_shortens_the_ceiling_timeout() {
+        let d = tmpdir("hostcmd-reqtimeout");
+        let dir = d.0.to_string_lossy().into_owned();
+        let b = cmd_broker(&d.0, json!({"hang": {"argv": ["/bin/sleep", "300"], "cwd": dir, "timeout_s": 600}}));
+        let started = std::time::Instant::now();
+        let r = cmd(&b, json!({"name": "hang", "timeout_s": 0.5}));
+        assert_eq!(r["result"]["timed_out"], json!(true), "{r}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

@@ -60,6 +60,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from session import PaletteSession, SessionDeadError  # noqa: E402
+from source_transport import LONGEST_TURN_TIMEOUT  # noqa: E402
 
 
 def _payload(value):
@@ -129,6 +130,12 @@ class HostBridge:
             slot[0].set()
 
 
+def _bridge_timeout(limit: float) -> float:
+    """A host request must be answered (or given up on) before the call
+    itself times out, so the kernel gets an error rather than being killed."""
+    return max(1.0, limit - 5.0)
+
+
 def _read_stdin(bridge: HostBridge, requests: queue.Queue) -> None:
     """Route each stdin line: host replies to the bridge, everything else to
     the main loop. None marks the end of input."""
@@ -163,7 +170,9 @@ def main() -> int:
     ap.add_argument("--repo-dir")
     ap.add_argument("--ceiling", default="{}", help="JSON object, or a path to a JSON file")
     ap.add_argument("--network", action="store_true")
-    ap.add_argument("--turn-timeout", type=float, default=60.0)
+    ap.add_argument("--turn-timeout", type=float, default=60.0, help="A call's limit when it names none")
+    ap.add_argument("--max-turn-timeout", type=float,
+                    help="The longest limit a call may ask for with 'timeout_s'; default --turn-timeout")
     ap.add_argument("--startup-timeout", type=float, default=180.0)
     ap.add_argument("--workspace-dir", help="Task directory the worker works in; bound writable, never deleted")
     ap.add_argument("--scratch-root", help="Session scratch root; created at startup and removed on close")
@@ -171,6 +180,10 @@ def main() -> int:
     ap.add_argument("--state-dir", help="Where the kernel saves its state after each completed call, and where a "
                     "new kernel revives it from; created if missing, never deleted")
     args = ap.parse_args()
+    max_turn_timeout = args.turn_timeout if args.max_turn_timeout is None else args.max_turn_timeout
+    if not 0 < args.turn_timeout <= max_turn_timeout <= LONGEST_TURN_TIMEOUT:
+        ap.error(f"--turn-timeout must be positive and no more than --max-turn-timeout, "
+                 f"which is at most {LONGEST_TURN_TIMEOUT} (7 days)")
 
     # Default SIGTERM handling exits without running `finally`, which leaked
     # the session's depot clone every time a host killed this bridge.
@@ -189,6 +202,7 @@ def main() -> int:
 
     kwargs = {"project_dir": args.project_dir, "ceiling": ceiling, "ceiling_file": ceiling_file,
               "network_enabled": args.network, "turn_timeout": args.turn_timeout,
+              "max_turn_timeout": max_turn_timeout,
               "startup_timeout": args.startup_timeout, "task_workspace_dir": args.workspace_dir,
               "workspace_dir": args.scratch_root, "receipts_dir": args.receipts_dir}
     if args.repo_dir:
@@ -213,9 +227,7 @@ def main() -> int:
         _respond({"kind": "ERROR", "error": f"failed to start PaletteSession: {e}"})
         return 1
 
-    # A host request must be answered (or given up on) before the call itself
-    # times out, so the kernel gets an error rather than being killed.
-    bridge = HostBridge(timeout=max(1.0, args.turn_timeout - 5.0))
+    bridge = HostBridge(timeout=_bridge_timeout(args.turn_timeout))
     session._broker.host_bridge = bridge
     requests: queue.Queue = queue.Queue()
     threading.Thread(target=_read_stdin, args=(bridge, requests), daemon=True).start()
@@ -241,6 +253,20 @@ def main() -> int:
                 _respond({"request_id": request_id, "success": False, "data": None,
                            "error": "request 'code' must be a string"})
                 continue
+            limit = req.get("timeout_s")
+            if limit is not None and (isinstance(limit, bool) or not isinstance(limit, (int, float))
+                                      or not 0 < limit <= max_turn_timeout):
+                _respond({"request_id": request_id, "success": False, "data": None,
+                          "error": f"request 'timeout_s' must be a number in (0, {max_turn_timeout:g}], "
+                                   f"this host's --max-turn-timeout"})
+                continue
+            if limit is not None and req.get("ephemeral"):
+                _respond({"request_id": request_id, "success": False, "data": None,
+                          "error": "request 'timeout_s' does not apply to an ephemeral call: its broker child "
+                                   "is bounded by the session's --turn-timeout"})
+                continue
+            limit = args.turn_timeout if limit is None else float(limit)
+            bridge.timeout = _bridge_timeout(limit)
 
             try:
                 result = session.turn(
@@ -250,6 +276,7 @@ def main() -> int:
                     payload=_payload(req.get("payload")),
                     include_map=req.get("map") is True,
                     digest=req.get("digest") is not False,
+                    timeout_s=limit,
                 )
                 _respond({
                     "request_id": request_id,
