@@ -56,8 +56,10 @@ receives an audit receipt.
 Use the command from Julia:
 
 ```julia
-job = Palette.host_command("inference", "What is 6 times 7?"; wait=false)
-result = Palette.host_command_poll(job["job"])
+job = Palette.host_command("inference", "What is 6 times 7?"; wait=false)["job"]
+Palette.host_command_poll(job)   # running => true and the output so far
+# ... a later call, once it has finished:
+result = Palette.host_command_poll(job)
 ```
 
 An unconfigured command or package is denied. Host commands run with the

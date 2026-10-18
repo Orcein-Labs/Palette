@@ -1823,47 +1823,99 @@ fn run_captured_with_env(argv: &[String], env: Option<&BTreeMap<String, Option<S
     Ok(WorkerResult { returncode, stdout, stderr, timed_out })
 }
 
-/// Keeps only the last `cap` bytes a pipe produces: a renderer may print for
-/// minutes, and only the end of its output is reported.
-fn read_tail(mut r: impl Read + Send + 'static, cap: usize) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let (mut kept, mut buf) = (Vec::new(), [0u8; 8192]);
+/// The last `cap` bytes a pipe produced, shared with the thread reading it:
+/// a renderer may print for minutes, and only the end is kept. `start` is
+/// the stream offset of `kept[0]`, so a reader holding an offset can tell
+/// what it has not seen yet, and how much of that was dropped.
+#[derive(Default)]
+struct Tail {
+    kept: Vec<u8>,
+    start: u64,
+}
+
+type SharedTail = std::sync::Arc<std::sync::Mutex<Tail>>;
+
+fn read_tail(mut r: impl Read + Send + 'static, cap: usize) -> (SharedTail, std::thread::JoinHandle<()>) {
+    let tail = SharedTail::default();
+    let shared = tail.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
         while let Ok(n) = r.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            kept.extend_from_slice(&buf[..n]);
-            if kept.len() > 2 * cap {
-                kept.drain(..kept.len() - cap);
+            let mut t = shared.lock().unwrap();
+            t.kept.extend_from_slice(&buf[..n]);
+            if t.kept.len() > cap {
+                let drop = t.kept.len() - cap;
+                t.kept.drain(..drop);
+                t.start += drop as u64;
             }
         }
-        if kept.len() > cap {
-            kept.drain(..kept.len() - cap);
+    });
+    (tail, reader)
+}
+
+/// Output a reader at stream offset `*seen` has not read yet, and how many
+/// of those bytes the tail had already dropped. While the command runs,
+/// `whole` is false and the text stops before a UTF-8 sequence still being
+/// written, so a character is never split between two reads.
+fn read_since(tail: &SharedTail, seen: &mut u64, whole: bool) -> (String, u64) {
+    let t = tail.lock().unwrap();
+    let skipped = t.start.saturating_sub(*seen);
+    let from = (*seen).max(t.start) - t.start;
+    let mut bytes = &t.kept[from as usize..];
+    if !whole {
+        if let Err(e) = std::str::from_utf8(bytes) {
+            if e.error_len().is_none() {
+                bytes = &bytes[..e.valid_up_to()];
+            }
         }
-        kept
-    })
+    }
+    *seen = t.start + from + bytes.len() as u64;
+    (String::from_utf8_lossy(bytes).into_owned(), skipped)
 }
 
 /// An operator-named host command (the broker's host_command), started in a
 /// process group of its own. A watchdog kills the whole group at the
 /// deadline whether or not anyone is waiting, so helper processes a
-/// renderer starts never outlive it; dropping the job kills it too. The
-/// group is always signalled before the command is reaped, under one lock
-/// with the watchdog, so a signal can never reach a reused pid.
+/// renderer starts never outlive it; cancelling or dropping the job kills
+/// it too. The group is always signalled before the command is reaped,
+/// under one lock with the watchdog, so a signal can never reach a reused
+/// pid. Output is read incrementally: each `read_new` and the final result
+/// return only what earlier reads did not.
 pub struct HostJob {
     child: std::process::Child,
-    out: Option<std::thread::JoinHandle<Vec<u8>>>,
-    err: Option<std::thread::JoinHandle<Vec<u8>>>,
+    tails: [SharedTail; 2],
+    readers: Vec<std::thread::JoinHandle<()>>,
+    seen: [u64; 2],
     started: Instant,
-    // (finished, timed_out)
-    state: std::sync::Arc<std::sync::Mutex<(bool, bool)>>,
+    state: std::sync::Arc<std::sync::Mutex<JobState>>,
+}
+
+#[derive(Default)]
+struct JobState {
+    finished: bool,
+    timed_out: bool,
+    cancelled: bool,
 }
 
 pub struct HostJobResult {
     pub returncode: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Bytes of each stream dropped from the tail before they were read.
+    pub skipped: [u64; 2],
     pub timed_out: bool,
+    pub cancelled: bool,
+    pub seconds: f64,
+}
+
+/// Output a running job produced since the last read.
+pub struct HostJobOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub skipped: [u64; 2],
     pub seconds: f64,
 }
 
@@ -1894,34 +1946,37 @@ impl HostJob {
         cmd.args(&argv[1..]).current_dir(cwd).process_group(0)
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("starting {}: {e}", argv[0]))?;
-        let out = read_tail(child.stdout.take().unwrap(), output_cap);
-        let err = read_tail(child.stderr.take().unwrap(), output_cap);
-        let state = std::sync::Arc::new(std::sync::Mutex::new((false, false)));
+        let (out, out_reader) = read_tail(child.stdout.take().unwrap(), output_cap);
+        let (err, err_reader) = read_tail(child.stderr.take().unwrap(), output_cap);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(JobState::default()));
         let (pgid, watched) = (child.id() as i32, state.clone());
         let deadline = Instant::now() + timeout;
         std::thread::spawn(move || loop {
             {
                 let mut st = watched.lock().unwrap();
-                if st.0 {
+                if st.finished {
                     return;
                 }
                 if Instant::now() >= deadline {
-                    st.1 = true;
+                    st.timed_out = true;
                     kill_group(pgid);
                     return;
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
         });
-        Ok(HostJob { child, out: Some(out), err: Some(err), started: Instant::now(), state })
+        Ok(HostJob {
+            child, tails: [out, err], readers: vec![out_reader, err_reader], seen: [0, 0],
+            started: Instant::now(), state,
+        })
     }
 
-    /// The result once the command has exited, `None` while it runs.
-    pub fn poll(&mut self) -> Result<Option<HostJobResult>, String> {
-        if !exited_unreaped(self.child.id() as i32, false)? {
-            return Ok(None);
-        }
-        self.finish().map(Some)
+    pub fn seconds(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    pub fn running(&self) -> Result<bool, String> {
+        exited_unreaped(self.child.id() as i32, false).map(|exited| !exited)
     }
 
     pub fn wait(&mut self) -> Result<HostJobResult, String> {
@@ -1929,25 +1984,45 @@ impl HostJob {
         self.finish()
     }
 
+    /// Kills the command's whole group and returns its result, marked
+    /// cancelled unless it had already finished or timed out.
+    pub fn cancel(&mut self) -> Result<HostJobResult, String> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if !st.finished && !st.timed_out && self.running()? {
+                st.cancelled = true;
+                kill_group(self.child.id() as i32);
+            }
+        }
+        self.wait()
+    }
+
+    /// Output produced since the last read, while the command runs.
+    pub fn read_new(&mut self) -> HostJobOutput {
+        let (stdout, s0) = read_since(&self.tails[0], &mut self.seen[0], false);
+        let (stderr, s1) = read_since(&self.tails[1], &mut self.seen[1], false);
+        HostJobOutput { stdout, stderr, skipped: [s0, s1], seconds: self.started.elapsed().as_secs_f64() }
+    }
+
     fn finish(&mut self) -> Result<HostJobResult, String> {
         use std::os::unix::process::ExitStatusExt;
-        let timed_out = {
+        let (timed_out, cancelled) = {
             let mut st = self.state.lock().unwrap();
-            st.0 = true;
+            st.finished = true;
             // Helpers left in the group after the command exited go too:
             // their open pipes would otherwise keep the output readers waiting.
             kill_group(self.child.id() as i32);
-            st.1
+            (st.timed_out, st.cancelled)
         };
         let status = self.child.wait().map_err(|e| e.to_string())?;
-        let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
-            String::from_utf8_lossy(&h.map(|h| h.join().unwrap_or_default()).unwrap_or_default()).into_owned()
-        };
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        let (stdout, s0) = read_since(&self.tails[0], &mut self.seen[0], true);
+        let (stderr, s1) = read_since(&self.tails[1], &mut self.seen[1], true);
         Ok(HostJobResult {
             returncode: status.code().unwrap_or_else(|| -status.signal().unwrap_or(0)),
-            stdout: text(self.out.take()),
-            stderr: text(self.err.take()),
-            timed_out,
+            stdout, stderr, skipped: [s0, s1], timed_out, cancelled,
             seconds: self.started.elapsed().as_secs_f64(),
         })
     }
@@ -1956,8 +2031,8 @@ impl HostJob {
 impl Drop for HostJob {
     fn drop(&mut self) {
         let mut st = self.state.lock().unwrap();
-        if !st.0 {
-            st.0 = true;
+        if !st.finished {
+            st.finished = true;
             kill_group(self.child.id() as i32);
             drop(st);
             let _ = self.child.wait();

@@ -90,6 +90,10 @@ class HostCommandParity:
             "spawn": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $!"], "cwd": d, "timeout_s": 30},
             "job": {"argv": ["/bin/sh", "-c", "echo $$ > started; read line < go; echo done"], "cwd": d},
             "long": {"argv": ["/bin/sh", "-c", "sleep 300 & echo $! > long-ready; wait"], "cwd": d},
+            "ticks": {"argv": ["/bin/sh", "-c", "echo one; echo $$ > started; read line < go; echo two; echo err >&2"], "cwd": d},
+            "loud": {"argv": ["/bin/sh", "-c", "head -c 40000 /dev/zero | tr '\\0' x; echo"], "cwd": d},
+            "sleep": {"argv": ["/bin/sleep", "300"], "cwd": d, "timeout_s": 600},
+            "quick": {"argv": ["/bin/true"], "cwd": d},
         }}}, self.tmp)
 
     def tearDown(self):
@@ -109,7 +113,14 @@ class HostCommandParity:
         self.assertIn("takes no arguments", reason({"name": "pwd", "args": ["-P"]}))
         self.assertIn("list of strings", reason({"name": "pwd", "args": "-P"}))
         self.assertIn("absolute path", reason({"name": "relative"}))
-        self.assertIn("run, start or poll", reason({"name": "pwd", "action": "sudo"}))
+        self.assertIn("run, start, poll, cancel or list", reason({"name": "pwd", "action": "sudo"}))
+        # A request may shorten a command's timeout, never extend it.
+        self.assertIn("(0, 60]", reason({"name": "pwd", "timeout_s": 61}))
+        self.assertIn("timeout_s", reason({"name": "pwd", "timeout_s": 0}))
+        self.assertIn("timeout_s", reason({"name": "pwd", "timeout_s": "5"}))
+        self.assertIn("timeout_s", reason({"name": "pwd", "timeout_s": True}))
+        self.assertEqual(reason({"name": "pwd", "timeout_s": 5}), "APPROVED")
+        self.assertIn("cancel requires a string 'job'", reason({"action": "cancel"}))
 
     def test_timeout_kills_the_whole_group(self):
         started = time.monotonic()
@@ -138,6 +149,62 @@ class HostCommandParity:
         helper = read_fifo(self.tmp / "long-ready")
         self.b.close()
         self.assertTrue(pid_dead(helper), "a job outlived its session")
+
+
+    def test_poll_streams_output_since_the_last_poll(self):
+        job = self.b({"name": "ticks", "action": "start"})["result"]["job"]
+        read_fifo(self.tmp / "started")                  # "one" is written; the job waits on `go`
+        seen, deadline = "", time.monotonic() + 10
+        while seen != "one\n" and time.monotonic() < deadline:
+            r = self.b({"action": "poll", "job": job})["result"]
+            self.assertTrue(r["running"], r)
+            self.assertEqual(r["name"], "ticks")
+            seen += r["stdout"]
+        self.assertEqual(seen, "one\n")
+        self.assertEqual(self.b({"action": "poll", "job": job})["result"]["stdout"], "")
+        write_fifo(self.tmp / "go")
+        rest, err, deadline = "", "", time.monotonic() + 10
+        while time.monotonic() < deadline:
+            r = self.b({"action": "poll", "job": job})["result"]
+            rest, err = rest + r["stdout"], err + r["stderr"]
+            if not r["running"]:
+                break
+        self.assertFalse(r["running"], r)
+        self.assertEqual(rest, "two\n", "the final result repeated output a poll had returned")
+        self.assertEqual(err, "err\n")
+        self.assertFalse(r["cancelled"])
+
+    def test_cancel_kills_the_job_group_and_list_names_jobs(self):
+        job = self.b({"name": "long", "action": "start"})["result"]["job"]
+        helper = read_fifo(self.tmp / "long-ready")
+        listed = self.b({"action": "list"})["result"]["jobs"]
+        self.assertEqual([(j["job"], j["name"], j["running"]) for j in listed], [(job, "long", True)])
+        r = self.b({"action": "cancel", "job": job})["result"]
+        self.assertTrue(r["cancelled"], r)
+        self.assertFalse(r["running"])
+        self.assertFalse(r["timed_out"])
+        self.assertTrue(pid_dead(helper), "a cancelled job's helper survived")
+        self.assertEqual(self.b({"action": "list"})["result"]["jobs"], [])
+        self.assertIn("no running", self.b({"action": "cancel", "job": job})["reason"])
+        # Cancelling a job that already finished reports it finished, not cancelled.
+        job = self.b({"name": "quick", "action": "start"})["result"]["job"]
+        deadline = time.monotonic() + 10
+        while self.b({"action": "list"})["result"]["jobs"][0]["running"] and time.monotonic() < deadline:
+            pass                                         # each broker round trip paces the loop
+        r = self.b({"action": "cancel", "job": job})["result"]
+        self.assertEqual((r["cancelled"], r["returncode"]), (False, 0), r)
+
+    def test_reports_output_the_tail_dropped(self):
+        r = self.b({"name": "loud"})["result"]
+        self.assertEqual(len(r["stdout"]), 16 * 1024)
+        self.assertEqual(r["stdout_skipped_bytes"], 40001 - 16 * 1024)
+        self.assertNotIn("stderr_skipped_bytes", r)
+
+    def test_request_timeout_shortens_the_ceiling_timeout(self):
+        started = time.monotonic()
+        r = self.b({"name": "sleep", "timeout_s": 0.5})
+        self.assertTrue(r["result"]["timed_out"], r)
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class PythonHostCommandTest(HostCommandParity, unittest.TestCase):

@@ -208,6 +208,14 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         default = self.call("palette", {"code":"pwd()"})
         self.assertEqual(default["data"], str(self.workspace))
         self.assertTrue(default["legacy_shared"])
+        self.assertEqual(self.call("palette", {"code":"1 + 1", "timeout_s":5})["data"], 2)
+        short = self.call("palette", {"code":"sleep(10); 1", "timeout_s":1}, error=True)
+        self.assertTrue(short["interrupted"])
+        self.assertIn("exceeded its 1.0s limit", short["error"])
+        self.assertEqual(self.call("palette", {"code":"1 + 2"})["data"], 3)
+        for bad in (0, -1, 1e6, True, "5"):
+            refused = self.call("palette", {"code":"1", "timeout_s":bad}, error=True)
+            self.assertIn("Invalid timeout_s", refused["error"])
         unknown = self.call("palette_workspace", {
             "action":"create", "workspace_id":"unknown-root", "scope":"open", "project_root_id":"/tmp",
         }, error=True)

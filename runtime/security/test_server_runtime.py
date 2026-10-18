@@ -70,6 +70,29 @@ class ServerRuntimeTests(unittest.TestCase):
                 else:
                     os.environ["PALETTE_HOST_COMMANDS"] = previous
 
+    def test_S03_profile_sets_call_time_limits(self):
+        with tempfile.TemporaryDirectory(prefix="palette-server-limits-") as tmp:
+            root = Path(tmp)
+            profile = root / "profile.json"
+            base = {"format": 1, "repo": str(REPO), "data": str(root / "data"),
+                    "depot": str(root / "depot"), "ceiling": str(root / "ceiling.json"),
+                    "runtime_root": str(root / "capabilities")}
+            profile.write_text(json.dumps(base))
+            env = environment(load_profile(profile))
+            self.assertEqual((env["PALETTE_TURN_TIMEOUT"], env["PALETTE_MAX_TURN_TIMEOUT"]), ("60", "1800"))
+            profile.write_text(json.dumps({**base, "turn_timeout": 120, "max_turn_timeout": 7200.5}))
+            env = environment(load_profile(profile))
+            self.assertEqual((env["PALETTE_TURN_TIMEOUT"], env["PALETTE_MAX_TURN_TIMEOUT"]), ("120", "7200.5"))
+            profile.write_text(json.dumps({**base, "max_turn_timeout": 604799.75}))
+            self.assertEqual(environment(load_profile(profile))["PALETTE_MAX_TURN_TIMEOUT"], "604799.75")
+            for bad in ({"turn_timeout": 0}, {"turn_timeout": True}, {"turn_timeout": "90"},
+                        {"turn_timeout": 120, "max_turn_timeout": 60}, {"max_turn_timeout": 30},
+                        {"max_turn_timeout": 604801}):
+                with self.subTest(bad=bad):
+                    profile.write_text(json.dumps({**base, **bad}))
+                    with self.assertRaisesRegex(ValueError, "no more than max_turn_timeout"):
+                        load_profile(profile)
+
 
 if __name__ == "__main__":
     unittest.main()

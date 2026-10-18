@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 
-from source_transport import normalize_palette_call
+from source_transport import call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, protected_host_paths
@@ -35,6 +35,7 @@ binding_view = {}
 binding_epoch = None
 connection_failure = None
 FROZEN_CEILING = operator_ceiling()
+TURN_LIMITS = turn_limits()
 RUNTIME_ROOT = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(REPO, "runtime/capabilities")))).expanduser().resolve()
 runtime_registry = RuntimeRegistry(RUNTIME_ROOT, FROZEN_CEILING, workspace=WORKSPACE, state_dir=STATE_DIR,
                                    repo=REPO, host_binary=HOST)
@@ -186,7 +187,8 @@ def start(*, prepared=True):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     command = [HOST, "session", "--project-dir", REPO, "--repo-dir", REPO,
                "--workspace-dir", WORKSPACE, "--state-dir", str(STATE_DIR),
-               "--receipts-dir", str(RECEIPTS_DIR), "--ceiling", json.dumps(FROZEN_CEILING)]
+               "--receipts-dir", str(RECEIPTS_DIR), "--ceiling", json.dumps(FROZEN_CEILING),
+               "--turn-timeout", seconds_text(TURN_LIMITS[0]), "--max-turn-timeout", seconds_text(TURN_LIMITS[1])]
     if os.environ.get("PALETTE_SCRATCH_ROOT"):
         command += ["--scratch-root", os.environ["PALETTE_SCRATCH_ROOT"]]
     started = time.monotonic()
@@ -233,7 +235,9 @@ def execute(args):
 def receive_result(rid, args):
     global session_notice, connection_failure, refresh_pending
     send_child({"request_id": rid, **args})
-    deadline = time.monotonic() + 90
+    # The host stops a call that overruns its limit by 12 s; the rest is
+    # for host requests answered during the call.
+    deadline = time.monotonic() + call_limit(args, TURN_LIMITS) + 30
     while True:
         event = receive(deadline)
         if event.get("event") == "host_request":
@@ -374,7 +378,7 @@ def control(args):
 
 schema = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
     {"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
-    "ephemeral": {"type": "boolean"}}, "additionalProperties": False}
+    "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "additionalProperties": False}
 control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart"]},
     "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
 
@@ -396,7 +400,7 @@ def main():
                     result = {}
                 elif method == "tools/list":
                     result = {"tools": [
-                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change.", "inputSchema": schema},
+                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_command(name; wait=false) runs longer host work as a job.", "inputSchema": schema},
                         {"name": "palette_control", "description": "Inspect preparation, prepare offline, or restart. restore=false starts a clean world and retires the previous snapshot without deleting workspace files. prepare=false exercises the cold path.", "inputSchema": control_schema}]}
                 elif method == "tools/call":
                     params = msg["params"]

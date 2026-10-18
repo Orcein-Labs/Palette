@@ -13,8 +13,10 @@ import subprocess
 import sys
 
 from filesystem_layout import require_disjoint
+from source_transport import LONGEST_TURN_TIMEOUT, seconds_text, turn_limits
 
-FIELDS = {"format", "repo", "data", "depot", "ceiling", "runtime_root", "host_commands", "read_roots", "repair_config", "patch_roots"}
+FIELDS = {"format", "repo", "data", "depot", "ceiling", "runtime_root", "host_commands", "read_roots", "repair_config",
+          "patch_roots", "turn_timeout", "max_turn_timeout"}
 
 
 def absolute(value, name):
@@ -53,6 +55,16 @@ def load_profile(path):
     if not isinstance(read_roots, list):
         raise ValueError("read_roots must be a list")
     paths["read_roots"] = [absolute(value, "read root") for value in read_roots]
+    # A call's default time limit and the longest one it may ask for.
+    limits = {key: profile[key] for key in ("turn_timeout", "max_turn_timeout") if key in profile}
+    try:
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in limits.values()):
+            raise ValueError
+        paths["turn_limits"] = turn_limits({"PALETTE_TURN_TIMEOUT": limits.get("turn_timeout", 60),
+                                            "PALETTE_MAX_TURN_TIMEOUT": limits.get("max_turn_timeout", 1800)})
+    except ValueError:
+        raise ValueError("turn_timeout must be a positive number of seconds, no more than max_turn_timeout, "
+                         f"which is at most {LONGEST_TURN_TIMEOUT} (7 days)") from None
     return paths
 
 
@@ -69,6 +81,7 @@ def environment(paths):
                PALETTE_CAPABILITY_CEILING=str(paths["ceiling"]),
                PALETTE_RUNTIME_ROOT=str(paths["runtime_root"]),
                JULIA_DEPOT_PATH=str(paths["depot"]), JULIA_PKG_OFFLINE="true")
+    env["PALETTE_TURN_TIMEOUT"], env["PALETTE_MAX_TURN_TIMEOUT"] = map(seconds_text, paths["turn_limits"])
     if "host_commands" in paths:
         env["PALETTE_HOST_COMMANDS"] = str(paths["host_commands"])
     if "repair_config" in paths:
