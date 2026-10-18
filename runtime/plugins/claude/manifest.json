@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "palette",
   "display_name": "Palette",
-  "version": "0.3.1",
+  "version": "0.1.0",
   "description": "Persistent Julia operator surface connected to your prepared Palette runtime.",
   "author": {
     "name": "Matt C"

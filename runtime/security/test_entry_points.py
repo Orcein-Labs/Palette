@@ -64,8 +64,12 @@ class ProductionEntryPointsTest(unittest.TestCase):
     def test_every_part_reports_one_version(self):
         import tomllib
         from provisioning import palette_version
-        host = tomllib.loads((HERE.parent / "host/Cargo.toml").read_text())["package"]["version"]
-        self.assertEqual(palette_version(HERE.parents[1]), host)
+        version = palette_version(HERE.parents[1])
+        self.assertEqual(tomllib.loads((HERE.parent / "host/Cargo.toml").read_text())["package"]["version"], version)
+        # The release bundles take their version from the plugin manifests.
+        for manifest in ("palette/plugin.json", "claude/manifest.json"):
+            with self.subTest(manifest=manifest):
+                self.assertEqual(json.loads((HERE.parent / "plugins" / manifest).read_text())["version"], version)
 
 
 class PrivateInstanceTest(unittest.TestCase):
@@ -83,14 +87,11 @@ class PrivateInstanceTest(unittest.TestCase):
             host.chmod(0o755)
             env = {k: v for k, v in os.environ.items() if not k.startswith(("PALETTE_", "OPERATOR_"))}
             env.update(PALETTE_REPO=str(repo), PALETTE_DATA_HOME=str(data))
-            out = subprocess.run([sys.executable, str(HERE / "serve_palette.py")], env=env, stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, check=True).stdout
-            seen = json.loads(out)
-            self.assertEqual(seen["PALETTE_PACKAGE_DEPOT"], str(data.resolve() / "packages"))
-            env["PALETTE_PACKAGE_DEPOT"] = "/srv/shared-packages"
-            out = subprocess.run([sys.executable, str(HERE / "serve_palette.py")], env=env, stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, check=True).stdout
-            self.assertEqual(json.loads(out)["PALETTE_PACKAGE_DEPOT"], "/srv/shared-packages")
+            for extra, expected in (({}, str(data.resolve() / "packages")),
+                                    ({"PALETTE_PACKAGE_DEPOT": "/srv/shared-packages"}, "/srv/shared-packages")):
+                out = subprocess.run([sys.executable, str(HERE / "serve_palette.py")], env={**env, **extra},
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True).stdout
+                self.assertEqual(json.loads(out)["PALETTE_PACKAGE_DEPOT"], expected)
 
 
 if __name__ == "__main__":

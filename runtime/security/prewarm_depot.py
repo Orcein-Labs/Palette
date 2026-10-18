@@ -59,7 +59,7 @@ def preparation_identity(project_dir: str, repo_dir: str, julia_bin: str) -> dic
                                   *project.joinpath("src").rglob("*.jl"),
                                   *repo.joinpath("runtime", "scripts").glob("*.jl"),
                                   *project.glob("*Project.toml"), *project.glob("*Manifest.toml")]))}
-    package_root = Path(os.environ.get("PALETTE_PACKAGE_DEPOT", str(Path.home() / ".palette/packages"))).expanduser().resolve()
+    package_root = Path(os.environ.get("PALETTE_PACKAGE_DEPOT") or Path.home() / ".palette/packages").expanduser().resolve()
     package_environment = package_root / "environment"
     optional_files = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                       for p in sorted([*package_environment.glob("*Project.toml"), *package_environment.glob("*Manifest.toml")])}

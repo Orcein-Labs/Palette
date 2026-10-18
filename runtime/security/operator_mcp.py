@@ -14,7 +14,7 @@ import uuid
 
 from source_transport import call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
-from prewarm_depot import error_summary, prepare, preparation_identity, preparation_status, resolve_real_julia_binary
+from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
 from patch_broker import PatchBroker, approval_mode
@@ -175,12 +175,12 @@ def prepare_session():
     if record["state"] != "prepared":
         raise PreparationFailed("Palette could not prepare its Julia environment, so no call ran. "
                                 "palette_control action=prepare retries it once the cause is fixed. "
-                                "The preparation reported:\n" + error_summary(str(record.get("error") or record.get("output") or "")))
+                                "The preparation reported:\n" + str(record.get("error") or ""))
     return preparation
 
 
 def start(*, prepared=True):
-    global proc, frames, hello, session_notice, preparation
+    global proc, frames, hello, session_notice, preparation, kernel_costs
     if proc is not None:
         if proc.poll() is not None:
             stop()
