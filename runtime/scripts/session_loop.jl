@@ -371,6 +371,7 @@ for line in eachline(PROTO_IN)
             # so it needs no Julia quoting: `write("x.py", PAYLOAD)`.
             Core.eval(mod, Expr(:global, Expr(:(=), :PAYLOAD, payload)))
             call = length(Palette.get_kernel_state().execution_history) + 1
+            Palette.note_started_call!(call, code)
             (receipt, interrupted, stuck), output = execute_turn(code, timeout_s === nothing ? nothing : Float64(timeout_s))
             printed = Palette.task_notice_hint(scrub(output))
             resp["call"] = call

@@ -666,6 +666,58 @@ function note_completed_call!(call::Int)
 end
 
 """
+    note_started_call!(call, code)
+
+Records in STATE_DIR that `call` started, and its code. When the kernel stops
+before the call completes, a revival names the call and what it assigns, and
+the next kernel does not reuse its number.
+"""
+function note_started_call!(call::Int, code::String)
+    dir = STATE_DIR[]
+    isempty(dir) && return nothing
+    tmp = joinpath(dir, "started_call.tmp")
+    write(tmp, JSON.json(Dict("call" => call, "code" => first(code, MAX_STOPPED_CODE_CHARS))))
+    mv(tmp, joinpath(dir, "started_call"); force=true)
+    return nothing
+end
+const MAX_STOPPED_CODE_CHARS = 64_000
+
+# The call the previous kernel was running when it stopped, with its code, if
+# it started after the last completed one.
+function stopped_call(dir::String, completed::Int)
+    started = try
+        JSON.parse(read(joinpath(dir, "started_call"), String))
+    catch
+        nothing
+    end
+    started isa AbstractDict || return nothing
+    c = get(started, "call", nothing)
+    c isa Integer && c > completed || return nothing
+    return (Int(c), string(get(started, "code", "")))
+end
+
+# The names a call's top level assigns or defines.
+function top_level_names(code::String)
+    ex = try
+        Meta.parseall(code)
+    catch
+        return String[]
+    end
+    names = String[]
+    for st in top_statements(ex)
+        append!(names, defined_names(st))
+        st isa Expr && st.head in (:(=), :global) || continue
+        lhs = st.args[1]
+        lhs isa Expr && lhs.head === :(=) && (lhs = lhs.args[1])
+        lhs isa Symbol && push!(names, string(lhs))
+        lhs isa Expr && lhs.head === :tuple && append!(names, [string(a) for a in lhs.args if a isa Symbol])
+    end
+    return unique(names)
+end
+
+calls_text(a::Int, b::Int) = a == b ? "call $(a)" : "calls $(a)–$(b)"
+
+"""
     snapshot_state!(call; waiting = () -> false)
 
 Writes the state at the end of `call` to STATE_DIR, replacing the last
@@ -858,7 +910,7 @@ function revive_state!()
     dir = STATE_DIR[]
     path = joinpath(dir, "manifest.json")
     if isempty(dir) || !isfile(path)
-        previous = !isempty(dir) && isfile(joinpath(dir, "last_call"))
+        previous = !isempty(dir) && (isfile(joinpath(dir, "last_call")) || isfile(joinpath(dir, "started_call")))
         return revival_observation!(; lost=previous ? ["previous live state: no complete snapshot remains"] : String[],
             text=previous ? "[revival] No complete snapshot remains. Prior live state is lost; workspace files remain." : "")
     end
@@ -1145,11 +1197,16 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
         end
     end
 
-    # This kernel continues the old one's call numbers and file tracking.
+    # This kernel continues the old one's call numbers, past calls that
+    # completed after the snapshot or stopped, and its file tracking.
+    last = something(tryparse(Int, strip(read_or_empty(joinpath(dir, "last_call")))), call)
+    stopped = stopped_call(dir, max(call, last))
     hist = state.execution_history
-    while length(hist) < call
+    while length(hist) < max(call, last)
         push!(hist, ExecutionRecord(uuid4(), Dates.now(), "", true, nothing, 0.0))
     end
+    stopped === nothing ||
+        push!(hist, ExecutionRecord(uuid4(), Dates.now(), stopped[2], false, "the kernel stopped during this call", 0.0))
     empty!(DEFINITION_LOG)
     append!(DEFINITION_LOG, m["definitions"])
     for (p, s, c) in m["used_files"]
@@ -1171,10 +1228,14 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
 
     push!(lines, "[revival] The previous kernel stopped. This kernel revived the state saved at the end of call $call" *
                  (data_block === nothing ? "." : "; its data could not be restored because $data_block."))
-    last = tryparse(Int, strip(read_or_empty(joinpath(dir, "last_call"))))
-    last !== nothing && last > call &&
-        push!(lines, "  Call$(last == call + 1 ? " $last" : "s $(call + 1)–$last") completed after this state was saved: " *
+    last > call &&
+        push!(lines, "  $(uppercasefirst(calls_text(call + 1, last))) completed after this state was saved: " *
                      "what $(last == call + 1 ? "it" : "they") changed in the kernel is lost; files written to the workspace remain.")
+    if stopped !== nothing
+        assigned = top_level_names(stopped[2])
+        push!(lines, "  Call $(stopped[1]) was running when the kernel stopped: what it changed in the kernel is lost" *
+                     (isempty(assigned) ? "" : " (it assigns $(join(assigned, ", ")))") * "; files it wrote to the workspace remain.")
+    end
     procs = String.(get(m, "processes", String[]))
     isempty(procs) || push!(lines, "  Background processes stopped with the previous kernel: " *
                                    join(("`$(first(c, 100))`" for c in procs), ", ") * ". Start them again if you need them.")
@@ -1191,6 +1252,7 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                  "Other runtime state starts fresh: random number streams, settings changed inside packages, open handles. " *
                  "Files in the workspace are unchanged.")
     uncertain = copy(approx)
-    last !== nothing && last > call && push!(uncertain, "calls $(call + 1)–$last completed after the saved snapshot")
+    last > call && push!(uncertain, "$(calls_text(call + 1, last)) completed after the saved snapshot")
+    stopped === nothing || push!(uncertain, "call $(stopped[1]) stopped before it completed")
     return revival_observation!(; restored=exact, rebuilt, stale, lost, uncertain, saved_call=call, text=join(lines, "\n"))
 end

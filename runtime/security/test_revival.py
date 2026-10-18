@@ -463,6 +463,7 @@ class RevivalTest(unittest.TestCase):
         out, r = self.revive("(a, b)")
         self.assertEqual(r["data"], [1, 2])
         self.assertIn("Calls 3–5 completed after this state was saved", out)
+        self.assertEqual(r["call"], 6, "the unsaved calls' numbers are not reused")
         self.session("c = 3")
         out, r = self.revive("c")
         self.assertNotIn("completed after this state was saved", out)
@@ -550,10 +551,16 @@ class RevivalTest(unittest.TestCase):
         k.turn("v = [1, 2, 3]; count_ = 1")
         r = k.turn("v[1] = 100; count_ = 2; s = 0; while true; s += 1; end")
         self.assertTrue(r.get("session_dead") or r.get("kernel_exit") or not r["success"], r)
+        # With a state directory the next kernel revives, so the kill must not say everything is gone.
+        self.assertIn("revives what it can of the last saved state", r["error"])
+        self.assertNotIn("Every binding is gone", r["error"])
         k.close()
         out, r = self.revive("(v, count_, @isdefined(s))")
         self.assertIn("end of call 1", out)
+        self.assertIn("Call 2 was running when the kernel stopped", out)
+        self.assertIn("(it assigns count_, s)", out)
         self.assertEqual(r["data"], [[1, 2, 3], 1, False])
+        self.assertEqual(r["call"], 3, "the killed call's number is not reused")
 
     def test_normal_restart_continues_call_numbers_and_revives_again(self):
         self.session("a = 1", "b = 2")

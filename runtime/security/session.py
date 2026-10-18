@@ -98,6 +98,14 @@ def _readline_with_timeout(pipe, timeout: float) -> str:
         sel.close()
 
 
+def after_kernel_stop(revives: bool) -> str:
+    """What a stopped kernel leaves for the next call; the worker says the same when it stops itself."""
+    if revives:
+        return ("The next call starts a new kernel, which revives what it can of the last saved state "
+                "(its report names the call) and says what it could not.")
+    return "Every binding is gone; files written to the workspace remain."
+
+
 class PaletteSession:
     """One persistent, sandboxed Palette worker plus its own broker,
     ceiling, and depot clone -- a real Julia process kept alive across
@@ -134,6 +142,7 @@ class PaletteSession:
         self.project_dir = project_dir
         self.repo_dir = repo_dir
         self.turn_timeout = turn_timeout
+        self._revives = bool(state_dir)
         self.max_turn_timeout = turn_timeout if max_turn_timeout is None else max_turn_timeout
         self._stderr_tail = ""
         self._lock = threading.Lock()
@@ -364,7 +373,7 @@ class PaletteSession:
                 raise SessionTimeoutError(
                     f"The call exceeded its {limit:g}s limit and did not respond to the interrupt: "
                     f"compute that never yields cannot be interrupted, so the kernel was stopped. "
-                    f"Every binding is gone; files written to the workspace remain."
+                    + after_kernel_stop(self._revives)
                 )
             except (BrokenPipeError, OSError) as e:
                 raise SessionDeadError(f"session {self.session_id} pipe broke: {e}") from e
