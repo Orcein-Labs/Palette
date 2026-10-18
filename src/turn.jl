@@ -785,7 +785,9 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
             receipt.result.success || (costs["failed_phase"] = "execution")
             receipt
         end, timeout_s)
-        turn[2] && (costs["failed_phase"] = costs["phase"])
+        # An interrupt that execute() caught leaves its failed receipt and lets
+        # the closure finish, so the phase it already recorded is the one to keep.
+        turn[2] && get!(costs, "failed_phase", costs["phase"])
         refresh_workspace_packages!(reload=false)
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]

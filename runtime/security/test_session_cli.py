@@ -1167,6 +1167,8 @@ class TestSessionCli(unittest.TestCase):
         self.assertNotIn("session_dead", r)
         self.assertIn("before", r["output"])
         self.assertIn("every binding are intact", r["error"])
+        self.assertEqual(r["costs"]["failed_phase"], "execution")
+        self.assertTrue(r["error"].startswith("Interrupted during execution:"), r["error"])
         r = self._turn('(keep, process_running(bg), strip(sh"pgrep -c -x sleep".stdout))')
         self.assertEqual(r["data"], [99, True, "1"])
 
