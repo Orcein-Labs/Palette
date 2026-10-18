@@ -76,7 +76,7 @@ def main():
         'licenses/AGPL-3.0-only.txt':source['LICENSE'],
         'licenses/MIT-INHERITED.txt':inherited,
         'licenses/BOUNDARIES.md':source['runtime/licenses/README.md'],
-        'SOURCE.json':json.dumps({'repository':'https://github.com/latentcollapse/Palette.jl','revision':revision,'plugin_version':version,'runtime':'source; prepare on Linux or WSL2','extra_language_toolchains':False,'sdk_omitted_authoring_manifests':sorted(excluded)},indent=2).encode()+b'\n'
+        'SOURCE.json':json.dumps({'repository':'https://github.com/latentcollapse/Palette','revision':revision,'plugin_version':version,'runtime':'source; prepare on Linux or WSL2','extra_language_toolchains':False,'sdk_omitted_authoring_manifests':sorted(excluded)},indent=2).encode()+b'\n'
     }
     claude={n.removeprefix('runtime/plugins/claude/'):d for n,d in source.items() if n.startswith('runtime/plugins/claude/')}
     claude.update({'LICENSE':license_text,'NOTICE':source['NOTICE'],'MIT-INHERITED.txt':inherited})

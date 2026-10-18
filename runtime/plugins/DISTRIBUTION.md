@@ -11,7 +11,7 @@ a prebuilt host, prepares the sandbox, registers Claude Code, Codex and, on
 Windows, Claude Desktop, and checks one call:
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows run `install.ps1` instead; `sdk/runtime/docs/install.md` gives the
