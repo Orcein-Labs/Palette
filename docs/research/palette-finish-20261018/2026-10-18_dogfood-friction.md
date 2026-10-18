@@ -50,3 +50,20 @@ empty home directory and only Claude Code and Codex on the path.
 The first package install prints nothing for about 150 s while it fetches the
 registry; the elapsed-time line covers it. juliaup's current release, Julia
 1.13.2, installed and ran Palette with no changes.
+
+## Windows end-to-end run
+
+A fresh Windows 11 Pro virtual machine with no WSL ran the one-line
+`install.ps1` against a local copy of the release. The first run enabled the
+WSL platform and asked for a restart. The second installed Ubuntu, created the
+Linux user, installed the sandbox packages as root, downloaded and checked the
+release, installed Julia 1.13.2 with juliaup, prepared the sandbox and passed
+the `1 + 1` call. On this machine's slow virtual disk, the package step took
+about 15 min and sandbox preparation about 7 min. No Claude client was
+installed in the machine, so the Windows registration path is still untested.
+
+| Friction | Status |
+|---|---|
+| After creating the Linux user, `wsl --install` leaves the user at an Ubuntu prompt, and the installer waits behind it with nothing saying so. | Fixed: the installer says to type `exit` at that prompt. |
+| Installing curl inside an existing distribution assumed apt. | Fixed: apt, dnf, pacman or zypper. |
+| `install.sh` printed its Linux closing message, including `rm -rf` removal steps, before the Windows one. | Fixed: under `install.ps1` only the Windows next steps print. |
