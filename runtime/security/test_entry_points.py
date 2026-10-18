@@ -6,7 +6,11 @@ production entry point may reach them, so a change made only to the Python
 twin can never be what a deployment runs.
 """
 import ast
+import json
+import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -56,6 +60,31 @@ class ProductionEntryPointsTest(unittest.TestCase):
             with self.subTest(entry=entry):
                 text = (HERE / f"{entry}.py").read_text(encoding="utf-8")
                 self.assertIn("runtime/host/target/release/palette-host", text)
+
+
+class PrivateInstanceTest(unittest.TestCase):
+    def test_a_private_data_home_gets_its_own_package_store(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo, data = Path(root, "repo"), Path(root, "data")
+            router = repo / "runtime/security/operator_workspace_router.py"
+            host = repo / "runtime/host/target/release/palette-host"
+            for path in (router, host):
+                path.parent.mkdir(parents=True)
+            for name in ("Project.toml", "Manifest.toml"):
+                (repo / name).write_text("")
+            router.write_text("import json, os\nprint(json.dumps({k: v for k, v in os.environ.items() if k.startswith(('PALETTE_', 'OPERATOR_'))}))\n")
+            host.write_text("")
+            host.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("PALETTE_", "OPERATOR_"))}
+            env.update(PALETTE_REPO=str(repo), PALETTE_DATA_HOME=str(data))
+            out = subprocess.run([sys.executable, str(HERE / "serve_palette.py")], env=env, stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, check=True).stdout
+            seen = json.loads(out)
+            self.assertEqual(seen["PALETTE_PACKAGE_DEPOT"], str(data.resolve() / "packages"))
+            env["PALETTE_PACKAGE_DEPOT"] = "/srv/shared-packages"
+            out = subprocess.run([sys.executable, str(HERE / "serve_palette.py")], env=env, stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, check=True).stdout
+            self.assertEqual(json.loads(out)["PALETTE_PACKAGE_DEPOT"], "/srv/shared-packages")
 
 
 if __name__ == "__main__":
