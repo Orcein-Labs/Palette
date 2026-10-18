@@ -61,6 +61,12 @@ class ProductionEntryPointsTest(unittest.TestCase):
                 text = (HERE / f"{entry}.py").read_text(encoding="utf-8")
                 self.assertIn("runtime/host/target/release/palette-host", text)
 
+    def test_every_part_reports_one_version(self):
+        import tomllib
+        from provisioning import palette_version
+        host = tomllib.loads((HERE.parent / "host/Cargo.toml").read_text())["package"]["version"]
+        self.assertEqual(palette_version(HERE.parents[1]), host)
+
 
 class PrivateInstanceTest(unittest.TestCase):
     def test_a_private_data_home_gets_its_own_package_store(self):

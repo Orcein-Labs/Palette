@@ -15,7 +15,7 @@ import uuid
 from source_transport import call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
 from prewarm_depot import error_summary, prepare, preparation_identity, preparation_status, resolve_real_julia_binary
-from provisioning import operator_ceiling, protected_host_paths
+from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
 from patch_broker import PatchBroker, approval_mode
 from repair_broker import RepairBroker
@@ -404,7 +404,7 @@ def main():
                     continue
                 if method == "initialize":
                     result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
-                              "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.2.0"}}
+                              "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/list":
