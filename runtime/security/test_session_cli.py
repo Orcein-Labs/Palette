@@ -964,7 +964,9 @@ class TestSessionCli(unittest.TestCase):
                 recovered = call("palette", {"code": '(n,read("after-death.txt",String))'})
                 self.assertEqual(recovered["data"], [43, "file survived"])
                 self.assertNotEqual(recovered["epoch"], saved["epoch"])
-                self.assertEqual(recovered["session"]["restoration"], "restored")
+                # The call that exited was running when the kernel stopped; its n=999 is lost, so the revival is partial.
+                self.assertEqual(recovered["session"]["restoration"], "partially_restored")
+                self.assertIn("was running when the kernel stopped", recovered["output"])
                 self.assertIn("previous_connection_failure", recovered["session"])
                 self.assertIn("unknown", recovered["session"]["recovery_warning"])
                 clean = call("palette_control", {"action": "restart", "restore": False})
