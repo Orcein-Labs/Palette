@@ -26,6 +26,7 @@ using UUIDs
 using Sockets
 using JSON
 using SHA
+using PrecompileTools: @compile_workload
 using Base.CoreLogging: AbstractLogger, with_logger, current_logger
 using Statistics: mean as stdlib_mean
 
@@ -1925,6 +1926,7 @@ include("provenance.jl")
 include("digest.jl")
 include("workspace_map.jl")
 include("stress.jl")
+include("session_requests.jl")
 include("precompile_workload.jl")
 
 export KernelState, ExecutionRecord

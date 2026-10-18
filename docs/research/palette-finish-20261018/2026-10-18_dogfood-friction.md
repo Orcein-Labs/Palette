@@ -90,3 +90,21 @@ session, and to prewarm (4.4 min).
 | One job ran every suite in turn. | Fixed: four shards. Each took 17 to 23 min without a cache. |
 | Every shard prepared the package depot from nothing. | Fixed: shard 1 saves the prewarmed depot to the Actions cache, and every shard restores it. Shards then took 7 to 9 min, except shard 1 at 15.5 min. |
 | Shard 1 also runs the shared gates (Julia and Rust unit tests, test policy), which took its gates step to 14 min against 6 to 7 min on the others. | Fixed: `verify_operator.py` deals test cases across the shards by their recorded seconds (`test-case-seconds.json`, refreshed from CI logs by `record-test-case-seconds.py`), with shard 1 starting 90 s behind. The recorded test time per Rust shard is now about 500 s, against 740 s on the old shard 1. The gate (under 15 min, green on 10 consecutive runs) is measured after the next push. |
+
+## A6: cold and warm cost
+
+Measured on this machine with one session per host, timing from launch to the
+HELLO line and then eight calls (`1 + 1` first). MP-12 already reports the
+first call's costs apart from warm calls in `status` and receipts.
+
+| Stage | Session ready (HELLO) | First call | Warm calls (median) |
+|---|---|---|---|
+| Start of A6 | about 8 s | 1.3 s | 3 to 5 ms |
+| Overlay depots | 3.9 to 4.3 s | 1.31 to 1.37 s | 3 to 5 ms |
+| Request loop in the package image | 2.85 to 2.86 s (Rust host), 3.7 to 4.1 s (Python host) | 0.26 to 0.30 s | 3 to 4 ms |
+
+| Friction | Status |
+|---|---|
+| Each session copied the whole package depot before Julia started, about 4 s of the 8 s. | Fixed: the session depot is a kernel overlay of the snapshot, so nothing is copied. Hosts fall back to a copy when bwrap is older than 0.8 or the kernel refuses unprivileged overlays. |
+| The first call compiled the session loop's request handling, about 1.1 s, because script code is not in a package image. | Fixed: request handling moved into the package (`Palette.serve_requests`), and the precompile workload runs it through a pipe as the worker does. The second call still takes about 0.21 s, mostly the first state snapshot. |
+| About 2.3 s remains between Julia starting and HELLO; loading Palette itself takes 0.26 s. | Open, below the Speed gate (cold start well under 11 s). |
