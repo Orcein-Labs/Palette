@@ -728,6 +728,7 @@ request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...)
     Palette.request_capability(category, params; kwargs...)
 host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette.host_command(name, args...; kwargs...)
 host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
+host_command_wait(job::AbstractString; kw...) = Palette.host_command_wait(job; kw...)
 host_command_cancel(job::AbstractString) = Palette.host_command_cancel(job)
 host_jobs(; kwargs...) = Palette.host_jobs(; kwargs...)
 host_commands(; kwargs...) = Palette.host_commands(; kwargs...)
@@ -1811,9 +1812,23 @@ function host_command_request(params::Dict{String,Any}, what::String; timeout_s:
     return resp["result"]
 end
 
+# The broker forgets a job once a poll returns its result, so the kernel keeps
+# the last few results: a second poll of a finished job (a wait loop's own
+# poll took the result) returns the same result instead of an error.
+const HOST_JOB_RESULTS = Dict{String, Dict{String,Any}}()
+const HOST_JOB_RESULT_ORDER = String[]
+const HOST_JOB_RESULTS_KEPT = 16
+
 function host_job_request(action::String, job::AbstractString)
-    result = host_command_request(Dict{String,Any}("action" => action, "job" => String(job)), "host_command $action")
-    get(result, "running", false) === true || delete!(HOST_JOBS, String(job))
+    id = String(job)
+    action == "poll" && haskey(HOST_JOB_RESULTS, id) && return HOST_JOB_RESULTS[id]
+    result = host_command_request(Dict{String,Any}("action" => action, "job" => id), "host_command $action")
+    if get(result, "running", false) !== true
+        delete!(HOST_JOBS, id)
+        HOST_JOB_RESULTS[id] = result
+        push!(HOST_JOB_RESULT_ORDER, id)
+        length(HOST_JOB_RESULT_ORDER) > HOST_JOB_RESULTS_KEPT && delete!(HOST_JOB_RESULTS, popfirst!(HOST_JOB_RESULT_ORDER))
+    end
     return result
 end
 
@@ -1823,8 +1838,33 @@ end
 For a `host_command(...; wait=false)` job: while it runs, `running => true`
 with the `stdout` and `stderr` it wrote since the last poll; once it has
 finished, its result, holding only output no earlier poll returned.
+Polling a finished job again returns the same result (the kernel keeps the
+last 16). `host_command_wait` blocks until the job finishes.
 """
 host_command_poll(job::AbstractString) = host_job_request("poll", job)
+
+"""
+    Palette.host_command_wait(job; timeout_s=nothing, interval_s=5) -> Dict
+
+Block until a `host_command(...; wait=false)` job finishes and return its
+result, with all the output no earlier poll returned. Returns the running
+poll (`running => true`) if `timeout_s` passes first; the job keeps running.
+Waiting counts against the call's own deadline, so give the call one longer
+than the wait.
+"""
+function host_command_wait(job::AbstractString; timeout_s::Union{Nothing,Real}=nothing, interval_s::Real=5)
+    id = String(job)
+    haskey(HOST_JOB_RESULTS, id) && return HOST_JOB_RESULTS[id]
+    t0 = time()
+    while true
+        # Listing does not consume output, so the result keeps all of it.
+        held = [j for j in host_jobs(; timeout_s=60) if string(j["job"]) == id]
+        isempty(held) && return host_job_request("poll", id)  # error names the missing job
+        held[1]["running"] === true || return host_job_request("poll", id)
+        timeout_s !== nothing && time() - t0 >= timeout_s && return host_job_request("poll", id)
+        sleep(interval_s)
+    end
+end
 
 """
     Palette.host_command_cancel(job) -> Dict
@@ -1933,7 +1973,7 @@ export KernelState, ExecutionRecord
 export get_kernel_state, reset_kernel_state
 export OperatorType, OperatorVocabulary
 export CODE_EXECUTION_VOCAB, OPERATOR_INVOCATION_VOCAB, STATE_QUERY_VOCAB
-export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_cancel, host_jobs, host_commands
+export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_wait, host_command_cancel, host_jobs, host_commands
 export EphemeralTool, EphemeralToolViolation, check_ephemeral_source!, record_tool_capsule
 export register_operator!
 export OperationResult, StructuredResponse

@@ -236,6 +236,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         for bad in (0, -1, 1e6, True, "5"):
             refused = self.call("palette", {"code":"1", "timeout_s":bad}, error=True)
             self.assertIn("Invalid timeout_s", refused["error"])
+        self.assertIn("must be a number in (0, ", refused["error"])
         unknown = self.call("palette_workspace", {
             "action":"create", "workspace_id":"unknown-root", "scope":"open", "project_root_id":"/tmp",
         }, error=True)
