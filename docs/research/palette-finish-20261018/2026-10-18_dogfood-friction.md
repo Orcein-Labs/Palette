@@ -108,3 +108,15 @@ first call's costs apart from warm calls in `status` and receipts.
 | Each session copied the whole package depot before Julia started, about 4 s of the 8 s. | Fixed: the session depot is a kernel overlay of the snapshot, so nothing is copied. Hosts fall back to a copy when bwrap is older than 0.8 or the kernel refuses unprivileged overlays. |
 | The first call compiled the session loop's request handling, about 1.1 s, because script code is not in a package image. | Fixed: request handling moved into the package (`Palette.serve_requests`), and the precompile workload runs it through a pipe as the worker does. The second call still takes about 0.21 s, mostly the first state snapshot. |
 | About 2.3 s remains between Julia starting and HELLO; loading Palette itself takes 0.26 s. | Open, below the Speed gate (cold start well under 11 s). |
+
+## Phase A exit: Luxel L-10 through Palette
+
+A private Palette instance with Luxel host commands (git, cargo, Julia under
+the GPU lock, the presented-fps bench and the identity check) carries the
+quality-preset work. Source edits go through the client's edit tool; every
+build, test, render and git step goes through Palette.
+
+| Friction | Status |
+|---|---|
+| Luxel could not be both a writable project root and the directory its host commands run in. The refusal named only `/mnt/d/Code Projects` as the overlap, not why it was protected. | The refusal is right: a kernel that could write a host command's directory could change what the host runs, such as a `build.rs`. Fixed: the error names the project root, says why command directories are protected, and points to `PALETTE_READ_ROOTS`. |
+| A default workspace directory that did not exist failed the first call with `FileNotFoundError`, after start-up had succeeded. | Fixed: the router creates it once the layout checks pass. |
