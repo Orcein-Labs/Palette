@@ -398,7 +398,14 @@ def workspace_control(args):
             workspaces = [default_entry()] + [e for e in entries if visible(e, context)]
             roots = [{"project_root_id": identifier, "workspace_dir": str(path)}
                      for identifier, path in sorted(PROJECT_ROOTS.items())]
-            return {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
+            listing = {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
+            # Counted, not named: another context's threads stay out of this listing.
+            others = sum(e["scope"] == "thread" and not visible(e, context) for e in entries)
+            if others:
+                listing["other_thread_workspaces"] = others
+                listing["note"] = (f"{others} thread workspace(s) belong to other context_id values and are not listed; "
+                                   "list again with the context_id that created one to see it.")
+            return listing
     entry = resolve(args)
     if action == "attach":
         if not context or not args.get("workspace_id"):
