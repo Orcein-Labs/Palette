@@ -27,7 +27,7 @@ from filesystem_layout import require_disjoint
 from provisioning import operator_ceiling, protected_host_paths
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
 from generation_runtime import GenerationStore
-from source_transport import normalize_palette_call
+from source_transport import call_limit, normalize_palette_call, timeout_schema, turn_limits
 
 REPO = Path(os.environ.get("PALETTE_REPO", Path(__file__).absolute().parents[2])).resolve()
 BASE = Path(os.environ["OPERATOR_WORKSPACE"]).resolve()
@@ -39,6 +39,7 @@ generation_lock = threading.RLock()
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_LIVE = int(os.environ.get("PALETTE_MAX_LIVE_WORKSPACES", "4"))
 IDLE_SECONDS = float(os.environ.get("PALETTE_WORKSPACE_IDLE_SECONDS", "900"))
+TURN_LIMITS = turn_limits()
 if MAX_LIVE < 1 or IDLE_SECONDS <= 0:
     raise ValueError("Workspace limits must be positive")
 require_disjoint([BASE], [REPO, ROOT, LEGACY, LEGACY_RECEIPTS, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
@@ -256,7 +257,8 @@ class Child:
         rid = uuid.uuid4().hex
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
         self.proc.stdin.flush()
-        deadline = time.monotonic() + 210
+        # A start, its preparation and the call, whose own limit the child enforces.
+        deadline = time.monotonic() + 150 + call_limit(params.get("arguments", {}), TURN_LIMITS)
         while True:
             frame = self.frames.get(timeout=max(0.001, deadline - time.monotonic()))
             if isinstance(frame, Exception):
@@ -480,13 +482,13 @@ def text_result(value, error=False):
 
 
 # Reuse the proven adapter schemas without importing its process-owning globals.
-PALETTE_SCHEMA = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]}, "ephemeral": {"type": "boolean"}}, "required": [], "additionalProperties": False}
+PALETTE_SCHEMA = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]}, "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "required": [], "additionalProperties": False}
 CONTROL_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "generation_status", "activate_generation"]}, "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "generation_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
 WORKSPACE_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]}, "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
 for schema in (PALETTE_SCHEMA, CONTROL_SCHEMA, WORKSPACE_SCHEMA, PATCH_SCHEMA):
     schema["properties"].update(workspace_id={"type": "string", "maxLength": 64}, context_id={"type": "string", "maxLength": 256})
 TOOLS = [{"name": name, "description": description, "inputSchema": schema, "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}} for name, description, schema in [
-    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics.", PALETTE_SCHEMA),
+    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. timeout_s sets this call's time limit; Palette.host_command(name; wait=false) runs longer host work as a job.", PALETTE_SCHEMA),
     ("palette_control", "Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot.", CONTROL_SCHEMA),
     ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.", WORKSPACE_SCHEMA),
     ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.", PATCH_SCHEMA)]]
@@ -503,6 +505,9 @@ def validate(args, schema):
         if kind == "string" and (not isinstance(value, str) or not value or len(value) > spec.get("maxLength", 1048576)):
             raise ValueError("Invalid " + key)
         if kind == "boolean" and not isinstance(value, bool):
+            raise ValueError("Invalid " + key)
+        if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                 or not spec.get("exclusiveMinimum", float("-inf")) < value <= spec.get("maximum", float("inf"))):
             raise ValueError("Invalid " + key)
 
 

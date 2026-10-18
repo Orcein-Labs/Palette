@@ -727,6 +727,8 @@ request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...)
     Palette.request_capability(category, params; kwargs...)
 host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette.host_command(name, args...; kwargs...)
 host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
+host_command_cancel(job::AbstractString) = Palette.host_command_cancel(job)
+host_jobs(; kwargs...) = Palette.host_jobs(; kwargs...)
 fs_digest(paths::Vector{String}) = Palette.fs_digest(paths)
 reloads() = deepcopy(Palette.RELOAD_REPORTS)
 revival() = deepcopy(Palette.REVIVAL_OBSERVATION[])
@@ -834,13 +836,16 @@ function kernelinfo()
     end
     loaded = sort!([String(nameof(m)) for m in values(Base.loaded_modules) if String(nameof(m)) in deps])
     timeout = get(ENV, "PALETTE_TURN_TIMEOUT", "")
+    max_timeout = get(ENV, "PALETTE_MAX_TURN_TIMEOUT", timeout)
+    limit = isempty(timeout) ? "set by the host" :
+        max_timeout == timeout ? timeout * "s per call" : timeout * "s per call; a call may ask for up to " * max_timeout * "s (timeout_s)"
     offline = get(ENV, "JULIA_PKG_OFFLINE", "") == "true"
     nbind = length(varinfo(mod).rows)
     println("""
         Palette kernel: Julia $(VERSION), $(Threads.nthreads()) thread(s), $(nbind) binding(s), $(Base.format_bytes(Base.gc_live_bytes())) live
         workspace  $(pwd()) (read/write; files outlive the kernel)
         persists   bindings, functions, types and loaded packages, until the kernel stops
-        time limit $(isempty(timeout) ? "set by the host" : timeout * "s") per call. Waiting work (sleep, run, read, I/O) is interrupted and the kernel keeps its state;
+        time limit $(limit). Waiting work (sleep, run, read, I/O) is interrupted and the kernel keeps its state;
                    compute that never yields cannot be interrupted, so the kernel stops and its bindings are lost
         network    $(offline ? "none; Pkg.add cannot install packages" : "available")
         packages   loadable: Julia stdlib, $(join(deps, ", "))
@@ -1758,42 +1763,81 @@ function fs_digest(paths::Vector{String})
 end
 
 """
-    Palette.host_command(name, args...; wait=true, timeout_s=14460) -> Dict
+    Palette.host_command(name, args...; wait=true, timeout_s=nothing) -> Dict
 
 Run a command the operator named in this session's ceiling, on the host,
 outside the sandbox: the way a kernel reaches a GPU, a renderer or a build
 it cannot run itself. The ceiling fixes the command's program, working
-directory and timeout; `args` are passed only to a command whose ceiling
-entry sets `extra_args`. Never a shell. Broker-side ceiling shape:
+directory and timeout; `timeout_s` may shorten that timeout for this call,
+never extend it. `args` are passed only to a command whose ceiling entry
+sets `extra_args`. Never a shell. Broker-side ceiling shape:
 `{"host_command": {"commands": {"render": {"argv": ["/abs/prog", ...],
 "cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`.
 
 With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
-KiB), `timed_out` and `seconds`. With `wait=false` returns at once with a
-`job` id, for work longer than a turn; `host_command_poll(job)` returns
-`running => true` until the result.
+KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
+`cancelled` and `seconds`. With `wait=false` returns at once with a `job`
+id, for work longer than a turn: `host_command_poll(job)` returns the
+output since the last poll while it runs, then the result;
+`host_command_cancel(job)` kills it; `host_jobs()` lists the jobs held.
 """
-function host_command(name::AbstractString, args::AbstractString...; wait::Bool=true, timeout_s::Real=14460.0)
+function host_command(name::AbstractString, args::AbstractString...; wait::Bool=true,
+                      timeout_s::Union{Nothing,Real}=nothing)
     params = Dict{String,Any}("name" => String(name), "args" => collect(String, args),
                               "action" => wait ? "run" : "start")
+    timeout_s === nothing || (params["timeout_s"] = Float64(timeout_s))
+    # The broker enforces the command's deadline; this wait only has to
+    # outlast it (14400 s is the most a ceiling may set).
+    result = host_command_request(params, "host_command $(repr(name))";
+                                  timeout_s=(timeout_s === nothing ? 14400.0 : Float64(timeout_s)) + 60.0)
+    wait || (HOST_JOBS[result["job"]] = String(name))
+    return result
+end
+
+# Jobs this kernel started and has not seen finish, id => command name, for
+# the turn's jobs line. The broker holds the jobs themselves; a revived
+# kernel starts with this empty, and host_jobs() still lists them.
+const HOST_JOBS = Dict{String, String}()
+
+function host_command_request(params::Dict{String,Any}, what::String; timeout_s::Real=320.0)
     resp = request_capability("host_command", params; timeout_s)
     get(resp, "approved", false) === true ||
-        error("host_command $(repr(name)) was not allowed: $(get(resp, "reason", "no reason given"))")
+        error("$what was not allowed: $(get(resp, "reason", "no reason given"))")
     return resp["result"]
+end
+
+function host_job_request(action::String, job::AbstractString)
+    result = host_command_request(Dict{String,Any}("action" => action, "job" => String(job)), "host_command $action")
+    get(result, "running", false) === true || delete!(HOST_JOBS, String(job))
+    return result
 end
 
 """
     Palette.host_command_poll(job) -> Dict
 
-The result of a `host_command(...; wait=false)` job once it has finished,
-or `running => true` while it runs.
+For a `host_command(...; wait=false)` job: while it runs, `running => true`
+with the `stdout` and `stderr` it wrote since the last poll; once it has
+finished, its result, holding only output no earlier poll returned.
 """
-function host_command_poll(job::AbstractString)
-    resp = request_capability("host_command", Dict{String,Any}("action" => "poll", "job" => String(job)))
-    get(resp, "approved", false) === true ||
-        error("host_command poll was not allowed: $(get(resp, "reason", "no reason given"))")
-    return resp["result"]
-end
+host_command_poll(job::AbstractString) = host_job_request("poll", job)
+
+"""
+    Palette.host_command_cancel(job) -> Dict
+
+Kill a `host_command(...; wait=false)` job's whole process group and return
+its result. `cancelled` is false when the job had already finished.
+"""
+host_command_cancel(job::AbstractString) = host_job_request("cancel", job)
+
+"""
+    Palette.host_jobs(; timeout_s=320) -> Vector
+
+The host_command jobs this session holds, longest-running first, each with
+`job`, `name`, `running` and `seconds`. A finished job stays listed until
+`host_command_poll` returns its result.
+"""
+host_jobs(; timeout_s::Real=320.0) =
+    host_command_request(Dict{String,Any}("action" => "list"), "host_command list"; timeout_s)["jobs"]
 
 #==============================================================================
 PHASE 10: Integration Demo Helpers
@@ -1873,7 +1917,7 @@ export KernelState, ExecutionRecord
 export get_kernel_state, reset_kernel_state
 export OperatorType, OperatorVocabulary
 export CODE_EXECUTION_VOCAB, OPERATOR_INVOCATION_VOCAB, STATE_QUERY_VOCAB
-export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll
+export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_cancel, host_jobs
 export EphemeralTool, EphemeralToolViolation, check_ephemeral_source!, record_tool_capsule
 export register_operator!
 export OperationResult, StructuredResponse

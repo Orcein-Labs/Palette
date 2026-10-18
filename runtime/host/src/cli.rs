@@ -26,6 +26,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The longest --max-turn-timeout this host takes (7 days); the Python host
+/// and launchers share it as source_transport.LONGEST_TURN_TIMEOUT.
+const LONGEST_TURN_TIMEOUT: f64 = 604800.0;
+
 static OUT: Mutex<()> = Mutex::new(());
 
 /// Responses (main thread) and host-request events (broker threads) share
@@ -38,7 +42,8 @@ fn respond(v: &Value) {
 }
 
 struct Bridge {
-    timeout: Duration,
+    /// Set for each call from its limit.
+    timeout: Mutex<Duration>,
     pending: Mutex<HashMap<String, Sender<Value>>>,
     closed: AtomicBool,
 }
@@ -58,8 +63,9 @@ impl Bridge {
         let mut data = payload.as_object().cloned().unwrap_or_default();
         data.insert("type".into(), json!(rtype));
         respond(&json!({"event": "host_request", "id": rid, "data": data}));
-        let reply = rx.recv_timeout(self.timeout).unwrap_or_else(|_| {
-            json!({"status": "error", "error": format!("the agent host did not answer '{rtype}' within {}s", util::fmt_g(self.timeout.as_secs_f64()))})
+        let timeout = *self.timeout.lock().unwrap();
+        let reply = rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            json!({"status": "error", "error": format!("the agent host did not answer '{rtype}' within {}s", util::fmt_g(timeout.as_secs_f64()))})
         });
         self.pending.lock().unwrap().remove(&rid);
         reply
@@ -93,6 +99,7 @@ struct Args {
     ceiling: String,
     network: bool,
     turn_timeout: f64,
+    max_turn_timeout: Option<f64>,
     startup_timeout: f64,
     workspace_dir: Option<String>,
     state_dir: Option<String>,
@@ -102,7 +109,7 @@ struct Args {
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut a = Args { project_dir: String::new(), repo_dir: None, ceiling: "{}".into(), network: false,
-                       turn_timeout: 60.0, startup_timeout: 180.0, workspace_dir: None, state_dir: None, receipts_dir: None, scratch_root: None };
+                       turn_timeout: 60.0, max_turn_timeout: None, startup_timeout: 180.0, workspace_dir: None, state_dir: None, receipts_dir: None, scratch_root: None };
     let mut i = 0;
     let val = |i: &mut usize| -> Result<String, String> {
         *i += 1;
@@ -115,6 +122,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--ceiling" => a.ceiling = val(&mut i)?,
             "--network" => a.network = true,
             "--turn-timeout" => a.turn_timeout = val(&mut i)?.parse().map_err(|e| format!("--turn-timeout: {e}"))?,
+            "--max-turn-timeout" => a.max_turn_timeout = Some(val(&mut i)?.parse().map_err(|e| format!("--max-turn-timeout: {e}"))?),
             "--startup-timeout" => a.startup_timeout = val(&mut i)?.parse().map_err(|e| format!("--startup-timeout: {e}"))?,
             "--workspace-dir" => a.workspace_dir = Some(val(&mut i)?),
             "--state-dir" => a.state_dir = Some(val(&mut i)?),
@@ -126,6 +134,11 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     if a.project_dir.is_empty() {
         return Err("--project-dir is required".into());
+    }
+    let max_turn_timeout = a.max_turn_timeout.unwrap_or(a.turn_timeout);
+    if !(a.turn_timeout > 0.0 && a.turn_timeout <= max_turn_timeout && max_turn_timeout <= LONGEST_TURN_TIMEOUT) {
+        return Err(format!("--turn-timeout must be positive and no more than --max-turn-timeout, \
+                            which is at most {LONGEST_TURN_TIMEOUT} (7 days)"));
     }
     if a.repo_dir.is_none() {
         a.repo_dir = Some(default_repo_dir()?);
@@ -225,6 +238,7 @@ pub fn main(argv: &[String]) -> i32 {
     }
 
     let turn_timeout = args.turn_timeout;
+    let max_turn_timeout = args.max_turn_timeout.unwrap_or(turn_timeout);
     let session = PaletteSession::start(SessionOptions {
         project_dir: args.project_dir.clone(),
         repo_dir: args.repo_dir.clone().unwrap_or_default(),
@@ -234,6 +248,7 @@ pub fn main(argv: &[String]) -> i32 {
         receipts_dir: args.receipts_dir.clone(),
         scratch_root: args.scratch_root.clone(),
         turn_timeout,
+        max_turn_timeout,
         task_workspace_dir: args.workspace_dir.clone(),
         startup_timeout: args.startup_timeout,
         state_dir,
@@ -246,10 +261,8 @@ pub fn main(argv: &[String]) -> i32 {
         }
     };
 
-    // A host request must be answered or given up on before the call itself
-    // times out, so the kernel gets an error rather than being killed.
     let bridge = Arc::new(Bridge {
-        timeout: Duration::from_secs_f64((turn_timeout - 5.0).max(1.0)),
+        timeout: Mutex::new(bridge_timeout(turn_timeout)),
         pending: Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
     });
@@ -312,13 +325,34 @@ pub fn main(argv: &[String]) -> i32 {
             respond(&json!({"request_id": request_id, "success": false, "data": null, "error": "request 'code' must be a string"}));
             continue;
         };
+        let limit = match req.get("timeout_s").filter(|v| !v.is_null()) {
+            None => turn_timeout,
+            Some(v) => match v.as_f64().filter(|&t| t > 0.0 && t <= max_turn_timeout) {
+                Some(t) => t,
+                None => {
+                    respond(&json!({"request_id": request_id, "success": false, "data": null,
+                                    "error": format!("request 'timeout_s' must be a number in (0, {}], this host's --max-turn-timeout",
+                                                     util::fmt_g(max_turn_timeout))}));
+                    continue;
+                }
+            },
+        };
+        let ephemeral = req.get("ephemeral").is_some_and(truthy);
+        if ephemeral && req.get("timeout_s").is_some_and(|v| !v.is_null()) {
+            respond(&json!({"request_id": request_id, "success": false, "data": null,
+                            "error": "request 'timeout_s' does not apply to an ephemeral call: its broker child \
+                                      is bounded by the session's --turn-timeout"}));
+            continue;
+        }
+        *bridge.timeout.lock().unwrap() = bridge_timeout(limit);
         let result = session.turn(Turn {
             code,
-            ephemeral: req.get("ephemeral").is_some_and(truthy),
+            ephemeral,
             ephemeral_ceiling: req.get("ceiling").filter(|c| !c.is_null()).cloned(),
             payload: payload(req.get("payload")),
             include_map: req.get("map") == Some(&Value::Bool(true)),
             digest: req.get("digest") != Some(&Value::Bool(false)),
+            timeout_s: Some(limit),
         });
         if stop.load(Ordering::SeqCst) {
             break; // shutting down: no reply, as for any process killed mid-call
@@ -355,6 +389,12 @@ pub fn main(argv: &[String]) -> i32 {
     session.close();
     let sig = signum.load(Ordering::SeqCst);
     if sig != 0 { 128 + sig } else { 0 }
+}
+
+/// A host request must be answered or given up on before the call itself
+/// times out, so the kernel gets an error rather than being killed.
+fn bridge_timeout(limit: f64) -> Duration {
+    Duration::from_secs_f64((limit - 5.0).max(1.0))
 }
 
 fn truthy(v: &Value) -> bool {

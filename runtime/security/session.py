@@ -113,6 +113,7 @@ class PaletteSession:
         network_enabled: bool = False,
         receipts_dir: str | None = None,
         turn_timeout: float = 60.0,
+        max_turn_timeout: float | None = None,
         task_workspace_dir: str | None = None,
         startup_timeout: float = 180.0,
         state_dir: str | None = None,
@@ -133,6 +134,7 @@ class PaletteSession:
         self.project_dir = project_dir
         self.repo_dir = repo_dir
         self.turn_timeout = turn_timeout
+        self.max_turn_timeout = turn_timeout if max_turn_timeout is None else max_turn_timeout
         self._stderr_tail = ""
         self._lock = threading.Lock()
         self._closed = False
@@ -241,6 +243,7 @@ class PaletteSession:
             argv += ["--setenv", "PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette"]
             # kernelinfo() reports the limit a call runs under.
             argv += ["--setenv", "PALETTE_TURN_TIMEOUT", f"{turn_timeout:g}"]
+            argv += ["--setenv", "PALETTE_MAX_TURN_TIMEOUT", f"{self.max_turn_timeout:g}"]
             # The sandbox starts with a clear environment; the limits on saved
             # state pass through when the host sets them (src/revival.jl).
             for name in ("PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES"):
@@ -289,7 +292,7 @@ class PaletteSession:
 
     def turn(self, code: str, *, ephemeral: bool = False, ephemeral_ceiling: dict | None = None,
              payload: str | dict[str, str] | None = None, include_map: bool = False,
-             digest: bool = True) -> dict:
+             digest: bool = True, timeout_s: float | None = None) -> dict:
         """Send one script to the persistent worker and block for its one
         response. Raises SessionDeadError if the process is gone -- never
         silently relaunches; a new process would mean a new epoch, i.e. a
@@ -309,11 +312,17 @@ class PaletteSession:
         string syntax, or named texts (`{"old": ..., "new": ...}`) that the
         turn reads as `PAYLOAD["old"]`.
 
-        The worker enforces `turn_timeout` itself: it interrupts a turn that
+        `timeout_s` is this call's limit, `turn_timeout` when None or the
+        call is ephemeral; the caller keeps it within `max_turn_timeout`.
+
+        The worker enforces the limit itself: it interrupts a turn that
         is waiting (sleep, a subprocess, I/O) and keeps the kernel. This call
         waits `HARD_TIMEOUT_MARGIN_S` longer before killing the worker, which
         only compute that never yields should reach.
         """
+        # A scratch call's broker child is bounded by the session default, so
+        # it never runs under a different limit.
+        limit = self.turn_timeout if timeout_s is None or ephemeral else timeout_s
         with self._lock:
             if self._closed:
                 raise SessionDeadError(f"session {self.session_id} was explicitly closed")
@@ -325,7 +334,7 @@ class PaletteSession:
             self._next_request_id += 1
             request_id = str(self._next_request_id)
             req = {"request_id": request_id, "kind": "EPHEMERAL" if ephemeral else "EXECUTE", "code": code,
-                   "timeout_s": self.turn_timeout}
+                   "timeout_s": limit}
             if ephemeral and ephemeral_ceiling is not None:
                 req["ceiling"] = ephemeral_ceiling
             if payload is not None:
@@ -337,7 +346,7 @@ class PaletteSession:
             try:
                 self._proc.stdin.write(json.dumps(req) + "\n")
                 self._proc.stdin.flush()
-                line = _readline_with_timeout(self._proc.stdout, self.turn_timeout + HARD_TIMEOUT_MARGIN_S)
+                line = _readline_with_timeout(self._proc.stdout, limit + HARD_TIMEOUT_MARGIN_S)
             except TimeoutError:
                 # TimeoutError IS-A OSError in Python's builtin hierarchy --
                 # this branch must come before the (BrokenPipeError, OSError)
@@ -353,7 +362,7 @@ class PaletteSession:
                 self._proc.kill()
                 self._proc.wait()
                 raise SessionTimeoutError(
-                    f"The call exceeded its {self.turn_timeout:g}s limit and did not respond to the interrupt: "
+                    f"The call exceeded its {limit:g}s limit and did not respond to the interrupt: "
                     f"compute that never yields cannot be interrupted, so the kernel was stopped. "
                     f"Every binding is gone; files written to the workspace remain."
                 )

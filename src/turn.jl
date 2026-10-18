@@ -424,6 +424,37 @@ fmt_age(s) = s < 60 ? "$(round(Int, s))s" : s < 3600 ? "$(round(Int, s / 60))m" 
 
 # One line on the session's background work, when it changed since the last:
 # what runs, and what finished and waits to be collected.
+# host_command jobs this kernel started, by asking the broker only while
+# there are some: a job that finished is named once, with the poll that
+# returns its result.
+const HOST_FINISH_REPORTED = Set{String}()
+function report_host_jobs!(running::Vector{String}, finished::Vector{String})
+    isempty(HOST_JOBS) && return
+    # The line runs before the call's code and outside its deadline, so a
+    # broker slow to answer skips it rather than holding up the call.
+    listed = try
+        host_jobs(; timeout_s=10)
+    catch e
+        push!(running, "host jobs (listing them failed: $(sprint(showerror, e)))")
+        return
+    end
+    held = Set{String}()
+    for j in listed
+        id = string(j["job"]); haskey(HOST_JOBS, id) || continue
+        push!(held, id)
+        if j["running"] === true
+            push!(running, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\"))")
+        elseif !(id in HOST_FINISH_REPORTED)
+            push!(HOST_FINISH_REPORTED, id)
+            push!(finished, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\") returns its result)")
+        end
+    end
+    # Jobs the broker no longer holds (its session restarted) are gone.
+    for id in collect(keys(HOST_JOBS))
+        id in held || (delete!(HOST_JOBS, id); delete!(HOST_FINISH_REPORTED, id))
+    end
+end
+
 function report_jobs(mod::Module)
     running = String[]; finished = String[]
     for (t, sym) in bound_tasks(mod)
@@ -434,6 +465,7 @@ function report_jobs(mod::Module)
             push!(finished, "task `$sym` (fetch($sym) returns its value)")
         end
     end
+    report_host_jobs!(running, finished)
     procs = background_processes()
     for (pid, cmd, _) in first(procs, 6)
         push!(running, "`$(first(cmd, 80))` (pid $pid)")

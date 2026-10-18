@@ -91,6 +91,8 @@ if ccall(:jl_generating_output, Cint, ()) == 1
         empty!(LAST_RUNNING[])
         empty!(REPORTED_TASKS)
         empty!(FINISH_REPORTED)
+        empty!(HOST_JOBS)
+        empty!(HOST_FINISH_REPORTED)
         empty!(TASK_OBSERVATIONS)
         TASK_SEQUENCE[] = 0
         TASK_EPOCH[] = ""
