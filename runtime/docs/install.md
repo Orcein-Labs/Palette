@@ -196,7 +196,7 @@ The adapter's entrypoint is `runtime/security/operator_workspace_router.py`. It 
 | `PALETTE_READ_ROOTS` | Host directories the kernel may read, `:`-separated; see [authority](authority.md) |
 | `PALETTE_HOST_COMMANDS` | JSON file of host commands the kernel may run; see [authority](authority.md) |
 | `PALETTE_CAPABILITY_CEILING` | Host-owned JSON capability ceiling loaded once at adapter startup |
-| `PALETTE_PACKAGE_DEPOT` | Durable broker-managed package store; defaults to `~/.palette/packages` |
+| `PALETTE_PACKAGE_DEPOT` | Durable broker-managed package store. The installers and `serve_palette.py` set it to `packages` under the instance's data directory (`PALETTE_DATA_HOME`), so a private instance never shares another's store; a host started without it uses `~/.palette/packages` |
 | `PALETTE_RECEIPT_RETENTION_DAYS` | Days a session's default receipts directory is kept after its last write, before a later session archives it into `~/.palette/docs/receipts/<YYYY-MM>.zip`. Defaults to 30. `0` deletes it when the session closes. See [capabilities](capabilities.md) |
 | `JULIA_DEPOT_PATH` | Provisioned Julia depot |
 | `JULIA_PKG_OFFLINE` | Julia's offline package policy |
