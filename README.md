@@ -29,14 +29,14 @@ Linux, or WSL2 on Windows. One command installs Julia if needed, the sandbox
 host and its packages, then connects Claude Code and Codex and checks one call.
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows, in PowerShell or a command prompt. It sets up WSL2 with Ubuntu if
 you have none, installs Palette inside it, and also connects Claude Desktop:
 
 ```powershell
-powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.ps1'))"
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
 ```
 
 The installer asks for your password once, to install bubblewrap and Python 3
