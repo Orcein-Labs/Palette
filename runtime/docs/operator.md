@@ -26,6 +26,18 @@ For a complex script, send a tool payload and call `bash(PAYLOAD)`; payload is
 verbatim text for this call only. Standard Julia `run` and `read` also work within
 the session's authority envelope.
 
+## Call costs
+
+`Palette.costs(call)` reports `execution_seconds` and `compile_seconds`, the part
+of execution the process spent compiling. `first_call_in_kernel` is true for the
+first agent call a kernel runs after its warm-up, the call that pays for any
+compilation the warm-up missed. Compile timing nests, so `@time` still works.
+
+`palette_control` `status` returns `costs` for the current kernel: the host's
+start-up seconds, the first call's costs, the warm-call count, and medians over
+the last 20 warm calls. Round trips are measured by the operator, from request to
+result. Ephemeral calls are not counted.
+
 ## Revival and freshness
 
 A restart reconstructs supported definitions and deserializes supported data.

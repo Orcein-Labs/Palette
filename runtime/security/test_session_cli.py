@@ -817,6 +817,21 @@ class TestSessionCli(unittest.TestCase):
         self.assertGreaterEqual(observed["worker_pipe_seconds"], 0)
         self.assertGreater(observed["worker_response_bytes"], 0)
 
+    def test_costs_mark_the_first_call_and_count_compile_time(self):
+        first = self._turn("1 + 1")
+        self.assertTrue(first["costs"]["first_call_in_kernel"])
+        self.assertGreaterEqual(first["costs"]["compile_seconds"], 0)
+        compiled = self._turn("fresh_method(x) = x + 1; fresh_method(1)")
+        self.assertFalse(compiled["costs"]["first_call_in_kernel"])
+        self.assertGreater(compiled["costs"]["compile_seconds"], 0)
+        self.assertLessEqual(compiled["costs"]["compile_seconds"], compiled["costs"]["execution_seconds"] + 0.05)
+        # A user's own @time nests inside the call's compile timing.
+        timed = self._turn("@time fresh_method(2)")
+        self.assertTrue(timed["success"], timed)
+        self.assertIn("seconds", timed["output"])
+        # The call's record keeps the mark.
+        self.assertTrue(self._turn("Palette.costs(1)")["data"]["first_call_in_kernel"])
+
     def test_B02_reload_reports_observed_changes_and_identity_risk(self):
         pkg = Path(self.task_workspace, "DeskKit")
         (pkg / "src").mkdir(parents=True)
@@ -958,6 +973,15 @@ class TestSessionCli(unittest.TestCase):
                 self.assertTrue(any(row.startswith("matrix (") for row in inventory["bindings"]))
                 changed = call("palette", {"code": "n=43"})
                 self.assertTrue(any(row.startswith("n (") for row in changed["binding_changes"]["new_or_changed"]))
+                # The restart's own call is this kernel's first; the three since are warm.
+                costs = call("palette_control", {"action": "status"})["costs"]
+                self.assertEqual(costs["epoch"], revived["epoch"])
+                self.assertGreater(costs["host_startup_seconds"], 0)
+                self.assertEqual(costs["first_call"]["call"], revived["call"])
+                self.assertGreater(costs["first_call"]["round_trip_seconds"], 0)
+                self.assertEqual((costs["warm_calls"], costs["last_warm_call"]["call"]), (3, changed["call"]))
+                self.assertGreaterEqual(costs["recent_warm_median"]["compile_seconds"], 0)
+                self.assertLess(costs["recent_warm_median"]["round_trip_seconds"], costs["first_call"]["round_trip_seconds"])
                 saved = call("palette_control", {"action": "restart"})
                 death = call("palette", {"code": 'n=999;write("after-death.txt","file survived");exit(19)'}, success=False)
                 self.assertTrue(death["session_dead"])

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -34,6 +35,9 @@ preparation = None
 binding_view = {}
 binding_epoch = None
 connection_failure = None
+# This kernel's start-up, first call and warm calls, which palette_control status reports.
+kernel_costs = None
+WARM_CALLS_KEPT = 20
 FROZEN_CEILING = operator_ceiling()
 TURN_LIMITS = turn_limits()
 RUNTIME_ROOT = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(REPO, "runtime/capabilities")))).expanduser().resolve()
@@ -212,7 +216,10 @@ def start(*, prepared=True):
     except Exception:
         stop()
         raise
-    session_notice = {"epoch": hello["epoch"], "host_startup_seconds": time.monotonic() - started,
+    startup = time.monotonic() - started
+    kernel_costs = {"epoch": hello["epoch"], "host_startup_seconds": round(startup, 3), "first_call": None,
+                    "warm_calls": 0, "recent_warm_calls": []}
+    session_notice = {"epoch": hello["epoch"], "host_startup_seconds": startup,
                       "preparation": preparation, "snapshot_present": hello.get("revival", False),
                       "restoration": "uncertain" if hello.get("revival") else "fresh_empty_world"}
     if connection_failure is not None:
@@ -228,7 +235,10 @@ def execute(args):
         raise ValueError("view must be quiet or full")
     rid = uuid.uuid4().hex
     try:
+        started = time.monotonic()
         event = receive_result(rid, args)
+        if args.get("ephemeral") is not True:
+            note_call_cost(event, time.monotonic() - started)
         if event.get("session_dead") is True and args.get("ephemeral") is not True:
             connection_failure = {"epoch": hello.get("epoch"), "error": event.get("error"), "call": event.get("call")}
             # The CLI exits after its terminal result. Retire its pipes before
@@ -239,6 +249,34 @@ def execute(args):
         connection_failure = {"epoch": hello.get("epoch") if hello else None, "error": str(exc), "completion": "unknown"}
         stop()
         raise
+
+
+def note_call_cost(event, seconds):
+    costs = event.get("costs")
+    if kernel_costs is None or not isinstance(costs, dict):
+        return
+    row = {"call": event.get("call"), "round_trip_seconds": round(seconds, 3),
+           **{key: costs.get(key) for key in ("execution_seconds", "compile_seconds")}}
+    if costs.get("first_call_in_kernel"):
+        kernel_costs["first_call"] = row
+        return
+    kernel_costs["warm_calls"] += 1
+    kernel_costs["recent_warm_calls"] = (kernel_costs["recent_warm_calls"] + [row])[-WARM_CALLS_KEPT:]
+
+
+def cost_status():
+    if kernel_costs is None:
+        return None
+    recent = kernel_costs["recent_warm_calls"]
+    status = {key: kernel_costs[key] for key in ("epoch", "host_startup_seconds", "first_call", "warm_calls")}
+    if recent:
+        measured = {key: [row[key] for row in recent if isinstance(row[key], (int, float))]
+                    for key in ("round_trip_seconds", "execution_seconds", "compile_seconds")}
+        status["recent_warm_median"] = {key: round(statistics.median(values), 3) for key, values in measured.items() if values}
+        status["last_warm_call"] = recent[-1]
+    status["limits"] = (f"Round trips are measured by this server, from request to result. The median covers the last {WARM_CALLS_KEPT} warm calls. "
+                        "compile_seconds counts compilation by any task in the kernel during the call.")
+    return status
 
 
 def receive_result(rid, args):
@@ -368,7 +406,8 @@ def control(args):
         identity = preparation_identity(REPO, REPO, resolve_real_julia_binary())
         record = preparation_status(identity)
         return {"connected": proc is not None and proc.poll() is None, "epoch": hello.get("epoch") if hello else None,
-                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error", "reason") if record.get(k) is not None}}
+                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error", "reason") if record.get(k) is not None},
+                "costs": cost_status()}
     if action == "prepare":
         return prepare_session()
     if action == "restart":
