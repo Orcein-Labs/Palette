@@ -11,25 +11,38 @@
 baremodule WorkloadScope
 using Base
 end
-if ccall(:jl_generating_output, Cint, ()) == 1
+# @compile_workload also keeps what the workload compiles in other packages'
+# methods, such as JSON's parser and Base's show methods for common results.
+# A bare jl_generating_output block kept only Palette's own.
+@compile_workload begin
     try
         GLOBAL_STATE[] = KernelState(WorkloadScope)
-        JSON.parse("""{"request_id":"1","kind":"EXECUTE","code":"1 + 1","payload":null,"timeout_s":60}""")
-        for code in ("x = [1 2; 3 4]\nf(y) = y .+ 1\nf(x)",
+        JSON.parse("""{"request_id":"1","kind":"EXECUTE","code":"1 + 1","payload":null,"timeout_s":60}"""; dicttype=Dict{String, Any})
+        execute_turn("1", nothing)
+        # Requests as the worker serves them: read from a pipe, answered
+        # through a function. As script code, the first request compiled all
+        # of this, about 1.1 s. The results are those models ask for most.
+        let pipe = Base.link_pipe!(Pipe(); reader_supports_async=true, writer_supports_async=true), replies = String[]
+            codes = ("1 + 1", "x = [1 2; 3 4]\nf(y) = y .+ 1\nf(x)",
                      "for i in 1:3\n    s = i\nend\nprintln(\"done\")",
                      "d = Dict(\"a\" => 1); (d, :b, 1.5, \"s\", nothing)",
-                     "error(\"workload\")",
-                     "undefined_name + 1",
-                     "g(x::Int) = x\ng(\"s\")")
-            (receipt, interrupted, _), output = execute_turn(code, 60.0)
-            value = receipt.result.data
-            safe_json(Dict{String,Any}("kind" => "RESULT", "epoch" => "e", "request_id" => "1",
-                "success" => receipt.result.success, "data" => bounded_data(value), "display" => text_display(value),
-                "output" => scrub(output), "error" => receipt.result.error, "call" => 1, "interrupted" => interrupted))
-            retain_output!(1, output)
-            binding_list!(WorkloadScope, 1)
+                     "error(\"workload\")", "undefined_name + 1", "g(x::Int) = x\ng(\"s\")", "s = \"\$(1",
+                     "\"ok\"", "readdir(tempdir())[1:0]", "Dict(:a => 1)", "rand(3)", "1.5")
+            for (i, code) in enumerate(codes)
+                request = Dict{String,Any}("request_id" => string(i), "kind" => "EXECUTE", "code" => code)
+                i == 1 && (request["timeout_s"] = 60)
+                println(pipe.in, JSON.json(request))
+            end
+            for request in (Dict("request_id" => "p", "kind" => "EXECUTE", "code" => "length(PAYLOAD[\"a\"])",
+                                 "payload" => Dict("a" => "t"), "digest" => false),
+                            Dict("request_id" => "o", "kind" => "OTHER", "code" => ""))
+                println(pipe.in, JSON.json(request))
+            end
+            println(pipe.in, "not json\n")
+            close(pipe.in)
+            serve_requests(resp -> push!(replies, safe_json(resp)), pipe.out, () -> false, "e")
+            close(pipe)
         end
-        execute_turn("1", nothing)
         # The result's additions: the digest of long output, the jobs line, and
         # the workspace map, which opens a session's first result and took 8.7 s
         # there compiled cold.
@@ -60,7 +73,7 @@ if ccall(:jl_generating_output, Cint, ()) == 1
         # No definitions: replaying them would redefine WorkloadScope's
         # methods, which precompilation forbids.
         empty!(DEFINITION_LOG)
-        snapshot_state!(6)
+        snapshot_state!(6; waiting = () -> false)
         revive_state!()
     catch e
         # Everything after the failing line goes uncompiled, and the kernel's first calls are slow.

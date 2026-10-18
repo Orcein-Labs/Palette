@@ -131,7 +131,7 @@ The oracle covers these categories, one suite each, as run by
 | Category | Suite |
 |---|---|
 | Authority: bind layout, read and write roots, network, credentials, broker ceilings | `test_authority.py` |
-| Session: persistent and ephemeral turns, kill detection, session roots, depot clones, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
+| Session: persistent and ephemeral turns, kill detection, session roots, session depots, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
 | Session bridge: the stdio protocol of `session_cli` / `palette-host session` | `test_session_cli.py` |
 | Revival: what a replacement kernel restores, rebuilds or reports lost | `test_revival.py` |
 | Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `test_host_bridge.py` |

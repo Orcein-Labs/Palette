@@ -569,13 +569,27 @@ pub(crate) fn expired_orphaned_dirs(root: &Path, prefix: &str, min_age: Duration
 
 /// Removes an owned directory and then its owner record.
 pub fn remove_owned_dir(dir: &Path) {
+    unlock_overlay_work(dir);
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_file(clone_owner_path(dir));
 }
 
-/// Removes a session depot clone and then its owner record.
-pub fn remove_session_depot(clone: &Path) {
-    remove_owned_dir(clone);
+/// The kernel leaves an overlay's `work/work` at mode 000, which stops
+/// `remove_dir_all` descending into it.
+fn unlock_overlay_work(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let work = dir.join(OVERLAY_WORK).join("work");
+    let real_dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if real_dir(&dir.join(OVERLAY_WORK)) && real_dir(&work) {
+        let _ = fs::set_permissions(&work, fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// Removes a session depot and its owner record, then releases the snapshot
+/// an overlay depot holds.
+pub fn remove_session_depot(depot: &Path) {
+    remove_owned_dir(depot);
+    snapshot_holds().retain(|(dir, _)| dir != depot);
 }
 
 /// Where a session's broker receipts go when the caller names no receipts
@@ -650,11 +664,20 @@ pub(crate) fn private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// One private, writable prepared-depot clone for a session's worker caches.
+/// One private, writable prepared depot for a session's worker caches.
 /// Broker-authorized package installs live in the separate durable package store.
-/// The clone comes from the newest snapshot of the depot when one exists,
-/// otherwise from the live depot. Callers release it with `remove_session_depot`.
+///
+/// With a snapshot of the depot and a bwrap that mounts overlays, the depot
+/// is an overlay: `lower` links to the snapshot, which stays held until
+/// `remove_session_depot`, and writes land in `upper` (see
+/// `overlay_depot_layers`). Otherwise it is a copy of the newest snapshot, or
+/// of the live depot when there is none; a live depot can change, so it is
+/// never an overlay's lower layer. Callers release it with `remove_session_depot`.
 pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String> {
+    create_session_depot_as(real_depot, overlay_supported)
+}
+
+fn create_session_depot_as(real_depot: Option<&str>, overlay: fn(&Path) -> bool) -> Result<PathBuf, String> {
     let depot = real_depot.map(str::to_string).unwrap_or_else(default_depot);
     let root = Path::new(&depot).parent().unwrap_or(Path::new("/")).join(".palette-depot-clones");
     fs::create_dir_all(&root).map_err(|e| format!("creating {}: {e}", root.display()))?;
@@ -664,13 +687,19 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
         remove_session_depot(&dest);
         return Err(e);
     }
-    let copied = match hold_depot_snapshot(Path::new(&depot)) {
-        // Nothing writes a snapshot, so one attempt copies it or fails for real.
+    let made = match hold_depot_snapshot(Path::new(&depot)) {
         Ok(Some(snapshot)) => {
-            let copied = copy_tree(&snapshot.path, &dest, 1);
-            drop(snapshot);
+            let made = if layer_overlay(&snapshot.path, &dest).is_ok() && overlay(&dest) {
+                snapshot_holds().push((dest.clone(), snapshot));
+                Ok(())
+            } else {
+                // Nothing writes a snapshot, so one attempt copies it or fails for real.
+                let copied = copy_tree(&snapshot.path, &dest, 1);
+                drop(snapshot);
+                copied
+            };
             try_sweep_depot_snapshots(Path::new(&depot));
-            copied
+            made
         }
         // The live depot may be precompiling. A Julia process removes its
         // temporary files, and one removed between cp listing a directory and
@@ -678,7 +707,7 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
         Ok(None) => copy_tree(Path::new(&depot), &dest, DEPOT_CLONE_ATTEMPTS),
         Err(e) => Err(e),
     };
-    match copied {
+    match made {
         Ok(()) => Ok(dest),
         Err(e) => {
             remove_session_depot(&dest);
@@ -687,6 +716,62 @@ pub fn create_session_depot(real_depot: Option<&str>) -> Result<PathBuf, String>
     }
 }
 
+const OVERLAY_LOWER: &str = "lower";
+const OVERLAY_UPPER: &str = "upper";
+const OVERLAY_WORK: &str = "work";
+
+/// The snapshots held by this process's overlay depots, by depot.
+fn snapshot_holds() -> std::sync::MutexGuard<'static, Vec<(PathBuf, HeldSnapshot)>> {
+    static HOLDS: std::sync::Mutex<Vec<(PathBuf, HeldSnapshot)>> = std::sync::Mutex::new(Vec::new());
+    HOLDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn layer_overlay(snapshot: &Path, dest: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(snapshot, dest.join(OVERLAY_LOWER))?;
+    fs::create_dir(dest.join(OVERLAY_UPPER))?;
+    fs::create_dir(dest.join(OVERLAY_WORK))
+}
+
+/// The canonical lower, upper and work directories of an overlay depot, or
+/// None for a copied one.
+fn overlay_depot_layers(depot: &Path) -> Result<Option<[PathBuf; 3]>, String> {
+    if !fs::symlink_metadata(depot.join(OVERLAY_LOWER)).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(None);
+    }
+    Ok(Some([
+        canonical_dir("depot snapshot", &depot.join(OVERLAY_LOWER))?,
+        canonical_dir("depot overlay upper", &depot.join(OVERLAY_UPPER))?,
+        canonical_dir("depot overlay work", &depot.join(OVERLAY_WORK))?,
+    ]))
+}
+
+/// Whether bwrap mounts the overlay `depot` describes. bwrap before 0.8 has
+/// no `--overlay`, and some kernels refuse unprivileged overlay mounts. A
+/// probe that hangs counts as no, so the session copies instead of waiting.
+fn overlay_supported(depot: &Path) -> bool {
+    let Ok(Some([lower, upper, work])) = overlay_depot_layers(depot) else { return false };
+    let Ok(mut probe) = Command::new("bwrap")
+        .args(["--unshare-user", "--ro-bind", "/", "/", "--overlay-src"]).arg(&lower)
+        .arg("--overlay").arg(&upper).arg(&work).arg(&lower)
+        .args(["--", "true"])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn() else { return false };
+    let deadline = Instant::now() + OVERLAY_PROBE_TIMEOUT;
+    loop {
+        match probe.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = probe.kill();
+                let _ = probe.wait();
+                return false;
+            }
+        }
+    }
+}
+
+const OVERLAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How many times a live depot clone is tried before the session gives up.
 const DEPOT_CLONE_ATTEMPTS: usize = 3;
 
@@ -694,6 +779,7 @@ const DEPOT_CLONE_ATTEMPTS: usize = 3;
 fn copy_tree(source: &Path, dest: &Path, attempts: usize) -> Result<(), String> {
     let mut failure = String::new();
     for attempt in 0..attempts {
+        unlock_overlay_work(dest);
         let _ = fs::remove_dir_all(dest); // cp wants a destination that does not exist yet
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(200));
@@ -1051,6 +1137,7 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     let project = canonical_dir("project", Path::new(s.project_dir))?;
     let original_depot = canonical_dir("shared Julia depot", Path::new(s.julia_depot))?;
     let depot_clone = s.depot_clone_dir.map(|p| canonical_dir("private Julia depot clone", Path::new(p))).transpose()?;
+    let depot_overlay = depot_clone.as_deref().map(overlay_depot_layers).transpose()?.flatten();
     let package_store = s.package_store_root.map(|p| canonical_dir("persistent package store", Path::new(p))).transpose()?;
     let package_depot = s.package_depot_dir.map(|p| canonical_dir("persistent package depot", Path::new(p))).transpose()?;
     let package_environment = s.package_environment_dir.map(|p| canonical_dir("persistent package environment", Path::new(p))).transpose()?;
@@ -1088,6 +1175,7 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
         ("system /dev", system_dev.as_path()), ("synthetic /run/palette", Path::new("/run/palette")),
     ];
     if let Some(path) = depot_clone.as_deref() { protected.push(("private Julia depot clone source", path)); }
+    if let Some([lower, _, _]) = depot_overlay.as_ref() { protected.push(("depot snapshot", lower.as_path())); }
     if let Some(path) = package_store.as_deref() { protected.push(("persistent package store", path)); }
     if let Some(path) = task_tools_root.as_deref() { protected.push(("task tools", path)); }
     if let Some(path) = broker_root.as_deref() { protected.push(("broker socket directory", path)); }
@@ -1113,7 +1201,11 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     // Guest-side targets keep their configured paths.
     let utf8 = |p: &Path, what: &str| p.to_str().map(str::to_owned).ok_or(format!("{what} path is not valid UTF-8"));
     let toolchain_src = utf8(&toolchain_root, "Julia toolchain")?;
-    let depot_source = utf8(depot_clone.as_deref().unwrap_or(&original_depot), "Julia depot")?;
+    let depot_mount: Vec<String> = match &depot_overlay {
+        Some([lower, upper, work]) => vec!["--overlay-src".into(), utf8(lower, "depot snapshot")?, "--overlay".into(),
+                                           utf8(upper, "depot overlay upper")?, utf8(work, "depot overlay work")?],
+        None => vec!["--bind".into(), utf8(depot_clone.as_deref().unwrap_or(&original_depot), "Julia depot")?],
+    };
     let repo_src = utf8(&repo, "repository")?;
     let project_src = utf8(&project, "project")?;
     let task_tools_src = task_tools_root.as_deref().map(|p| utf8(p, "task tools")).transpose()?;
@@ -1135,11 +1227,11 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
            // Preserve the host ELF loader layout (Ubuntu differs from Arch).
            "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
            "--symlink", "usr/bin", "/bin", "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
-           "--ro-bind", &toolchain_src, &toolchain,
-           // The primary depot, writable at its own real path; the source is
-           // this worker's private clone, never the shared depot.
-           "--bind", &depot_source, s.julia_depot,
-           "--ro-bind", &repo_src, s.repo_dir,
+           "--ro-bind", &toolchain_src, &toolchain]);
+    // The primary depot, writable at its own real path; the source is this
+    // worker's private overlay or clone, never the shared depot.
+    push(&depot_mount.iter().map(String::as_str).chain([s.julia_depot]).collect::<Vec<_>>());
+    push(&["--ro-bind", &repo_src, s.repo_dir,
            "--ro-bind", &project_src, s.project_dir,
            "--bind", workspace, workspace]);
     if let (Some(src), Some(t)) = (task_tools_src.as_deref(), task_tools) {
@@ -1536,17 +1628,17 @@ mod tests {
 
         // A Julia process writing the live depot does not reach the clone.
         fs::write(depot.join("cache"), "churned").unwrap();
-        let clone = create_session_depot(depot.to_str()).unwrap();
+        let clone = copied_depot(&depot);
         assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "prepared");
         fs::remove_dir_all(&depot).unwrap();
-        let without_live = create_session_depot(depot.to_str()).unwrap();
+        let without_live = copied_depot(&depot);
         assert_eq!(fs::read_to_string(without_live.join("cache")).unwrap(), "prepared");
 
         fs::create_dir(&depot).unwrap();
         fs::write(depot.join("cache"), "reprepared").unwrap();
         let second = publish_depot_snapshot(&depot).unwrap();
         assert!(second > first);
-        let newer = create_session_depot(depot.to_str()).unwrap();
+        let newer = copied_depot(&depot);
         assert_eq!(fs::read_to_string(newer.join("cache")).unwrap(), "reprepared");
         let mut left: Vec<_> = fs::read_dir(&snapshots).unwrap().map(|e| e.unwrap().path()).collect();
         left.sort();
@@ -1573,10 +1665,78 @@ mod tests {
         assert_eq!(fs::read_to_string(held.path.join("cache")).unwrap(), "first");
         drop(held);
 
-        let clone = create_session_depot(depot.to_str()).unwrap();
+        let clone = copied_depot(&depot);
         assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "second");
         assert!(!first.exists(), "the released snapshot was not swept");
         assert!(second.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn copied_depot(depot: &Path) -> PathBuf {
+        create_session_depot_as(depot.to_str(), |_| false).unwrap()
+    }
+
+    #[test]
+    fn overlay_depots_hold_their_snapshot_until_removed() {
+        let root = util::mkdtemp("palette-depot-overlay-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "first").unwrap();
+        let first = publish_depot_snapshot(&depot).unwrap();
+        let overlay = create_session_depot_as(depot.to_str(), |_| true).unwrap();
+        assert_eq!(fs::read_link(overlay.join(OVERLAY_LOWER)).unwrap(), first);
+        assert!(overlay.join(OVERLAY_UPPER).is_dir() && overlay.join(OVERLAY_WORK).is_dir());
+        assert!(clone_owner_path(&overlay).is_file());
+
+        fs::write(depot.join("cache"), "second").unwrap();
+        let second = publish_depot_snapshot(&depot).unwrap();
+        assert!(first.is_dir(), "a snapshot under a live overlay was swept");
+        remove_session_depot(&overlay);
+        assert!(fs::symlink_metadata(&overlay).is_err() && fs::symlink_metadata(clone_owner_path(&overlay)).is_err());
+        let copy = copied_depot(&depot);
+        assert!(!first.exists(), "a removed overlay kept its snapshot held");
+        assert_eq!(fs::read_to_string(copy.join("cache")).unwrap(), "second");
+        assert!(second.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_overlay_depot_mounts_writably_over_its_untouched_snapshot() {
+        let root = util::mkdtemp("palette-depot-overlay-mount-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "prepared").unwrap();
+        let snapshot = publish_depot_snapshot(&depot).unwrap();
+        let overlay = create_session_depot(depot.to_str()).unwrap();
+        if !overlay.join(OVERLAY_LOWER).exists() {
+            eprintln!("skipped: this bwrap or kernel does not mount unprivileged overlays");
+            remove_session_depot(&overlay);
+            fs::remove_dir_all(&root).unwrap();
+            return;
+        }
+        let [lower, upper, work] = overlay_depot_layers(&overlay).unwrap().unwrap();
+        let guest = depot.to_str().unwrap();
+        let status = Command::new("bwrap")
+            .args(["--unshare-user", "--ro-bind", "/", "/", "--overlay-src"]).arg(&lower)
+            .arg("--overlay").arg(&upper).arg(&work).arg(guest)
+            .args(["--", "sh", "-c", "test \"$(cat \"$1/cache\")\" = prepared && echo worker > \"$1/cache\" && rm \"$1/cache\" && mkdir \"$1/compiled\"", "sh", guest])
+            .status().unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(snapshot.join("cache")).unwrap(), "prepared", "a write reached the snapshot");
+        assert!(upper.join("compiled").is_dir());
+        remove_session_depot(&overlay);
+        assert!(fs::symlink_metadata(&overlay).is_err(), "the overlay's work dir blocked removal");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_overlay_probe_falls_back_to_a_copy() {
+        let root = util::mkdtemp("palette-depot-overlay-fallback-").unwrap();
+        let depot = dir(&root, "depot");
+        fs::write(depot.join("cache"), "prepared").unwrap();
+        publish_depot_snapshot(&depot).unwrap();
+        let copy = copied_depot(&depot);
+        assert!(fs::symlink_metadata(copy.join(OVERLAY_LOWER)).is_err());
+        assert_eq!(fs::read_to_string(copy.join("cache")).unwrap(), "prepared");
+        assert!(snapshot_holds().iter().all(|(d, _)| d != &copy), "a copied depot holds its snapshot");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1764,6 +1924,40 @@ mod tests {
         assert_eq!(command_overlap(&r(&home), &only_parent), Some(r(&home)));
         assert_eq!(command_overlap(&r(&home.join("sibling")), &only_parent), None);
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn an_overlay_depot_is_mounted_as_an_overlay_at_the_depot_path() {
+        let root = util::mkdtemp("palette-overlay-argv-").unwrap();
+        let (repo, project, depot, workspace) = (dir(&root, "repo"), dir(&root, "project"), dir(&root, "depot"), dir(&root, "workspace"));
+        dir(&root, "toolchain/bin");
+        let snapshot = dir(&root, "snapshot");
+        let overlay = dir(&root, "overlay");
+        layer_overlay(&snapshot, &overlay).unwrap();
+        let s = |p: &Path| p.to_str().unwrap().to_owned();
+        let (depot_s, overlay_s) = (s(&depot), s(&overlay));
+        let argv = build_bwrap_argv(&SandboxSpec {
+            workspace_dir: &s(&workspace), broker_socket_dir: None, project_dir: &s(&project), repo_dir: &s(&repo),
+            julia_bin: &s(&root.join("toolchain/bin/julia")), julia_depot: &depot_s, network_enabled: false,
+            depot_clone_dir: Some(&overlay_s), package_store_root: None, package_depot_dir: None,
+            package_environment_dir: None, state_dir: None,
+        }).unwrap();
+        let canon = |p: PathBuf| s(&fs::canonicalize(p).unwrap());
+        let expected = ["--overlay-src".to_string(), canon(snapshot), "--overlay".into(),
+                        canon(overlay.join(OVERLAY_UPPER)), canon(overlay.join(OVERLAY_WORK)), depot_s.clone()];
+        assert!(argv.windows(6).any(|w| w == expected), "{argv:?}");
+        assert!(!argv.windows(3).any(|w| w[0] == "--bind" && w[2] == depot_s), "{argv:?}");
+
+        // The snapshot is protected: a workspace inside it is refused.
+        let inside = dir(&root, "snapshot/ws");
+        let error = build_bwrap_argv(&SandboxSpec {
+            workspace_dir: &s(&inside), broker_socket_dir: None, project_dir: &s(&project), repo_dir: &s(&repo),
+            julia_bin: &s(&root.join("toolchain/bin/julia")), julia_depot: &depot_s, network_enabled: false,
+            depot_clone_dir: Some(&overlay_s), package_store_root: None, package_depot_dir: None,
+            package_environment_dir: None, state_dir: None,
+        }).unwrap_err();
+        assert!(error.contains("depot snapshot"), "{error}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -97,10 +97,13 @@ record without starting preparation. Preparation failures remain failures;
 raising a client's call timeout is not a substitute for a prepared installation.
 
 A successful preparation also publishes a snapshot of the depot in
-`<depot parent>/.palette-depot-snapshots/<depot name>/`. Sessions clone it
-instead of the live depot, so a Julia process that shares the depot cannot
-break a session's clone. A reused preparation publishes one when none exists.
-Until a snapshot exists, sessions clone the live depot. On a filesystem
+`<depot parent>/.palette-depot-snapshots/<depot name>/`. Each session mounts an
+overlay of it: the snapshot is the read-only lower layer and the session writes
+to a private upper layer, so starting a session copies nothing and a Julia
+process that shares the live depot cannot break a session's depot. A reused
+preparation publishes a snapshot when none exists. Sessions copy the snapshot
+instead when bwrap is older than 0.8 or the kernel refuses unprivileged overlay
+mounts, and copy the live depot until a snapshot exists. On a filesystem
 without reflinks the snapshot is a full copy of the depot.
 
 ## Local stdio plugin

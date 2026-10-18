@@ -721,7 +721,9 @@ snapshot only once the new one is complete. When the last complete snapshot was
 slow and recent, and `waiting()` says a request is waiting, it stops and
 returns `nothing`; the last complete snapshot stays.
 """
-function snapshot_state!(call::Int; waiting::Function = () -> false)
+# Unspecialized: each kernel passes its own callback, and the body compiled
+# into the package image must serve it.
+function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> false))
     dir = STATE_DIR[]
     isempty(dir) && return nothing
     started = time()
