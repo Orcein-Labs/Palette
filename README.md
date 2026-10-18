@@ -23,39 +23,54 @@ We've run long-horizon R&D spirals on this desk. Bugs showed up and they were ab
 
 Clients attach over MCP, or over the host session (newline-delimited JSON on stdio). The kernel is local. Talk to whichever model you already use.
 
-## Use Palette in your chatbot
+## Install
 
-Get **Palette-ChatGPT.zip** or **Palette-Claude.zip** from the release assets
-when published. Each is one uploadable plugin with SDK source and setup
-instructions. Claude Desktop extensions use the separate `.mcpb` option. Read the [client installation guide](runtime/plugins/DISTRIBUTION.md).
-Prepare a Linux runtime locally or on a server; ChatGPT Chat needs a supported
-remote connection to it. [Server deployment](runtime/docs/server.md) keeps normal
-compute, packages and state on that server, with local devices as optional edges.
-ZIP upload alone does not start a runtime.
+Linux, or WSL2 on Windows. One command installs Julia if needed, the sandbox
+host and its packages, then connects Claude Code and Codex and checks one call.
 
-## Quick start
+```sh
+curl -fsSL https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.sh | sh
+```
 
-Import the Julia package with `using Palette`.
+On Windows, in PowerShell or a command prompt. It sets up WSL2 with Ubuntu if
+you have none, installs Palette inside it, and also connects Claude Desktop:
+
+```powershell
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette.jl/releases/latest/download/install.ps1'))"
+```
+
+The installer asks for your password once, to install bubblewrap and Python 3
+from your distribution; on Windows it needs none. The first run takes several
+minutes while it prepares the sandbox. Everything else lives in
+`~/.local/share/palette`, runs locally, and needs no account. Run the command
+again to update.
+
+Then start a new Claude Code or Codex session and ask it to evaluate `x = 41`,
+then `x + 1`. Other MCP clients can run `~/.local/share/palette/client/palette-mcp`
+as a stdio server. The [installation guide](runtime/docs/install.md) covers
+settings, a source checkout, servers and removal.
+
+### Claude and ChatGPT apps
+
+**Palette-ChatGPT.zip**, **Palette-Claude.zip** and the Claude Desktop extension
+**Palette-Claude.mcpb** are release assets: uploadable plugins with SDK source
+and setup instructions ([client guide](runtime/plugins/DISTRIBUTION.md)). An
+upload alone does not start a runtime. ChatGPT Chat needs a remote connection
+to one; [server deployment](runtime/docs/server.md) keeps compute, packages and
+state on that server.
+
+## Use the Julia package
+
+`using Palette` works without the sandbox:
 
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=. -e 'using Palette; execute(ExecuteCode("x = 41")); println(execute(ExecuteCode("x + 1")).result.data)'
 ```
 
-For supervised, sandboxed sessions on Linux, install Julia 1.12, Python 3,
-bubblewrap, and a Rust build toolchain, then build the host:
-
-```sh
-cargo build --manifest-path runtime/host/Cargo.toml --release --locked
-python3 runtime/security/prewarm_depot.py --project-dir "$PWD" --host-bin "$PWD/runtime/host/target/release/palette-host"
-runtime/host/target/release/palette-host session --repo-dir "$PWD" --project-dir "$PWD" --workspace-dir /absolute/path/to/workspace --state-dir /absolute/path/to/state --ceiling '{}'
-```
-
-The session speaks newline-delimited JSON on stdin/stdout. After its startup
-message, send `{"request_id":"1","code":"x = 41"}` and then
-`{"request_id":"2","code":"x + 1"}`. Close stdin to stop it.
-Keep state outside the workspace. The plain Julia API above does not create an
-OS sandbox; the supervised host does.
+The plain Julia API does not create an OS sandbox; the supervised host does.
+The [installation guide](runtime/docs/install.md) shows how to run the host
+session directly, which speaks newline-delimited JSON on stdio.
 
 ## Talking to the kernel
 
@@ -101,8 +116,8 @@ runtime dependency.
 | `runtime/` | Host, adapters, installer, worker entrypoint, public docs, and plugin package |
 | `test/` | Julia package tests and fixtures |
 
-The tracked root has five folders: the three SDK directories above, `.github/`
-for CI, and `.agents/` for the plugin marketplace. Public docs and the plugin
+The tracked root has six folders: the three SDK directories above, `docs/` for
+project research, `.github/` for CI, and `.agents/` for the plugin marketplace. Public docs and the plugin
 package live under `runtime/docs/` and `runtime/plugins/`.
 
 Rust builds Palette's host; Python supports its adapters. Additional language

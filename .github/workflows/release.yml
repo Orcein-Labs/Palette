@@ -1,0 +1,75 @@
+name: Release
+
+# A version tag publishes what runtime/scripts/install.sh downloads: the source with a
+# prebuilt host, the installers and the sandbox setup script they fetch, the
+# client bundles, and one checksum file.
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build; leave empty to build without publishing
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # The oldest supported runner, so the host's glibc floor stays at 2.35.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+        fetch-depth: 0
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build the host
+      run: cargo build --manifest-path runtime/host/Cargo.toml --release --locked
+
+    - name: Package the release
+      run: |
+        out="$RUNNER_TEMP/release"
+        mkdir -p "$out"
+        git archive --format=tar --prefix=palette/ HEAD > "$out/palette.tar"
+        tar --append --file="$out/palette.tar" \
+            --transform='s,^,palette/,' --owner=0 --group=0 \
+            runtime/host/target/release/palette-host
+        gzip -9n "$out/palette.tar"
+        mv "$out/palette.tar.gz" "$out/palette-linux-x86_64.tar.gz"
+        cp runtime/scripts/install.sh runtime/scripts/install.ps1 runtime/scripts/setup-sandbox-host.sh "$out/"
+        python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/bundles"
+        cp "$RUNNER_TEMP"/bundles/*.zip "$RUNNER_TEMP"/bundles/*.mcpb "$out/"
+        (cd "$out" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+        echo "RELEASE_DIR=$out" >> "$GITHUB_ENV"
+
+    - name: Check the packaged host runs
+      run: |
+        tar -xzf "$RELEASE_DIR/palette-linux-x86_64.tar.gz" -C "$RUNNER_TEMP"
+        # With no arguments the host prints its usage and exits nonzero.
+        { "$RUNNER_TEMP/palette/runtime/host/target/release/palette-host" 2>&1 || true; } | grep 'usage: palette-host'
+
+    - name: Publish
+      if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ inputs.tag || github.ref_name }}
+      run: |
+        # A tag with a hyphen (v1.0.0-rc.1) is a prerelease, which
+        # releases/latest skips; install it with PALETTE_VERSION=<tag>.
+        case "$TAG" in *-*) pre=--prerelease ;; *) pre= ;; esac
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          gh release upload "$TAG" "$RELEASE_DIR"/* --clobber
+        else
+          gh release create "$TAG" "$RELEASE_DIR"/* --title "$TAG" --generate-notes $pre
+        fi
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: palette-release
+        path: ${{ env.RELEASE_DIR }}
