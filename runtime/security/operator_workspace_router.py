@@ -524,7 +524,8 @@ def validate(args, schema):
             raise ValueError("Invalid " + key)
         if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))
                                  or not spec.get("exclusiveMinimum", float("-inf")) < value <= spec.get("maximum", float("inf"))):
-            raise ValueError("Invalid " + key)
+            raise ValueError(f"Invalid {key}: must be a number in ({spec.get('exclusiveMinimum', float('-inf')):g}, "
+                             f"{spec.get('maximum', float('inf')):g}]")
 
 
 def serve_stream(stdin, stdout):
