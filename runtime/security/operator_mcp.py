@@ -14,7 +14,7 @@ import uuid
 
 from source_transport import call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
-from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
+from prewarm_depot import error_summary, prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, protected_host_paths
 from runtime_registry import RuntimeRegistry
 from patch_broker import PatchBroker, approval_mode
@@ -96,8 +96,15 @@ def project_result(event, *, full=False, ephemeral=False):
     return result
 
 
+class PreparationFailed(RuntimeError):
+    """The Julia environment could not be prepared, so no kernel started and no call ran."""
+
+
 def tool_failure(exc):
     """All tool responses retain a JSON payload for routed and direct clients."""
+    if isinstance(exc, PreparationFailed):
+        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)}],
+                "isError": True}
     event = {"success": False,
              "error": f"{type(exc).__name__}: {exc}. Check connection status and restoration evidence; work may not have completed."}
     if connection_failure is not None:
@@ -166,7 +173,9 @@ def prepare_session():
     preparation["recorded_preparation_seconds"] = record.get("seconds")
     preparation["identity"] = hashlib.sha256(json.dumps(record["identity"], sort_keys=True).encode()).hexdigest()
     if record["state"] != "prepared":
-        raise RuntimeError("preparation failed: " + str(record.get("error", record.get("output", "")))[:2000])
+        raise PreparationFailed("Palette could not prepare its Julia environment, so no call ran. "
+                                "palette_control action=prepare retries it once the cause is fixed. "
+                                "The preparation reported:\n" + error_summary(str(record.get("error") or record.get("output") or "")))
     return preparation
 
 
@@ -359,7 +368,7 @@ def control(args):
         identity = preparation_identity(REPO, REPO, resolve_real_julia_binary())
         record = preparation_status(identity)
         return {"connected": proc is not None and proc.poll() is None, "epoch": hello.get("epoch") if hello else None,
-                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error") if k in record}}
+                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error", "reason") if record.get(k) is not None}}
     if action == "prepare":
         return prepare_session()
     if action == "restart":

@@ -891,14 +891,21 @@ class TestSessionCli(unittest.TestCase):
             marker.write_text(json.dumps({**record, "state": "invented"}))
             self.assertEqual(invoke("--status")[1]["state"], "failed")
             marker.write_text(json.dumps(record))
-            self.assertTrue(invoke()[1]["reused"])
+            reused = invoke()[1]
+            self.assertTrue(reused["reused"])
+            self.assertNotIn("previous_state", reused)
             source = repo / "src/Palette.jl"
             source.write_text(source.read_text() + "\n# Preparation identity control\n")
-            self.assertEqual(invoke("--status")[1]["state"], "stale")
+            stale = invoke("--status")[1]
+            self.assertEqual((stale["state"], stale["error"]), ("stale", None), stale)
             self.assertEqual(invoke()[1]["state"], "prepared")
             (repo / "Project.toml").write_text("this is invalid TOML!")
             code, record = invoke()
             self.assertEqual((code, record["state"]), (1, "failed"), record)
+            self.assertNotIn("\x1b[", record["error"])
+            # Julia's output is printed once, as the cut-down error; the full text stays in the record file.
+            self.assertFalse({"output", "stderr"} & record.keys(), record.keys())
+            self.assertTrue(json.loads(Path(record["record_file"]).read_text())["stderr"])
             self.assertEqual(invoke("--status")[1]["state"], "failed")
             marker = next(Path(root, "state").glob("*.json"))
             marker.write_text("[]")
