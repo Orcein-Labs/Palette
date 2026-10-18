@@ -318,10 +318,6 @@ class TestAuthorityUnderPersistence(SessionTestCase):
         self.assertEqual(Path(target).read_text(), "eph")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestReadRoots(SessionTestCase):
     """PALETTE_READ_ROOTS: the kernel reads the host directory at its own
     path, cannot write it, and sees nothing beside it."""
@@ -401,3 +397,7 @@ class TestHostCommand(SessionTestCase):
                 self.assertIn("the ceiling's limit", r["data"])
         finally:
             shutil.rmtree(outside, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

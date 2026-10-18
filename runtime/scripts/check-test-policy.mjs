@@ -475,6 +475,17 @@ function scan(content, path = "") {
 		}
 	}
 
+	if (path.endsWith(".py")) {
+		// Run as a script, unittest.main() exits before anything defined after it.
+		const main = maskedLines.findIndex((line) => /^if\s+__name__\b/.test(line));
+		if (main >= 0) {
+			for (let index = main + 1; index < lines.length; index += 1) {
+				const definition = maskedLines[index].match(/^(?:class|def|async\s+def)\s+([A-Za-z_]\w*)/);
+				if (definition) add("unreachable-test", index + 1, `${definition[1]} defined after the __main__ block`, "<module>");
+			}
+		}
+	}
+
 	for (const match of maskedContent.matchAll(/\.(?:listen|bind)\s*\(/g)) {
 		let argument = (match.index ?? 0) + match[0].length;
 		while (/\s/.test(maskedContent[argument] ?? "")) argument += 1;
