@@ -121,7 +121,7 @@ class TestSessionCli(unittest.TestCase):
         Path(self.task_workspace, "marker.txt").write_text("from-host")
         self.proc = subprocess.Popen(
             [*session_cmd(), "--project-dir", PROJECT_DIR, "--ceiling", "{}",
-             "--workspace-dir", self.task_workspace, "--turn-timeout", "20"],
+             "--workspace-dir", self.task_workspace, "--turn-timeout", "20", "--max-turn-timeout", "40"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -543,6 +543,39 @@ class TestSessionCli(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertEqual(self._turn("keep")["data"], 1)
 
+    def test_a_call_names_its_own_time_limit_within_the_maximum(self):
+        """Every call ran under the session's one limit, so work longer than
+        it could not run in a call at all."""
+        r = self._turn("sleep(22); 1", timeout_s=30)
+        self.assertEqual((r["success"], r["data"]), (True, 1), r)
+        r = self._turn("x = 7; sleep(15); 1", request_id="2", timeout_s=2)
+        self.assertFalse(r["success"])
+        self.assertIn("2", r["error"])
+        self.assertNotIn("session_dead", r)
+        self.assertEqual(self._turn("x", request_id="3")["data"], 7, "a shorter limit keeps the kernel")
+        for bad in (41, 0, -1, True, "10"):
+            r = self._turn("1", request_id="4", timeout_s=bad)
+            self.assertFalse(r["success"])
+            self.assertEqual(r["error"], "request 'timeout_s' must be a number in (0, 40], this host's --max-turn-timeout")
+        self.assertEqual(self._turn("x + 1", request_id="5", timeout_s=None)["data"], 8)
+        # A scratch call's broker child runs under the session limit, so a
+        # shorter one would kill the kernel waiting on it.
+        r = self._turn("1", request_id="6", ephemeral=True, timeout_s=5)
+        self.assertFalse(r["success"])
+        self.assertIn("does not apply to an ephemeral call", r["error"])
+        self.assertEqual(self._turn("x", request_id="7")["data"], 7)
+
+    def test_startup_refuses_limits_out_of_range(self):
+        for limits in (["0"], ["30", "--max-turn-timeout", "20"], ["20", "--max-turn-timeout", "inf"],
+                       ["20", "--max-turn-timeout", "nan"], ["20", "--max-turn-timeout", "604801"]):
+            with self.subTest(limits=limits):
+                result = subprocess.run(
+                    [*session_cmd(), "--project-dir", PROJECT_DIR, "--ceiling", "{}",
+                     "--workspace-dir", self.task_workspace, "--turn-timeout", *limits],
+                    input="", capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("at most 604800 (7 days)", result.stdout + result.stderr)
+
     def test_kernel_helpers_describe_the_session(self):
         r = self._turn("struct Pt; x::Int; end; v = zeros(10); Pt(3)")
         self.assertEqual(r["display"], "Pt(3)", "types print without the session module's internal name")
@@ -551,7 +584,7 @@ class TestSessionCli(unittest.TestCase):
         self.assertIn("v", r["display"].split())
         self.assertNotIn("PAYLOAD", r["display"])
         r = self._turn("kernelinfo()")
-        self.assertIn("time limit 20s", r["output"])
+        self.assertIn("time limit 20s per call; a call may ask for up to 40s (timeout_s)", r["output"])
         self.assertIn("network    none", r["output"])
 
     def test_unassigned_results_are_not_retained(self):

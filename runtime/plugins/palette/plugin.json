@@ -6,7 +6,7 @@
   "author": {
     "name": "Matt C"
   },
-  "repository": "https://github.com/latentcollapse/Palette.jl",
+  "repository": "https://github.com/latentcollapse/Palette",
   "license": "Apache-2.0",
   "keywords": [
     "julia",
