@@ -9,6 +9,7 @@ import tempfile
 import shutil
 import shlex
 from filesystem_layout import require_disjoint
+from provisioning import palette_version
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,7 +45,7 @@ def main():
         parser.error(f"host is not executable: {host}")
     manifest_path = plugin / ".codex-plugin/plugin.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {
-        "name": "palette", "version": "0.3.0", "description": "Persistent Julia Palette with offline preparation and existing state revival.",
+        "name": "palette", "version": palette_version(repo), "description": "Persistent Julia Palette with offline preparation and existing state revival.",
         "interface": {"displayName": "Palette", "shortDescription": "Persistent local Julia workbench"}}
     if manifest.get("name") != "palette" or (args.format == "codex" and (plugin / "plugin.json").exists()):
         parser.error("target must be a Palette plugin using the Codex compatibility manifest")

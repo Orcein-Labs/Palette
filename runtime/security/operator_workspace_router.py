@@ -24,7 +24,7 @@ import uuid
 
 from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode
 from filesystem_layout import require_disjoint
-from provisioning import operator_ceiling, protected_host_paths
+from provisioning import operator_ceiling, palette_version, protected_host_paths
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
 from generation_runtime import GenerationStore
 from source_transport import call_limit, normalize_palette_call, timeout_schema, turn_limits
@@ -235,7 +235,7 @@ class Child:
             self.proc = subprocess.Popen([sys.executable, str(generation_adapter)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True, bufsize=1, cwd=self.entry["workspace_dir"], env=env, pass_fds=(self.lease.fileno(),))
             self.generation_id = generation["generation_id"]
             threading.Thread(target=self.pump, args=(self.proc, self.frames), daemon=True).start()
-            self.exchange("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": "0.3.0"}})
+            self.exchange("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": palette_version(REPO)}})
         except Exception:
             self.stop()
             raise
@@ -544,7 +544,7 @@ def serve_stream(stdin, stdout):
             if method == "initialize":
                 capabilities = msg.get("params", {}).get("capabilities", {})
                 atomic_json(ROOT / "client-capabilities.json", {"elicitation": capabilities.get("elicitation"), "protocolVersion": msg.get("params", {}).get("protocolVersion")})
-                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.3.0"}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
+                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
