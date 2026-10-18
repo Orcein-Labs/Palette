@@ -149,6 +149,15 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overlap", result.stderr)
 
+    def test_D02_missing_default_workspace_is_created_at_start(self):
+        workspace = Path(self.tmp.name) / "not-yet" / "workspace"
+        result = subprocess.run([sys.executable, str(ROUTER)],
+            input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
+            capture_output=True, text=True, timeout=60,
+            env={**self.env, "OPERATOR_WORKSPACE":str(workspace)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(workspace.is_dir())
+
     def test_D03_registry_cannot_redirect_a_worker_mount(self):
         self.call("palette_workspace", {"action":"create", "workspace_id":"registry-check", "scope":"open"})
         path = Path(self.env["PALETTE_WORKSPACE_STATE_ROOT"]) / "registry.json"
@@ -175,6 +184,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overlap", result.stderr)
+                self.assertIn("PALETTE_READ_ROOTS", result.stderr)
 
     def test_C04_configured_project_roots_share_files_and_isolate_worlds(self):
         shadow = Path(self.tmp.name) / "shadow-project"
