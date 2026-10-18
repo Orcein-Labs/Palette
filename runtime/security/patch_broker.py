@@ -362,7 +362,7 @@ class PatchBroker:
 
     def classify(self, target, relative):
         if target not in self.roots:
-            raise PermissionError("Target is not in the host-configured patch roots")
+            raise self.unknown_target(target)
         candidate = Path(self.roots[target]).joinpath(*parent_path_parts(relative)).absolute()
         if credential_location(candidate):
             return {"class": "forbidden", "self_apply": False, "reason": "credential or secret path"}

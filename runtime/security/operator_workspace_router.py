@@ -400,7 +400,7 @@ def workspace_control(args):
                      for identifier, path in sorted(PROJECT_ROOTS.items())]
             listing = {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
             # Counted, not named: another context's threads stay out of this listing.
-            others = sum(e["scope"] == "thread" and not visible(e, context) for e in entries)
+            others = sum(e["scope"] == "thread" and e.get("owner_context") != context for e in entries)
             if others:
                 listing["other_thread_workspaces"] = others
                 listing["note"] = (f"{others} thread workspace(s) belong to other context_id values and are not listed; "
