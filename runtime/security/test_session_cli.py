@@ -1182,6 +1182,8 @@ class TestSessionCli(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertIs(r.get("session_dead"), True)
         self.assertIn("never yields", r["error"])
+        # This session has no state directory, so nothing comes back.
+        self.assertIn("Every binding is gone", r["error"])
 
     def test_turn_that_swallows_the_interrupt_stops_the_kernel(self):
         r = self._turn("while true; try sleep(0.5) catch end; end")

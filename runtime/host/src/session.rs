@@ -68,6 +68,8 @@ pub struct PaletteSession {
     pub capabilities: Value,
     pub broker: Arc<Broker>,
     turn_timeout: f64,
+    /// A state directory is set, so the next kernel revives the last saved state.
+    revives: bool,
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<Option<String>>,
@@ -116,6 +118,15 @@ enum Wait {
 
 fn dead(msg: impl Into<String>) -> SessionError {
     SessionError::Dead(msg.into())
+}
+
+/// What a stopped kernel leaves for the next call; the worker says the same when it stops itself.
+fn after_kernel_stop(revives: bool) -> &'static str {
+    if revives {
+        "The next call starts a new kernel, which revives what it can of the last saved state (its report names the call) and says what it could not."
+    } else {
+        "Every binding is gone; files written to the workspace remain."
+    }
 }
 
 impl PaletteSession {
@@ -358,6 +369,7 @@ impl PaletteSession {
             capabilities: json!({}),
             broker,
             turn_timeout: o.turn_timeout,
+            revives: o.state_dir.is_some(),
             child,
             stdin,
             lines,
@@ -460,8 +472,8 @@ impl PaletteSession {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 return Err(dead(format!(
-                    "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. Every binding is gone; files written to the workspace remain.",
-                    util::fmt_g(limit))));
+                    "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. {}",
+                    util::fmt_g(limit), after_kernel_stop(self.revives))));
             }
         };
         let Some(line) = line else {
