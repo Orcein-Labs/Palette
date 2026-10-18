@@ -656,14 +656,17 @@ Records in STATE_DIR that `call` completed. A snapshot can give way and fall
 behind; a revival compares this with the call its snapshot holds and says
 which calls' effects on the kernel it could not bring back.
 """
-function note_completed_call!(call::Int)
-    dir = STATE_DIR[]
-    isempty(dir) && return nothing
-    tmp = joinpath(dir, "last_call.tmp")
-    write(tmp, string(call))
-    mv(tmp, joinpath(dir, "last_call"); force=true)
+note_completed_call!(call::Int) = (isempty(STATE_DIR[]) || write_state_file!(STATE_DIR[], "last_call", string(call)); nothing)
+
+# Replaces `name` in `dir` whole: a reader sees the old text or the new, never part.
+function write_state_file!(dir::String, name::String, text::String)
+    tmp = joinpath(dir, name * ".tmp")
+    write(tmp, text)
+    mv(tmp, joinpath(dir, name); force=true)
     return nothing
 end
+
+const MAX_STOPPED_CODE_CHARS = 64_000
 
 """
     note_started_call!(call, code)
@@ -673,14 +676,10 @@ before the call completes, a revival names the call and what it assigns, and
 the next kernel does not reuse its number.
 """
 function note_started_call!(call::Int, code::String)
-    dir = STATE_DIR[]
-    isempty(dir) && return nothing
-    tmp = joinpath(dir, "started_call.tmp")
-    write(tmp, JSON.json(Dict("call" => call, "code" => first(code, MAX_STOPPED_CODE_CHARS))))
-    mv(tmp, joinpath(dir, "started_call"); force=true)
+    isempty(STATE_DIR[]) && return nothing
+    write_state_file!(STATE_DIR[], "started_call", JSON.json(Dict("call" => call, "code" => first(code, MAX_STOPPED_CODE_CHARS))))
     return nothing
 end
-const MAX_STOPPED_CODE_CHARS = 64_000
 
 # The call the previous kernel was running when it stopped, with its code, if
 # it started after the last completed one.
@@ -693,7 +692,7 @@ function stopped_call(dir::String, completed::Int)
     started isa AbstractDict || return nothing
     c = get(started, "call", nothing)
     c isa Integer && c > completed || return nothing
-    return (Int(c), string(get(started, "code", "")))
+    return (call=Int(c), code=string(get(started, "code", "")))
 end
 
 # The names a call's top level assigns or defines.
@@ -706,16 +705,13 @@ function top_level_names(code::String)
     names = String[]
     for st in top_statements(ex)
         append!(names, defined_names(st))
-        st isa Expr && st.head in (:(=), :global) || continue
-        lhs = st.args[1]
-        lhs isa Expr && lhs.head === :(=) && (lhs = lhs.args[1])
-        lhs isa Symbol && push!(names, string(lhs))
-        lhs isa Expr && lhs.head === :tuple && append!(names, [string(a) for a in lhs.args if a isa Symbol])
+        append!(names, sort!(string.(collect(assigned_symbols(st)))))
     end
     return unique(names)
 end
 
 calls_text(a::Int, b::Int) = a == b ? "call $(a)" : "calls $(a)–$(b)"
+calls_pronoun(a::Int, b::Int) = a == b ? "it" : "they"
 
 """
     snapshot_state!(call; waiting = () -> false)
@@ -849,9 +845,7 @@ function snapshot_state!(call::Int; waiting::Function = () -> false)
     for f in written
         mv(joinpath(dir, f * ".tmp"), joinpath(dir, f); force=true)
     end
-    tmp = joinpath(dir, "manifest.json.tmp")
-    write(tmp, JSON.json(manifest))
-    mv(tmp, joinpath(dir, "manifest.json"); force=true)   # the commit point
+    write_state_file!(dir, "manifest.json", JSON.json(manifest))   # the commit point
     LAST_SAVED_CALL[] = call
     LAST_SNAPSHOT_SECONDS[] = time() - started
     keep = Set(written)
@@ -1199,14 +1193,14 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
 
     # This kernel continues the old one's call numbers, past calls that
     # completed after the snapshot or stopped, and its file tracking.
-    last = something(tryparse(Int, strip(read_or_empty(joinpath(dir, "last_call")))), call)
-    stopped = stopped_call(dir, max(call, last))
+    last = max(call, something(tryparse(Int, strip(read_or_empty(joinpath(dir, "last_call")))), call))
+    stopped = stopped_call(dir, last)
     hist = state.execution_history
-    while length(hist) < max(call, last)
+    while length(hist) < last
         push!(hist, ExecutionRecord(uuid4(), Dates.now(), "", true, nothing, 0.0))
     end
     stopped === nothing ||
-        push!(hist, ExecutionRecord(uuid4(), Dates.now(), stopped[2], false, "the kernel stopped during this call", 0.0))
+        push!(hist, ExecutionRecord(uuid4(), Dates.now(), stopped.code, false, "the kernel stopped during this call", 0.0))
     empty!(DEFINITION_LOG)
     append!(DEFINITION_LOG, m["definitions"])
     for (p, s, c) in m["used_files"]
@@ -1230,10 +1224,10 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                  (data_block === nothing ? "." : "; its data could not be restored because $data_block."))
     last > call &&
         push!(lines, "  $(uppercasefirst(calls_text(call + 1, last))) completed after this state was saved: " *
-                     "what $(last == call + 1 ? "it" : "they") changed in the kernel is lost; files written to the workspace remain.")
+                     "what $(calls_pronoun(call + 1, last)) changed in the kernel is lost; files written to the workspace remain.")
     if stopped !== nothing
-        assigned = top_level_names(stopped[2])
-        push!(lines, "  Call $(stopped[1]) was running when the kernel stopped: what it changed in the kernel is lost" *
+        assigned = top_level_names(stopped.code)
+        push!(lines, "  Call $(stopped.call) was running when the kernel stopped: what it changed in the kernel is lost" *
                      (isempty(assigned) ? "" : " (it assigns $(join(assigned, ", ")))") * "; files it wrote to the workspace remain.")
     end
     procs = String.(get(m, "processes", String[]))
@@ -1253,6 +1247,6 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                  "Files in the workspace are unchanged.")
     uncertain = copy(approx)
     last > call && push!(uncertain, "$(calls_text(call + 1, last)) completed after the saved snapshot")
-    stopped === nothing || push!(uncertain, "call $(stopped[1]) stopped before it completed")
+    stopped === nothing || push!(uncertain, "call $(stopped.call) stopped before it completed")
     return revival_observation!(; restored=exact, rebuilt, stale, lost, uncertain, saved_call=call, text=join(lines, "\n"))
 end
