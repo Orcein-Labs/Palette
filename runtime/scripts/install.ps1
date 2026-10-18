@@ -48,6 +48,7 @@ function Find-Distribution {
 $distribution = Find-Distribution
 if (-not $distribution) {
     Say 'Installing WSL2 with Ubuntu (Windows asks for permission; Ubuntu asks for a new Linux user name and password)'
+    Write-Host 'When Ubuntu leaves you at a Linux prompt ($), type exit to let this installer continue.'
     & wsl.exe --install --distribution Ubuntu
     $distribution = Find-Distribution
     if (-not $distribution) {
@@ -65,7 +66,7 @@ Say "Using WSL distribution $distribution"
 # Root inside WSL needs no password, so the sandbox's system packages are
 # installed here rather than by sudo inside install.sh.
 Say 'Installing the sandbox system packages'
-In-Linux --user root --exec sh -c 'command -v curl >/dev/null || { apt-get update && apt-get install -y curl ca-certificates; }; curl -fsSL $0/setup-sandbox-host.sh | sh -s install' $release
+In-Linux --user root --exec sh -c 'command -v curl >/dev/null || if command -v apt-get >/dev/null; then apt-get update && apt-get install -y curl ca-certificates; elif command -v dnf >/dev/null; then dnf install -y curl; elif command -v pacman >/dev/null; then pacman -S --needed --noconfirm curl; else zypper --non-interactive install curl; fi; curl -fsSL $0/setup-sandbox-host.sh | sh -s install' $release
 if ($LASTEXITCODE -ne 0) { Stop-Install 'could not install the sandbox system packages' }
 
 # The Linux installer reads its settings from these, passed through WSLENV.
