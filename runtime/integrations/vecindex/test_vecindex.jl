@@ -369,5 +369,33 @@ end
 
         VI.vecindex(Dict{String,Any}("action" => "drop", "store" => "duck_test"))
     end
+
+    @testset "7. .gitignore-aware codegraph indexing & auto-mode threshold" begin
+        @test VI._IVF_AUTO_MIN_ITEMS == 50_000
+        if Sys.which("git") !== nothing
+            mktempdir() do root
+                run(pipeline(`git -C $root init -q`; stdout=devnull, stderr=devnull))
+                write(joinpath(root, ".gitignore"), "research/\n")
+                mkpath(joinpath(root, "research"))
+                write(joinpath(root, "keep.jl"), "f(x) = x\n")
+                write(joinpath(root, "research", "scratch.jl"), "g(x) = x\n")
+                allowed = VI._git_nonignored_files(root)
+                @test allowed !== nothing
+                @test "keep.jl" in allowed
+                @test !("research/scratch.jl" in allowed)
+
+                def_t = NamedTuple{(:name, :kind, :line),Tuple{String,Symbol,Int}}
+                call_t = NamedTuple{(:caller, :callee, :line),Tuple{String,String,Int}}
+                mk(p, n) = (path=p, language=:julia, definitions=def_t[(name=n, kind=:function, line=1)], calls=call_t[])
+                cg = (root=root, files=Dict("keep.jl" => mk("keep.jl", "f"),
+                                            "research/scratch.jl" => mk("research/scratch.jl", "g")))
+                st = VI.VecStore("gi"; dim=64, capacity=8)
+                VI.index_codegraph!(st, cg; include_polyglot=false)
+                ids = st.ids[1:st.count]
+                @test any(id -> startswith(id, "keep.jl:"), ids)
+                @test !any(id -> startswith(id, "research/"), ids)
+            end
+        end
+    end
 end
 
