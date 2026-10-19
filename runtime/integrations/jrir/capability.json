@@ -1,0 +1,9 @@
+{
+  "id": "jrir",
+  "name": "Julia-Rust Intermediate Representation & LLVM Inlining Bridge",
+  "version": "0.1.0",
+  "language": "julia",
+  "entrypoint": "jrir.jl",
+  "symbol": "jrir",
+  "dependencies": []
+}
