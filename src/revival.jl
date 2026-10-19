@@ -798,11 +798,10 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         push!(bindings, b)
     end
     byname = Dict(b["name"] => b for b in bindings)
-    seq = string(call, "-", round(Int, time() * 1000) % 10^9)
     written = String[]
     stored = Dict{String, Any}[]
     total = 0
-    for (i, g) in enumerate(groups)
+    for g in groups
         if give_way()
             foreach(f -> rm(joinpath(dir, f * ".tmp"); force=true), written)
             return nothing
@@ -833,10 +832,16 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
             continue
         end
         total += length(bytes)
-        file = "data-$seq-$i.jls"
-        write(joinpath(dir, file * ".tmp"), bytes)
-        push!(written, file)
-        push!(stored, Dict{String, Any}("file" => file, "names" => sort(g.names), "sha256" => bytes2hex(sha256(bytes)),
+        sha = bytes2hex(sha256(bytes))
+        # Named by content: data that did not change keeps its file, which the
+        # checkpoints that link it share instead of each pinning a copy.
+        file = "data-$(first(sha, 32)).jls"
+        existing = joinpath(dir, file)
+        if !(file in written) && !(isfile(existing) && filesize(existing) == length(bytes))
+            write(joinpath(dir, file * ".tmp"), bytes)
+            push!(written, file)
+        end
+        push!(stored, Dict{String, Any}("file" => file, "names" => sort(g.names), "sha256" => sha,
                                         "user_types" => sort!(collect(g.user))))
     end
     usertypes = Set(t for g in stored for t in g["user_types"])
@@ -858,7 +863,7 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
     write_state_file!(dir, "manifest.json", JSON.json(manifest))   # the commit point
     LAST_SAVED_CALL[] = call
     LAST_SNAPSHOT_SECONDS[] = time() - started
-    keep = Set(written)
+    keep = Set(String(g["file"]) for g in stored)
     for f in readdir(dir)
         startswith(f, "data-") && !(f in keep) && rm(joinpath(dir, f); force=true)
     end

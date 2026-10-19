@@ -255,7 +255,7 @@ class PaletteSession:
             argv += ["--setenv", "PALETTE_MAX_TURN_TIMEOUT", f"{self.max_turn_timeout:g}"]
             # The sandbox starts with a clear environment; the limits on saved
             # state pass through when the host sets them (src/revival.jl).
-            for name in ("PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES"):
+            for name in ("PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS"):
                 if name in os.environ:
                     argv += ["--setenv", name, os.environ[name]]
             argv += ["--", julia_bin, "--startup-file=no", str(Path(self.repo_dir) / "runtime/scripts/session_loop.jl")]
