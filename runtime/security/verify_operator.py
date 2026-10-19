@@ -135,7 +135,7 @@ def main():
         implementation_env = {**env, "PALETTE_HOST_BIN": str(host)} if implementation == "rust" else env
         runs += [(security / suite, implementation, implementation_env) for suite in
                  ("test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py", "test_host_bridge.py",
-                  "test_contexts.py", "test_time_machine.py")]
+                  "test_contexts.py", "test_time_machine.py", "test_tools.py")]
         # Receipts are the Rust host's, and test_host_command runs the Python broker itself.
         if implementation == "rust":
             runs += [(security / suite, implementation, implementation_env) for suite in
