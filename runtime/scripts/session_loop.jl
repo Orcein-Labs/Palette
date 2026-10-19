@@ -167,6 +167,14 @@ let state = Palette.get_kernel_state()
                  "Partial reconstructed state may remain; inspect bindings. Files in the workspace remain.")
     end
     Palette.REVIVAL_REPORT[] = Palette.restore_report(Palette.REVIVAL_REPORT[])
+    # Project and trusted tools: a stub per tool, so the first call loads it.
+    empty!(Palette.TOOL_USES)
+    try
+        Base.invokelatest(Palette.install_tool_stubs!, state.eval_module)
+    catch e
+        Palette.REVIVAL_REPORT[] = join(filter(!isempty, [Palette.REVIVAL_REPORT[],
+            "[tools] Listing project and trusted tools failed ($(first(sprint(showerror, e), 200))); none are bound."]), "\n")
+    end
 end
 
 respond(Dict{String,Any}("kind" => "HELLO", "epoch" => EPOCH, "schema_revision" => 3,

@@ -309,7 +309,7 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
         end
         push!(DEFINITION_LOG, entry)
     end
-    return
+    return ex
 end
 
 # Definition forms of an included file, as they are on disk now (or in
@@ -746,7 +746,7 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
     groups = Group[]
     for (k, sym) in enumerate(sort!(Base.invokelatest(names, mod; all=true)))
         k % 32 == 0 && give_way() && return nothing
-        (sym === nameof(mod) || sym in KERNEL_BINDINGS || startswith(string(sym), '#')) && continue
+        session_binding(mod, sym) || continue
         Base.invokelatest(isdefined, mod, sym) || continue
         v = Base.invokelatest(getglobal, mod, sym)
         name = string(sym)

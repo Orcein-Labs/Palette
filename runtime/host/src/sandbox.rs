@@ -20,6 +20,7 @@ pub const SANDBOX_USER: &str = "palette";
 const SANDBOX_OWNED_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "JULIA_DEPOT_PATH", "JULIA_PROJECT", "JULIA_LOAD_PATH",
     "JULIA_PKG_OFFLINE", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
+    "PALETTE_TRUSTED_TOOLS",
 ];
 
 /// The real julia binary, past the juliaup shim. An explicit PALETTE_JULIA_BIN
@@ -382,6 +383,7 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     // the build machine's checkout and leave a relocated install unprotected.
     protected.extend(util::installed_checkout());
     protected.extend(parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?);
+    protected.extend(trusted_tools_dir(std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())?);
     for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR"] {
         if let Ok(path) = std::env::var(key) { if !path.is_empty() { protected.push(PathBuf::from(path)); } }
     }
@@ -1107,6 +1109,20 @@ pub(crate) fn parse_read_roots(spec: Option<&str>) -> Result<Vec<PathBuf>, Strin
     Ok(roots)
 }
 
+/// The directory of human-approved kernel tools, from PALETTE_TRUSTED_TOOLS.
+/// The kernel reads it like a read root; only the patch broker writes it,
+/// after a human approves.
+pub(crate) fn trusted_tools_dir(spec: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(dir) = spec.filter(|s| !s.is_empty()) else { return Ok(None) };
+    if !Path::new(dir).is_absolute() {
+        return Err(format!("PALETTE_TRUSTED_TOOLS must be an absolute path: {dir}"));
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+        .map_err(|e| format!("creating trusted tool directory {dir}: {e}"))?;
+    canonical_dir("trusted tool directory", Path::new(dir)).map(Some)
+}
+
 /// A read root may not contain any other mount, so no mount order can let it
 /// hide one (a writable depot clone, the synthetic /tmp), and it may not lie
 /// inside a writable mount, where the worker could write what it reads.
@@ -1188,7 +1204,9 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     // /tmp/workspace-style child mounts are intentional; only an equal or
     // ancestor workspace/state mount could hide the synthetic /tmp or /run root.
     check_writable_roots_not_masked(&writable, &required_roots)?;
-    let read_roots = parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?;
+    let trusted_tools = trusted_tools_dir(std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())?;
+    let mut read_roots = parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?;
+    read_roots.extend(trusted_tools.clone());
     let others: Vec<(&str, &Path)> = protected.iter().chain(required_roots.iter()).copied().collect();
     check_read_roots(&read_roots, &writable, &others)?;
     let read_roots: Vec<String> = read_roots.iter().map(|r| r.to_string_lossy().into_owned()).collect();
@@ -1278,6 +1296,9 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     }
     for (k, v) in &task_env {
         push(&["--setenv", k, v]);
+    }
+    if let Some(dir) = trusted_tools.as_deref() {
+        push(&["--setenv", "PALETTE_TRUSTED_TOOLS", &utf8(dir, "trusted tool directory")?]);
     }
     if let Some(d) = broker_socket_dir {
         let sock = format!("{d}/broker.sock");
@@ -1372,6 +1393,19 @@ mod tests {
         let file = root.join("file");
         fs::write(&file, "x").unwrap();
         assert!(parse_read_roots(Some(&file.to_string_lossy())).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trusted_tools_dir_is_created_absolute_and_canonical() {
+        let root = fs::canonicalize(util::mkdtemp("palette-trusted-tools-").unwrap()).unwrap();
+        let dir = root.join("trusted").join("tools");
+        assert_eq!(trusted_tools_dir(None).unwrap(), None);
+        assert_eq!(trusted_tools_dir(Some("")).unwrap(), None);
+        assert!(trusted_tools_dir(Some("relative/tools")).is_err());
+        assert_eq!(trusted_tools_dir(Some(&dir.to_string_lossy())).unwrap(), Some(dir.clone()));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         let _ = fs::remove_dir_all(root);
     }
 

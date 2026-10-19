@@ -75,6 +75,31 @@ end
         empty!(DEFINITION_LOG)
         snapshot_state!(6; waiting = () -> false)
         revive_state!()
+        # A code graph's first build and queries, and the tool index, stubs and
+        # lookup a session starts with: cold, these took about 3.4 s.
+        let root = mktempdir(), previous = WORKSPACE_ROOT[]
+            try
+                WORKSPACE_ROOT[] = root
+                write(joinpath(root, "lib.jl"), "\"Doc.\"\nfunction g(x::Int)\n    x\nend\nf(x) = g(x)\nmacro m(e) e end\n")
+                write(joinpath(root, "lib.rs"), "fn a() { b(); }\n")
+                Pharos.digest(codegraph(root))
+                Api.definitions("g")
+                Api.callers("g")
+                dir = mkpath(joinpath(root, ".palette", "tools"))
+                code = "workload_tool(x) = x + 1\n"
+                write(joinpath(dir, "workload_tool.jl"), code)
+                write(joinpath(dir, "workload_tool.json"), JSON.json(Dict("name" => "workload_tool", "stage" => "project",
+                    "source_sha256" => bytes2hex(sha256(code)), "evidence" => [], "signatures" => ["workload_tool(x)"], "doc" => "")))
+                install_tool_stubs!(WorkloadScope)
+                # Not call_tool: loading evaluates into a new module, which
+                # precompilation refuses.
+                tool_lookup("workload_tool")
+                tool_stamps("workload_tool")
+            finally
+                WORKSPACE_ROOT[] = previous
+                rm(root; recursive=true, force=true)
+            end
+        end
     catch e
         # Everything after the failing line goes uncompiled, and the kernel's first calls are slow.
         @warn "precompile workload stopped early" exception=(e, catch_backtrace())
@@ -109,6 +134,7 @@ end
         empty!(TASK_OBSERVATIONS)
         TASK_SEQUENCE[] = 0
         TASK_EPOCH[] = ""
+        empty!(TOOL_USES); empty!(TOOL_SOURCES); empty!(TOOL_STUBS); empty!(LOADED_TOOLS); empty!(CODE_GRAPHS)
     end
     precompile(Base.open, (Base.RawFD,))
 end
