@@ -65,3 +65,5 @@ In `"auto"` mode (the default), `vecindex` uses `search_exact!` (`BLAS.gemv!`) f
 | `search_exact!` (`BLAS.gemv!` + `select_topk_max!`, default `< 50k`) | `118.4 µs` | `0 B` | `87.5x` | `1.00` / `1.00` |
 | `search_ivf!` (Contiguous IVF + 4-way AVX2 FMA, explicit or $\ge 50\text{k}$) | **`56.0 µs`** | **`0 B`** | **`185.0x`** | `0.91–1.00` (clustered; scales with `n_probe`) |
 
+IVF recall depends on how clustered the data is. On unclustered data (Gaussian, $N = 20,000$, $d = 256$, `n_list = 71`) recall@10 is `0.58` at `n_probe = 24` (the default, about `n_list / 3`) and `0.46` at `n_probe = 16`. A store that crosses `50,000` items switches `"auto"` to IVF whatever its data, so pass a larger `n_probe` or `"mode" => "exact"` when recall matters more than latency. Every reply reports `mode_used`.
+
