@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 
-from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode
+from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode, patch_roots_from_env
 from filesystem_layout import require_disjoint
 from provisioning import operator_ceiling, palette_version, protected_host_paths
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
@@ -70,13 +70,7 @@ def workspace_protected_paths():
         value = os.environ.get(name)
         if value:
             protected.append(Path(value).expanduser())
-    try:
-        patch_roots = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object") from exc
-    if not isinstance(patch_roots, dict):
-        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object")
-    for target, raw_path in patch_roots.items():
+    for target, raw_path in patch_roots_from_env().items():
         if not isinstance(target, str) or not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
             raise ValueError("PALETTE_PATCH_ROOTS must map target IDs to absolute paths")
         protected.append(Path(raw_path).expanduser())
@@ -505,7 +499,7 @@ WORKSPACE_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["create
 for schema in (PALETTE_SCHEMA, CONTROL_SCHEMA, WORKSPACE_SCHEMA, PATCH_SCHEMA):
     schema["properties"].update(workspace_id={"type": "string", "maxLength": 64}, context_id={"type": "string", "maxLength": 256})
 TOOLS = [{"name": name, "description": description, "inputSchema": schema, "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}} for name, description, schema in [
-    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call traced (records the method each top-level call dispatched to, see Palette.xray), reference (registered reference implementations replace the fast ones), memoized, or budgeted (budget={seconds, bytes}); Palette.context!(name) sets a session default.", PALETTE_SCHEMA),
+    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call traced (records the method each top-level call dispatched to, see Palette.xray), reference (registered reference implementations replace the fast ones), memoized, or budgeted (budget={seconds, bytes}); Palette.context!(name) sets a session default. Api.promote(:f) keeps a helper used in 3 successful calls as a project tool (.palette/tools); Api.tools() lists project and trusted tools, which load on first call; Api.trust(:f) asks a human to approve it as trusted. Api.definitions(name) and Api.callers(name) query the workspace code graph (Api.codegraph()).", PALETTE_SCHEMA),
     ("palette_control", "Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot and keeps its checkpoints. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the world at that checkpoint (fork=true makes it a new world), after saving the current world as an auto- checkpoint. action=receipts returns the host receipts of call=n (this kernel's, unless epoch is given; Palette.xray(n) shows its costs), or filters them by kind and since/until (unix seconds).", CONTROL_SCHEMA),
     ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.", WORKSPACE_SCHEMA),
     ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.", PATCH_SCHEMA)]]
@@ -531,7 +525,7 @@ def validate(args, schema):
 
 def serve_stream(stdin, stdout):
     capabilities = {}
-    roots = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
+    roots = patch_roots_from_env()
     require_disjoint(roots.values(), [ROOT, LEGACY, LEGACY_RECEIPTS])
     ceiling = operator_ceiling()
     repair_config_path = os.environ.get("PALETTE_REPAIR_CONFIG")

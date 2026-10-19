@@ -186,6 +186,9 @@ def protected_host_paths(
     if read_roots:
         from filesystem_layout import parse_read_roots
         paths.update(Path(root).resolve(strict=False) for root in parse_read_roots(read_roots))
+    trusted_tools = os.environ.get("PALETTE_TRUSTED_TOOLS")
+    if trusted_tools:
+        paths.add(Path(trusted_tools).expanduser().resolve(strict=False))
     commands = checked.get("host_command", {}).get("commands", {})
     for spec in commands.values():
         argv = spec["argv"]

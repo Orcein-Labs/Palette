@@ -109,6 +109,8 @@ function refresh!(g::CodeGraph; files=nothing)
         lang = _language(rel)
         lang === nothing && continue
         abs = joinpath(g.root, rel)
+        # lstat: a symlink is skipped, not followed out of the root. The inode
+        # catches a file replaced by rename with the same size and mtime.
         st = lstat(abs)
         isfile(st) || continue
         stamp = (Float64(st.mtime), Float64(st.size), Float64(st.inode))
@@ -154,13 +156,15 @@ function refresh!(g::CodeGraph; files=nothing)
     return g
 end
 
-_matches(n::AbstractString, name::AbstractString) = n == name || endswith(n, "." * name)
+# Matches a name equal to `name` or ending in "." * name.
+_matcher(name::AbstractString) = (suffix = "." * name; n -> n == name || endswith(n, suffix))
 
 "Definitions whose name equals `name` or ends with \".\" * name, as (path, definition) pairs."
 function definitions(g::CodeGraph, name::AbstractString)
     out = Tuple{String,Definition}[]
+    matches = _matcher(name)
     for (path, e) in g.files, d in e.definitions
-        _matches(d.name, name) && push!(out, (path, d))
+        matches(d.name) && push!(out, (path, d))
     end
     return sort!(out; by=t -> (t[1], t[2].line))
 end
@@ -168,8 +172,9 @@ end
 "Calls whose callee equals `name` or ends with \".\" * name, as (path, call) pairs."
 function callers(g::CodeGraph, name::AbstractString)
     out = Tuple{String,Call}[]
+    matches = _matcher(name)
     for (path, e) in g.files, c in e.calls
-        _matches(c.callee, name) && push!(out, (path, c))
+        matches(c.callee) && push!(out, (path, c))
     end
     return sort!(out; by=t -> (t[1], t[2].line))
 end
@@ -239,13 +244,7 @@ function _jspecial!(st::JState, h::Symbol, a::Vector{Any}, line::Int, encl::Stri
     if h === :function && !isempty(a)
         core = _sig_core(a[1])
         name = _def_name(core)
-        if name === nothing
-            line = _jscan!(st, a[1], line, encl)
-            for r in a[2:end]
-                line = _jscan!(st, r, line, encl)
-            end
-            return line
-        end
+        name === nothing && return nothing
         return _jdef!(st, :function, name, core, a[2:end], line, encl)
     elseif h === :(=) && length(a) == 2
         core = _sig_core(a[1])
