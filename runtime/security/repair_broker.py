@@ -386,11 +386,17 @@ class RepairBroker:
         action = args.get("action")
         if action == "detect":
             return self.detect(args)
+        if action == "targets":
+            return {"targets": {name: {"root": root, "test_recipe": name in self.test_recipes}
+                                for name, root in sorted(self.patches.roots.items())},
+                    "configured_by": "PALETTE_PATCH_ROOTS, a JSON object of target name to source directory, set by the host"}
         if action == "classify":
             changes = args.get("changes")
             target = args.get("target")
-            if not isinstance(changes, list) or target not in self.patches.roots:
-                raise ValueError("classify requires a configured target and changes")
+            if target not in self.patches.roots:
+                raise self.patches.unknown_target(target)
+            if not isinstance(changes, list):
+                raise ValueError("classify requires changes")
             return {"status": "classified", "files": self.classify_changes(target, changes)}
         if action == "propose":
             return self.propose(args, workspace)
@@ -405,4 +411,4 @@ class RepairBroker:
                 record["status"] = "interrupted_completion_unknown"
                 self.store(record)
             return {key: value for key, value in record.items() if key != "changes"}
-        raise ValueError("Unknown repair action")
+        raise ValueError("Unknown repair action; expected targets, detect, classify, propose, test, apply or status")

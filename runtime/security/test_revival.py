@@ -68,7 +68,8 @@ def section(report: str, heading: str) -> str:
     return m.group(1) if m else ""
 
 
-class RevivalTest(unittest.TestCase):
+class KernelTestCase(unittest.TestCase):
+    """A temporary workspace and state dir, and kernels started on them."""
     def setUp(self):
         if shutil.which("bwrap") is None or not Path(PROJECT_DIR).exists():
             self.fail("needs bwrap and the prepared test project")
@@ -101,6 +102,8 @@ class RevivalTest(unittest.TestCase):
     def manifest(self) -> dict:
         return json.loads(Path(self.state, "manifest.json").read_text())
 
+
+class RevivalTest(KernelTestCase):
     def test_MT016_dynamic_include_and_five_dependents(self):
         Path(self.ws, "foundation.jl").write_text("module Foundation; export Token; struct Token; n::Int; end; end\n")
         self.session('path_="foundation.jl"; include(path_); using .Foundation; ' +
@@ -463,6 +466,7 @@ class RevivalTest(unittest.TestCase):
         out, r = self.revive("(a, b)")
         self.assertEqual(r["data"], [1, 2])
         self.assertIn("Calls 3–5 completed after this state was saved", out)
+        self.assertEqual(r["call"], 6, "the unsaved calls' numbers are not reused")
         self.session("c = 3")
         out, r = self.revive("c")
         self.assertNotIn("completed after this state was saved", out)
@@ -520,6 +524,15 @@ class RevivalTest(unittest.TestCase):
         for name in ("LINE_RE", "m", "rules"):
             self.assertIn(f"{name} (", exact)
 
+    def test_a_const_from_an_included_file_stays_const(self):
+        # Found in the Time Machine demo: the revived const came back as a plain
+        # global, so including its file again failed to declare it const.
+        Path(self.ws, "consts.jl").write_text('const PATTERN = r"^p50 (\\d+)$"\nscale(x) = 2x\n')
+        self.session('include("consts.jl"); n = scale(parse(Int, match(PATTERN, "p50 21")[1]))')
+        out, r = self.revive('include("consts.jl"); (isconst(@__MODULE__, :PATTERN), n, match(PATTERN, "p50 3")[1])')
+        self.assertTrue(r["success"], out)
+        self.assertEqual(r["data"], [True, 42, "3"])
+
     def test_a_revived_closure_runs_the_code_it_was_made_with(self):
         # make_adder is redefined after add3 was made. The rebuilt make_adder
         # makes closures of the same generated name; add3 must not become one.
@@ -550,10 +563,16 @@ class RevivalTest(unittest.TestCase):
         k.turn("v = [1, 2, 3]; count_ = 1")
         r = k.turn("v[1] = 100; count_ = 2; s = 0; while true; s += 1; end")
         self.assertTrue(r.get("session_dead") or r.get("kernel_exit") or not r["success"], r)
+        # With a state directory the next kernel revives, so the kill must not say everything is gone.
+        self.assertIn("revives what it can of the last saved state", r["error"])
+        self.assertNotIn("Every binding is gone", r["error"])
         k.close()
         out, r = self.revive("(v, count_, @isdefined(s))")
         self.assertIn("end of call 1", out)
+        self.assertIn("Call 2 was running when the kernel stopped", out)
+        self.assertIn("(it assigns count_, s)", out)
         self.assertEqual(r["data"], [[1, 2, 3], 1, False])
+        self.assertEqual(r["call"], 3, "the killed call's number is not reused")
 
     def test_normal_restart_continues_call_numbers_and_revives_again(self):
         self.session("a = 1", "b = 2")

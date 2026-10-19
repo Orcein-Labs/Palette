@@ -796,15 +796,28 @@ class Broker:
         Actions: "run" (default) waits; "start" returns a job id at once;
         "poll" with that id returns {"running": True} and the output since
         the last poll, or the result; "cancel" kills the job's process group
-        and returns its result; "list" names the jobs still held. Mirrors
-        runtime/host/src/broker.rs host_command.
+        and returns its result; "list" names the jobs still held;
+        "commands" names the commands the ceiling allows. A command with a
+        "lock" file runs under an exclusive flock on it, shared with work
+        outside Palette (a GPU lock); waiting for the lock counts against its
+        timeout. Mirrors runtime/host/src/broker.rs host_command.
 
         Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
-        "cwd": "/abs", "timeout_s": 600, "extra_args": false}}}}"""
+        "cwd": "/abs", "timeout_s": 600, "extra_args": false,
+        "lock": "/abs/file", "description": "..."}}}}"""
         cap = self.ceiling.get("host_command")
         if cap is None:
             raise CapabilityDenied("host_command not in this session's ceiling")
         action = params.get("action", "run")
+        if action == "commands":
+            listed = []
+            for name, spec in (cap.get("commands") or {}).items():
+                spec = spec if isinstance(spec, dict) else {}
+                entry = {"name": name, "argv": spec.get("argv"), "cwd": spec.get("cwd"),
+                         "timeout_s": spec.get("timeout_s", 60.0), "extra_args": spec.get("extra_args") is True}
+                entry.update({k: spec[k] for k in ("lock", "description") if k in spec})
+                listed.append(entry)
+            return {"commands": listed}
         if action == "list":
             with self._jobs_lock:
                 listed = [{"job": job_id, "name": name, "running": job.running(), "seconds": round(job.seconds(), 3)}
@@ -827,7 +840,7 @@ class Broker:
             result = job.cancel() if action == "cancel" else job.wait()
             return {**result, "job": job_id, "name": name}
         if action not in ("run", "start"):
-            raise CapabilityDenied(f"host_command action must be run, start, poll, cancel or list, not {action!r}")
+            raise CapabilityDenied(f"host_command action must be run, start, poll, cancel, list or commands, not {action!r}")
         name = params.get("name")
         if not isinstance(name, str) or not name:
             raise CapabilityDenied("host_command requires a non-empty string 'name'")
@@ -864,15 +877,26 @@ class Broker:
             raise CapabilityDenied(f"host command {name!r} takes no arguments (its ceiling entry does not set extra_args)")
         if len(args) > 64 or any("\0" in a or len(a.encode()) > 4096 for a in args):
             raise CapabilityDenied("host_command accepts at most 64 arguments of at most 4096 bytes, without NUL")
+        argv = argv + args
+        lock = spec.get("lock")
+        if lock is not None:
+            if (not isinstance(lock, str) or not os.path.isabs(lock) or os.path.isdir(lock)
+                    or not os.path.isdir(os.path.dirname(lock))):
+                raise misconfigured("'lock' must be an absolute file path in an existing directory")
+            flock = next((f for f in ("/usr/bin/flock", "/bin/flock") if os.path.isfile(f)), None)
+            if flock is None:
+                raise misconfigured("'lock' needs flock(1) from util-linux, which is not installed")
+            argv = [flock, "--exclusive", lock] + argv
+        shown = {"lock": lock} if lock is not None else {}
         if action == "start":
             with self._jobs_lock:
                 if len(self._jobs) >= MAX_HOST_JOBS:
                     raise CapabilityDenied(f"at most {MAX_HOST_JOBS} host_command jobs may run at once; "
                                            "poll one to completion or cancel one first")
                 job_id = uuid.uuid4().hex[:16]
-                self._jobs[job_id] = (name, HostJob(argv + args, cwd, float(timeout_s)))
-            return {"job": job_id, "name": name, "running": True}
-        return {**HostJob(argv + args, cwd, float(timeout_s)).wait(), "name": name}
+                self._jobs[job_id] = (name, HostJob(argv, cwd, float(timeout_s)))
+            return {"job": job_id, "name": name, "running": True, **shown}
+        return {**HostJob(argv, cwd, float(timeout_s)).wait(), "name": name, **shown}
 
     HANDLERS = {
         "host_request": _handle_host_request,

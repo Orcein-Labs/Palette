@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -162,6 +163,29 @@ class PatchTests(unittest.TestCase):
         self.assertEqual((self.root / "a.txt").read_text(), "before\n")
         with self.assertRaises(PermissionError):
             self.broker.approve(request["request_id"], "wrong digest", "local_administrator")
+
+    def test_the_printed_approve_command_approves_exactly_this_patch(self):
+        request = self.prepare()
+        result = self.broker.call({"action": "apply", "request_id": request["request_id"]}, "world-a", {}, None, None)
+        self.assertIn(request["patch_sha256"], result["approve_command"])
+        review = subprocess.run(shlex.split(result["review_command"]), capture_output=True, text=True)
+        self.assertEqual(review.returncode, 0, review.stderr)
+        approve = subprocess.run(shlex.split(result["approve_command"]), capture_output=True, text=True)
+        self.assertEqual(approve.returncode, 0, approve.stderr)
+        applied = self.broker.call({"action": "apply", "request_id": request["request_id"]}, "world-a", {}, None, None)
+        self.assertEqual(applied["status"], "applied", applied)
+
+    def test_an_unknown_target_names_the_configured_ones(self):
+        for action in ("read", "prepare"):
+            with self.subTest(action=action), self.assertRaises(PermissionError) as raised:
+                self.broker.call({"action": action, "target": "projcet", "path": "a.txt", "changes": []}, "world-a", {}, None, None)
+            self.assertIn("configured: project", str(raised.exception))
+        repair = RepairBroker(self.broker, {}, {})
+        listed = repair.call({"action": "targets"}, "world-a")
+        self.assertEqual(listed["targets"], {"project": {"root": str(self.root.resolve()), "test_recipe": False}})
+        with self.assertRaises(PermissionError) as raised:
+            repair.call({"action": "classify", "target": "projcet", "changes": []}, "world-a")
+        self.assertIn("PALETTE_PATCH_ROOTS", str(raised.exception))
 
     def test_administrator_mode_never_asks_the_client(self):
         broker = PatchBroker(self.store, {"project": str(self.root)}, approval="administrator")

@@ -318,10 +318,6 @@ class TestAuthorityUnderPersistence(SessionTestCase):
         self.assertEqual(Path(target).read_text(), "eph")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestReadRoots(SessionTestCase):
     """PALETTE_READ_ROOTS: the kernel reads the host directory at its own
     path, cannot write it, and sees nothing beside it."""
@@ -371,6 +367,8 @@ class TestHostCommand(SessionTestCase):
                 self.assertIn("takes no arguments", r["data"])
                 r = s.turn('try; Palette.host_command("sh"); catch e; sprint(showerror, e); end')
                 self.assertIn("not in this session's ceiling", r["data"])
+                r = s.turn('sort([c["name"] for c in Palette.host_commands()])')
+                self.assertEqual(r["data"], ["cat-marker", "echo", "gated", "long"])
                 s.turn('job = Palette.host_command("gated"; wait=false)["job"]')
                 with open(outside / "started") as f:      # the job is running, blocked on `go`
                     shell = int(f.read())
@@ -385,6 +383,13 @@ class TestHostCommand(SessionTestCase):
                 r = s.turn('Palette.host_command_poll(job)')
                 self.assertIs(r["data"]["running"], False)
                 self.assertEqual(r["data"]["stdout"], "finished\n")
+                # A second poll of the finished job (a wait loop's own poll
+                # took the result) returns the same result, not an error.
+                r = s.turn('Palette.host_command_poll(job)')
+                self.assertEqual((r["data"]["running"], r["data"]["stdout"]), (False, "finished\n"))
+                r = s.turn('w = Palette.host_command("echo", "waited"; wait=false)["job"]; '
+                           'p = Palette.host_command_wait(w; interval_s=0.2); (p["running"], p["returncode"], p["stdout"])')
+                self.assertEqual(r["data"], [False, 0, "waited\n"])
                 # The jobs line, printed before each turn's code runs, names
                 # a running job until it is cancelled; cancel kills it.
                 s.turn('long = Palette.host_command("long"; wait=false)["job"]')
@@ -399,3 +404,7 @@ class TestHostCommand(SessionTestCase):
                 self.assertIn("the ceiling's limit", r["data"])
         finally:
             shutil.rmtree(outside, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

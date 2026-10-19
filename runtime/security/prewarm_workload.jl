@@ -10,7 +10,10 @@ for name in sort(unique([stdlibs; project_deps; optional_deps]))
     try
         Core.eval(Main, :(import $(Symbol(name))))
     catch e
-        push!(failed, name * ": " * first(sprint(showerror, e), 200))
+        # A precompile failure puts its cause at the end of a long message.
+        message = sprint(showerror, e)
+        length(message) > 4000 && (message = first(message, 1000) * "\n[...]\n" * last(message, 3000))
+        push!(failed, name * ": " * message)
     end
 end
 println("prewarmed ", length(Base.loaded_modules), " modules")

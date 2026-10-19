@@ -29,6 +29,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,15 @@ from launch_worker import (build_bwrap_argv, default_depot, has_depot_snapshot, 
                            publish_depot_snapshot, resolve_real_julia_binary)
 
 PREWARM = Path(__file__).with_name("prewarm_workload.jl").read_text()
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def error_summary(text: str, head: int = 1000, tail: int = 3000) -> str:
+    """Julia's error output without colour codes, cut in the middle: the cause leads and the stack ends it."""
+    text = ANSI.sub("", text or "").strip()
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[... {len(text) - head - tail} characters left out ...]\n{text[-tail:]}"
 
 
 def preparation_identity(project_dir: str, repo_dir: str, julia_bin: str) -> dict:
@@ -49,7 +59,7 @@ def preparation_identity(project_dir: str, repo_dir: str, julia_bin: str) -> dic
                                   *project.joinpath("src").rglob("*.jl"),
                                   *repo.joinpath("runtime", "scripts").glob("*.jl"),
                                   *project.glob("*Project.toml"), *project.glob("*Manifest.toml")]))}
-    package_root = Path(os.environ.get("PALETTE_PACKAGE_DEPOT", str(Path.home() / ".palette/packages"))).expanduser().resolve()
+    package_root = Path(os.environ.get("PALETTE_PACKAGE_DEPOT") or Path.home() / ".palette/packages").expanduser().resolve()
     package_environment = package_root / "environment"
     optional_files = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
                       for p in sorted([*package_environment.glob("*Project.toml"), *package_environment.glob("*Manifest.toml")])}
@@ -84,11 +94,13 @@ def preparation_status(identity: dict, state_dir: str | None = None) -> dict:
     if record.get("state") not in ("preparing", "prepared", "failed") or not isinstance(record.get("cache_files", {}), dict):
         return {"state": "failed", "error": "invalid preparation state or cache inventory", "identity": identity}
     if record.get("identity") != identity:
-        return {**record, "state": "stale", "current_identity": identity}
+        # The old error belongs to sources that are gone; the next prepare replaces it.
+        return {**record, "state": "stale", "error": None, "current_identity": identity,
+                "reason": "the project, Palette's sources or Julia changed since this preparation"}
     if record.get("state") == "prepared" and any(not Path(p).is_file() or
             hashlib.sha256(Path(p).read_bytes()).hexdigest() != digest
             for p, digest in record.get("cache_files", {}).items()):
-        return {**record, "state": "stale", "error": "prepared cache missing or changed"}
+        return {**record, "state": "stale", "error": None, "reason": "prepared cache missing or changed"}
     if record.get("state") == "preparing":
         try:
             os.kill(record["pid"], 0)
@@ -109,14 +121,15 @@ def process_start(pid: int) -> str:
 
 
 def prepare(project_dir: str, repo_dir: str, *, state_dir: str | None = None,
-            host_bin: str | None = None, force: bool = False) -> dict:
+            host_bin: str | None = None, force: bool = False, timeout_s: float | None = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="palette-prewarm-") as workspace:
         return _prepare_in_workspace(project_dir, repo_dir, workspace, state_dir=state_dir,
-                                     host_bin=host_bin, force=force)
+                                     host_bin=host_bin, force=force, timeout_s=timeout_s)
 
 
 def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, state_dir: str | None = None,
-                          host_bin: str | None = None, force: bool = False) -> dict:
+                          host_bin: str | None = None, force: bool = False,
+                          timeout_s: float | None = None) -> dict:
     julia_bin = resolve_real_julia_binary()
     identity = preparation_identity(project_dir, repo_dir, julia_bin)
     path = preparation_path(identity, state_dir)
@@ -133,6 +146,8 @@ def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, st
         if previous["state"] == "prepared" and not force:
             if not has_depot_snapshot(identity["depot"]):
                 _publish_snapshot(identity["depot"])
+            # What came before this preparation no longer describes it.
+            previous.pop("previous_state", None)
             return {**previous, "reused": True}
         record = {"schema": "palette.preparation.v1", "state": "preparing", "identity": identity,
                   "pid": os.getpid(), "process_start": process_start(os.getpid()),
@@ -149,10 +164,19 @@ def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, st
                     package_store_root=package_root, package_depot_dir=package_depot,
                     package_environment_dir=package_environment)
                 argv += ["--", julia_bin, "--startup-file=no", "-e", PREWARM]
-            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
-            record.update(state="prepared" if result.returncode == 0 else "failed",
+            timed_out = False
+            try:
+                result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                # A hung prewarm otherwise ends as a cancelled CI step with no output at all.
+                # The partial output is bytes even in text mode.
+                out, err = (t.decode(errors="replace") if isinstance(t, bytes) else (t or "") for t in (exc.stdout, exc.stderr))
+                result = subprocess.CompletedProcess(argv, -9, out, f"prewarm did not finish in {timeout_s:g} s; "
+                                                     f"its output so far:\n{err or out}")
+            record.update(state="prepared" if result.returncode == 0 else "failed", timed_out=timed_out,
                           returncode=result.returncode, output=result.stdout, stderr=result.stderr,
-                          error=None if result.returncode == 0 else result.stderr or result.stdout)
+                          error=None if result.returncode == 0 else error_summary(result.stderr or result.stdout))
             loaded_caches = next((json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
                                   if line.startswith("palette_preparation_caches=")), [])
             record["cache_files"] = {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in loaded_caches}
@@ -185,12 +209,17 @@ def main() -> int:
     ap.add_argument("--host-bin")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--timeout-s", type=float, help="fail, with the output so far, after this long")
     args = ap.parse_args()
     record = (preparation_status(preparation_identity(args.project_dir, args.repo_dir,
                   resolve_real_julia_binary()), args.state_dir) if args.status else
               prepare(args.project_dir, args.repo_dir, state_dir=args.state_dir,
-                      host_bin=args.host_bin, force=args.force))
-    print(json.dumps(record, ensure_ascii=False))
+                      host_bin=args.host_bin, force=args.force, timeout_s=args.timeout_s))
+    # The record file keeps Julia's full output; the printed record names that
+    # file and leads with `error`, the cut-down cause, instead of repeating it.
+    summary = {k: v for k, v in record.items() if k not in ("output", "stderr")}
+    summary["record_file"] = str(preparation_path(record["identity"], args.state_dir))
+    print(json.dumps(summary, ensure_ascii=False))
     return 1 if record["state"] == "failed" else 0
 
 

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -15,8 +16,9 @@ import uuid
 from source_transport import call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
-from provisioning import operator_ceiling, protected_host_paths
+from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
+import time_machine
 from patch_broker import PatchBroker, approval_mode
 from repair_broker import RepairBroker
 
@@ -34,6 +36,9 @@ preparation = None
 binding_view = {}
 binding_epoch = None
 connection_failure = None
+# This kernel's start-up, first call and warm calls, which palette_control status reports.
+kernel_costs = None
+WARM_CALLS_KEPT = 20
 FROZEN_CEILING = operator_ceiling()
 TURN_LIMITS = turn_limits()
 RUNTIME_ROOT = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(REPO, "runtime/capabilities")))).expanduser().resolve()
@@ -96,8 +101,15 @@ def project_result(event, *, full=False, ephemeral=False):
     return result
 
 
+class PreparationFailed(RuntimeError):
+    """The Julia environment could not be prepared, so no kernel started and no call ran."""
+
+
 def tool_failure(exc):
     """All tool responses retain a JSON payload for routed and direct clients."""
+    if isinstance(exc, PreparationFailed):
+        return {"content": [{"type": "text", "text": json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)}],
+                "isError": True}
     event = {"success": False,
              "error": f"{type(exc).__name__}: {exc}. Check connection status and restoration evidence; work may not have completed."}
     if connection_failure is not None:
@@ -166,12 +178,14 @@ def prepare_session():
     preparation["recorded_preparation_seconds"] = record.get("seconds")
     preparation["identity"] = hashlib.sha256(json.dumps(record["identity"], sort_keys=True).encode()).hexdigest()
     if record["state"] != "prepared":
-        raise RuntimeError("preparation failed: " + str(record.get("error", record.get("output", "")))[:2000])
+        raise PreparationFailed("Palette could not prepare its Julia environment, so no call ran. "
+                                "palette_control action=prepare retries it once the cause is fixed. "
+                                "The preparation reported:\n" + str(record.get("error") or ""))
     return preparation
 
 
 def start(*, prepared=True):
-    global proc, frames, hello, session_notice, preparation
+    global proc, frames, hello, session_notice, preparation, kernel_costs
     if proc is not None:
         if proc.poll() is not None:
             stop()
@@ -203,7 +217,10 @@ def start(*, prepared=True):
     except Exception:
         stop()
         raise
-    session_notice = {"epoch": hello["epoch"], "host_startup_seconds": time.monotonic() - started,
+    startup = time.monotonic() - started
+    kernel_costs = {"epoch": hello["epoch"], "host_startup_seconds": round(startup, 3), "first_call": None,
+                    "warm_calls": 0, "recent_warm_calls": []}
+    session_notice = {"epoch": hello["epoch"], "host_startup_seconds": startup,
                       "preparation": preparation, "snapshot_present": hello.get("revival", False),
                       "restoration": "uncertain" if hello.get("revival") else "fresh_empty_world"}
     if connection_failure is not None:
@@ -219,7 +236,10 @@ def execute(args):
         raise ValueError("view must be quiet or full")
     rid = uuid.uuid4().hex
     try:
+        started = time.monotonic()
         event = receive_result(rid, args)
+        if args.get("ephemeral") is not True:
+            note_call_cost(event, time.monotonic() - started)
         if event.get("session_dead") is True and args.get("ephemeral") is not True:
             connection_failure = {"epoch": hello.get("epoch"), "error": event.get("error"), "call": event.get("call")}
             # The CLI exits after its terminal result. Retire its pipes before
@@ -230,6 +250,34 @@ def execute(args):
         connection_failure = {"epoch": hello.get("epoch") if hello else None, "error": str(exc), "completion": "unknown"}
         stop()
         raise
+
+
+def note_call_cost(event, seconds):
+    costs = event.get("costs")
+    if kernel_costs is None or not isinstance(costs, dict):
+        return
+    row = {"call": event.get("call"), "round_trip_seconds": round(seconds, 3),
+           **{key: costs.get(key) for key in ("execution_seconds", "compile_seconds")}}
+    if costs.get("first_call_in_kernel"):
+        kernel_costs["first_call"] = row
+        return
+    kernel_costs["warm_calls"] += 1
+    kernel_costs["recent_warm_calls"] = (kernel_costs["recent_warm_calls"] + [row])[-WARM_CALLS_KEPT:]
+
+
+def cost_status():
+    if kernel_costs is None:
+        return None
+    recent = kernel_costs["recent_warm_calls"]
+    status = {key: kernel_costs[key] for key in ("epoch", "host_startup_seconds", "first_call", "warm_calls")}
+    if recent:
+        measured = {key: [row[key] for row in recent if isinstance(row[key], (int, float))]
+                    for key in ("round_trip_seconds", "execution_seconds", "compile_seconds")}
+        status["recent_warm_median"] = {key: round(statistics.median(values), 3) for key, values in measured.items() if values}
+        status["last_warm_call"] = recent[-1]
+    status["limits"] = (f"Round trips are measured by this server, from request to result. The median covers the last {WARM_CALLS_KEPT} warm calls. "
+                        "compile_seconds counts compilation by any task in the kernel during the call.")
+    return status
 
 
 def receive_result(rid, args):
@@ -352,23 +400,30 @@ def complete_runtime_refresh(turn_event):
 
 
 def control(args):
-    if any(key in args and not isinstance(args[key], bool) for key in ("restore", "prepare")):
-        raise ValueError("restore and prepare must be booleans")
+    if any(key in args and not isinstance(args[key], bool) for key in ("restore", "prepare", "fork")):
+        raise ValueError("restore, prepare and fork must be booleans")
     action = args["action"]
     if action == "status":
         identity = preparation_identity(REPO, REPO, resolve_real_julia_binary())
         record = preparation_status(identity)
         return {"connected": proc is not None and proc.poll() is None, "epoch": hello.get("epoch") if hello else None,
-                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error") if k in record}}
+                "state_dir": str(STATE_DIR), "preparation": {k: record[k] for k in ("state", "seconds", "error", "reason") if record.get(k) is not None},
+                "costs": cost_status()}
     if action == "prepare":
         return prepare_session()
-    if action == "restart":
+    if action == "checkpoints":
+        return time_machine.list_checkpoints(STATE_DIR)
+    if action == "restore":
+        # The next kernel saves the world it leaves, then revives the checkpoint.
+        time_machine.request_restore(STATE_DIR, args.get("checkpoint"), args.get("fork", False))
+    if action in ("restart", "restore"):
         previous_epoch = hello.get("epoch") if hello else None
         stop()
         retired = None
-        if args.get("restore", True) is False and STATE_DIR.exists():
+        if action == "restart" and args.get("restore", True) is False and STATE_DIR.exists():
             retired = str(STATE_DIR.with_name(STATE_DIR.name + ".retired-" + uuid.uuid4().hex))
             os.replace(STATE_DIR, retired)
+            time_machine.carry_checkpoints(retired, STATE_DIR)
         start(prepared=args.get("prepare", True))
         result = execute({"code": "nothing"})
         result.update(previous_epoch=previous_epoch, retired_snapshot=retired)
@@ -379,8 +434,9 @@ def control(args):
 schema = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
     {"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
     "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "additionalProperties": False}
-control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart"]},
-    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
+control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "checkpoints", "restore"]},
+    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "checkpoint": {"type": "string"}, "fork": {"type": "boolean"}},
+    "required": ["action"], "additionalProperties": False}
 
 
 def main():
@@ -395,13 +451,13 @@ def main():
                     continue
                 if method == "initialize":
                     result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
-                              "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.2.0"}}
+                              "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/list":
                     result = {"tools": [
-                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_command(name; wait=false) runs longer host work as a job.", "inputSchema": schema},
-                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, or restart. restore=false starts a clean world and retires the previous snapshot without deleting workspace files. prepare=false exercises the cold path.", "inputSchema": control_schema}]}
+                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job.", "inputSchema": schema},
+                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, restart, or go back to a checkpoint. restore=false starts a clean world and retires the previous snapshot without deleting workspace files; checkpoints are kept. prepare=false exercises the cold path. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the kernel in that checkpoint's world (fork=true makes it a new world), after saving the current world as an auto- checkpoint.", "inputSchema": control_schema}]}
                 elif method == "tools/call":
                     params = msg["params"]
                     args = params.get("arguments", {})

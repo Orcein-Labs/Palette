@@ -26,6 +26,7 @@ using UUIDs
 using Sockets
 using JSON
 using SHA
+using PrecompileTools: @compile_workload
 using Base.CoreLogging: AbstractLogger, with_logger, current_logger
 using Statistics: mean as stdlib_mean
 
@@ -727,11 +728,16 @@ request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...)
     Palette.request_capability(category, params; kwargs...)
 host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette.host_command(name, args...; kwargs...)
 host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
+host_command_wait(job::AbstractString; kw...) = Palette.host_command_wait(job; kw...)
 host_command_cancel(job::AbstractString) = Palette.host_command_cancel(job)
 host_jobs(; kwargs...) = Palette.host_jobs(; kwargs...)
+host_commands(; kwargs...) = Palette.host_commands(; kwargs...)
 fs_digest(paths::Vector{String}) = Palette.fs_digest(paths)
 reloads() = deepcopy(Palette.RELOAD_REPORTS)
 revival() = deepcopy(Palette.REVIVAL_OBSERVATION[])
+checkpoint(name::AbstractString; note::AbstractString="") = Palette.checkpoint(name; note)
+checkpoints() = Palette.checkpoints()
+forget_checkpoint(name::AbstractString) = Palette.forget_checkpoint(name)
 jobs() = Palette.task_observations()
 taskinfo(t::Task) = Palette.task_observation(t)
 environment(name::AbstractString) = Palette.package_environment(name)
@@ -1772,7 +1778,10 @@ directory and timeout; `timeout_s` may shorten that timeout for this call,
 never extend it. `args` are passed only to a command whose ceiling entry
 sets `extra_args`. Never a shell. Broker-side ceiling shape:
 `{"host_command": {"commands": {"render": {"argv": ["/abs/prog", ...],
-"cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`.
+"cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`. A command
+with `"lock": "/abs/file"` runs under an exclusive flock on that file, shared
+with work outside Palette (a GPU lock); the wait counts against its timeout.
+`host_commands()` lists the commands this session may run.
 
 With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
 KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
@@ -1806,9 +1815,23 @@ function host_command_request(params::Dict{String,Any}, what::String; timeout_s:
     return resp["result"]
 end
 
+# The broker forgets a job once a poll returns its result, so the kernel keeps
+# the last few results: a second poll of a finished job (a wait loop's own
+# poll took the result) returns the same result instead of an error.
+const HOST_JOB_RESULTS = Dict{String, Dict{String,Any}}()
+const HOST_JOB_RESULT_ORDER = String[]
+const HOST_JOB_RESULTS_KEPT = 16
+
 function host_job_request(action::String, job::AbstractString)
-    result = host_command_request(Dict{String,Any}("action" => action, "job" => String(job)), "host_command $action")
-    get(result, "running", false) === true || delete!(HOST_JOBS, String(job))
+    id = String(job)
+    action == "poll" && haskey(HOST_JOB_RESULTS, id) && return HOST_JOB_RESULTS[id]
+    result = host_command_request(Dict{String,Any}("action" => action, "job" => id), "host_command $action")
+    if get(result, "running", false) !== true
+        delete!(HOST_JOBS, id)
+        HOST_JOB_RESULTS[id] = result
+        push!(HOST_JOB_RESULT_ORDER, id)
+        length(HOST_JOB_RESULT_ORDER) > HOST_JOB_RESULTS_KEPT && delete!(HOST_JOB_RESULTS, popfirst!(HOST_JOB_RESULT_ORDER))
+    end
     return result
 end
 
@@ -1818,8 +1841,33 @@ end
 For a `host_command(...; wait=false)` job: while it runs, `running => true`
 with the `stdout` and `stderr` it wrote since the last poll; once it has
 finished, its result, holding only output no earlier poll returned.
+Polling a finished job again returns the same result (the kernel keeps the
+last 16). `host_command_wait` blocks until the job finishes.
 """
 host_command_poll(job::AbstractString) = host_job_request("poll", job)
+
+"""
+    Palette.host_command_wait(job; timeout_s=nothing, interval_s=5) -> Dict
+
+Block until a `host_command(...; wait=false)` job finishes and return its
+result, with all the output no earlier poll returned. Returns the running
+poll (`running => true`) if `timeout_s` passes first; the job keeps running.
+Waiting counts against the call's own deadline, so give the call one longer
+than the wait.
+"""
+function host_command_wait(job::AbstractString; timeout_s::Union{Nothing,Real}=nothing, interval_s::Real=5)
+    id = String(job)
+    haskey(HOST_JOB_RESULTS, id) && return HOST_JOB_RESULTS[id]
+    t0 = time()
+    while true
+        # Listing does not consume output, so the result keeps all of it.
+        held = [j for j in host_jobs(; timeout_s=60) if string(j["job"]) == id]
+        isempty(held) && return host_job_request("poll", id)  # error names the missing job
+        held[1]["running"] === true || return host_job_request("poll", id)
+        timeout_s !== nothing && time() - t0 >= timeout_s && return host_job_request("poll", id)
+        sleep(interval_s)
+    end
+end
 
 """
     Palette.host_command_cancel(job) -> Dict
@@ -1838,6 +1886,16 @@ The host_command jobs this session holds, longest-running first, each with
 """
 host_jobs(; timeout_s::Real=320.0) =
     host_command_request(Dict{String,Any}("action" => "list"), "host_command list"; timeout_s)["jobs"]
+
+"""
+    Palette.host_commands(; timeout_s=320) -> Vector
+
+The commands this session's ceiling lets `host_command` run, each with
+`name`, `argv`, `cwd`, `timeout_s`, `extra_args` and, when set, `lock` and
+`description`.
+"""
+host_commands(; timeout_s::Real=320.0) =
+    host_command_request(Dict{String,Any}("action" => "commands"), "host_command commands"; timeout_s)["commands"]
 
 #==============================================================================
 PHASE 10: Integration Demo Helpers
@@ -1907,17 +1965,19 @@ Exports
 
 include("turn.jl")
 include("revival.jl")
+include("time_machine.jl")
 include("provenance.jl")
 include("digest.jl")
 include("workspace_map.jl")
 include("stress.jl")
+include("session_requests.jl")
 include("precompile_workload.jl")
 
 export KernelState, ExecutionRecord
 export get_kernel_state, reset_kernel_state
 export OperatorType, OperatorVocabulary
 export CODE_EXECUTION_VOCAB, OPERATOR_INVOCATION_VOCAB, STATE_QUERY_VOCAB
-export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_cancel, host_jobs
+export ExecuteCode, InvokeOperator, GetState, ShellEscape, fs_digest, host_command, host_command_poll, host_command_wait, host_command_cancel, host_jobs, host_commands
 export EphemeralTool, EphemeralToolViolation, check_ephemeral_source!, record_tool_capsule
 export register_operator!
 export OperationResult, StructuredResponse
