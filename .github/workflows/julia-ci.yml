@@ -229,6 +229,7 @@ jobs:
         python3 runtime/security/prewarm_depot.py
         --project-dir "$GITHUB_WORKSPACE"
         --host-bin "$GITHUB_WORKSPACE/runtime/host/target/release/palette-host"
+        --timeout-s 720
     - name: Check routing, ownership, recovery and one-shot patch authority
       env:
         JULIA_NUM_THREADS: '1'
