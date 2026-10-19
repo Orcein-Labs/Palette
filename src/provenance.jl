@@ -101,14 +101,14 @@ function eval_observed(mod, parsed)
     end
     scoped(ex) = ex isa Expr && (ex.head in (:local, :return) || ex.head in (:toplevel, :block) && any(scoped, ex.args))
     # Local declarations and returns belong to one evaluation scope.
-    scoped(parsed) && return observed_statement(mod, parsed, () -> Core.eval(mod, softscope(parsed)))
+    scoped(parsed) && return observed_statement(mod, parsed, () -> Core.eval(mod, softscope(context_rewrite(parsed))))
     flatten(parsed)
     for st in statements
         if st isa LineNumberNode
             line = st
             continue
         end
-        value = observed_statement(mod, st, () -> Core.eval(mod, Expr(:toplevel, line, softscope(st))))
+        value = observed_statement(mod, st, () -> Core.eval(mod, Expr(:toplevel, line, softscope(context_rewrite(st)))))
     end
     return value
 end

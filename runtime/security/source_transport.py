@@ -9,6 +9,11 @@ worker's existing `code` field only after JSON decoding.
 must be supplied.
 
 `timeout_s` is a call's own time limit, within the host's maximum.
+
+`context` and `budget` choose the call's execution context; neither applies to
+an ephemeral call. They are refused here, before the call starts, because a
+rejected request must not stop the kernel. Same wording as the host (cli.rs)
+and the kernel (contexts.jl).
 """
 from __future__ import annotations
 
@@ -37,7 +42,30 @@ def normalize_palette_call(args: dict) -> dict:
 
     if has_source:
         value["code"] = value.pop("source")
+    check_context(value)
     return value
+
+
+CONTEXT_NAMES = ("normal", "traced", "reference", "memoized", "budgeted")
+
+CONTEXT_SCHEMA = {
+    "context": {"type": "string", "enum": list(CONTEXT_NAMES)},
+    "budget": {"type": "object", "properties": {"seconds": {"type": "number", "exclusiveMinimum": 0},
+                                                "bytes": {"type": "integer", "minimum": 1}},
+               "additionalProperties": False},
+}
+
+
+def check_context(args: dict) -> None:
+    for field in ("context", "budget"):
+        if args.get("ephemeral") is True and args.get(field) is not None:
+            raise SourceTransportError(f"request '{field}' does not apply to an ephemeral call: "
+                                       "a scratch worker always runs in the normal context")
+    context = args.get("context")
+    if args.get("budget") is not None and context != "budgeted":
+        raise SourceTransportError('a budget applies only to the budgeted context: send context "budgeted" with it'
+                                   if context is None else
+                                   f'a budget applies only to the budgeted context, not "{context}"')
 
 
 # The hosts refuse a longer --max-turn-timeout.
