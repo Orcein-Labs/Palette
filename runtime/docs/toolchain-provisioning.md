@@ -44,8 +44,9 @@ entries are merged into its host-command ceiling; conflicting names fail
 closed. Requests cannot choose or change either configuration file.
 
 Julia packages approved through `package_management` are installed by the
-host broker into the durable store named by `PALETTE_PACKAGE_DEPOT` (default
-`~/.palette/packages`). The store is outside session scratch and routed
+host broker into the durable store named by `PALETTE_PACKAGE_DEPOT`
+(`<data home>/packages` for an installed or `serve_palette.py` instance,
+otherwise `~/.palette/packages`). The store is outside session scratch and routed
 workspaces. Workers mount it read-only, and their writable compiled-cache
 depot remains session-local. The same package environment is reused after a
 session or adapter restart. Worker networking stays disabled. The optional

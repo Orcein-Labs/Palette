@@ -16,14 +16,16 @@ access unless explicitly enabled. See runtime/docs/authority.md for the
 current host and worker authority contracts. Inherited source attribution
 and license grants are retained in NOTICE and runtime/licenses/.
 
-Depot handling is NOT a layered writable-over-readonly overlay (that was
-tried and, on this substrate, actively caused the cold-start problem it
-was meant to solve -- see _clone_depot's docstring for the root cause,
-found by direct reproduction). Each worker gets its own real, cheap
-(reflink) clone of the prepared depot, bound writable as the primary
-`JULIA_DEPOT_PATH` entry. The clone is copied from the newest snapshot that
-preparation published (see publish_depot_snapshot), not from the live depot. A separate durable operator package store may be
-present as a later read-only depot entry for broker-provisioned packages.
+Each worker gets its own private writable depot, mounted as the single
+`JULIA_DEPOT_PATH` entry. A split depot path (a writable entry before a
+read-only one) was tried and caused the cold-start problem it was meant to
+solve; see _clone_depot's docstring for the root cause. When preparation
+published a snapshot (see publish_depot_snapshot) and bwrap mounts
+overlays, the private depot is a kernel overlay of that snapshot: still one
+depot path entry, so there is no cascade, and nothing is copied. Otherwise
+it is a reflink copy of the snapshot, or of the live depot when there is
+none. A separate durable operator package store may be present as a later
+read-only depot entry for broker-provisioned packages.
 
 Paths are bound at IDENTICAL guest paths to their host paths (no
 remapping). Julia's own package manifests and precompile cache embed
@@ -41,6 +43,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 import zlib
@@ -49,8 +52,7 @@ from pathlib import Path
 from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
 
 
-def _clone_depot(real_depot: str, clone_root: str, source: str | None = None,
-                 attempts: int | None = None) -> str:
+def _clone_depot(real_depot: str, clone_root: str) -> str:
     """Make a real, independent, cheap copy of the depot for one worker's
     exclusive writable use.
 
@@ -78,19 +80,68 @@ def _clone_depot(real_depot: str, clone_root: str, source: str | None = None,
     later, but not yet proven to be slow enough here to justify a
     filesystem-specific special case).
 
-    `source` is a snapshot of `real_depot` to copy instead of the live
-    depot; see publish_depot_snapshot.
+    create_session_depot uses this copy only when there is no snapshot of
+    the depot. A kernel overlay of a snapshot is also a single depot entry,
+    so it avoids the cascade too, without copying.
     """
+    dest = _new_session_depot_dir(clone_root)
+    try:
+        _copy_tree(real_depot, dest, DEPOT_CLONE_ATTEMPTS)
+    except BaseException:
+        remove_session_depot(dest)
+        raise
+    return dest
+
+
+def _new_session_depot_dir(clone_root: str) -> str:
     dest = tempfile.mkdtemp(dir=clone_root, prefix="depot-")
     try:
         record = _clone_owner_record()
         if record is not None:
             Path(dest + CLONE_OWNER_SUFFIX).write_text(record, encoding="ascii")
-        _copy_tree(source or real_depot, dest, attempts or DEPOT_CLONE_ATTEMPTS)
     except BaseException:
         remove_session_depot(dest)
         raise
     return dest
+
+
+OVERLAY_LOWER, OVERLAY_UPPER, OVERLAY_WORK = "lower", "upper", "work"
+# The snapshot fds this process's overlay depots hold, by depot.
+_snapshot_holds: dict[str, int] = {}
+_snapshot_holds_lock = threading.Lock()
+
+
+def _layer_overlay(snapshot: Path, dest: str) -> None:
+    os.symlink(snapshot, os.path.join(dest, OVERLAY_LOWER))
+    os.mkdir(os.path.join(dest, OVERLAY_UPPER))
+    os.mkdir(os.path.join(dest, OVERLAY_WORK))
+
+
+def overlay_depot_layers(depot: str) -> tuple[str, str, str] | None:
+    """The real lower, upper and work directories of an overlay depot, or
+    None for a copied one."""
+    if not os.path.islink(os.path.join(depot, OVERLAY_LOWER)):
+        return None
+    layers = tuple(os.path.realpath(os.path.join(depot, name))
+                   for name in (OVERLAY_LOWER, OVERLAY_UPPER, OVERLAY_WORK))
+    for layer in layers:
+        if not os.path.isdir(layer):
+            raise RuntimeError(f"depot overlay layer is not a directory: {layer}")
+    return layers
+
+
+def _overlay_supported(depot: str) -> bool:
+    """Whether bwrap mounts the overlay `depot` describes. bwrap before 0.8
+    has no `--overlay`, and some kernels refuse unprivileged overlay mounts.
+    A probe that hangs counts as no, so the session copies instead of waiting."""
+    try:
+        lower, upper, work = overlay_depot_layers(depot)
+        return subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "--overlay-src", lower,
+                               "--overlay", upper, work, lower, "--", "true"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+    except (OSError, RuntimeError, TypeError, subprocess.TimeoutExpired):
+        return False
 
 
 # Every directory this host owns outside its own scratch root -- a depot clone
@@ -214,13 +265,30 @@ def sweep_orphaned_depot_clones(clone_root: str) -> None:
 
 def remove_owned_dir(directory: str | os.PathLike) -> None:
     """Remove an owned directory and then its owner record."""
+    _unlock_overlay_work(directory)
     shutil.rmtree(directory, ignore_errors=True)
     Path(str(directory) + CLONE_OWNER_SUFFIX).unlink(missing_ok=True)
 
 
+def _unlock_overlay_work(directory: str | os.PathLike) -> None:
+    """The kernel leaves an overlay's `work/work` at mode 000, which stops
+    rmtree descending into it."""
+    work = os.path.join(directory, OVERLAY_WORK)
+    try:
+        if stat.S_ISDIR(os.lstat(work).st_mode) and stat.S_ISDIR(os.lstat(os.path.join(work, "work")).st_mode):
+            os.chmod(os.path.join(work, "work"), 0o700)
+    except OSError:
+        pass
+
+
 def remove_session_depot(clone: str) -> None:
-    """Remove a session depot clone and then its owner record."""
+    """Remove a session depot and its owner record, then release the
+    snapshot an overlay depot holds."""
     remove_owned_dir(clone)
+    with _snapshot_holds_lock:
+        fd = _snapshot_holds.pop(clone, None)
+    if fd is not None:
+        os.close(fd)
 
 
 def _copy_tree(source: str, dest: str, attempts: int) -> None:
@@ -230,6 +298,7 @@ def _copy_tree(source: str, dest: str, attempts: int) -> None:
     copy. A later attempt copies the settled tree."""
     try:
         for attempt in range(attempts):
+            _unlock_overlay_work(dest)
             shutil.rmtree(dest, ignore_errors=True)  # cp needs the destination to not exist yet
             if attempt:
                 time.sleep(0.2)
@@ -275,27 +344,23 @@ def _snapshot_names(root: Path) -> list[str]:
     return sorted(names, key=lambda n: int(n[len(SNAPSHOT_PREFIX):]))
 
 
-@contextmanager
-def _hold_depot_snapshot(depot: str):
-    """Yields the newest snapshot of `depot` held under a shared flock, or
-    None when it has none."""
+def _acquire_depot_snapshot(depot: str) -> tuple[Path, int] | None:
+    """The newest snapshot of `depot` and an fd holding a shared flock on
+    it, or None when it has none. The caller closes the fd to release it."""
     root = depot_snapshot_root(depot)
     if root is None:
-        yield None
-        return
+        return None
     try:
         if not stat.S_ISDIR(os.lstat(root).st_mode):
             raise OSError(f"{root} is not a directory")
     except FileNotFoundError:
-        yield None
-        return
+        return None
     # A sweep can take the chosen snapshot between listing and locking, but
     # only after a newer one was published, so the next listing finds that.
     for _ in range(8):
         names = _snapshot_names(root)
         if not names:
-            yield None
-            return
+            return None
         path = root / names[-1]
         try:
             fd = _open_dir_nofollow(path)
@@ -309,11 +374,26 @@ def _hold_depot_snapshot(depot: str):
             except OSError:
                 pass
             if named is not None and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
-                yield path
-                return
+                fd, kept = -1, fd
+                return path, kept
         finally:
-            os.close(fd)
+            if fd >= 0:
+                os.close(fd)
     raise OSError(f"the depot snapshots in {root} kept changing")
+
+
+@contextmanager
+def _hold_depot_snapshot(depot: str):
+    """Yields the newest snapshot of `depot` held under a shared flock, or
+    None when it has none."""
+    held = _acquire_depot_snapshot(depot)
+    if held is None:
+        yield None
+        return
+    try:
+        yield held[0]
+    finally:
+        os.close(held[1])
 
 
 def _snapshot_lock(root: Path) -> int:
@@ -764,8 +844,11 @@ def build_bwrap_argv(
         protected.append(task_tools)
     if broker_socket_dir:
         protected.append(broker_socket_dir)
+    depot_overlay = overlay_depot_layers(depot_clone_dir) if depot_clone_dir else None
     if depot_clone_dir:
         protected.append(depot_clone_dir)
+    if depot_overlay:
+        protected.append(depot_overlay[0])
     if package_store_root:
         protected.append(package_store_root)
     writable = [workspace_dir] + ([state_dir] if state_dir else [])
@@ -818,15 +901,21 @@ def build_bwrap_argv(
         "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
         # julia toolchain -- read-only
         "--ro-bind", real(julia_toolchain_dir), julia_toolchain_dir,
-        # depot -- bound WRITABLE, at the depot's own real path (package
-        # source paths are baked into precompiled caches as absolutes, so
-        # the guest path must match, not just the content). The source is
-        # this worker's own private clone (see _clone_depot), never the
-        # live shared depot: a single writable entry avoids the split-
-        # JULIA_DEPOT_PATH build-id cascade below, without handing the
-        # worker write access to every other session's cache. The separate
-        # operator package store, when configured, follows read-only.
-        "--bind", real(depot_clone_dir or julia_depot), julia_depot,
+    ]
+    # depot -- WRITABLE, at the depot's own real path (package source paths
+    # are baked into precompiled caches as absolutes, so the guest path must
+    # match, not just the content). The source is this worker's private
+    # overlay or clone (see create_session_depot), never the live shared
+    # depot: a single writable entry avoids the split-JULIA_DEPOT_PATH
+    # build-id cascade (see _clone_depot), without handing the worker write
+    # access to every other session's cache. The separate operator package
+    # store, when configured, follows read-only.
+    if depot_overlay:
+        lower, upper, work = depot_overlay
+        argv += ["--overlay-src", lower, "--overlay", upper, work, julia_depot]
+    else:
+        argv += ["--bind", real(depot_clone_dir or julia_depot), julia_depot]
+    argv += [
         # this repo's source (the Palette package) -- read-only, worker cannot modify it
         "--ro-bind", real(repo_dir), repo_dir,
         # the dev project (Project.toml/Manifest.toml naming Palette + IJulia + deps) -- read-only
@@ -1140,22 +1229,48 @@ def package_store_paths(
     return str(path), str(depot), str(environment)
 
 
-def create_session_depot(real_depot: str | None = None, clone_root: str | None = None) -> str:
+def create_session_depot(real_depot: str | None = None, clone_root: str | None = None,
+                         overlay_supported=_overlay_supported) -> str:
     """Create the private writable prewarmed depot used for worker caches.
-    The clone comes from the newest snapshot of the depot when one exists,
-    otherwise from the live depot. Callers release it with
+
+    With a snapshot of the depot and a bwrap that mounts overlays, the depot
+    is an overlay: `lower` links to the snapshot, which stays held until
+    remove_session_depot, and writes land in `upper` (see
+    overlay_depot_layers). Otherwise it is a copy of the newest snapshot, or
+    of the live depot when there is none; a live depot can change, so it is
+    never an overlay's lower layer. Callers release it with
     remove_session_depot."""
     depot = real_depot or default_depot()
     root = clone_root or str(Path(depot).parent / ".palette-depot-clones")
     Path(root).mkdir(parents=True, exist_ok=True)
     sweep_orphaned_depot_clones(root)
-    with _hold_depot_snapshot(depot) as snapshot:
-        if snapshot is None:
-            return _clone_depot(depot, root)
-        # Nothing writes a snapshot, so one attempt copies it or fails for real.
-        clone = _clone_depot(depot, root, source=str(snapshot), attempts=1)
+    held = _acquire_depot_snapshot(depot)
+    if held is None:
+        return _clone_depot(depot, root)
+    snapshot, fd = held
+    try:
+        dest = _new_session_depot_dir(root)
+        try:
+            _layer_overlay(snapshot, dest)
+            layered = overlay_supported(dest)
+        except OSError:
+            layered = False
+        if layered:
+            with _snapshot_holds_lock:
+                _snapshot_holds[dest] = fd
+            fd = -1
+        else:
+            try:
+                # Nothing writes a snapshot, so one attempt copies it or fails for real.
+                _copy_tree(str(snapshot), dest, 1)
+            except BaseException:
+                remove_session_depot(dest)
+                raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
     _try_sweep_depot_snapshots(depot)
-    return clone
+    return dest
 
 
 def run_worker(

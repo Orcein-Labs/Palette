@@ -52,16 +52,19 @@ Setting the retention to `0` restores the earlier behavior: receipts live in
 the session's scratch root and are deleted when the session closes.
 
 A session's default scratch root, `~/.palette-sessions/<session id>`, and its
-depot clone in `.palette-depot-clones` each carry a `.owner` record naming the
+session depot in `.palette-depot-clones` each carry a `.owner` record naming the
 host process. If that process is killed before its teardown runs, the next
 session started in the same pid namespace removes them. A caller-supplied
 scratch root is never swept.
 
-A session's depot clone is copied from the newest snapshot of the prepared
-depot, in `.palette-depot-snapshots/<depot name>/snap-<sequence>` beside the
-depot. A successful preparation publishes the snapshot. Palette binds no
-snapshot into a sandbox, so no Julia process writes one, and the copy cannot race a
-precompile. The session holds a shared lock on the snapshot while it copies.
+A session's depot is built from the newest snapshot of the prepared depot, in
+`.palette-depot-snapshots/<depot name>/snap-<sequence>` beside the depot. A
+successful preparation publishes the snapshot. The session's depot is an
+overlay: the snapshot is mounted read-only as the lower layer and the worker
+writes to a private upper layer, so no Julia process writes a snapshot. The
+session holds a shared lock on the snapshot for as long as the overlay lives.
+When bwrap is older than 0.8 or the kernel refuses unprivileged overlay mounts,
+the session copies the snapshot instead and holds the lock only while it copies.
 Publishing removes the older snapshots that no session holds, and so does a
 later session. When no snapshot exists, the session clones the live depot and
 retries up to three times if a precompile changes the tree during the copy.

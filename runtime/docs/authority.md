@@ -49,10 +49,13 @@ GPU, a renderer, a build):
 
 ```json
 {"render": {"argv": ["/usr/bin/julia", "--project=/abs/proj", "/abs/proj/render.jl"],
-            "cwd": "/abs/proj", "timeout_s": 900, "extra_args": true}}
+            "cwd": "/abs/proj", "timeout_s": 900, "extra_args": true,
+            "lock": "/tmp/gpu.lock", "description": "render a frame on the GPU"}}
 ```
 
-Turn code runs one by name with `Palette.host_command("render", args...)`.
+Turn code runs one by name with `Palette.host_command("render", args...)`,
+and `Palette.host_commands()` lists the commands the session may run, with
+their descriptions.
 The program is an absolute path and never a shell; arguments reach only a
 command whose entry sets `extra_args`. Each command runs in its own process
 group, killed whole at `timeout_s` (at most 4 hours; a call's own
@@ -61,6 +64,14 @@ group, killed whole at `timeout_s` (at most 4 hours; a call's own
 poll, then the result; `Palette.host_command_cancel(job)` kills the group;
 `Palette.host_jobs()` lists the jobs held, and the turn's jobs line names the
 ones still running. Jobs still running when the session ends are killed.
+A command with a `lock` file runs under an exclusive `flock(1)` on it, the
+same lock other GPU work on the machine takes, so two renders never share
+the GPU; waiting for the lock counts against `timeout_s`. A command's cwd,
+lock and the absolute paths in its argv are protected like the mounts above:
+no writable root or package store may lie inside, equal or contain one, nor
+equal or contain its parent directory (which could rename it). A sibling in
+the same parent is fine, so a store under `~/.local` sits beside a command
+that runs in `~/project`.
 Commands run with the host process's privilege and environment, outside every
 mount rule above: list only commands you would let the model run unattended.
 
@@ -120,7 +131,7 @@ The oracle covers these categories, one suite each, as run by
 | Category | Suite |
 |---|---|
 | Authority: bind layout, read and write roots, network, credentials, broker ceilings | `test_authority.py` |
-| Session: persistent and ephemeral turns, kill detection, session roots, depot clones, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
+| Session: persistent and ephemeral turns, kill detection, session roots, session depots, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
 | Session bridge: the stdio protocol of `session_cli` / `palette-host session` | `test_session_cli.py` |
 | Revival: what a replacement kernel restores, rebuilds or reports lost | `test_revival.py` |
 | Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `test_host_bridge.py` |

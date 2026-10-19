@@ -89,6 +89,16 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.router_stderr.flush()
         return Path(self.router_stderr.name).read_text(errors="replace")[-12000:]
 
+    def test_list_says_when_other_contexts_own_thread_workspaces(self):
+        self.call("palette_workspace", {"action":"create", "workspace_id":"hidden-a", "scope":"thread", "context_id":"ctx-hidden-a"})
+        listing = self.call("palette_workspace", {"action":"list"})
+        self.assertNotIn("hidden-a", [w["workspace_id"] for w in listing["workspaces"]])
+        self.assertEqual(listing["other_thread_workspaces"], 1)
+        self.assertIn("context_id", listing["note"])
+        own = self.call("palette_workspace", {"action":"list", "context_id":"ctx-hidden-a"})
+        self.assertIn("hidden-a", [w["workspace_id"] for w in own["workspaces"]])
+        self.assertNotIn("other_thread_workspaces", own)
+
     def call(self, name, arguments, *, error=False):
         request = {
             "jsonrpc": "2.0",
@@ -139,6 +149,15 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overlap", result.stderr)
 
+    def test_D02_missing_default_workspace_is_created_at_start(self):
+        workspace = Path(self.tmp.name) / "not-yet" / "workspace"
+        result = subprocess.run([sys.executable, str(ROUTER)],
+            input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
+            capture_output=True, text=True, timeout=60,
+            env={**self.env, "OPERATOR_WORKSPACE":str(workspace)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(workspace.is_dir())
+
     def test_D03_registry_cannot_redirect_a_worker_mount(self):
         self.call("palette_workspace", {"action":"create", "workspace_id":"registry-check", "scope":"open"})
         path = Path(self.env["PALETTE_WORKSPACE_STATE_ROOT"]) / "registry.json"
@@ -165,6 +184,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overlap", result.stderr)
+                self.assertIn("PALETTE_READ_ROOTS", result.stderr)
 
     def test_C04_configured_project_roots_share_files_and_isolate_worlds(self):
         shadow = Path(self.tmp.name) / "shadow-project"
@@ -216,6 +236,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         for bad in (0, -1, 1e6, True, "5"):
             refused = self.call("palette", {"code":"1", "timeout_s":bad}, error=True)
             self.assertIn("Invalid timeout_s", refused["error"])
+        self.assertIn("must be a number in (0, ", refused["error"])
         unknown = self.call("palette_workspace", {
             "action":"create", "workspace_id":"unknown-root", "scope":"open", "project_root_id":"/tmp",
         }, error=True)

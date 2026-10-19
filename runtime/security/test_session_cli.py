@@ -817,6 +817,21 @@ class TestSessionCli(unittest.TestCase):
         self.assertGreaterEqual(observed["worker_pipe_seconds"], 0)
         self.assertGreater(observed["worker_response_bytes"], 0)
 
+    def test_costs_mark_the_first_call_and_count_compile_time(self):
+        first = self._turn("1 + 1")
+        self.assertTrue(first["costs"]["first_call_in_kernel"])
+        self.assertGreaterEqual(first["costs"]["compile_seconds"], 0)
+        compiled = self._turn("fresh_method(x) = x + 1; fresh_method(1)")
+        self.assertFalse(compiled["costs"]["first_call_in_kernel"])
+        self.assertGreater(compiled["costs"]["compile_seconds"], 0)
+        self.assertLessEqual(compiled["costs"]["compile_seconds"], compiled["costs"]["execution_seconds"] + 0.05)
+        # A user's own @time nests inside the call's compile timing.
+        timed = self._turn("@time fresh_method(2)")
+        self.assertTrue(timed["success"], timed)
+        self.assertIn("seconds", timed["output"])
+        # The call's record keeps the mark.
+        self.assertTrue(self._turn("Palette.costs(1)")["data"]["first_call_in_kernel"])
+
     def test_B02_reload_reports_observed_changes_and_identity_risk(self):
         pkg = Path(self.task_workspace, "DeskKit")
         (pkg / "src").mkdir(parents=True)
@@ -891,14 +906,21 @@ class TestSessionCli(unittest.TestCase):
             marker.write_text(json.dumps({**record, "state": "invented"}))
             self.assertEqual(invoke("--status")[1]["state"], "failed")
             marker.write_text(json.dumps(record))
-            self.assertTrue(invoke()[1]["reused"])
+            reused = invoke()[1]
+            self.assertTrue(reused["reused"])
+            self.assertNotIn("previous_state", reused)
             source = repo / "src/Palette.jl"
             source.write_text(source.read_text() + "\n# Preparation identity control\n")
-            self.assertEqual(invoke("--status")[1]["state"], "stale")
+            stale = invoke("--status")[1]
+            self.assertEqual((stale["state"], stale["error"]), ("stale", None), stale)
             self.assertEqual(invoke()[1]["state"], "prepared")
             (repo / "Project.toml").write_text("this is invalid TOML!")
             code, record = invoke()
             self.assertEqual((code, record["state"]), (1, "failed"), record)
+            self.assertNotIn("\x1b[", record["error"])
+            # Julia's output is printed once, as the cut-down error; the full text stays in the record file.
+            self.assertFalse({"output", "stderr"} & record.keys(), record.keys())
+            self.assertTrue(json.loads(Path(record["record_file"]).read_text())["stderr"])
             self.assertEqual(invoke("--status")[1]["state"], "failed")
             marker = next(Path(root, "state").glob("*.json"))
             marker.write_text("[]")
@@ -951,13 +973,26 @@ class TestSessionCli(unittest.TestCase):
                 self.assertTrue(any(row.startswith("matrix (") for row in inventory["bindings"]))
                 changed = call("palette", {"code": "n=43"})
                 self.assertTrue(any(row.startswith("n (") for row in changed["binding_changes"]["new_or_changed"]))
+                # The restart's own call is this kernel's first; the three since are warm.
+                costs = call("palette_control", {"action": "status"})["costs"]
+                self.assertEqual(costs["epoch"], revived["epoch"])
+                self.assertGreater(costs["host_startup_seconds"], 0)
+                self.assertEqual(costs["first_call"]["call"], revived["call"])
+                self.assertGreater(costs["first_call"]["round_trip_seconds"], 0)
+                self.assertEqual((costs["warm_calls"], costs["last_warm_call"]["call"]), (3, changed["call"]))
+                self.assertGreaterEqual(costs["recent_warm_median"]["compile_seconds"], 0)
+                # The first call is no longer reliably the slowest: the package image
+                # holds the request loop, and the first warm call writes the first snapshot.
+                self.assertGreater(costs["recent_warm_median"]["round_trip_seconds"], 0)
                 saved = call("palette_control", {"action": "restart"})
                 death = call("palette", {"code": 'n=999;write("after-death.txt","file survived");exit(19)'}, success=False)
                 self.assertTrue(death["session_dead"])
                 recovered = call("palette", {"code": '(n,read("after-death.txt",String))'})
                 self.assertEqual(recovered["data"], [43, "file survived"])
                 self.assertNotEqual(recovered["epoch"], saved["epoch"])
-                self.assertEqual(recovered["session"]["restoration"], "restored")
+                # The call that exited was running when the kernel stopped; its n=999 is lost, so the revival is partial.
+                self.assertEqual(recovered["session"]["restoration"], "partially_restored")
+                self.assertIn("was running when the kernel stopped", recovered["output"])
                 self.assertIn("previous_connection_failure", recovered["session"])
                 self.assertIn("unknown", recovered["session"]["recovery_warning"])
                 clean = call("palette_control", {"action": "restart", "restore": False})
@@ -1167,6 +1202,8 @@ class TestSessionCli(unittest.TestCase):
         self.assertNotIn("session_dead", r)
         self.assertIn("before", r["output"])
         self.assertIn("every binding are intact", r["error"])
+        self.assertEqual(r["costs"]["failed_phase"], "execution")
+        self.assertTrue(r["error"].startswith("Interrupted during execution:"), r["error"])
         r = self._turn('(keep, process_running(bg), strip(sh"pgrep -c -x sleep".stdout))')
         self.assertEqual(r["data"], [99, True, "1"])
 
@@ -1182,6 +1219,8 @@ class TestSessionCli(unittest.TestCase):
         self.assertFalse(r["success"])
         self.assertIs(r.get("session_dead"), True)
         self.assertIn("never yields", r["error"])
+        # This session has no state directory, so nothing comes back.
+        self.assertIn("Every binding is gone", r["error"])
 
     def test_turn_that_swallows_the_interrupt_stops_the_kernel(self):
         r = self._turn("while true; try sleep(0.5) catch end; end")

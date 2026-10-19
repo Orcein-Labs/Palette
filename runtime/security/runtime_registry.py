@@ -12,10 +12,9 @@ from pathlib import Path
 import re
 import shutil
 import sys
-import tomllib
 from typing import Any
 
-from provisioning import _configured_path_arguments
+from provisioning import _configured_path_arguments, palette_version
 
 
 CAPABILITY_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -102,8 +101,8 @@ class RuntimeRegistry:
         version = "unknown"
         if self.repo:
             try:
-                version = str(tomllib.loads((self.repo / "Project.toml").read_text()).get("version", "unknown"))
-            except (OSError, ValueError):
+                version = palette_version(self.repo)
+            except (OSError, ValueError, KeyError):
                 pass
         adapter_digest = _json_digest(self.adapter_identity)
         return {"version": version, "content_sha256": _json_digest({"runtime": protected,

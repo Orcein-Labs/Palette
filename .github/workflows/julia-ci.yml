@@ -107,7 +107,12 @@ jobs:
 
   security-suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 40
+    env:
+      # Runners are AMD or Intel at random. Package images built for one
+      # runner's native CPU are rejected on the other, and that shard then
+      # recompiled the whole depot, about 8 minutes. Both support x86-64-v3.
+      JULIA_CPU_TARGET: x86-64-v3
     strategy:
       fail-fast: false
       matrix:
@@ -115,6 +120,9 @@ jobs:
         # the conformance oracle until it is removed (runtime/docs/authority.md)
         # and runs nightly and on manual dispatch.
         implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
+        # verify_operator.py runs the shared gates on shard 1 and deals the test
+        # cases across the shards by runtime/security/test-case-seconds.json.
+        shard: [1, 2, 3, 4]
 
     steps:
     - uses: actions/checkout@v7
@@ -142,6 +150,24 @@ jobs:
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
 
+    # The sandbox clears the environment; the task environment carries the
+    # CPU target to prewarm and the sessions, which compile in it.
+    - name: Pass the CPU target into the sandbox
+      run: |
+        grep -m1 "model name" /proc/cpuinfo
+        echo "JULIA_CPU_TARGET=$JULIA_CPU_TARGET" > "$RUNNER_TEMP/palette-task.env"
+        echo "PALETTE_TASK_ENV=$RUNNER_TEMP/palette-task.env" >> "$GITHUB_ENV"
+
+    # The depot holds the packages and the caches prewarm_depot.py compiles;
+    # the gates still run prewarm, which only recompiles what changed.
+    - name: Restore the Julia depot
+      id: depot
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.julia
+        key: palette-depot-v2-${{ runner.os }}-julia1.12-${{ env.JULIA_CPU_TARGET }}-${{ hashFiles('Project.toml', 'src/**', 'runtime/security/prewarm_workload.jl') }}
+        restore-keys: palette-depot-v2-${{ runner.os }}-julia1.12-${{ env.JULIA_CPU_TARGET }}-
+
     - name: Instantiate the operator and its test environment
       run: |
         julia --project=@. -e 'using Pkg; Pkg.instantiate()'
@@ -158,6 +184,18 @@ jobs:
         python3 runtime/security/verify_operator.py
         --project-dir "$GITHUB_WORKSPACE/security-test-env"
         --implementation "${{ matrix.implementation }}"
+        --shard "${{ matrix.shard }}/4"
+
+    - name: Report the depot size sessions clone
+      if: always()
+      run: du -sh ~/.julia ~/.palette-depot-snapshots 2>/dev/null || true
+
+    - name: Save the Julia depot
+      if: always() && matrix.shard == 1 && matrix.implementation == 'rust' && steps.depot.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.julia
+        key: ${{ steps.depot.outputs.cache-primary-key }}
 
   operator-adapters:
     runs-on: ubuntu-24.04
@@ -191,9 +229,10 @@ jobs:
         python3 runtime/security/prewarm_depot.py
         --project-dir "$GITHUB_WORKSPACE"
         --host-bin "$GITHUB_WORKSPACE/runtime/host/target/release/palette-host"
+        --timeout-s 720
     - name: Check routing, ownership, recovery and one-shot patch authority
       env:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime test_depot_clones test_entry_points
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime test_depot_clones test_entry_points test_preparation_messages

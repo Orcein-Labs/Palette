@@ -20,6 +20,9 @@ def main():
     os.environ.setdefault("OPERATOR_WORKSPACE", str(data / "workspace"))
     os.environ.setdefault("PALETTE_STATE_DIR", str(data / "state"))
     os.environ.setdefault("PALETTE_WORKSPACE_STATE_ROOT", str(data / "worlds"))
+    # A private instance keeps its packages beside its other data instead of
+    # sharing the host-wide store, as the installers already arrange.
+    os.environ.setdefault("PALETTE_PACKAGE_DEPOT", str(data / "packages"))
     sys.path.insert(0, str(repo / "runtime/security"))
     runpy.run_path(str(repo / "runtime/security/operator_workspace_router.py"), run_name="__main__")
 
