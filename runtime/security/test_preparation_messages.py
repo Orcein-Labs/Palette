@@ -10,7 +10,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from prewarm_depot import error_summary, preparation_path, preparation_status  # noqa: E402
+from prewarm_depot import error_summary, prepare, preparation_path, preparation_status  # noqa: E402
+from unittest import mock  # noqa: E402
 
 
 class ErrorSummaryTest(unittest.TestCase):
@@ -26,6 +27,23 @@ class ErrorSummaryTest(unittest.TestCase):
         self.assertTrue(summary.endswith(f"ZMQ [{uuid}]"))
         self.assertIn("characters left out", summary)
 
+
+
+class TimeoutTest(unittest.TestCase):
+    def test_a_hung_prewarm_fails_with_its_output_so_far(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Path(tmp, "host")
+            host.write_text("#!/bin/sh\necho 'Precompiling Stuck' >&2\nexec sleep 30\n")
+            host.chmod(0o755)
+            Path(tmp, "project").mkdir()
+            with mock.patch.dict(os.environ, {"PALETTE_PACKAGE_DEPOT": str(Path(tmp, "packages"))}):
+                record = prepare(str(Path(tmp, "project")), str(HERE.parents[1]), state_dir=str(Path(tmp, "state")),
+                                 host_bin=str(host), timeout_s=1)
+        self.assertEqual(record["state"], "failed")
+        self.assertTrue(record["timed_out"])
+        self.assertIn("did not finish in 1 s", record["error"])
+        self.assertIn("Precompiling Stuck", record["error"])
+        self.assertLess(record["seconds"], 10)
 
 class StaleStatusTest(unittest.TestCase):
     def record(self, root, **fields):
