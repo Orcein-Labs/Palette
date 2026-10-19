@@ -4,8 +4,9 @@
 Reads the job logs of a security-suite run (for example
 `gh api --allow-escape-sequences repos/OWNER/REPO/actions/jobs/ID/logs > shard1.log`;
 without the flag gh writes an empty log) and merges each
-case's seconds into runtime/security/test-case-seconds.json. Both hosts share
-a case's record. A case's time runs
+case's seconds into runtime/security/test-case-seconds.json, as the mean of its
+record and the new time: a single run's times vary too much to deal shards on.
+Both hosts share a case's record. A case's time runs
 from the end of the case before it, or from the start of its suite, so the first
 case of a suite carries the suite's start-up.
 """
@@ -46,7 +47,8 @@ def main():
     args = parser.parse_args()
     weights = json.loads(WEIGHTS.read_text()) if WEIGHTS.exists() else {}
     for log in args.logs:
-        weights.update(case_seconds(log))
+        for key, seconds in case_seconds(log).items():
+            weights[key] = round((weights[key] + seconds) / 2) if key in weights else seconds
     WEIGHTS.write_text(json.dumps(dict(sorted(weights.items())), indent=1) + "\n")
     print(f"{len(weights)} cases in {WEIGHTS.name}")
 
