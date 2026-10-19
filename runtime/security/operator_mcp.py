@@ -18,6 +18,7 @@ from source_transport import call_limit, normalize_palette_call, seconds_text, t
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
+import time_machine
 from patch_broker import PatchBroker, approval_mode
 from repair_broker import RepairBroker
 
@@ -399,8 +400,8 @@ def complete_runtime_refresh(turn_event):
 
 
 def control(args):
-    if any(key in args and not isinstance(args[key], bool) for key in ("restore", "prepare")):
-        raise ValueError("restore and prepare must be booleans")
+    if any(key in args and not isinstance(args[key], bool) for key in ("restore", "prepare", "fork")):
+        raise ValueError("restore, prepare and fork must be booleans")
     action = args["action"]
     if action == "status":
         identity = preparation_identity(REPO, REPO, resolve_real_julia_binary())
@@ -410,13 +411,19 @@ def control(args):
                 "costs": cost_status()}
     if action == "prepare":
         return prepare_session()
-    if action == "restart":
+    if action == "checkpoints":
+        return time_machine.list_checkpoints(STATE_DIR)
+    if action == "restore":
+        # The next kernel saves the world it leaves, then revives the checkpoint.
+        time_machine.request_restore(STATE_DIR, args.get("checkpoint"), args.get("fork", False))
+    if action in ("restart", "restore"):
         previous_epoch = hello.get("epoch") if hello else None
         stop()
         retired = None
-        if args.get("restore", True) is False and STATE_DIR.exists():
+        if action == "restart" and args.get("restore", True) is False and STATE_DIR.exists():
             retired = str(STATE_DIR.with_name(STATE_DIR.name + ".retired-" + uuid.uuid4().hex))
             os.replace(STATE_DIR, retired)
+            time_machine.carry_checkpoints(retired, STATE_DIR)
         start(prepared=args.get("prepare", True))
         result = execute({"code": "nothing"})
         result.update(previous_epoch=previous_epoch, retired_snapshot=retired)
@@ -427,8 +434,9 @@ def control(args):
 schema = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
     {"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
     "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "additionalProperties": False}
-control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart"]},
-    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}}, "required": ["action"], "additionalProperties": False}
+control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "checkpoints", "restore"]},
+    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "checkpoint": {"type": "string"}, "fork": {"type": "boolean"}},
+    "required": ["action"], "additionalProperties": False}
 
 
 def main():
@@ -449,7 +457,7 @@ def main():
                 elif method == "tools/list":
                     result = {"tools": [
                         {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job.", "inputSchema": schema},
-                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, or restart. restore=false starts a clean world and retires the previous snapshot without deleting workspace files. prepare=false exercises the cold path.", "inputSchema": control_schema}]}
+                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, restart, or go back to a checkpoint. restore=false starts a clean world and retires the previous snapshot without deleting workspace files; checkpoints are kept. prepare=false exercises the cold path. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the kernel in that checkpoint's world (fork=true makes it a new world), after saving the current world as an auto- checkpoint.", "inputSchema": control_schema}]}
                 elif method == "tools/call":
                     params = msg["params"]
                     args = params.get("arguments", {})

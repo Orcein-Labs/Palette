@@ -489,6 +489,7 @@ Prints what happened since the last call: output that background tasks and
 processes wrote, and each failed task bound in `mod`, once.
 """
 function report_background(mod::Module)
+    isempty(TIME_MACHINE_NOTICE[]) || (println(TIME_MACHINE_NOTICE[]); TIME_MACHINE_NOTICE[] = "")
     text = late_output()
     io = SINK[]
     if io !== nothing
@@ -642,7 +643,8 @@ function binding_provenance(name::Symbol; strong::Bool=false)
     T = typeof(value)
     changed_type = T isa DataType && !(value isa Function) && !current_definition(T)
     sources = binding_sources(origin, something(call, 0))
-    changed_files = [p for (p, evidence) in sources if source_changed(evidence; strong) || p in get(origin, "strong_stale_sources", String[])]
+    pins = pinned_files()
+    changed_files = [p for (p, evidence) in sources if world_source_changed(p, evidence, pins; strong) || p in get(origin, "strong_stale_sources", String[])]
     superseded = any(artifact_changed, get(origin, "artifacts", Dict{String, Any}[]))
     restoration = Dict(k => [s for s in get(REVIVAL_OBSERVATION[], k, String[]) if startswith(s, string(name) * " (")] for k in ("restored", "rebuilt", "stale", "lost", "uncertain"))
     return Dict{String, Any}("name" => string(name), "epoch" => TASK_EPOCH[], "type" => short_type(value),

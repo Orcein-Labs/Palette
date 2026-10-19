@@ -90,6 +90,7 @@ session, and to prewarm (4.4 min).
 | One job ran every suite in turn. | Fixed: four shards. Each took 17 to 23 min without a cache. |
 | Every shard prepared the package depot from nothing. | Fixed: shard 1 saves the prewarmed depot to the Actions cache, and every shard restores it. Shards then took 7 to 9 min, except shard 1 at 15.5 min. |
 | Shard 1 also runs the shared gates (Julia and Rust unit tests, test policy), which took its gates step to 14 min against 6 to 7 min on the others. | Fixed: `verify_operator.py` deals test cases across the shards by their recorded seconds (`test-case-seconds.json`, refreshed from CI logs by `record-test-case-seconds.py`), with shard 1 starting 90 s behind. The recorded test time per Rust shard is now about 500 s, against 740 s on the old shard 1. The gate (under 15 min, green on 10 consecutive runs) is measured after the next push. |
+| The operator-adapters job on e2dd763 was cancelled at its 20 min limit: the prewarm step ran for 18 min and printed nothing, against 3.5 min on earlier runs. | Fixed: `prewarm_depot.py --timeout-s` stops a hung prewarm and fails with its output so far, and CI passes 720 s. The cause of the hang is not known; the rerun of the same commit passed in 10.9 min, so it did not recur. |
 
 ## A6: cold and warm cost
 
@@ -123,3 +124,17 @@ build, test, render and git step goes through Palette.
 | A wait loop that polled a job until it stopped running lost the result: the loop's last poll took it, and the poll after the loop failed with "no running host_command job". A 21-minute `cargo test` result was lost this way. | Fixed: the kernel keeps the last 16 finished results, so polling a finished job again returns the same result, and `Palette.host_command_wait(job; timeout_s)` blocks until the job finishes and returns all of its output. |
 | A call with `timeout_s` over the limit was refused with only "Invalid timeout_s", which does not say the limit (1800 s by default). | Fixed: the refusal names the allowed range. |
 | A GPU host command already runs under the lock, so a script it runs must not take the same lock again: it would wait on itself until the timeout. | Documented in `tools/bench_presented.sh`. A lock held by the command is not visible to the script; there is no check. |
+| The call that waited for the 19-minute `cargo test` (green, return code 0) began with `[background jobs: running: host job \`cargo\` ...]`, which reads as stale next to the finished result. | By design: the line reports the session as the call starts, before its code runs; the next call reports that nothing is running. Left as is. |
+
+## Phase B: Time Machine demo
+
+The demo checkpointed a real analysis of the converge4 presented-frame logs,
+broke its summary operator, restored the checkpoint and undid the restore.
+
+| Friction | Status |
+|---|---|
+| After the restore, every value computed from the restored include was reported "restored but stale" with a `[changed on disk]` notice, while the receipt said each identity was the same. The staleness check compared against the workspace file, not the checkpoint copy the world runs. | Fixed: a file a restore pinned is checked against its checkpoint copy, in the revival report and in `Palette.provenance`. |
+| Including the analysis file again after the restore failed: "cannot declare LINE constant; it was already declared global". A `const` from an included file came back as a plain global, because only a call's own `const` statements were recorded as const. | Fixed: the snapshot asks Julia whether each binding is const. |
+| `c = Palette.checkpoints(); c.checkpoints[1]["name"]` raised a MethodError: the listing's entries were NamedTuples while the world record beside them was a Dict. | Fixed: entries are Dicts, like the world record and the host's listing. |
+| Undoing an undo named its automatic checkpoint `auto-…-before-auto-…-before-conv`, cut at 64 characters. | Fixed: restoring an automatic checkpoint saves `auto-<time>-before-undo`. |
+| `Palette.checkpoint` saves at the end of the call, so its "Saved checkpoint" notice appears at the start of the next call. | By design: the checkpoint holds the state the call ends with, and the notice says "the world at the end of call N". |
