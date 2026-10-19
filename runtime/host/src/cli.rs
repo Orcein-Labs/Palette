@@ -2,9 +2,10 @@
 //! spawns once per agent session. Newline-delimited JSON:
 //!
 //!   HELLO     {"kind": "HELLO", "epoch", "session_id", "revival"}   (once, at startup)
-//!   Request   {"request_id", "code", "ephemeral"?, "ceiling"?, "payload"?, "map"?, "digest"?}
+//!   Request   {"request_id", "code", "ephemeral"?, "ceiling"?, "payload"?, "map"?, "digest"?,
+//!              "context"?, "budget"?}
 //!   Response  {"request_id", "success", "data", "display", "output", "error", "epoch",
-//!              "interrupted", "call", "bindings", "session_dead"?}
+//!              "interrupted", "call", "bindings", "context", "session_dead"?}
 //!
 //! Mid-call host requests (kernel -> host, while a call runs or after it):
 //!   Event     {"event": "host_request", "id", "data": {"type", ...payload}}
@@ -344,6 +345,18 @@ pub fn main(argv: &[String]) -> i32 {
                                       is bounded by the session's --turn-timeout"}));
             continue;
         }
+        let context_error = [("context", "a string", Value::is_string as fn(&Value) -> bool), ("budget", "an object", Value::is_object)]
+            .into_iter()
+            .find_map(|(field, kind, is_kind)| match req.get(field).filter(|v| !v.is_null()) {
+                Some(v) if !is_kind(v) => Some(format!("request '{field}' must be {kind}")),
+                Some(_) if ephemeral => Some(format!("request '{field}' does not apply to an ephemeral call: \
+                                                      a scratch worker always runs in the normal context")),
+                _ => None,
+            });
+        if let Some(error) = context_error {
+            respond(&json!({"request_id": request_id, "success": false, "data": null, "error": error}));
+            continue;
+        }
         *bridge.timeout.lock().unwrap() = bridge_timeout(limit);
         let result = session.turn(Turn {
             code,
@@ -353,6 +366,8 @@ pub fn main(argv: &[String]) -> i32 {
             include_map: req.get("map") == Some(&Value::Bool(true)),
             digest: req.get("digest") != Some(&Value::Bool(false)),
             timeout_s: Some(limit),
+            context: req.get("context").filter(|v| !v.is_null()).cloned(),
+            budget: req.get("budget").filter(|v| !v.is_null()).cloned(),
         });
         if stop.load(Ordering::SeqCst) {
             break; // shutting down: no reply, as for any process killed mid-call
@@ -372,6 +387,7 @@ pub fn main(argv: &[String]) -> i32 {
                 "revival": r.get("revival").cloned().unwrap_or(Value::Null),
                 "reloads": r.get("reloads").cloned().unwrap_or(Value::Null),
                 "costs": r.get("costs").cloned().unwrap_or(Value::Null),
+                "context": r.get("context").cloned().unwrap_or(Value::Null),
                 "transport_shortened": r.get("transport_shortened").cloned().unwrap_or(Value::Null),
             })),
             Err(SessionError::Dead(e)) => {

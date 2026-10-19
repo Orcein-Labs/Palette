@@ -185,7 +185,28 @@ Every capability builds on what the kernel already records, so the
    call at a time, by hand. None of them links a call to its host effects.
 9. **Product placement.** Palette. The Gesso drill-down is a later
    consumer.
-10. **Evidence status.** ENGINEERING CANDIDATE.
+10. **Evidence status.** MEASURED on one workload, 2026-10-19.
+    - Demo: a traced call ran `gpu-smi`, `git rev-parse` and the converge4
+      presented-frame bench at ultra (still camera, 396 s under the GPU
+      lock), and a second traced call summarised its output (close 42.3 ms,
+      medium 55.1 ms, wide 58.1 ms mean frame time). `Palette.xray(n)`
+      showed compile, run and GC seconds, bytes allocated, the method each
+      top-level call dispatched to, and the request id of each host command.
+    - Join coverage: 5 of 5 host requests across both calls joined a receipt
+      by request id; the receipt query read 0 unreadable lines.
+    - Overhead: 0.74 % of a warm `1 + 1` call. The per-call statements
+      Phases C and D added cost a median of 19.2 µs in the kernel (14
+      batches of 2000), and one `calls.jsonl` append costs 3.4 µs, against a
+      3.06 ms end-to-end warm call (median of 200). There is no X-Ray off
+      switch to A/B against, so the numerator is the added code timed in
+      place; it includes the turn-cost record that predates C, so it is an
+      upper bound.
+    - Compile time, GC time and allocation are process-wide; the record's
+      `limits` field says so.
+    - `test_xray.py` covers the join of every request in a call, results
+      that tracing leaves unchanged, and the context on the call record;
+      `test_receipt_query.py` covers the query, including that it leaves
+      the files unchanged.
 11. **Promotion rule.** The demo passes, overhead is measured under 1 % on
     warm calls, and receipt join coverage is 100 % of the host requests in a
     test session.
@@ -230,7 +251,17 @@ Every capability builds on what the kernel already records, so the
    deeper reach, but it is fragile across Julia versions. Flag-based A/B
    duplicates code.
 9. **Product placement.** Palette.
-10. **Evidence status.** ENGINEERING CANDIDATE.
+10. **Evidence status.** LANDED, 2026-10-19.
+    - `test_contexts.py` runs the four-context demo: `g([1, 2, 3])` gives 12
+      in normal, reference, traced and memoized, and the four X-Ray records
+      differ (no extra field; the replaced method; the dispatched method;
+      a memo miss, then a hit).
+    - The same tests cover one context per call, the session default being
+      reported in every reply and lost on restart, a redefinition between
+      memoized calls missing, budgets interrupting by time and by bytes, and
+      bad requests failing without harming the world.
+    - The context is on every call's costs, X-Ray record and
+      `calls.jsonl` line. The Phase C demo ran in the traced context.
 11. **Promotion rule.** The four-context demo passes as a test, and receipts
     show the context every time.
 
