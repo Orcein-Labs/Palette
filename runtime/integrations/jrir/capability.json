@@ -1,9 +1,9 @@
 {
   "id": "jrir",
-  "name": "Julia-Rust Intermediate Representation & LLVM Inlining Bridge",
   "version": "0.1.0",
-  "language": "julia",
-  "entrypoint": "jrir.jl",
-  "symbol": "jrir",
-  "dependencies": []
+  "source": "jrir.jl",
+  "entrypoint": "jrir",
+  "dependencies": [],
+  "requires": ["host_command"],
+  "description": "Julia-Rust Intermediate Representation, C-ABI layout verifier, cross-version LLVM 19-23 to LLVM 18 normalizer, and zero-allocation Base.llvmcall loop fuser"
 }
