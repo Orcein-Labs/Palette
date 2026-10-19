@@ -252,6 +252,33 @@ class RevivalTest(KernelTestCase):
             self.assertTrue(result["success"], result)
             self.assertEqual(result["data"], [42, True, True, []], out)
 
+    def test_a_project_the_new_kernel_cannot_see_is_not_restored(self):
+        # A generation switch: the saved project was the old generation's checkout,
+        # which the new kernel's sandbox does not mount.
+        gone = str(Path(self.state).parent / "palette-retired-generation")
+        self.session("v = [1, 2]")
+        own = self.session("Base.active_project()")[0]["data"]
+        m = self.manifest()
+        m["active_project"] = gone + "/Project.toml"
+        m["load_path"] = ["@", gone, *m["load_path"]]
+        Path(self.state, "manifest.json").write_text(json.dumps(m))
+        k = Kernel(self.ws, self.state)
+        try:
+            r = k.turn("(Base.active_project(), " + json.dumps(gone) + " in LOAD_PATH)")
+            self.assertTrue(r["success"], r)
+            self.assertEqual(r["data"], [own, False])
+            self.assertIn("is not visible to this kernel", r["output"])
+            self.assertTrue(k.turn("w = 3")["success"])
+        finally:
+            k.close()
+        self.assertEqual(self.manifest()["call"], 4)  # both turns after the revival were saved
+
+    def test_a_removed_active_project_does_not_stop_the_snapshot(self):
+        self.session('mkdir("p"); write("p/Project.toml", ""); Base.ACTIVE_PROJECT[] = abspath("p/Project.toml"); '
+                     'rm("p"; recursive=true); x = 1')
+        self.assertEqual(self.manifest()["call"], 1)
+        self.assertEqual(self.manifest()["environment"]["manifest"], "")
+
     # --- what must be marked, not restored silently --------------------
 
     def test_value_computed_from_a_file_that_changed_is_marked_stale(self):
