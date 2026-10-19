@@ -35,6 +35,17 @@ def parse_read_roots(spec):
     return roots
 
 
+def trusted_tools_dir(spec):
+    """The directory of human-approved kernel tools (PALETTE_TRUSTED_TOOLS),
+    created if missing. The kernel reads it; only the patch broker writes it."""
+    if not spec:
+        return None
+    if not Path(spec).is_absolute():
+        raise ValueError("PALETTE_TRUSTED_TOOLS must be an absolute path")
+    Path(spec).mkdir(parents=True, exist_ok=True, mode=0o700)
+    return str(Path(spec).resolve())
+
+
 def require_read_roots(roots, writable, others):
     """A read root may not contain any other mount, so no mount order can let
     it hide one, and may not lie inside a writable mount."""

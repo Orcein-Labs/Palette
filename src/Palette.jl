@@ -762,6 +762,12 @@ context!(name; kw...) = Palette.context!(name; kw...)
 reference!(f, sig::Type{<:Tuple}, impl) = Palette.reference!(f, sig, impl)
 references() = Palette.references()
 forget_reference!(f, sig::Type{<:Tuple}) = Palette.forget_reference!(f, sig)
+promote(name::Symbol; doc::Union{Nothing, AbstractString}=nothing) = Palette.promote_tool(name; doc)
+tools() = Palette.tool_index()
+trust(name::Symbol) = Palette.trust_request(name)
+codegraph(root::AbstractString=Palette.WORKSPACE_ROOT[]) = Palette.codegraph(root)
+definitions(name::AbstractString) = Palette.Pharos.definitions(Palette.codegraph(), name)
+callers(name::AbstractString) = Palette.Pharos.callers(Palette.codegraph(), name)
 function costs(n::Integer)
     haskey(Palette.TURN_COSTS, n) || error("no phase observations retained for call $n")
     return deepcopy(Palette.TURN_COSTS[n])
@@ -829,7 +835,7 @@ Every binding this session has created, with its size and summary.
 function varinfo(mod::Module=get_kernel_state().eval_module)
     rows = NTuple{3,String}[]
     for sym in sort!(Base.invokelatest(names, mod; all=true))
-        (sym === nameof(mod) || sym in KERNEL_BINDINGS || startswith(string(sym), '#')) && continue
+        session_binding(mod, sym) || continue
         Base.invokelatest(isdefined, mod, sym) || continue
         v = Base.invokelatest(getglobal, mod, sym)
         size = try
@@ -1040,14 +1046,12 @@ function execute(op::ExecuteCode)::OperationReceipt
         # miss bindings that unquestionably exist (confirmed by direct
         # testing, not assumed). Base.invokelatest forces resolution
         # against the current world.
-        own_name = nameof(state.eval_module)
         for sym in Base.invokelatest(names, state.eval_module; all=true)
             # :Palette is the constant KernelState's constructor binds here so
             # turn code can reach `Palette.request_capability` without
             # re-importing it every turn -- not a user variable, must not
             # show up in GetState/discovery any more than :eval or :include do.
-            (sym === own_name || sym in KERNEL_BINDINGS) && continue
-            startswith(string(sym), '#') && continue
+            session_binding(state.eval_module, sym) || continue
             if Base.invokelatest(isdefined, state.eval_module, sym)
                 state.variables[string(sym)] = Base.invokelatest(getfield, state.eval_module, sym)
             end
@@ -2000,6 +2004,8 @@ include("digest.jl")
 include("workspace_map.jl")
 include("stress.jl")
 include("session_requests.jl")
+include("pharos.jl")
+include("tools.jl")
 include("precompile_workload.jl")
 
 export KernelState, ExecutionRecord

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import selectors
 import shlex
 import stat
@@ -20,13 +21,33 @@ import sys
 import tempfile
 import time
 import uuid
-from filesystem_layout import require_disjoint
+from filesystem_layout import require_disjoint, trusted_tools_dir
 
 PATCH_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["read", "prepare", "status", "apply"]}, "target": {"type": "string"}, "path": {"type": "string"}, "request_id": {"type": "string"}, "changes": {"type": "array", "maxItems": 16, "items": {"type": "object", "properties": {"path": {"type": "string"}, "before_sha256": {"type": ["string", "null"]}, "content": {"type": "string"}}, "required": ["path", "before_sha256", "content"], "additionalProperties": False}}}, "required": ["action"], "additionalProperties": False}
 MAX_BYTES = 65536
 REQUEST_FIELDS = ("request_id", "workspace_id", "target", "root", "root_identity", "changes", "preview", "created_at", "expiry", "allowed_operations")
 AUTO_APPLY_CLASSES = frozenset({"runtime", "tools", "recipes", "adapters"})
 IMMUTABLE_CREDENTIAL_COMPONENTS = frozenset({".ssh", ".aws", ".gnupg", "credentials", "secrets"})
+# The directory of human-approved kernel tools (PALETTE_TRUSTED_TOOLS). Only a
+# human approval writes there: no auto-apply class or repair can reach it.
+TRUSTED_TOOLS_TARGET = "trusted_tools"
+TRUSTED_TOOL_FILE = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*\.(jl|json)")
+
+
+def patch_roots_from_env(environ=os.environ):
+    """PALETTE_PATCH_ROOTS, plus the trusted tool directory when one is set."""
+    try:
+        roots = json.loads(environ.get("PALETTE_PATCH_ROOTS", "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object") from exc
+    if not isinstance(roots, dict):
+        raise ValueError("PALETTE_PATCH_ROOTS must be a JSON object")
+    if TRUSTED_TOOLS_TARGET in roots:
+        raise ValueError(f"{TRUSTED_TOOLS_TARGET!r} is a reserved patch target; set PALETTE_TRUSTED_TOOLS instead")
+    trusted = trusted_tools_dir(environ.get("PALETTE_TRUSTED_TOOLS"))
+    if trusted:
+        roots[TRUSTED_TOOLS_TARGET] = trusted
+    return roots
 
 
 def credential_location(path):
@@ -241,6 +262,8 @@ def approval_mode(value):
 class PatchBroker:
     def __init__(self, storage, roots, auto_apply_prefixes=None, protected_paths=(),
                  registry_root=None, sandbox_source_paths=None, approval="client"):
+        if TRUSTED_TOOLS_TARGET in (auto_apply_prefixes or {}) or TRUSTED_TOOLS_TARGET in (sandbox_source_paths or {}):
+            raise ValueError("Trusted tools are approved by a human only; they take no auto-apply or sandbox source paths")
         self.approval = approval_mode(approval)
         self.storage = Path(storage).resolve()
         self.roots = {key: str(Path(path).resolve(strict=True)) for key, path in roots.items()}
@@ -363,6 +386,10 @@ class PatchBroker:
     def classify(self, target, relative):
         if target not in self.roots:
             raise self.unknown_target(target)
+        if target == TRUSTED_TOOLS_TARGET:
+            if not isinstance(relative, str) or not TRUSTED_TOOL_FILE.fullmatch(relative):
+                raise PermissionError("The trusted tool directory holds only <name>.jl and <name>.json files")
+            return {"class": "protected", "self_apply": False, "reason": "trusted tool: a human approves it"}
         candidate = Path(self.roots[target]).joinpath(*parent_path_parts(relative)).absolute()
         if credential_location(candidate):
             return {"class": "forbidden", "self_apply": False, "reason": "credential or secret path"}
