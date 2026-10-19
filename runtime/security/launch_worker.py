@@ -49,7 +49,7 @@ import zipfile
 import zlib
 from contextlib import contextmanager
 from pathlib import Path
-from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots
+from filesystem_layout import parse_read_roots, require_disjoint, require_preserved_roots, require_read_roots, trusted_tools_dir
 
 
 def _clone_depot(real_depot: str, clone_root: str) -> str:
@@ -719,7 +719,8 @@ def resolve_real_julia_binary() -> str:
 SANDBOX_USER = "palette"
 # The sandbox sets these itself; a task environment cannot move them.
 SANDBOX_OWNED_ENV = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "JULIA_DEPOT_PATH", "JULIA_PROJECT", "JULIA_LOAD_PATH",
-                     "JULIA_PKG_OFFLINE", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET"}
+                     "JULIA_PKG_OFFLINE", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
+                     "PALETTE_TRUSTED_TOOLS"}
 
 
 def read_task_env(path: str | None) -> dict[str, str]:
@@ -854,7 +855,8 @@ def build_bwrap_argv(
     writable = [workspace_dir] + ([state_dir] if state_dir else [])
     require_disjoint(writable, protected)
     require_preserved_roots(writable, ("/tmp", "/run"))
-    read_roots = parse_read_roots(os.environ.get("PALETTE_READ_ROOTS"))
+    trusted_tools = trusted_tools_dir(os.environ.get("PALETTE_TRUSTED_TOOLS"))
+    read_roots = parse_read_roots(os.environ.get("PALETTE_READ_ROOTS")) + ([trusted_tools] if trusted_tools else [])
     require_read_roots(read_roots, writable, protected + ["/tmp", "/run"])
 
     # Every bind source is the resolved path, not the raw string: a symlink
@@ -934,7 +936,8 @@ def build_bwrap_argv(
         argv += ["--ro-bind", real(task_tools), task_tools]
     for path in extra_ro_binds or []:
         argv += ["--ro-bind", real(path), path]
-    # Host directories the operator lets the kernel read (PALETTE_READ_ROOTS).
+    # Host directories the operator lets the kernel read (PALETTE_READ_ROOTS
+    # and the trusted tool directory).
     for path in read_roots:
         argv += ["--ro-bind", path, path]
     if broker_socket_dir:
@@ -970,6 +973,8 @@ def build_bwrap_argv(
     ]
     for key, value in task_env.items():
         argv += ["--setenv", key, value]
+    if trusted_tools:
+        argv += ["--setenv", "PALETTE_TRUSTED_TOOLS", trusted_tools]
     if broker_socket_dir:
         argv += ["--setenv", "PALETTE_BROKER_SOCKET", str(Path(broker_socket_dir) / "broker.sock")]
     if not network_enabled:

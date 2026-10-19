@@ -311,7 +311,21 @@ Every capability builds on what the kernel already records, so the
    - Graphify-style code graphs are offline snapshots, not live values tied
      to receipts.
 9. **Product placement.** Palette.
-10. **Evidence status.** PRODUCT SYNTHESIS, moving to ENGINEERING CANDIDATE.
+10. **Evidence status.** ENGINEERING CANDIDATE (2026-10-19). Measured on
+    Julia 1.12.6:
+    - **Lifecycle:** the demo passes as `runtime/security/test_tools.py` on
+      the Rust and the Python host (7 tests each).
+    - **Tool context:** for 6 tools with 3 evidence entries each,
+      `Palette.tools()` is 2438 bytes (about 609 tokens at 4 bytes per
+      token). The full source and sidecars are 8332 bytes (about 2083
+      tokens); the source alone, with docstrings, is 4825 bytes (about 1206
+      tokens). An index read takes 0.24 ms. The 6 tools are a stand-in
+      sample: the documented top-level functions of `src/pharos.jl`.
+    - **Code graph on the Luxel repo** (459 files from `git ls-files`): the
+      first build takes 6.6 s, a refresh with no change 0.089 s, and a
+      refresh after one changed file 0.10 to 0.13 s (a 96 KB Julia file,
+      a Python file and a Rust file). Listing files through git, rather than
+      walking the tree, took the first build down from 55 s.
 11. **Promotion rule.** The lifecycle demo passes as a test, the index
     token saving is measured, and the code-graph refresh is measured on the
     Luxel repo.

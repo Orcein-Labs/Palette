@@ -20,7 +20,7 @@ from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
 import receipt_query
 import time_machine
-from patch_broker import PatchBroker, approval_mode
+from patch_broker import PatchBroker, approval_mode, patch_roots_from_env
 from repair_broker import RepairBroker
 
 REPO = os.environ.get("PALETTE_REPO", str(Path(__file__).absolute().parents[2]))
@@ -50,9 +50,7 @@ PATCH_STATE_ROOT = Path(os.environ.get("PALETTE_WORKSPACE_STATE_ROOT",
     str(Path.home() / ".local/share/operator-surfaces/palette-workspaces"))).expanduser().resolve()
 PROTECTED_PATHS = [*protected_host_paths(FROZEN_CEILING, include_runtime_root=False), STATE_DIR, RECEIPTS_DIR, PATCH_STATE_ROOT]
 try:
-    PATCH_ROOTS = json.loads(os.environ.get("PALETTE_PATCH_ROOTS", "{}"))
-    if not isinstance(PATCH_ROOTS, dict):
-        raise ValueError("PALETTE_PATCH_ROOTS must contain a JSON object")
+    PATCH_ROOTS = patch_roots_from_env()
     repair_config_path = os.environ.get("PALETTE_REPAIR_CONFIG")
     REPAIR_CONFIG = json.loads(Path(repair_config_path).expanduser().read_text(encoding="utf-8")) if repair_config_path else {}
     if not isinstance(REPAIR_CONFIG, dict) or set(REPAIR_CONFIG) - {"test_recipes", "auto_apply_prefixes", "sandbox_source_paths"}:
@@ -463,7 +461,7 @@ def main():
                     result = {}
                 elif method == "tools/list":
                     result = {"tools": [
-                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call traced (records the method each top-level call dispatched to, see Palette.xray), reference (registered reference implementations replace the fast ones), memoized, or budgeted (budget={seconds, bytes}); Palette.context!(name) sets a session default.", "inputSchema": schema},
+                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call traced (records the method each top-level call dispatched to, see Palette.xray), reference (registered reference implementations replace the fast ones), memoized, or budgeted (budget={seconds, bytes}); Palette.context!(name) sets a session default. Api.promote(:f) keeps a helper used in 3 successful calls as a project tool (.palette/tools); Api.tools() lists project and trusted tools, which load on first call; Api.trust(:f) asks a human to approve it as trusted. Api.definitions(name) and Api.callers(name) query the workspace code graph (Api.codegraph()).", "inputSchema": schema},
                         {"name": "palette_control", "description": "Inspect preparation, prepare offline, restart, or go back to a checkpoint. restore=false starts a clean world and retires the previous snapshot without deleting workspace files; checkpoints are kept. prepare=false exercises the cold path. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the kernel in that checkpoint's world (fork=true makes it a new world), after saving the current world as an auto- checkpoint. action=receipts returns the host receipts of call=n (this kernel's, unless epoch is given; Palette.xray(n) shows its costs), or filters them by kind and since/until (unix seconds).", "inputSchema": control_schema}]}
                 elif method == "tools/call":
                     params = msg["params"]

@@ -95,6 +95,8 @@ Revival labels are `restored / rebuilt / stale / lost` (and uncertain, when that
 - Snapshots with dependency-aware reconstruction and preserved data aliases/cycles.
 - Per-binding source observations, content checks, and opt-in artifact freshness.
 - Host-mediated capabilities, workspace routing, and one-shot approved patches.
+- Helpers promoted to project tools by their call evidence, listed from an index and loaded on first use; trusted only after a human approves.
+- Pharos, a code graph of the workspace that re-parses only changed files and is cited in receipts.
 - A repository-owned MCP adapter for clients that support local stdio servers.
 
 ## Documentation

@@ -43,6 +43,16 @@ saved state) and may not lie inside a writable one, so `/` and a home
 directory holding the depot are refused at launch. Name the narrowest
 directories the work needs: everything under a root is readable.
 
+`PALETTE_TRUSTED_TOOLS` names the directory of trusted kernel tools. A
+helper becomes a project tool in the workspace's `.palette/tools` once it has
+succeeded in 3 calls (`Api.promote`); the kernel can write that. It becomes
+trusted only through a `palette_patch` request to the reserved
+`trusted_tools` target, which no auto-apply class or tested repair can
+approve: a human does. The directory is bound read-only into every worker,
+may not overlap the workspace, and holds only `<name>.jl` and `<name>.json`.
+Each listing re-hashes the source, so a trusted tool whose source no longer
+matches its approved hash is not offered as trusted.
+
 `PALETTE_HOST_COMMANDS` names a JSON file of host commands that becomes the
 session's `host_command` ceiling, for work the sandbox cannot do itself (a
 GPU, a renderer, a build):

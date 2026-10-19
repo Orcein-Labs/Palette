@@ -691,7 +691,7 @@ function binding_list!(mod::Module, call::Int)
     source_digest = binding_source_digest(call)
     definitions = IdDict{Any, Any}()
     for sym in sort!(Base.invokelatest(names, mod; all=true))
-        (sym === nameof(mod) || sym in KERNEL_BINDINGS || startswith(string(sym), '#')) && continue
+        session_binding(mod, sym) || continue
         Base.invokelatest(isdefined, mod, sym) || continue
         v = Base.invokelatest(getglobal, mod, sym)
         push!(live, sym)
@@ -832,7 +832,8 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
         refresh_workspace_packages!(reload=false)
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]
-        log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module)
+        ex = log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module)
+        ok && note_tool_uses!(ex, call, session_request)
         observe_tasks!(state.eval_module, call, code)
         turn
     end
@@ -856,6 +857,8 @@ function xray(n::Integer)
         "allocated_bytes" => c["allocated_bytes"],
         "capability_requests" => deepcopy(get(rec, "capability_requests", Dict{String, Any}[])),
         (k => deepcopy(get(rec, k, nothing)) for k in ("dispatch", "memo", "references"))...,
+        "tools" => deepcopy(get(c, "tools", Dict{String, Any}[])),
+        "codegraph" => deepcopy(get(c, "codegraph", Dict{String, Any}[])),
         "budget_exceeded" => get(c, "budget_exceeded", nothing),
         "receipts" => "palette_control {\"action\":\"receipts\",\"call\":$n} returns the host's receipts for this call",
         "limits" => "Compile time, GC time and allocation are process-wide: work other tasks did during the call is counted. run = execution - compile - GC. Dispatch is recorded only in the traced context, memo hits only in the memoized one, replaced methods only in the reference one; each covers the outermost call of every top-level statement (dispatch, memo) or the whole call (references).")

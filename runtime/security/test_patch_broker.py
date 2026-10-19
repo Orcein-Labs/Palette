@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import patch_broker as patch_broker_module
-from patch_broker import PatchBroker, approval_mode, request_digest
+from patch_broker import PatchBroker, TRUSTED_TOOLS_TARGET, approval_mode, patch_roots_from_env, request_digest
 from repair_broker import RepairBroker, normalize_recipe, run_isolated_test
 from prewarm_depot import resolve_real_julia_binary
 
@@ -651,6 +651,65 @@ class PatchTests(unittest.TestCase):
             self.assertEqual(failed["status"], "failed", failed)
             self.assertNotEqual(failed["exit_code"], 0)
             self.assertIn("No such file or directory", failed["output"])
+
+
+class TrustedToolTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.trusted = Path(self.tmp.name) / "trusted" / "tools"
+        self.store = Path(self.tmp.name) / "grants"
+
+    def test_the_target_comes_from_PALETTE_TRUSTED_TOOLS_only(self):
+        roots = patch_roots_from_env({"PALETTE_PATCH_ROOTS": "{}", "PALETTE_TRUSTED_TOOLS": str(self.trusted)})
+        self.assertEqual(roots, {TRUSTED_TOOLS_TARGET: str(self.trusted.resolve())})
+        self.assertTrue(self.trusted.is_dir())
+        self.assertEqual(self.trusted.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(patch_roots_from_env({"PALETTE_PATCH_ROOTS": "{}"}), {})
+        with self.assertRaisesRegex(ValueError, "reserved patch target"):
+            patch_roots_from_env({"PALETTE_PATCH_ROOTS": json.dumps({TRUSTED_TOOLS_TARGET: str(self.trusted)})})
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            patch_roots_from_env({"PALETTE_TRUSTED_TOOLS": "relative/tools"})
+        for bad in ("[]", "not json"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "JSON object"):
+                patch_roots_from_env({"PALETTE_PATCH_ROOTS": bad})
+
+    def test_it_cannot_be_auto_applied_or_a_sandbox_source(self):
+        roots = {TRUSTED_TOOLS_TARGET: str(self.trusted)}
+        self.trusted.mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "human"):
+            PatchBroker(self.store, roots, {TRUSTED_TOOLS_TARGET: [("runtime", "")]})
+        with self.assertRaisesRegex(ValueError, "human"):
+            PatchBroker(self.store, roots, sandbox_source_paths={TRUSTED_TOOLS_TARGET: ["helper.jl"]})
+
+    def test_only_tool_files_and_every_one_needs_a_human(self):
+        self.trusted.mkdir(parents=True)
+        broker = PatchBroker(self.store, {TRUSTED_TOOLS_TARGET: str(self.trusted)})
+        for name in ("helper.jl", "helper.json", "push_row!.jl", "_x9.json"):
+            with self.subTest(name=name):
+                self.assertEqual(broker.classify(TRUSTED_TOOLS_TARGET, name),
+                                 {"class": "protected", "self_apply": False, "reason": "trusted tool: a human approves it"})
+        for name in ("sub/helper.jl", "../helper.jl", "helper.py", ".helper.jl", "9lives.jl", "helper.jl.bak", "", None):
+            with self.subTest(name=name), self.assertRaises(PermissionError):
+                broker.classify(TRUSTED_TOOLS_TARGET, name)
+        with self.assertRaises(PermissionError):
+            broker.prepare({"target": TRUSTED_TOOLS_TARGET,
+                            "changes": [{"path": "sub/helper.jl", "before_sha256": None, "content": "x\n"}]}, "world-a")
+
+    def test_a_passing_repair_test_cannot_approve_it(self):
+        self.trusted.mkdir(parents=True)
+        broker = PatchBroker(self.store, {TRUSTED_TOOLS_TARGET: str(self.trusted)})
+        repair = RepairBroker(broker, {TRUSTED_TOOLS_TARGET: python_test_recipe("always-passes-v1", "-B", "-c", "pass")}, {})
+        changes = [{"path": "helper.jl", "before_sha256": None, "content": "helper(x) = x + 1\n"}]
+        proposed = repair.call({"action": "propose", "target": TRUSTED_TOOLS_TARGET, "changes": changes}, "world-a")
+        self.assertTrue(all(not row["self_apply"] for row in repair.classify_changes(TRUSTED_TOOLS_TARGET, changes)))
+        repair.call({"action": "test", "repair_id": proposed["repair_id"]}, "world-a")
+        tested = repair.wait_test(proposed["repair_id"], "world-a")
+        self.assertEqual(tested["status"], "tested", tested)
+        applied = repair.call({"action": "apply", "repair_id": proposed["repair_id"]}, "world-a", {}, None, io.StringIO())
+        self.assertNotEqual(applied["status"], "applied", applied)
+        self.assertFalse((self.trusted / "helper.jl").exists())
+        self.assertEqual(broker.inspect(proposed["patch_request_id"], "world-a")["status"], "pending")
 
 
 if __name__ == "__main__":

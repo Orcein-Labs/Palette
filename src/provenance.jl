@@ -42,7 +42,7 @@ end
 
 function binding_ids(mod)
     return Dict(n => objectid(Base.invokelatest(getglobal, mod, n)) for n in Base.invokelatest(names, mod; all=true)
-        if !(n in KERNEL_BINDINGS) && n !== nameof(mod) && !startswith(string(n), '#') && Base.invokelatest(isdefined, mod, n))
+        if session_binding(mod, n) && Base.invokelatest(isdefined, mod, n))
 end
 
 function observed_statement(mod, ex, run; source=nothing)
