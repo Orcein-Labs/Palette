@@ -654,3 +654,7 @@ end
     @test "WalkBox" in w.user
     @test w.kinds[Vector{Any}] === :object && w.kinds[Int] === nothing
 end
+
+# The code graph Palette.codegraph() serves, tested on its own.
+const Pharos = Palette.Pharos
+include("pharos.jl")
