@@ -752,11 +752,11 @@ pub unsafe extern "C" fn crc32_ieee_slice(ptr: *const u8, len: usize, seed: u32)
 pub unsafe extern "C" fn strip_ansi_slice(src: *const u8, len: usize, dst: *mut u8) -> usize { 0 }
 """
 
-# Raw rustc 1.97.1 (LLVM 22.1.6) IR for Cyan/Palette's 3 Rust <-> Julia seam kernels:
-# 1. compute_civil_dos (runtime/host/src/receipt_archive.rs:337-365) — exercises initializes((0, 32)),
-#    personality ptr @rust_eh_personality, and inline range(i64 1980, 2108) inside bb8
-# 2. crc32_ieee_slice (runtime/host/src/receipt_archive.rs:288-319) — SIMD <4 x i32> xor reduction
-# 3. strip_ansi_slice (closes src/digest.jl:14 strip_ansi regex allocation seam)
+# Raw rustc 1.97.1 (LLVM 22.1.6) IR compiled from `runtime/integrations/jrir/cyan_seams.rs`:
+# 1. compute_civil_dos (C-ABI wrapper for unix_to_civil + dos_datetime in runtime/host/src/receipt_archive.rs:337-365)
+#    — exercises initializes((0, 32)), personality ptr @rust_eh_personality, and inline range(i64 1980, 2108)
+# 2. crc32_ieee_slice (C-ABI wrapper for crc32_ieee in runtime/host/src/receipt_archive.rs:288-319) — SIMD <4 x i32> xor reduction
+# 3. strip_ansi_slice (exact automaton for src/digest.jl:9 `r"\e\[[0-9;?]*[A-Za-z]"`, preserving malformed/unterminated CSI)
 const _CYAN_SEAMS_RAW_LLVM22_IR = """
 ; ModuleID = 'cyan_seams.fb56a0e5-cgu.0'
 source_filename = "cyan_seams.fb56a0e5-cgu.0"
@@ -913,54 +913,67 @@ bb2:
 
 define noundef i64 @strip_ansi_slice(ptr noundef readonly captures(none) %src, i64 noundef %len, ptr noundef writeonly captures(none) %dst) unnamed_addr #2 {
 start:
-  %_515.not = icmp eq i64 %len, 0
-  br i1 %_515.not, label %bb19, label %bb2
-bb19:
-  %w.sroa.0.0.lcssa = phi i64 [ 0, %start ], [ %w.sroa.0.1, %bb18 ]
-  ret i64 %w.sroa.0.0.lcssa
+  %_52832.not = icmp eq i64 %len, 0
+  br i1 %_52832.not, label %bb26, label %bb2.lr.ph
+bb2.lr.ph:
+  %w.sroa.0.0.ph34 = phi i64 [ %2, %bb25 ], [ 0, %start ]
+  %r.sroa.0.0.ph33 = phi i64 [ %_11, %bb25 ], [ 0, %start ]
+  br label %bb2
+bb1:
+  %0 = add i64 %k.sroa.0.024, 1
+  %_5 = icmp ult i64 %0, %len
+  br i1 %_5, label %bb2, label %bb26
+bb26:
+  %w.sroa.0.0.ph.lcssa = phi i64 [ %w.sroa.0.0.ph34, %bb1 ], [ 0, %start ], [ %2, %bb25 ]
+  ret i64 %w.sroa.0.0.ph.lcssa
 bb2:
-  %w.sroa.0.017 = phi i64 [ %w.sroa.0.1, %bb18 ], [ 0, %start ]
-  %r.sroa.0.016 = phi i64 [ %r.sroa.0.2, %bb18 ], [ 0, %start ]
-  %_8 = getelementptr inbounds nuw i8, ptr %src, i64 %r.sroa.0.016
+  %r.sroa.0.029 = phi i64 [ %r.sroa.0.0.ph33, %bb2.lr.ph ], [ %0, %bb1 ]
+  %_8 = getelementptr inbounds nuw i8, ptr %src, i64 %r.sroa.0.029
   %b = load i8, ptr %_8, align 1, !noundef !3
-  %0 = icmp eq i8 %b, 27
-  %_11 = add nuw i64 %r.sroa.0.016, 1
+  %1 = icmp eq i8 %b, 27
+  %_11 = add nuw i64 %r.sroa.0.029, 1
+  br i1 %1, label %bb3, label %bb25
+bb3:
   %_10 = icmp ult i64 %_11, %len
-  %or.cond19 = select i1 %0, i1 %_10, i1 false
-  br i1 %or.cond19, label %bb4, label %bb17
-bb17:
-  %_26 = getelementptr inbounds nuw i8, ptr %dst, i64 %w.sroa.0.017
-  store i8 %b, ptr %_26, align 1
-  %1 = add i64 %w.sroa.0.017, 1
-  br label %bb18
+  br i1 %_10, label %bb4, label %bb25
+bb25:
+  %b44 = phi i8 [ 27, %bb11 ], [ 27, %bb4 ], [ 27, %bb3 ], [ 27, %bb15 ], [ %b, %bb2 ]
+  %_35 = getelementptr inbounds nuw i8, ptr %dst, i64 %w.sroa.0.0.ph34
+  store i8 %b44, ptr %_35, align 1
+  %2 = add i64 %w.sroa.0.0.ph34, 1
+  %_528 = icmp ult i64 %_11, %len
+  br i1 %_528, label %bb2.lr.ph, label %bb26
 bb4:
   %_14 = getelementptr inbounds nuw i8, ptr %src, i64 %_11
   %_13 = load i8, ptr %_14, align 1, !noundef !3
-  %2 = icmp eq i8 %_13, 91
-  br i1 %2, label %bb5, label %bb17
-bb5:
-  %3 = add nuw i64 %r.sroa.0.016, 2
-  %_17.old = icmp ult i64 %3, %len
-  br i1 %_17.old, label %bb7, label %bb18
+  %3 = icmp eq i8 %_13, 91
+  %4 = add nuw i64 %r.sroa.0.029, 2
+  %_1923 = icmp ult i64 %4, %len
+  %or.cond37 = select i1 %3, i1 %_1923, i1 false
+  br i1 %or.cond37, label %bb7, label %bb25
 bb7:
-  %r.sroa.0.1 = phi i64 [ %4, %bb9 ], [ %3, %bb5 ]
-  %_20 = getelementptr inbounds nuw i8, ptr %src, i64 %r.sroa.0.1
-  %c = load i8, ptr %_20, align 1, !noundef !3
-  %4 = add nuw i64 %r.sroa.0.1, 1
-  %5 = add i8 %c, -65
-  %or.cond = icmp ult i8 %5, 26
-  br i1 %or.cond, label %bb18, label %bb9
-bb9:
-  %6 = add i8 %c, -123
-  %or.cond1 = icmp ult i8 %6, -26
-  %_17 = icmp ult i64 %4, %len
-  %or.cond2 = and i1 %_17, %or.cond1
-  br i1 %or.cond2, label %bb7, label %bb18
-bb18:
-  %r.sroa.0.2 = phi i64 [ %3, %bb5 ], [ %_11, %bb17 ], [ %4, %bb7 ], [ %4, %bb9 ]
-  %w.sroa.0.1 = phi i64 [ %w.sroa.0.017, %bb5 ], [ %1, %bb17 ], [ %w.sroa.0.017, %bb7 ], [ %w.sroa.0.017, %bb9 ]
-  %_5 = icmp ult i64 %r.sroa.0.2, %len
-  br i1 %_5, label %bb2, label %bb19
+  %k.sroa.0.024 = phi i64 [ %5, %bb11 ], [ %4, %bb4 ]
+  %_22 = getelementptr inbounds nuw i8, ptr %src, i64 %k.sroa.0.024
+  %c = load i8, ptr %_22, align 1, !noundef !3
+  %_24 = icmp ugt i8 %c, 47
+  br i1 %_24, label %bb8, label %bb15
+bb8:
+  %_25 = icmp ult i8 %c, 58
+  br i1 %_25, label %bb11, label %switch.early.test
+switch.early.test:
+  switch i8 %c, label %bb15 [
+    i8 63, label %bb11
+    i8 59, label %bb11
+  ]
+bb11:
+  %5 = add nuw i64 %k.sroa.0.024, 1
+  %exitcond.not = icmp eq i64 %5, %len
+  br i1 %exitcond.not, label %bb25, label %bb7
+bb15:
+  %6 = and i8 %c, -33
+  %7 = add i8 %6, -65
+  %or.cond = icmp ult i8 %7, 26
+  br i1 %or.cond, label %bb1, label %bb25
 }
 
 declare i32 @rust_eh_personality(...)
@@ -970,6 +983,13 @@ declare i32 @llvm.vector.reduce.xor.v4i32(<4 x i32>) #4
 """
 
 const _CYAN_SEAMS_NORM_IR = normalize_llvm_ir(_CYAN_SEAMS_RAW_LLVM22_IR)
+
+function regenerate_cyan_seams_ir(; target_cpu::String="native")::String
+    rs_path = joinpath(@__DIR__, "cyan_seams.rs")
+    isfile(rs_path) || throw(ArgumentError("cyan_seams.rs not found at $rs_path"))
+    raw_ir = compile_rust_to_llvm_ir(read(rs_path, String); target_cpu=target_cpu)
+    return normalize_llvm_ir(raw_ir)
+end
 
 @inline function jrir_compute_civil_dos!(secs::Int64, out_ref::Ref{JRIRCivilDateTime})::UInt32
     GC.@preserve out_ref begin

@@ -1,5 +1,6 @@
 using Test
 using InteractiveUtils
+using Random
 
 module JRIRTestMod
     include("jrir.jl")
@@ -275,6 +276,49 @@ end
         @test String(dst_bytes[1:n_out]) == replace(ansi_sample, r"\e\[[0-9;]*[a-zA-Z]" => "")
         @test J.jrir_strip_ansi(ansi_sample) == replace(ansi_sample, r"\e\[[0-9;]*[a-zA-Z]" => "")
         @test (@allocated J.jrir_strip_ansi!(dst_bytes, src_bytes)) == 0
+    end
+
+    @testset "7. strip_ansi Malformed/Unterminated CSI + Adversarial Fuzz vs src/digest.jl Regex" begin
+        oracle(s) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
+        @test J.jrir_strip_ansi("progress \e[ 50% done") == "progress \e[ 50% done"
+        @test J.jrir_strip_ansi("\e[1;31") == "\e[1;31"
+        @test J.jrir_strip_ansi("\e[1;\e[31mX") == "\e[1;X"
+        @test J.jrir_strip_ansi("\e[?25l\e[?25h") == ""
+        @test J.jrir_strip_ansi("") == ""
+        @test J.jrir_strip_ansi("\e") == "\e"
+        @test J.jrir_strip_ansi("\e[") == "\e["
+
+        rng = MersenneTwister(20261019)
+        alphabet = UInt8['\e', '[', '0', '1', '9', ';', '?', 'm', 'A', 'z', ' ', '%', 'x', '\n']
+        mismatches = 0
+        for _ in 1:2_000
+            n = rand(rng, 0:48)
+            s = String([rand(rng, alphabet) for _ in 1:n])
+            J.jrir_strip_ansi(s) == oracle(s) || (mismatches += 1)
+        end
+        @test mismatches == 0
+    end
+
+    @testset "8. Capability manifest matches RuntimeRegistry schema" begin
+        allowed = Set(["id", "version", "source", "entrypoint", "dependencies", "requires", "description"])
+        authority = Set(["external_fs_write", "fs_digest", "host_command", "network_access",
+                         "package_management", "spawn_child_worker"])
+        for cap in ("jrir", "vecindex", "teamlab")
+            path = joinpath(@__DIR__, "..", cap, "capability.json")
+            isfile(path) || continue
+            txt = read(path, String)
+            keys_found = [m.captures[1] for m in eachmatch(r"^\s*\"([A-Za-z_]+)\"\s*:"m, txt)]
+            @test all(k -> k in allowed, keys_found)
+            @test occursin(Regex("\"entrypoint\"\\s*:\\s*\"$cap\""), txt)
+            req = match(r"\"requires\"\s*:\s*\[([^\]]*)\]", txt)
+            if req !== nothing
+                for m in eachmatch(r"\"([^\"]+)\"", req.captures[1])
+                    @test m.captures[1] in authority
+                end
+            end
+        end
+        @test isfile(joinpath(@__DIR__, "cyan_seams.rs"))
+        @test isdefined(J, :regenerate_cyan_seams_ir)
     end
 end
 
