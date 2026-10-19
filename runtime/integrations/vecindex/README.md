@@ -54,11 +54,14 @@ Palette.runtime("invoke", Dict("id" => "vecindex",
     "arguments" => Dict("action" => "drop", "store" => "code")))
 ```
 
-## Benchmarks ($N = 20,000$, $d = 256$, `Float32`, $k = 10$)
+## Benchmarks ($N = 20,000$, $d = 256$, `Float32`, $k = 10$, Clustered Synthetic Corpus)
 
-| Kernel | Post-Warmup Latency | Heap Allocations | Speedup vs Naive | Recall@10 |
+In `"auto"` mode (the default), `vecindex` uses `search_exact!` (`BLAS.gemv!`) for stores below `50,000` items (`~35 µs` at $N = 6,700$, `118.4 µs` at $N = 20,000$) to guarantee `1.00` exact recall, and switches to `search_ivf!` for stores with $\ge 50,000$ items (or when `"mode" => "ivf"` is explicitly requested).
+
+| Kernel | Post-Warmup Latency | Heap Allocations | Speedup vs Naive | Recall@10 (Clustered / Codegraph) |
 | :--- | ---: | ---: | ---: | ---: |
-| Naive normalizing cosine oracle | `10,353.2 µs` | `44,066.6 KB` | `1.0x` | `1.00` |
-| `mul!` + `partialsortperm` | `384.0 µs` | `241.7 KB` | `27.0x` | `1.00` |
-| `search_exact!` (`BLAS.gemv!` + `select_topk_max!`) | `118.4 µs` | `0 B` | `87.5x` | `1.00` |
-| `search_ivf!` (Contiguous IVF + 4-way AVX2 FMA) | **`56.0 µs`** | **`0 B`** | **`185.0x`** | **`1.00`** |
+| Naive normalizing cosine oracle | `10,353.2 µs` | `44,066.6 KB` | `1.0x` | `1.00` / `1.00` |
+| `mul!` + `partialsortperm` | `384.0 µs` | `241.7 KB` | `27.0x` | `1.00` / `1.00` |
+| `search_exact!` (`BLAS.gemv!` + `select_topk_max!`, default `< 50k`) | `118.4 µs` | `0 B` | `87.5x` | `1.00` / `1.00` |
+| `search_ivf!` (Contiguous IVF + 4-way AVX2 FMA, explicit or $\ge 50\text{k}$) | **`56.0 µs`** | **`0 B`** | **`185.0x`** | `0.91–1.00` (clustered; scales with `n_probe`) |
+

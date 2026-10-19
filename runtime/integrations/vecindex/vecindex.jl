@@ -14,7 +14,9 @@ const _MAX_ID_BYTES = 512
 const _MAX_K = 256
 const _DEFAULT_DIM = 256
 const _DEFAULT_CAPACITY = 256
-const _IVF_AUTO_MIN_ITEMS = 1024
+const _IVF_AUTO_MIN_ITEMS = 50_000
+
+
 
 """
     IVFIndex
@@ -360,7 +362,8 @@ function build_ivf!(store::VecStore; n_list::Int=0, n_probe::Int=0, iters::Int=3
     N > 0 || throw(ArgumentError("cannot build IVF index on an empty VecStore"))
 
     actual_n_list = n_list > 0 ? min(n_list, N) : clamp(round(Int, sqrt(N) / 2), 4, min(256, N))
-    actual_n_probe = n_probe > 0 ? min(n_probe, actual_n_list) : clamp(div(actual_n_list + 7, 8), 2, actual_n_list)
+    actual_n_probe = n_probe > 0 ? min(n_probe, actual_n_list) : clamp(div(actual_n_list + 2, 3), 2, actual_n_list)
+
 
     rng = MersenneTwister(seed)
     init_ids = randperm(rng, N)[1:actual_n_list]
@@ -747,7 +750,24 @@ const _POLYGLOT_EXT_LANG = Dict{String,String}(
 
 const _SKIP_SCAN_DIRS = Set([
     ".git", "vendor", "target", "node_modules", "__pycache__", "build", "dist", "_build", "venv", ".venv",
+    "scratch", "archive", "backup", "tmp", "old", "work(from chatgpt)",
 ])
+
+function _is_scratch_dir(d::AbstractString)::Bool
+    startswith(d, ".") && return true
+    d in _SKIP_SCAN_DIRS && return true
+    dl = lowercase(d)
+    (startswith(dl, "work(") || occursin("(from ", dl) || startswith(dl, "backup_") || startswith(dl, "scratch_")) && return true
+    return false
+end
+
+function _is_scratch_path(rel::AbstractString)::Bool
+    for part in eachsplit(rel, '/')
+        _is_scratch_dir(part) && return true
+    end
+    return false
+end
+
 
 const _NOISE_CALLEES = Set([
     "+", "-", "*", "/", "\\", "^", "%", "==", "!=", "===", "!==", "<", "<=", ">", ">=",
@@ -1009,14 +1029,33 @@ function index_codegraph!(store::VecStore, cg::AbstractDict; include_polyglot::B
     return indexed
 end
 
+function _git_nonignored_files(root_dir::AbstractString)::Union{Nothing,Set{String}}
+    isempty(root_dir) && return nothing
+    ispath(joinpath(root_dir, ".git")) || return nothing
+    Sys.which("git") === nothing && return nothing
+    try
+        raw = read(`git -C $root_dir ls-files -z --cached --others --exclude-standard`, String)
+        return Set{String}(replace(String(s), '\\' => '/') for s in eachsplit(raw, '\0') if !isempty(s))
+    catch
+        return nothing
+    end
+end
+
 function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
     hasproperty(cg, :files) || throw(ArgumentError("expected a Pharos.CodeGraph or AbstractDict"))
     root_dir = hasproperty(cg, :root) ? String(cg.root) : ""
+    git_allowed = _git_nonignored_files(root_dir)
     primary_buf = zeros(Float32, store.dim)
     callee_buf = zeros(Float32, store.dim)
     indexed = 0
 
     for path in sort!(collect(keys(cg.files)))
+        norm_p = replace(String(path), '\\' => '/')
+        if git_allowed !== nothing
+            !(norm_p in git_allowed) && continue
+        else
+            _is_scratch_path(norm_p) && continue
+        end
         entry = cg.files[path]
         lang = string(entry.language)
         lines = _read_source_lines(root_dir, path)
@@ -1064,7 +1103,7 @@ function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
     end
 
     if include_polyglot && !isempty(root_dir) && isdir(root_dir)
-        indexed += _index_extra_polyglot_files!(store, root_dir, Set(keys(cg.files)), primary_buf, callee_buf)
+        indexed += _index_extra_polyglot_files!(store, root_dir, Set(keys(cg.files)), primary_buf, callee_buf, git_allowed)
     end
     return indexed
 end
@@ -1075,10 +1114,11 @@ function _index_extra_polyglot_files!(
     already_indexed::Set{String},
     primary_buf::Vector{Float32},
     callee_buf::Vector{Float32},
+    git_allowed::Union{Nothing,Set{String}}=nothing,
 )::Int
     indexed = 0
     for (dir, dirs, files) in walkdir(root_dir; follow_symlinks=false, onerror=_ -> nothing)
-        filter!(d -> !startswith(d, ".") && !(d in _SKIP_SCAN_DIRS), dirs)
+        filter!(d -> !_is_scratch_dir(d), dirs)
         for fname in sort!(files)
             _, ext = splitext(fname)
             lang = get(_POLYGLOT_EXT_LANG, lowercase(ext), nothing)
@@ -1087,6 +1127,11 @@ function _index_extra_polyglot_files!(
             islink(full) && continue
             rel = replace(relpath(full, root_dir), '\\' => '/')
             rel in already_indexed && continue
+            if git_allowed !== nothing
+                !(rel in git_allowed) && continue
+            else
+                _is_scratch_path(rel) && continue
+            end
             lines = _read_source_lines(root_dir, rel)
             isempty(lines) && continue
             defs = _scan_polyglot_defs(lines, lang)
