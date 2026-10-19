@@ -8,7 +8,7 @@ Call `palette_workspace` with action=create, workspace_id=your-lab, context_id=a
 
 The operator configures `PALETTE_PROJECT_ROOTS` as a JSON object mapping stable IDs to absolute directories. `palette_workspace` list returns those IDs. Tool arguments select an ID and never supply a path. The configured directory is mounted writable as the worker's workspace at its host path. Keep each root narrow and disjoint from the legacy workspace, runtime, registry, saved state, scratch, toolchains, package stores, and read-only roots. Do not also configure a writable project root under `PALETTE_READ_ROOTS`.
 
-Scope thread compares caller-supplied keys. It prevents accidental collisions, not impersonation by a caller who knows the key. Project scope makes a workspace visible across contexts for its configured root; contexts share a Julia world by attaching to the same workspace ID. Open is an explicit cross-context sharing choice. Multiple workspaces can select the same root: their Julia state is independent while their project files are shared.
+Scope thread compares caller-supplied keys. It prevents accidental collisions, not impersonation by a caller who knows the key. A list shows another context's thread workspaces only as a count, `other_thread_workspaces`, with a `note` saying to list again with the context_id that created one. Project scope makes a workspace visible across contexts for its configured root; contexts share a Julia world by attaching to the same workspace ID. Open is an explicit cross-context sharing choice. Multiple workspaces can select the same root: their Julia state is independent while their project files are shared.
 
 The ownership lock is per Julia world. It does not coordinate different worlds or external editors such as local Work. Use one writer at a time for a shared checkout.
 
@@ -30,7 +30,7 @@ Use action=apply with request_id in the same logical workspace. When the client 
 
 To take the client out of approval entirely, set `PALETTE_PATCH_APPROVAL=administrator` in the operator environment. The broker then never sends a confirmation form, and every patch outside the auto-apply classes waits for the local administrator command below, even when the client supports forms. The default, `client`, keeps form confirmation. Any other value stops the adapter from starting. This mode removes the MCP channel, which an agent that drives its own client can answer. It does not stop a process that runs as your user and calls the administrator command itself, so on a machine where agents have a shell, keep that command behind the agent's own permission prompt.
 
-If the client does not support confirmation, the request remains pending. An explicitly authorized local administrator can inspect and approve it:
+If the client does not support confirmation, the request remains pending. The `approval_required` reply carries `review_command` and `approve_command`, the exact commands below with this request's storage path, identifier and digest filled in. An explicitly authorized local administrator can inspect and approve it:
 
 ```
 python3 runtime/security/patch_broker.py --storage /actual/registry/patches review REQUEST_ID
@@ -47,7 +47,7 @@ Targets should be a separate source checkout. Editing that checkout does not dep
 
 ## Tested repair workflow
 
-The host runtime can expose repair actions through `Palette.runtime("repair", payload)` without adding an MCP tool. The repair broker accepts `detect`, `classify`, `propose`, `test`, `status`, and `apply`. Detection reads only bounded files under a host-configured target. Proposals use the same exact `{path, before_sha256, content}` changes and digest binding as `palette_patch`.
+The host runtime can expose repair actions through `Palette.runtime("repair", payload)` without adding an MCP tool. The repair broker accepts `targets`, `detect`, `classify`, `propose`, `test`, `status`, and `apply`. `targets` lists the configured target names, their roots and whether each has a test recipe; a request naming any other target is refused with the configured names. Detection reads only bounded files under a host-configured target. Proposals use the same exact `{path, before_sha256, content}` changes and digest binding as `palette_patch`.
 
 The operator configures the target's fixed test recipe, frozen host-command protected paths, and any ordinary self-apply prefixes when constructing the host broker. None is accepted in a model request. Tests run in a disposable Bubblewrap worker with networking disabled, no inherited environment or capabilities, the staged candidate tree read-only, and only private scratch writable. Missing Bubblewrap or a failed recipe blocks application. A test result binds the exact proposed content digest and fixed recipe identity and arguments.
 

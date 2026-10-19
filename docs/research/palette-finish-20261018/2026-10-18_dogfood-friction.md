@@ -9,12 +9,12 @@ were the blocker it removes. Later items are built through Palette where it can.
 | Found in | Friction | Status |
 |---|---|---|
 | A1 | Session tests in a fresh worktree fail until the Julia project is instantiated by hand. | Fixed in A2: setup instantiates before it prewarms. |
-| A1 | The default package store under the home directory is refused by the protected-path ceiling, so tests need `PALETTE_PACKAGE_DEPOT` set elsewhere. | Fixed in A2 for installs: the store defaults to `~/.local/share/palette/data/packages`. A host command whose directory contains that path still blocks it (plan item A3). |
+| A1 | The default package store under the home directory is refused by the protected-path ceiling, so tests need `PALETTE_PACKAGE_DEPOT` set elsewhere. | Fixed in A2 for installs: the store defaults to `~/.local/share/palette/data/packages`. A host command whose directory contains that path still blocked it. Fixed in A3: a command path's parent refuses only roots that equal or contain it, so a store beside a command directory is allowed. |
 | A1 | A call stopped at its limit reports `Interrupted during completed`: the phase name is wrong. | Plan item A5 (name the execution phase on timeout). |
 | A1 | A scratch (`ephemeral`) call or spawned child stops at the session default less 10 s: the broker's child timeout is fixed per session. A scratch call with a shorter `timeout_s` killed the kernel waiting on it. | Hosts refuse `timeout_s` on a scratch call. Per-call child bounds are deferred and documented in `runtime/docs/authority.md`; long scratch work runs as a host command job. |
 | A1 | The jobs line prints at the start of a call, before its code runs, so a job started or cancelled in one call shows up in the next call's output. | Deferred: the line reports the state the call starts from. |
 | A1 | The server launcher's restricted environment dropped any limit set in the client environment. | Fixed: server profiles take `turn_timeout` and `max_turn_timeout`. |
-| A1 | A package store under `/tmp` is refused as overlapping a protected path when a host command's path is under `/tmp`, so the Rust host command tests fail with such a store. | Installs no longer default under `/tmp` (A2). Test runs still set the store outside it. |
+| A1 | A package store under `/tmp` is refused as overlapping a protected path when a host command's path is under `/tmp`, so the Rust host command tests fail with such a store. | Installs no longer default under `/tmp` (A2). Fixed in A3: a store and a command in sibling directories no longer overlap. |
 | A1 | Finishing a job held the jobs lock while it joined output readers, so a job whose grandchild kept a pipe open would stall every later call's jobs line. | Fixed: jobs finish outside the lock; the jobs line waits at most 10 s. |
 
 ## First-run friction
@@ -67,3 +67,74 @@ installed in the machine, so the Windows registration path is still untested.
 | After creating the Linux user, `wsl --install` leaves the user at an Ubuntu prompt, and the installer waits behind it with nothing saying so. | Fixed: the installer says to type `exit` at that prompt. |
 | Installing curl inside an existing distribution assumed apt. | Fixed: apt, dnf, pacman or zypper. |
 | `install.sh` printed its Linux closing message, including `rm -rf` removal steps, before the Windows one. | Fixed: under `install.ps1` only the Windows next steps print. |
+
+## A3: host commands
+
+| Friction | Status |
+|---|---|
+| A turn could not find out which host commands it may run; it had to be told the names. | Fixed: `Palette.host_commands()` lists them, with an optional `description` per command. The tool descriptions name it. |
+| GPU work through a host command did not take the machine's GPU lock (the converge3 render script takes none), so it could share the GPU with Codex jobs. | Fixed in the host: a command's `lock` file wraps it in `flock --exclusive`; the wait counts against its timeout. The live config gets the lock when this host is installed for the Phase A exit. |
+| A3 was built through Bash: building Palette through Palette needs host commands for `cargo test` and the Python suites in this worktree, and none are configured. | Open: configure dev host commands for the worktree before A4. |
+
+## A4: CI time
+
+Before this round, `security-suite` ran unsharded and took 50 to 90 min. One
+run hung for 90 min while preparing packages inside the sandbox, and one failed
+because ZMQ did not precompile there. Most of the time went to `test_session_cli`
+(11.1 min) and `test_revival` (11.0 min), where each test starts a fresh
+session, and to prewarm (4.4 min).
+
+| Friction | Status |
+|---|---|
+| `TestReadRoots` and `TestHostCommand` in `test_session.py` were defined after `unittest.main()`, so they had not run in CI since #22. | Fixed: the main block moved to the end, and `check-test-policy.mjs` refuses a test class defined after it. |
+| One job ran every suite in turn. | Fixed: four shards. Each took 17 to 23 min without a cache. |
+| Every shard prepared the package depot from nothing. | Fixed: shard 1 saves the prewarmed depot to the Actions cache, and every shard restores it. Shards then took 7 to 9 min, except shard 1 at 15.5 min. |
+| Shard 1 also runs the shared gates (Julia and Rust unit tests, test policy), which took its gates step to 14 min against 6 to 7 min on the others. | Fixed: `verify_operator.py` deals test cases across the shards by their recorded seconds (`test-case-seconds.json`, refreshed from CI logs by `record-test-case-seconds.py`), with shard 1 starting 90 s behind. The recorded test time per Rust shard is now about 500 s, against 740 s on the old shard 1. The gate (under 15 min, green on 10 consecutive runs) is measured after the next push. |
+| The operator-adapters job on e2dd763 was cancelled at its 20 min limit: the prewarm step ran for 18 min and printed nothing, against 3.5 min on earlier runs. | Fixed: `prewarm_depot.py --timeout-s` stops a hung prewarm and fails with its output so far, and CI passes 720 s. The cause of the hang is not known; the rerun of the same commit passed in 10.9 min, so it did not recur. |
+
+## A6: cold and warm cost
+
+Measured on this machine with one session per host, timing from launch to the
+HELLO line and then eight calls (`1 + 1` first). MP-12 already reports the
+first call's costs apart from warm calls in `status` and receipts.
+
+| Stage | Session ready (HELLO) | First call | Warm calls (median) |
+|---|---|---|---|
+| Start of A6 | about 8 s | 1.3 s | 3 to 5 ms |
+| Overlay depots | 3.9 to 4.3 s | 1.31 to 1.37 s | 3 to 5 ms |
+| Request loop in the package image | 2.85 to 2.86 s (Rust host), 3.7 to 4.1 s (Python host) | 0.26 to 0.30 s | 3 to 4 ms |
+
+| Friction | Status |
+|---|---|
+| Each session copied the whole package depot before Julia started, about 4 s of the 8 s. | Fixed: the session depot is a kernel overlay of the snapshot, so nothing is copied. Hosts fall back to a copy when bwrap is older than 0.8 or the kernel refuses unprivileged overlays. |
+| The first call compiled the session loop's request handling, about 1.1 s, because script code is not in a package image. | Fixed: request handling moved into the package (`Palette.serve_requests`), and the precompile workload runs it through a pipe as the worker does. The second call still takes about 0.21 s, mostly the first state snapshot. |
+| About 2.3 s remains between Julia starting and HELLO; loading Palette itself takes 0.26 s. | Open, below the Speed gate (cold start well under 11 s). |
+
+## Phase A exit: Luxel L-10 through Palette
+
+A private Palette instance with Luxel host commands (git, cargo, Julia under
+the GPU lock, the presented-fps bench and the identity check) carries the
+quality-preset work. Source edits go through the client's edit tool; every
+build, test, render and git step goes through Palette.
+
+| Friction | Status |
+|---|---|
+| Luxel could not be both a writable project root and the directory its host commands run in. The refusal named only the checkout's parent directory as the overlap, not why it was protected. | The refusal is right: a kernel that could write a host command's directory could change what the host runs, such as a `build.rs`. Fixed: the error names the project root, says why command directories are protected, and points to `PALETTE_READ_ROOTS`. |
+| A default workspace directory that did not exist failed the first call with `FileNotFoundError`, after start-up had succeeded. | Fixed: the router creates it once the layout checks pass. |
+| A wait loop that polled a job until it stopped running lost the result: the loop's last poll took it, and the poll after the loop failed with "no running host_command job". A 21-minute `cargo test` result was lost this way. | Fixed: the kernel keeps the last 16 finished results, so polling a finished job again returns the same result, and `Palette.host_command_wait(job; timeout_s)` blocks until the job finishes and returns all of its output. |
+| A call with `timeout_s` over the limit was refused with only "Invalid timeout_s", which does not say the limit (1800 s by default). | Fixed: the refusal names the allowed range. |
+| A GPU host command already runs under the lock, so a script it runs must not take the same lock again: it would wait on itself until the timeout. | Documented in `tools/bench_presented.sh`. A lock held by the command is not visible to the script; there is no check. |
+| The call that waited for the 19-minute `cargo test` (green, return code 0) began with `[background jobs: running: host job \`cargo\` ...]`, which reads as stale next to the finished result. | By design: the line reports the session as the call starts, before its code runs; the next call reports that nothing is running. Left as is. |
+
+## Phase B: Time Machine demo
+
+The demo checkpointed a real analysis of the converge4 presented-frame logs,
+broke its summary operator, restored the checkpoint and undid the restore.
+
+| Friction | Status |
+|---|---|
+| After the restore, every value computed from the restored include was reported "restored but stale" with a `[changed on disk]` notice, while the receipt said each identity was the same. The staleness check compared against the workspace file, not the checkpoint copy the world runs. | Fixed: a file a restore pinned is checked against its checkpoint copy, in the revival report and in `Palette.provenance`. |
+| Including the analysis file again after the restore failed: "cannot declare LINE constant; it was already declared global". A `const` from an included file came back as a plain global, because only a call's own `const` statements were recorded as const. | Fixed: the snapshot asks Julia whether each binding is const. |
+| `c = Palette.checkpoints(); c.checkpoints[1]["name"]` raised a MethodError: the listing's entries were NamedTuples while the world record beside them was a Dict. | Fixed: entries are Dicts, like the world record and the host's listing. |
+| Undoing an undo named its automatic checkpoint `auto-…-before-auto-…-before-conv`, cut at 64 characters. | Fixed: restoring an automatic checkpoint saves `auto-<time>-before-undo`. |
+| `Palette.checkpoint` saves at the end of the call, so its "Saved checkpoint" notice appears at the start of the next call. | By design: the checkpoint holds the state the call ends with, and the notice says "the world at the end of call N". |

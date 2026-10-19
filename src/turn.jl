@@ -489,6 +489,7 @@ Prints what happened since the last call: output that background tasks and
 processes wrote, and each failed task bound in `mod`, once.
 """
 function report_background(mod::Module)
+    isempty(TIME_MACHINE_NOTICE[]) || (println(TIME_MACHINE_NOTICE[]); TIME_MACHINE_NOTICE[] = "")
     text = late_output()
     io = SINK[]
     if io !== nothing
@@ -642,7 +643,8 @@ function binding_provenance(name::Symbol; strong::Bool=false)
     T = typeof(value)
     changed_type = T isa DataType && !(value isa Function) && !current_definition(T)
     sources = binding_sources(origin, something(call, 0))
-    changed_files = [p for (p, evidence) in sources if source_changed(evidence; strong) || p in get(origin, "strong_stale_sources", String[])]
+    pins = pinned_files()
+    changed_files = [p for (p, evidence) in sources if world_source_changed(p, evidence, pins; strong) || p in get(origin, "strong_stale_sources", String[])]
     superseded = any(artifact_changed, get(origin, "artifacts", Dict{String, Any}[]))
     restoration = Dict(k => [s for s in get(REVIVAL_OBSERVATION[], k, String[]) if startswith(s, string(name) * " (")] for k in ("restored", "rebuilt", "stale", "lost", "uncertain"))
     return Dict{String, Any}("name" => string(name), "epoch" => TASK_EPOCH[], "type" => short_type(value),
@@ -761,9 +763,12 @@ deadline, and capture everything it printed.
 function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
     state = get_kernel_state()
     call = length(state.execution_history) + 1
-    costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "execution_seconds" => nothing,
+    # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
+    # is the first one an agent pays for.
+    costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "first_call_in_kernel" => isempty(TURN_COSTS),
+        "execution_seconds" => nothing, "compile_seconds" => nothing,
         "projection_seconds" => nothing, "serialization_seconds" => nothing, "worker_pipe_seconds" => nothing,
-        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
+        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. compile_seconds is the part of execution the process spent compiling, in any task. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
     TURN_COSTS[call] = costs
     filter!(kv -> kv.first > call - KEEP_OUTPUTS, TURN_COSTS)
     return capture_output() do
@@ -775,7 +780,15 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
         costs["maintenance_seconds"] = (time_ns() - maintained) / 1e9
         costs["phase"] = "execution"
         turn = run_turn(() -> begin
-            receipt = execute(ExecuteCode(code))
+            # Compile timing nests (it counts enables), so user code may still use @time.
+            Base.cumulative_compile_timing(true)
+            compiled = first(Base.cumulative_compile_time_ns())
+            receipt = try
+                execute(ExecuteCode(code))
+            finally
+                costs["compile_seconds"] = (first(Base.cumulative_compile_time_ns()) - compiled) / 1e9
+                Base.cumulative_compile_timing(false)
+            end
             costs["execution_seconds"] = receipt.duration_ms / 1000
             costs["phase"] = "projection"
             started = time_ns()
@@ -785,7 +798,9 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
             receipt.result.success || (costs["failed_phase"] = "execution")
             receipt
         end, timeout_s)
-        turn[2] && (costs["failed_phase"] = costs["phase"])
+        # An interrupt that execute() caught leaves its failed receipt and lets
+        # the closure finish, so the phase it already recorded is the one to keep.
+        turn[2] && get!(costs, "failed_phase", costs["phase"])
         refresh_workspace_packages!(reload=false)
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]

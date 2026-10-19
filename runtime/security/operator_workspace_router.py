@@ -24,7 +24,7 @@ import uuid
 
 from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode
 from filesystem_layout import require_disjoint
-from provisioning import operator_ceiling, protected_host_paths
+from provisioning import operator_ceiling, palette_version, protected_host_paths
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
 from generation_runtime import GenerationStore
 from source_transport import call_limit, normalize_palette_call, timeout_schema, turn_limits
@@ -45,6 +45,8 @@ if MAX_LIVE < 1 or IDLE_SECONDS <= 0:
 require_disjoint([BASE], [REPO, ROOT, LEGACY, LEGACY_RECEIPTS, os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch"))])
 require_disjoint([ROOT, LEGACY, LEGACY_RECEIPTS], [REPO])
 require_disjoint([LEGACY, LEGACY_RECEIPTS], [ROOT])
+# A missing default workspace failed the first call, not start-up.
+BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 def workspace_protected_paths():
@@ -102,7 +104,14 @@ def configured_project_roots():
             raise ValueError(f"Project root {identifier} is unavailable") from exc
         if not path.is_dir():
             raise ValueError(f"Project root {identifier} is not a directory")
-        require_disjoint([path], [*protected, *roots.values()])
+        try:
+            require_disjoint([path], [*protected, *roots.values()])
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Project root {identifier}: {exc}. Host-command directories and binaries, their parents, "
+                "and Palette's own install and config are protected, because a kernel that could write "
+                "them could change what the host runs. Give the kernel read access with PALETTE_READ_ROOTS "
+                "instead, and change the tree through host commands.") from exc
         roots[identifier] = path
     return roots
 
@@ -235,7 +244,7 @@ class Child:
             self.proc = subprocess.Popen([sys.executable, str(generation_adapter)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True, bufsize=1, cwd=self.entry["workspace_dir"], env=env, pass_fds=(self.lease.fileno(),))
             self.generation_id = generation["generation_id"]
             threading.Thread(target=self.pump, args=(self.proc, self.frames), daemon=True).start()
-            self.exchange("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": "0.3.0"}})
+            self.exchange("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": palette_version(REPO)}})
         except Exception:
             self.stop()
             raise
@@ -398,7 +407,14 @@ def workspace_control(args):
             workspaces = [default_entry()] + [e for e in entries if visible(e, context)]
             roots = [{"project_root_id": identifier, "workspace_dir": str(path)}
                      for identifier, path in sorted(PROJECT_ROOTS.items())]
-            return {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
+            listing = {"workspaces": workspaces, "available_project_roots": roots, "identity": "caller-supplied context routing; not authentication"}
+            # Counted, not named: another context's threads stay out of this listing.
+            others = sum(e["scope"] == "thread" and e.get("owner_context") != context for e in entries)
+            if others:
+                listing["other_thread_workspaces"] = others
+                listing["note"] = (f"{others} thread workspace(s) belong to other context_id values and are not listed; "
+                                   "list again with the context_id that created one to see it.")
+            return listing
     entry = resolve(args)
     if action == "attach":
         if not context or not args.get("workspace_id"):
@@ -483,13 +499,13 @@ def text_result(value, error=False):
 
 # Reuse the proven adapter schemas without importing its process-owning globals.
 PALETTE_SCHEMA = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]}, "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "required": [], "additionalProperties": False}
-CONTROL_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "generation_status", "activate_generation"]}, "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "generation_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
+CONTROL_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "checkpoints", "restore", "generation_status", "activate_generation"]}, "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "checkpoint": {"type": "string", "maxLength": 64}, "fork": {"type": "boolean"}, "generation_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
 WORKSPACE_SCHEMA = {"type": "object", "properties": {"action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]}, "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}}, "required": ["action"], "additionalProperties": False}
 for schema in (PALETTE_SCHEMA, CONTROL_SCHEMA, WORKSPACE_SCHEMA, PATCH_SCHEMA):
     schema["properties"].update(workspace_id={"type": "string", "maxLength": 64}, context_id={"type": "string", "maxLength": 256})
 TOOLS = [{"name": name, "description": description, "inputSchema": schema, "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}} for name, description, schema in [
-    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. timeout_s sets this call's time limit; Palette.host_command(name; wait=false) runs longer host work as a job.", PALETTE_SCHEMA),
-    ("palette_control", "Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot.", CONTROL_SCHEMA),
+    ("palette", "Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job.", PALETTE_SCHEMA),
+    ("palette_control", "Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot and keeps its checkpoints. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the world at that checkpoint (fork=true makes it a new world), after saving the current world as an auto- checkpoint.", CONTROL_SCHEMA),
     ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.", WORKSPACE_SCHEMA),
     ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.", PATCH_SCHEMA)]]
 
@@ -508,7 +524,8 @@ def validate(args, schema):
             raise ValueError("Invalid " + key)
         if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))
                                  or not spec.get("exclusiveMinimum", float("-inf")) < value <= spec.get("maximum", float("inf"))):
-            raise ValueError("Invalid " + key)
+            raise ValueError(f"Invalid {key}: must be a number in ({spec.get('exclusiveMinimum', float('-inf')):g}, "
+                             f"{spec.get('maximum', float('inf')):g}]")
 
 
 def serve_stream(stdin, stdout):
@@ -537,7 +554,7 @@ def serve_stream(stdin, stdout):
             if method == "initialize":
                 capabilities = msg.get("params", {}).get("capabilities", {})
                 atomic_json(ROOT / "client-capabilities.json", {"elicitation": capabilities.get("elicitation"), "protocolVersion": msg.get("params", {}).get("protocolVersion")})
-                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": "0.3.0"}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
+                result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":

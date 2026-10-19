@@ -17,7 +17,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from typing import Any
+
+
+def palette_version(repo: str | Path) -> str:
+    """The version every adapter reports: the one in the checkout's Project.toml."""
+    return tomllib.loads(Path(repo, "Project.toml").read_text(encoding="utf-8"))["version"]
 
 
 _PACKAGE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
