@@ -171,6 +171,10 @@ function handle_request(@nospecialize(respond), line::AbstractString, epoch::Str
         end
         payload === nothing || payload isa Union{String, Dict{String, String}} || error("request 'payload' must be a string or an object of strings")
         if kind == "EPHEMERAL"
+            for field in ("context", "budget")
+                get(req, field, nothing) === nothing ||
+                    error("request '$field' does not apply to an ephemeral call: a scratch worker always runs in the normal context")
+            end
             ephemeral_reply!(resp, req, code, payload, timeout_s)
         elseif kind == "EXECUTE"
             snapshot_call = execute_reply!(respond, resp, req, code, payload, timeout_s)
@@ -189,6 +193,8 @@ function handle_request(@nospecialize(respond), line::AbstractString, epoch::Str
         resp["data"] = nothing
         resp["error"] = sprint(showerror, e)
     end
+    CURRENT_CALL[] = 0
+    CALL_CONTEXT[] = nothing
 
     resp["error"] = with_hint(get(resp, "error", nothing), code isa String ? code : "")
     if RELOAD_SEQUENCE[] > previous_reload_sequence
@@ -261,6 +267,14 @@ function ephemeral_reply!(resp, req, code::String, payload, timeout_s)
     end
 end
 
+# What stopped an interrupted call: its budget, or the request's time limit.
+function limit_text(costs, ctx, timeout_s)
+    why = get(costs, "budget_exceeded", nothing)
+    why === "bytes" && return "budget of $(ctx["budget"]["bytes"]) bytes allocated (process-wide)"
+    why === "seconds" && return "budget of $(ctx["budget"]["seconds"])s"
+    return "$(timeout_s)s limit"
+end
+
 # An EXECUTE request runs in this kernel's persistent eval module. Returns
 # the call to save the state of, or nothing for an interrupted call.
 function execute_reply!(@nospecialize(respond), resp, req, code::String, payload, timeout_s)
@@ -268,11 +282,16 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
     # A file's text arrives as a JSON string and is bound as it is,
     # so it needs no Julia quoting: `write("x.py", PAYLOAD)`.
     Core.eval(mod, Expr(:global, Expr(:(=), :PAYLOAD, payload)))
+    ctx = select_context(req)
     call = length(get_kernel_state().execution_history) + 1
     note_started_call!(call, code)
-    (receipt, interrupted, stuck), output = execute_turn(code, timeout_s === nothing ? nothing : Float64(timeout_s))
+    CURRENT_CALL[] = call
+    CALL_CONTEXT[] = ctx
+    (receipt, interrupted, stuck), output = execute_turn(code, timeout_s === nothing ? nothing : Float64(timeout_s);
+                                                         session_request=get(req, "session_request", nothing))
     printed = task_notice_hint(scrub(output))
     resp["call"] = call
+    resp["context"] = context_note(ctx)
     resp["bindings"] = binding_list!(get_kernel_state().eval_module, call)
     # Palette.output(call) gives back what the call printed, without what
     # the result adds in front of it below.
@@ -289,7 +308,7 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
         resp["costs"] = deepcopy(get(TURN_COSTS, call, Dict{String, Any}()))
         resp["success"] = false
         resp["data"] = nothing
-        resp["error"] = "During $(get(resp["costs"], "failed_phase", "execution")), the call exceeded its $(timeout_s)s limit and kept running after being interrupted " *
+        resp["error"] = "During $(get(resp["costs"], "failed_phase", "execution")), the call exceeded its $(limit_text(resp["costs"], ctx, timeout_s)) and kept running after being interrupted " *
                         "for $(Int(INTERRUPT_GRACE_S))s, so the kernel stopped. " *
                         (isempty(STATE_DIR[]) ? "Every binding is gone; files written to the workspace remain." :
                          "The next call starts a new kernel, which revives what it can of the last saved state (its report names the call) and says what it could not.")
@@ -310,7 +329,7 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
     resp["error"] = scrub(something(receipt.result.error, ""))
     if interrupted
         resp["interrupted"] = true
-        resp["error"] = "Interrupted during $(get(resp["costs"], "failed_phase", "execution")): the call exceeded its $(timeout_s)s limit. The kernel and every binding are intact; " *
+        resp["error"] = "Interrupted during $(get(resp["costs"], "failed_phase", "execution")): the call exceeded its $(limit_text(resp["costs"], ctx, timeout_s)). The kernel and every binding are intact; " *
                         "processes this call started were stopped. Output printed before the interrupt is above.\n" * resp["error"]
     end
     isempty(resp["error"]) && (resp["error"] = nothing)

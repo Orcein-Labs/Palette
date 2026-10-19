@@ -262,32 +262,42 @@ end
 const INTERRUPT_GRACE_S = 5.0
 
 """
-    run_turn(f, timeout_s) -> (value, interrupted, stuck)
+    run_turn(f, timeout_s; alloc_limit=nothing, tripped=Ref(:none)) -> (value, interrupted, stuck)
 
-Runs `f` in its own task. At `timeout_s` the task gets an InterruptException
-and the processes it started are killed; waiting work (sleep, run, read, I/O)
-ends there with the kernel and every binding intact. The deadline is noticed
+Runs `f` in its own task. At `timeout_s`, or once the process has allocated
+`alloc_limit` bytes since the start (polled every 50 ms), the task gets an
+InterruptException and the processes it started are killed; waiting work
+(sleep, run, read, I/O) ends there with the kernel and every binding intact.
+`tripped[]` says which limit it was (:seconds or :bytes). A limit is noticed
 only when the task yields: compute that never yields runs until the host
 kills the kernel. `stuck` means the task was still running when the grace
 period ended.
 """
-function run_turn(@nospecialize(f), timeout_s)
+function run_turn(@nospecialize(f), timeout_s; alloc_limit=nothing, tripped=Ref(:none))
     t = Task(f)
     t.sticky = true
     schedule(t)
-    timeout_s === nothing && return (fetch(t), false, false)
+    timeout_s === nothing && alloc_limit === nothing && return (fetch(t), false, false)
     before = sandbox_pids()
     interrupted = Ref(false)
     outcome = Channel{Symbol}(2)
     @async (try wait(t) catch end; put!(outcome, :done))
-    deadline = Timer(timeout_s)
-    watchdog = @async begin
-        try
-            wait(deadline)
-        catch
-            return  # closed: the turn finished in time
+    trip = Base.Event()
+    function trip!(why)
+        tripped[] === :none && (tripped[] = why)
+        notify(trip)
+    end
+    deadline = timeout_s === nothing ? nothing : Timer(_ -> trip!(:seconds), timeout_s)
+    if alloc_limit !== nothing
+        allocated0 = Base.gc_total_bytes(Base.gc_num())
+        @async while !istaskdone(t) && tripped[] === :none
+            Base.gc_total_bytes(Base.gc_num()) - allocated0 >= alloc_limit && (trip!(:bytes); break)
+            sleep(0.05)
         end
-        istaskdone(t) && return
+    end
+    watchdog = @async begin
+        wait(trip)
+        istaskdone(t) && return  # the turn finished in time
         interrupted[] = true
         giveup = time() + INTERRUPT_GRACE_S
         while !istaskdone(t) && time() < giveup
@@ -301,7 +311,8 @@ function run_turn(@nospecialize(f), timeout_s)
         istaskdone(t) || put!(outcome, :stuck)
     end
     result = take!(outcome)
-    close(deadline)
+    deadline === nothing || close(deadline)
+    istaskdone(t) && notify(trip)   # lets the watchdog go
     result === :stuck && return (nothing, true, true)
     interrupted[] && reap(before)
     # An interrupt that lands after the turn's own error handling, while its
@@ -760,17 +771,25 @@ One persistent turn: report what happened in the background and which used
 files changed, reload edited workspace packages, run `code` under the
 deadline, and capture everything it printed.
 """
-function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
+function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing)
     state = get_kernel_state()
     call = length(state.execution_history) + 1
     # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
     # is the first one an agent pays for.
+    ctx = CALL_CONTEXT[]
+    budget = ctx === nothing ? nothing : ctx["budget"]
     costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "first_call_in_kernel" => isempty(TURN_COSTS),
+        "context" => context_name(ctx),
         "execution_seconds" => nothing, "compile_seconds" => nothing,
         "projection_seconds" => nothing, "serialization_seconds" => nothing, "worker_pipe_seconds" => nothing,
-        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. compile_seconds is the part of execution the process spent compiling, in any task. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
+        "gc_seconds" => nothing, "allocated_bytes" => nothing, "run_seconds" => nothing, "session_request" => session_request,
+        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. compile_seconds and gc_seconds are the parts of execution the process spent compiling and collecting garbage, in any task; allocated_bytes is process-wide too. run_seconds = execution - compile - GC. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
     TURN_COSTS[call] = costs
-    filter!(kv -> kv.first > call - KEEP_OUTPUTS, TURN_COSTS)
+    retain!(TURN_COSTS, call)
+    start_xray_record!(call, ctx)
+    limit_s = budget === nothing || budget["seconds"] === nothing ? timeout_s :
+        timeout_s === nothing ? Float64(budget["seconds"]) : min(timeout_s, Float64(budget["seconds"]))
+    tripped = Ref(:none)
     return capture_output() do
         maintained = time_ns()
         isempty(REVIVAL_REPORT[]) || (println(REVIVAL_REPORT[]); REVIVAL_REPORT[] = "")
@@ -779,17 +798,22 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
         refresh_workspace_packages!()
         costs["maintenance_seconds"] = (time_ns() - maintained) / 1e9
         costs["phase"] = "execution"
-        turn = run_turn(() -> begin
+        turn = run_turn(() -> with_context(ctx) do
             # Compile timing nests (it counts enables), so user code may still use @time.
             Base.cumulative_compile_timing(true)
             compiled = first(Base.cumulative_compile_time_ns())
+            gc0 = Base.gc_num()
             receipt = try
                 execute(ExecuteCode(code))
             finally
+                gc = Base.GC_Diff(Base.gc_num(), gc0)
                 costs["compile_seconds"] = (first(Base.cumulative_compile_time_ns()) - compiled) / 1e9
+                costs["gc_seconds"] = gc.total_time / 1e9
+                costs["allocated_bytes"] = gc.allocd
                 Base.cumulative_compile_timing(false)
             end
             costs["execution_seconds"] = receipt.duration_ms / 1000
+            costs["run_seconds"] = max(0.0, costs["execution_seconds"] - costs["compile_seconds"] - costs["gc_seconds"])
             costs["phase"] = "projection"
             started = time_ns()
             project_turn_result!(receipt)
@@ -797,7 +821,11 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
             costs["phase"] = "completed"
             receipt.result.success || (costs["failed_phase"] = "execution")
             receipt
-        end, timeout_s)
+        end, limit_s; alloc_limit=budget === nothing ? nothing : budget["bytes"], tripped)
+        # The budget, not the request's own limit, stopped the call.
+        if turn[2] && budget !== nothing && (tripped[] === :bytes || limit_s != timeout_s)
+            costs["budget_exceeded"] = String(tripped[])
+        end
         # An interrupt that execute() caught leaves its failed receipt and lets
         # the closure finish, so the phase it already recorded is the one to keep.
         turn[2] && get!(costs, "failed_phase", costs["phase"])
@@ -808,4 +836,27 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64})
         observe_tasks!(state.eval_module, call, code)
         turn
     end
+end
+
+"""
+    Palette.xray(n) -> Dict
+
+What call `n` cost and which host effects it asked for, for the last
+$(KEEP_OUTPUTS) calls: execution split into compile, GC and run time, bytes
+allocated, and each capability request with the id the host's receipt carries.
+`palette_control {"action":"receipts","call":n}` returns those receipts.
+"""
+function xray(n::Integer)
+    c = get(TURN_COSTS, n, nothing)
+    c === nothing && error("no X-Ray record for call $n: it is older than the last $KEEP_OUTPUTS calls, or not yet made")
+    rec = get(XRAY, n, Dict{String, Any}())
+    return Dict{String, Any}("call" => n, "context" => get(c, "context", "normal"), "session_request" => c["session_request"],
+        "seconds" => Dict{String, Any}("execution" => c["execution_seconds"], "compile" => c["compile_seconds"],
+                                       "gc" => c["gc_seconds"], "run" => c["run_seconds"]),
+        "allocated_bytes" => c["allocated_bytes"],
+        "capability_requests" => deepcopy(get(rec, "capability_requests", Dict{String, Any}[])),
+        (k => deepcopy(get(rec, k, nothing)) for k in ("dispatch", "memo", "references"))...,
+        "budget_exceeded" => get(c, "budget_exceeded", nothing),
+        "receipts" => "palette_control {\"action\":\"receipts\",\"call\":$n} returns the host's receipts for this call",
+        "limits" => "Compile time, GC time and allocation are process-wide: work other tasks did during the call is counted. run = execution - compile - GC. Dispatch is recorded only in the traced context, memo hits only in the memoized one, replaced methods only in the reference one; each covers the outermost call of every top-level statement (dispatch, memo) or the whole call (references).")
 end

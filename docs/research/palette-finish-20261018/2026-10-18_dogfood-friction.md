@@ -138,3 +138,13 @@ broke its summary operator, restored the checkpoint and undid the restore.
 | `c = Palette.checkpoints(); c.checkpoints[1]["name"]` raised a MethodError: the listing's entries were NamedTuples while the world record beside them was a Dict. | Fixed: entries are Dicts, like the world record and the host's listing. |
 | Undoing an undo named its automatic checkpoint `auto-…-before-auto-…-before-conv`, cut at 64 characters. | Fixed: restoring an automatic checkpoint saves `auto-<time>-before-undo`. |
 | `Palette.checkpoint` saves at the end of the call, so its "Saved checkpoint" notice appears at the start of the next call. | By design: the checkpoint holds the state the call ends with, and the notice says "the world at the end of call N". |
+
+## Phase C: X-Ray demo on a Luxel bench
+
+A traced call ran the converge4 presented-frame bench through the
+`luxel-bench-presented` host command, and a second traced call summarised it.
+`Palette.xray(n)` and the receipt query joined all five host requests.
+
+| Friction | Status |
+|---|---|
+| The first attempt built the bench's output directory from `homedir()`. Inside the kernel that is the sandbox home, `/run/palette/home`, so the host command was handed a path that does not exist on the host; the failure showed up only when the next statement tried to read the summary. | Documented: `Palette.host_command` now says its arguments are read on the host, that `homedir()` and `tempdir()` exist only in the sandbox, and that paths under a read root are the same on both sides. No check: an argument is not known to be a path. |
