@@ -223,4 +223,151 @@ end
         res_d = VI.vecindex(Dict{String,Any}("action" => "drop", "store" => "abi_test"))
         @test res_d["status"] == "dropped"
     end
+
+    @testset "6. Filtered Duck-Type & Polyglot Subspace Search" begin
+        d = 128
+        cg_dict = Dict{String,Any}(
+            "symbols" => [
+                Dict{String,Any}(
+                    "name" => "_generate",
+                    "kind" => "function",
+                    "language" => "julia",
+                    "file" => "gesso.jl",
+                    "line" => 183,
+                    "fields" => ["mgr", "tokenizer", "context_length"],
+                    "callees" => ["encode", "decode", "kv_footprint"],
+                    "params" => ["args", "Dict"],
+                    "arity" => 1,
+                    "mutating" => false,
+                ),
+                Dict{String,Any}(
+                    "name" => "snapshot_state!",
+                    "kind" => "function",
+                    "language" => "julia",
+                    "file" => "revival.jl",
+                    "line" => 733,
+                    "fields" => ["manifest", "blobs"],
+                    "callees" => ["sha256", "bytes2hex", "serialize"],
+                    "params" => ["state", "KernelState"],
+                    "arity" => 1,
+                    "mutating" => true,
+                ),
+                Dict{String,Any}(
+                    "name" => "HeldSnapshot",
+                    "kind" => "struct",
+                    "language" => "rust",
+                    "file" => "sandbox.rs",
+                    "line" => 824,
+                    "fields" => ["dir", "lock_fd"],
+                    "callees" => String[],
+                    "params" => ["PathBuf", "RawFd"],
+                    "arity" => 0,
+                    "mutating" => false,
+                ),
+            ],
+        )
+        empty!(VI._STORES)
+        st = VI.VecStore("duck_test"; dim=d, capacity=16)
+        VI._STORES["duck_test"] = st
+        @test VI.index_codegraph!(st, cg_dict) == 3
+
+        # 1. Pure duck-type field filter (no query_text)
+        r1 = VI.vecindex(Dict{String,Any}(
+            "action" => "search",
+            "store" => "duck_test",
+            "filter" => Dict{String,Any}("has_fields_all" => ["mgr", "tokenizer"]),
+        ))
+        @test r1["mode_used"] == "duck_filter_only"
+        @test r1["filter_matches"] == 1
+        @test r1["hits"][1]["id"] == "gesso.jl:183:_generate"
+
+        # 2. Combined vector + duck-type callee & mutating filter
+        r2 = VI.vecindex(Dict{String,Any}(
+            "action" => "search",
+            "store" => "duck_test",
+            "query_text" => "state serialization",
+            "filter" => Dict{String,Any}(
+                "language" => "julia",
+                "mutating" => true,
+                "has_callees_all" => ["sha256", "bytes2hex"],
+            ),
+        ))
+        @test r2["filter_matches"] == 1
+        @test r2["hits"][1]["id"] == "revival.jl:733:snapshot_state!"
+
+        # 3. Polyglot scanner test (TypeScript & Go definitions + duck traits)
+        ts_lines = [
+            "export interface VectorConfig {",
+            "  dim: number;",
+            "  metric: string;",
+            "}",
+            "export function searchIndex(store: VecStore, query: Float32Array) {",
+            "  const n = store.count;",
+            "  return normalizeVec(query, store.embeddings);",
+            "}",
+        ]
+        ts_defs = VI._scan_polyglot_defs(ts_lines, "typescript")
+        @test length(ts_defs) == 2
+        @test ts_defs[1].name == "VectorConfig" && ts_defs[1].kind == "interface"
+        @test ts_defs[2].name == "searchIndex" && ts_defs[2].kind == "function"
+        fields, callees, params, arity = VI._extract_line_duck_traits(ts_lines, 5, 8)
+        @test "count" in fields && "embeddings" in fields
+        @test "normalizeVec" in callees
+        @test arity == 2
+
+        # 4. C# (.cs) multi-modifier class, inheritance, property, and virtual/override method extraction
+        cs_lines = [
+            "public partial class GamePlayer : GameLiving, IGamePlayer {",
+            "    protected readonly GameClient m_client;",
+            "    public virtual int Mana { get; set; }",
+            "    public override bool StartAttack(GameObject attackTarget) {",
+            "        if (m_client.Out != null) { m_client.Out.SendAttackMode(AttackState); }",
+            "        return base.StartAttack(attackTarget);",
+            "    }",
+            "}",
+        ]
+        cs_defs = VI._scan_polyglot_defs(cs_lines, "csharp")
+        @test length(cs_defs) == 2
+        @test cs_defs[1].name == "GamePlayer" && cs_defs[1].kind == "class"
+        @test cs_defs[2].name == "StartAttack" && cs_defs[2].kind == "function"
+        cs_cls_fields, _, cs_cls_params, _ = VI._extract_line_duck_traits(cs_lines, 1, 3)
+        @test "m_client" in cs_cls_fields && "Mana" in cs_cls_fields
+        @test "GameLiving" in cs_cls_params && "IGamePlayer" in cs_cls_params && "GameClient" in cs_cls_params
+        cs_fn_fields, cs_fn_callees, cs_fn_params, cs_fn_arity = VI._extract_line_duck_traits(cs_lines, 4, 8)
+        @test "Out" in cs_fn_fields
+        @test "SendAttackMode" in cs_fn_callees
+        @test "GameObject" in cs_fn_params && "attackTarget" in cs_fn_params
+        @test cs_fn_arity == 1
+
+        # 5. UTF-8 signature slicing (multi-byte Unicode identifiers like α, β) & Python top-level <module> + imports
+        jl_utf8_lines = [
+            "function _lava_scale!(dst::Vector{Float32}, α)",
+            "    return _lava_sync!(dst)",
+            "end",
+        ]
+        _, jl_utf8_callees, jl_utf8_params, jl_utf8_arity = VI._extract_line_duck_traits(jl_utf8_lines, 1, 3)
+        @test jl_utf8_arity == 2
+        @test "dst" in jl_utf8_params && "Vector" in jl_utf8_params
+        @test "_lava_sync!" in jl_utf8_callees
+
+        py_script_lines = [
+            "from transformers import AutoModelForCausalLM, LlamaConfig",
+            "model = AutoModelForCausalLM.from_pretrained('meta-llama/Llama-3')",
+            "out = model.generate(input_ids)",
+        ]
+        py_defs = VI._scan_polyglot_defs(py_script_lines, "python")
+        @test length(py_defs) == 1 && py_defs[1].name == "<module>" && py_defs[1].kind == "module"
+        py_fields, py_callees, py_params, _ = VI._extract_line_duck_traits(py_script_lines, 1, 3)
+        @test "transformers" in py_params
+        @test "AutoModelForCausalLM" in py_callees && "LlamaConfig" in py_callees && "generate" in py_callees
+        @test "from_pretrained" in py_fields
+
+        # 6. Ergonomic 'query' action & 'query' parameter aliases
+        r_alias = VI.vecindex(Dict("action" => "query", "store" => "duck_test", "query" => "snapshot_state", "k" => 1))
+        @test r_alias["status"] == "searched"
+        @test r_alias["hits"][1]["id"] == "revival.jl:733:snapshot_state!"
+
+        VI.vecindex(Dict{String,Any}("action" => "drop", "store" => "duck_test"))
+    end
 end
+

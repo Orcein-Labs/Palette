@@ -67,6 +67,7 @@ mutable struct VecStore
     scores_buf::Vector{Float32}              # length capacity scratch for exact BLAS
     top_idx_buf::Vector{Int}                 # length _MAX_K scratch
     top_val_buf::Vector{Float32}             # length _MAX_K scratch
+    filter_mask::BitVector                   # length capacity preallocated mask for duck-type filtering
     ivf::IVFIndex
 end
 
@@ -90,6 +91,7 @@ function VecStore(name::AbstractString; dim::Int=_DEFAULT_DIM, capacity::Int=_DE
         zeros(Float32, cap),
         zeros(Int, _MAX_K),
         fill(-Inf32, _MAX_K),
+        trues(cap),
         _empty_ivf(dim),
     )
 end
@@ -109,6 +111,7 @@ function _ensure_capacity!(store::VecStore, needed::Int)
     resize!(store.ids, new_cap)
     resize!(store.metadata, new_cap)
     resize!(store.scores_buf, new_cap)
+    resize!(store.filter_mask, new_cap)
     store.capacity = new_cap
     return store
 end
@@ -463,8 +466,13 @@ end
     return nothing
 end
 
-function select_topk_max!(top_idx::AbstractVector{Int}, top_val::AbstractVector{Float32},
-                          scores::AbstractVector{Float32}, k::Int)
+function select_topk_max!(
+    top_idx::AbstractVector{Int},
+    top_val::AbstractVector{Float32},
+    scores::AbstractVector{Float32},
+    k::Int,
+    allow_mask::Union{Nothing,BitVector}=nothing,
+)
     1 <= k <= min(length(top_idx), length(top_val)) ||
         throw(BoundsError("top_idx and top_val must have length >= k ($k)"))
     n = length(scores)
@@ -474,18 +482,27 @@ function select_topk_max!(top_idx::AbstractVector{Int}, top_val::AbstractVector{
         top_idx[i] = 0
     end
     actual_k == 0 && return top_idx
-    @inbounds for j in 1:n
-        _insert_topk!(top_idx, top_val, actual_k, j, scores[j])
+    if allow_mask === nothing
+        @inbounds for j in 1:n
+            _insert_topk!(top_idx, top_val, actual_k, j, scores[j])
+        end
+    else
+        length(allow_mask) >= n || throw(BoundsError("allow_mask length < scores length"))
+        @inbounds for j in 1:n
+            if allow_mask[j]
+                _insert_topk!(top_idx, top_val, actual_k, j, scores[j])
+            end
+        end
     end
     return top_idx
 end
 
 """
-    _scan_columns_reg4!(top_idx, top_val, k, mat, q_norm, start_col, end_col, id_map)
+    _scan_columns_reg4!(top_idx, top_val, k, mat, q_norm, start_col, end_col, id_map, allow_mask=nothing)
 
 4-column AVX2 FMA (`muladd`) register-blocked cosine similarity kernel.
-Loads `q_norm[i]` once per 4 database columns and fuses top-k insertion inline
-with **0 bytes allocated**. If `isempty(id_map)`, uses column index `p` directly.
+Loads `q_norm[i]` once per 4 database columns and fuses optional `allow_mask`
+filtering and top-k insertion inline with **0 bytes allocated**.
 """
 @inline function _scan_columns_reg4!(
     top_idx::Vector{Int},
@@ -496,6 +513,7 @@ with **0 bytes allocated**. If `isempty(id_map)`, uses column index `p` directly
     start_col::Int,
     end_col::Int,
     id_map::Vector{Int},
+    allow_mask::Union{Nothing,BitVector}=nothing,
 )
     d = size(mat, 1)
     use_map = !isempty(id_map)
@@ -516,27 +534,34 @@ with **0 bytes allocated**. If `isempty(id_map)`, uses column index `p` directly
             s3 = muladd(mat[i, p + 2], qi, s3)
             s4 = muladd(mat[i, p + 3], qi, s4)
         end
-        if s1 > top_val[k]
-            _insert_topk!(top_idx, top_val, k, use_map ? id_map[p] : p, s1)
+        id1 = use_map ? id_map[p] : p
+        if (allow_mask === nothing || allow_mask[id1]) && s1 > top_val[k]
+            _insert_topk!(top_idx, top_val, k, id1, s1)
         end
-        if s2 > top_val[k]
-            _insert_topk!(top_idx, top_val, k, use_map ? id_map[p + 1] : (p + 1), s2)
+        id2 = use_map ? id_map[p + 1] : (p + 1)
+        if (allow_mask === nothing || allow_mask[id2]) && s2 > top_val[k]
+            _insert_topk!(top_idx, top_val, k, id2, s2)
         end
-        if s3 > top_val[k]
-            _insert_topk!(top_idx, top_val, k, use_map ? id_map[p + 2] : (p + 2), s3)
+        id3 = use_map ? id_map[p + 2] : (p + 2)
+        if (allow_mask === nothing || allow_mask[id3]) && s3 > top_val[k]
+            _insert_topk!(top_idx, top_val, k, id3, s3)
         end
-        if s4 > top_val[k]
-            _insert_topk!(top_idx, top_val, k, use_map ? id_map[p + 3] : (p + 3), s4)
+        id4 = use_map ? id_map[p + 3] : (p + 3)
+        if (allow_mask === nothing || allow_mask[id4]) && s4 > top_val[k]
+            _insert_topk!(top_idx, top_val, k, id4, s4)
         end
         p += 4
     end
     @inbounds while p <= end_col
-        s = 0.0f0
-        @simd for i in 1:d
-            s = muladd(mat[i, p], q_norm[i], s)
-        end
-        if s > top_val[k]
-            _insert_topk!(top_idx, top_val, k, use_map ? id_map[p] : p, s)
+        id = use_map ? id_map[p] : p
+        if allow_mask === nothing || allow_mask[id]
+            s = 0.0f0
+            @simd for i in 1:d
+                s = muladd(mat[i, p], q_norm[i], s)
+            end
+            if s > top_val[k]
+                _insert_topk!(top_idx, top_val, k, id, s)
+            end
         end
         p += 1
     end
@@ -546,10 +571,10 @@ end
 """
     search_exact!(top_idx::Vector{Int}, top_val::Vector{Float32},
                   store::VecStore, query::AbstractVector{Float32}, k::Int;
-                  normalize_query::Bool=true) -> Int
+                  normalize_query::Bool=true, allow_mask::Union{Nothing,BitVector}=nothing) -> Int
 
 Zero-allocation exact cosine search using OpenBLAS `gemv!('T', ...)` and in-place
-top-k insertion. Returns the number of candidates scored (`store.count`).
+top-k insertion. Supports inline `allow_mask` pre-filtering.
 """
 function search_exact!(
     top_idx::Vector{Int},
@@ -558,6 +583,7 @@ function search_exact!(
     query::AbstractVector{Float32},
     k::Int;
     normalize_query::Bool=true,
+    allow_mask::Union{Nothing,BitVector}=nothing,
 )::Int
     1 <= k <= min(length(top_idx), length(top_val)) ||
         throw(BoundsError("top_idx and top_val must have length >= k ($k)"))
@@ -576,7 +602,7 @@ function search_exact!(
     mat_view = @view store.embeddings[:, 1:N]
     scores_view = @view store.scores_buf[1:N]
     BLAS.gemv!('T', 1.0f0, mat_view, store.q_norm, 0.0f0, scores_view)
-    select_topk_max!(top_idx, top_val, scores_view, actual_k)
+    select_topk_max!(top_idx, top_val, scores_view, actual_k, allow_mask)
     return N
 end
 
@@ -585,12 +611,11 @@ const _EMPTY_INT_VEC = Int[]
 """
     search_ivf!(top_idx::Vector{Int}, top_val::Vector{Float32},
                 store::VecStore, query::AbstractVector{Float32}, k::Int;
-                n_probe::Int=0, normalize_query::Bool=true) -> Int
+                n_probe::Int=0, normalize_query::Bool=true,
+                allow_mask::Union{Nothing,BitVector}=nothing) -> Int
 
-Zero-allocation Contiguous-Cluster IVF search with 4-column AVX2 FMA register blocking.
-Also scans any unindexed incremental tail (`ivf.indexed_count + 1 : store.count`)
-so newly upserted items are found with 100% recall before an IVF rebuild.
-Returns the number of candidate vectors scored.
+Zero-allocation Contiguous-Cluster IVF search with 4-column AVX2 FMA register blocking
+and optional `allow_mask` duck-type pre-filtering.
 """
 function search_ivf!(
     top_idx::Vector{Int},
@@ -600,6 +625,7 @@ function search_ivf!(
     k::Int;
     n_probe::Int=0,
     normalize_query::Bool=true,
+    allow_mask::Union{Nothing,BitVector}=nothing,
 )::Int
     1 <= k <= min(length(top_idx), length(top_val)) ||
         throw(BoundsError("top_idx and top_val must have length >= k ($k)"))
@@ -613,7 +639,8 @@ function search_ivf!(
 
     ivf = store.ivf
     if !ivf.valid || ivf.n_list == 0
-        return search_exact!(top_idx, top_val, store, query, k; normalize_query=normalize_query)
+        return search_exact!(top_idx, top_val, store, query, k;
+                             normalize_query=normalize_query, allow_mask=allow_mask)
     end
 
     if normalize_query
@@ -637,6 +664,7 @@ function search_ivf!(
                 top_idx, top_val, actual_k,
                 ivf.embeddings_perm, store.q_norm,
                 start_col, end_col, ivf.perm_to_id,
+                allow_mask,
             )
             scored += (end_col - start_col + 1)
         end
@@ -649,8 +677,25 @@ function search_ivf!(
             top_idx, top_val, actual_k,
             store.embeddings, store.q_norm,
             tail_start, N, _EMPTY_INT_VEC,
+            allow_mask,
         )
         scored += (N - ivf.indexed_count)
+    end
+
+    # If a selective allow_mask yielded fewer than actual_k hits in the probed coarse centroids,
+    # scan all allowed columns directly (still 0 bytes allocated) so filtered recall is never starved.
+    if allow_mask !== nothing && probes < ivf.n_list && top_idx[actual_k] == 0
+        @inbounds for i in 1:k
+            top_val[i] = -Inf32
+            top_idx[i] = 0
+        end
+        _scan_columns_reg4!(
+            top_idx, top_val, actual_k,
+            store.embeddings, store.q_norm,
+            1, N, _EMPTY_INT_VEC,
+            allow_mask,
+        )
+        return N
     end
 
     return scored
@@ -680,36 +725,247 @@ function register_palette_hooks!()
 end
 
 # ---------------------------------------------------------------------------
-# Pharos Codegraph Integration
+# Duck-Type Trait Extraction & Polyglot Codegraph Integration
 # ---------------------------------------------------------------------------
+
+const _POLYGLOT_EXT_LANG = Dict{String,String}(
+    ".jl"  => "julia",
+    ".py"  => "python",
+    ".rs"  => "rust",
+    ".ts"  => "typescript",
+    ".tsx" => "typescript",
+    ".js"  => "javascript",
+    ".jsx" => "javascript",
+    ".go"  => "go",
+    ".c"   => "c",
+    ".h"   => "c",
+    ".cpp" => "cpp",
+    ".cc"  => "cpp",
+    ".hpp" => "cpp",
+    ".cs"  => "csharp",
+)
+
+const _SKIP_SCAN_DIRS = Set([
+    ".git", "vendor", "target", "node_modules", "__pycache__", "build", "dist", "_build", "venv", ".venv",
+])
+
+const _NOISE_CALLEES = Set([
+    "+", "-", "*", "/", "\\", "^", "%", "==", "!=", "===", "!==", "<", "<=", ">", ">=",
+    ":", "=>", "|", "&", "!", "~", "getindex", "setindex!", "firstindex", "lastindex", "Colon",
+])
+
+function _is_noise_callee(c::AbstractString)::Bool
+    isempty(c) && return true
+    c in _NOISE_CALLEES && return true
+    # Filter pure operator symbols (no ASCII letters or underscore)
+    for b in codeunits(c)
+        if (b >= UInt8('A') && b <= UInt8('Z')) || (b >= UInt8('a') && b <= UInt8('z')) || b == UInt8('_')
+            return false
+        end
+    end
+    return true
+end
+
+"""
+    _extract_line_duck_traits(lines, start_line, end_line) -> (fields, callees, params, arity)
+
+Fast, language-agnostic lexical extractor over `lines[start_line:end_line]`:
+- `fields`: `.identifier` property accesses (`self.mgr`, `store.ivf`, `this.state`)
+  and `field::Type` / `field: Type` struct declarations.
+- `callees`: `identifier(` invocations (excluding AST operator noise).
+- `params` & `arity`: parameter names, type tags, and base classes from the signature header.
+"""
+function _extract_line_duck_traits(lines::Vector{String}, start_line::Int, end_line::Int)
+    fields = String[]
+    callees = String[]
+    params = String[]
+    arity = 0
+    s_line = clamp(start_line, 1, length(lines))
+    e_line = clamp(end_line, s_line, min(length(lines), s_line + 250))
+
+    # Extract parameters from signature line(s) (UTF-8 safe via nextind/prevind)
+    header = lines[s_line]
+    if s_line < e_line && !occursin(')', header)
+        header = header * " " * lines[s_line + 1]
+    end
+    p_open = findfirst('(', header)
+    p_close = p_open === nothing ? nothing : findnext(')', header, nextind(header, p_open))
+    if p_open !== nothing && p_close !== nothing && p_close > nextind(header, p_open)
+        inner = SubString(header, nextind(header, p_open), prevind(header, p_close))
+        for part in eachsplit(inner, ',')
+            tok = strip(part)
+            isempty(tok) && continue
+            (tok == "self" || tok == "cls" || tok == "&self" || tok == "&mut self" || tok == "this") && continue
+            arity += 1
+            for m in eachmatch(r"[A-Za-z_][A-Za-z0-9_!]*", tok)
+                push!(params, String(m.match))
+            end
+        end
+    end
+
+    # Python return type annotation `-> ReturnType:` on def header
+    m_py_ret = match(r"->\s*([A-Za-z_][A-Za-z0-9_.\[\], ]*)\s*:", header)
+    if m_py_ret !== nothing
+        for tm in eachmatch(r"[A-Za-z_][A-Za-z0-9_]*", m_py_ret.captures[1])
+            push!(params, String(tm.match))
+        end
+    end
+
+    kw_skip = Set([
+        "if", "elif", "for", "foreach", "while", "switch", "return", "catch", "except", "with",
+        "lock", "using", "fixed", "function", "def", "fn", "class", "in", "where", "nameof",
+        "typeof", "sizeof", "default", "print", "len", "range", "isinstance", "super",
+    ])
+    # Extract C# / C++ / Rust / TS inheritance / implemented interfaces from header line (e.g. `class GamePlayer : GameLiving, IGamePlayer`)
+    m_inh = match(r"(?:class|struct|interface)\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*([^{]+)", header)
+    if m_inh !== nothing
+        for base_part in eachsplit(m_inh.captures[1], ',')
+            b = strip(base_part)
+            m_b = match(r"^([A-Za-z_][A-Za-z0-9_]*)", b)
+            m_b !== nothing && push!(params, String(m_b.captures[1]))
+        end
+    end
+
+    for ln in s_line:e_line
+        line = lines[ln]
+        # 1. Dot-property accesses: obj.field (skipping numeric literals like 1.0f0)
+        for m in eachmatch(r"[A-Za-z_\)\]]\.([A-Za-z_][A-Za-z0-9_]*)", line)
+            f = String(m.captures[1])
+            push!(fields, f)
+        end
+        # 1b. Python imports (`from pkg.mod import sym1, sym2` or `import pkg`)
+        m_from = match(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+)$", line)
+        if m_from !== nothing
+            push!(params, String(m_from.captures[1]))
+            for imp in eachsplit(m_from.captures[2], ',')
+                m_i = match(r"^([A-Za-z_][A-Za-z0-9_]*)", strip(imp))
+                m_i !== nothing && push!(callees, String(m_i.captures[1]))
+            end
+        end
+        # 2a. Julia / Rust / TS / Python typed field declarations (`centroids::Matrix{Float32}` or `pub count: usize`)
+        if ln > s_line
+            m_decl = match(r"^\s*(?:pub\s+|readonly\s+|private\s+|public\s+|protected\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::|:)\s*([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m_decl !== nothing && !(String(m_decl.captures[1]) in ("if", "elif", "else", "for", "while", "try", "except", "finally", "with", "class", "def", "return"))
+                push!(fields, String(m_decl.captures[1]))
+                push!(params, String(m_decl.captures[2]))
+            else
+                # 2b. C# / C++ / Java property & field declarations (`public virtual int Health { get; set; }`, `protected readonly GameClient m_client;`)
+                m_cs = match(r"^\s*(?:(?:public|private|protected|internal|virtual|override|abstract|sealed|static|readonly|volatile|new)\s+)+([A-Za-z_][A-Za-z0-9_<>.,\[\]\?]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|;|=>|=)", line)
+                if m_cs !== nothing
+                    t_raw = String(m_cs.captures[1])
+                    f_name = String(m_cs.captures[2])
+                    if !(t_raw in ("class", "struct", "interface", "enum", "return", "namespace", "using"))
+                        push!(fields, f_name)
+                        for tm in eachmatch(r"[A-Za-z_][A-Za-z0-9_]*", t_raw)
+                            push!(params, String(tm.match))
+                        end
+                    end
+                end
+            end
+        end
+        # 3. Function/method calls: callee(
+        for m in eachmatch(r"([A-Za-z_][A-Za-z0-9_!]*)\s*\(", line)
+            c = String(m.captures[1])
+            (c in kw_skip || _is_noise_callee(c)) && continue
+            push!(callees, c)
+        end
+    end
+    return unique!(fields), unique!(callees), unique!(params), arity
+end
+
+function _scan_polyglot_defs(lines::Vector{String}, lang::String)
+    defs = Vector{NamedTuple{(:name, :kind, :line),Tuple{String,String,Int}}}()
+    for (idx, line) in enumerate(lines)
+        if lang == "typescript" || lang == "javascript"
+            m = match(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(function|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)", line)
+            if m !== nothing
+                push!(defs, (name=String(m.captures[2]), kind=String(m.captures[1]), line=idx))
+            else
+                m_const = match(r"^(?:export\s+)const\s+([A-Za-z_$][A-Za-z0-9_$]*)", line)
+                m_const !== nothing && push!(defs, (name=String(m_const.captures[1]), kind="const", line=idx))
+            end
+        elseif lang == "go"
+            m_fn = match(r"^\s*func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+            if m_fn !== nothing
+                push!(defs, (name=String(m_fn.captures[1]), kind="function", line=idx))
+            else
+                m_ty = match(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(struct|interface)", line)
+                m_ty !== nothing && push!(defs, (name=String(m_ty.captures[1]), kind=String(m_ty.captures[2]), line=idx))
+            end
+        elseif lang in ("c", "cpp", "csharp")
+            m_st = match(r"^\s*(?:template\s*<[^>]*>\s*)?(?:(?:public|private|protected|internal|abstract|sealed|static|partial|readonly|unsafe|new)\s+)*(struct|class|interface|enum)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m_st !== nothing
+                push!(defs, (name=String(m_st.captures[2]), kind=String(m_st.captures[1]), line=idx))
+            else
+                m_fn = match(r"^\s*(?:(?:public|private|protected|internal|virtual|override|abstract|sealed|static|async|extern|unsafe|inline|constexpr|new)\s+)*(?:[A-Za-z_][A-Za-z0-9_:<>\*&\?,\[\]\s]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*$", line)
+                if m_fn !== nothing && !(String(m_fn.captures[1]) in ("if", "for", "foreach", "while", "switch", "return", "catch", "lock", "using", "fixed", "nameof", "typeof", "sizeof", "base", "this"))
+                    push!(defs, (name=String(m_fn.captures[1]), kind="function", line=idx))
+                end
+            end
+        elseif lang == "python"
+            m = match(r"^\s*(?:async\s+)?(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m !== nothing
+                k = m.captures[1] == "def" ? "function" : "class"
+                push!(defs, (name=String(m.captures[2]), kind=k, line=idx))
+            end
+        elseif lang == "rust"
+            m = match(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|const\s+)?(fn|struct|enum|trait|type|mod)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m !== nothing
+                k = m.captures[1] == "fn" ? "function" : String(m.captures[1])
+                push!(defs, (name=String(m.captures[2]), kind=k, line=idx))
+            end
+        elseif lang == "julia"
+            m = match(r"^\s*(?:@[A-Za-z_.]+\s+)?(?:mutable\s+)?(function|struct|macro|const)\s+([A-Za-z_][A-Za-z0-9_!]*)", line)
+            if m !== nothing
+                push!(defs, (name=String(m.captures[2]), kind=String(m.captures[1]), line=idx))
+            end
+        end
+    end
+    # For top-level Python scripts without def/class, index a synthetic module entry at line 1
+    if lang == "python" && isempty(defs) && !isempty(lines)
+        push!(defs, (name="<module>", kind="module", line=1))
+    end
+    return defs
+end
 
 function _embed_symbol_with_callees!(
     primary_buf::Vector{Float32},
     callee_buf::Vector{Float32},
     primary_text::AbstractString,
-    calls_str::AbstractString,
+    behavior_text::AbstractString,
 )
     embed_text!(primary_buf, primary_text)
-    if !isempty(calls_str)
-        embed_text!(callee_buf, calls_str)
+    if !isempty(behavior_text)
+        embed_text!(callee_buf, behavior_text)
         d = length(primary_buf)
         @inbounds @simd for i in 1:d
-            primary_buf[i] = muladd(0.85f0, primary_buf[i], 0.15f0 * callee_buf[i])
+            primary_buf[i] = muladd(0.80f0, primary_buf[i], 0.20f0 * callee_buf[i])
         end
     end
     return primary_buf
 end
 
+function _read_source_lines(root::AbstractString, relpath::AbstractString)::Vector{String}
+    isempty(root) && return String[]
+    full = joinpath(root, relpath)
+    (!isfile(full) || islink(full)) && return String[]
+    return try
+        readlines(full)
+    catch
+        String[]
+    end
+end
+
 """
-    index_codegraph!(store::VecStore, cg) -> Int
+    index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true) -> Int
 
 Index symbols from `Palette.codegraph()` (either a `Pharos.CodeGraph` struct or
-a JSON-like `AbstractDict`) into `store` using `embed_text!`.
-Primary symbol identity (name, kind, file) receives 85% normalized energy and
-call-graph neighborhood (`callees`) receives 15% normalized energy so functions
-with large call fan-out are never diluted by length normalization.
+a JSON-like `AbstractDict`) into `store` with full duck-type traits (`fields`,
+`callees`, `params`, `arity`, `mutating`). When `include_polyglot=true` and
+`cg.root` is present, also scans additional polyglot files (`.ts`, `.js`, `.go`,
+`.c`, `.cpp`, `.h`, `.cs`) under `cg.root`.
 """
-function index_codegraph!(store::VecStore, cg::AbstractDict)::Int
+function index_codegraph!(store::VecStore, cg::AbstractDict; include_polyglot::Bool=true)::Int
     symbols = get(cg, "symbols", Any[])
     symbols isa AbstractVector || throw(ArgumentError("codegraph dict has no symbols array"))
     primary_buf = zeros(Float32, store.dim)
@@ -720,20 +976,32 @@ function index_codegraph!(store::VecStore, cg::AbstractDict)::Int
         name = String(get(sym, "name", ""))
         isempty(name) && continue
         kind = String(get(sym, "kind", "symbol"))
+        lang = String(get(sym, "language", "unknown"))
         file = String(get(sym, "file", ""))
-        line = get(sym, "line", 0)
+        line = Int(get(sym, "line", 0))
         sig = String(get(sym, "signature", name))
-        calls = get(sym, "calls", Any[])
-        calls_str = calls isa AbstractVector ? join(String.(calls), " ") : ""
+        raw_calls = String.(get(sym, "calls", get(sym, "callees", Any[])))
+        calls = [c for c in raw_calls if !_is_noise_callee(c)]
+        fields = String.(get(sym, "fields", Any[]))
+        params = String.(get(sym, "params", Any[]))
+        arity = Int(get(sym, "arity", length(params)))
+        mutating = Bool(get(sym, "mutating", endswith(name, "!")))
+        behavior_str = join(vcat(calls, fields, params), " ")
         id = isempty(file) ? name : "$(file):$(line):$(name)"
-        primary_text = "$(name) $(name) $(name) $(kind) $(sig) $(file)"
-        _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, calls_str)
+        primary_text = "$(name) $(name) $(name) $(kind) $(lang) $(sig) $(file)"
+        _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, behavior_str)
         meta = Dict{String,Any}(
             "name" => name,
             "kind" => kind,
+            "language" => lang,
             "file" => file,
             "line" => line,
             "signature" => sig,
+            "callees" => calls,
+            "fields" => fields,
+            "params" => params,
+            "arity" => arity,
+            "mutating" => mutating,
         )
         upsert!(store, id, primary_buf; metadata=meta)
         indexed += 1
@@ -741,28 +1009,43 @@ function index_codegraph!(store::VecStore, cg::AbstractDict)::Int
     return indexed
 end
 
-function index_codegraph!(store::VecStore, cg)::Int
+function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
     hasproperty(cg, :files) || throw(ArgumentError("expected a Pharos.CodeGraph or AbstractDict"))
+    root_dir = hasproperty(cg, :root) ? String(cg.root) : ""
     primary_buf = zeros(Float32, store.dim)
     callee_buf = zeros(Float32, store.dim)
     indexed = 0
+
     for path in sort!(collect(keys(cg.files)))
         entry = cg.files[path]
         lang = string(entry.language)
+        lines = _read_source_lines(root_dir, path)
         callees_by_caller = Dict{String,Vector{String}}()
         for c in entry.calls
+            _is_noise_callee(c.callee) && continue
             push!(get!(callees_by_caller, c.caller, String[]), c.callee)
         end
-        for def in entry.definitions
+        defs = entry.definitions
+        if isempty(defs) && lang == "python" && !isempty(lines)
+            defs = [(name=splitext(basename(path))[1], kind=:module, line=1)]
+        end
+        n_defs = length(defs)
+        for (d_idx, def) in enumerate(defs)
             name = def.name
             isempty(name) && continue
             kind = string(def.kind)
             line = def.line
-            callees = unique(get(callees_by_caller, name, String[]))
-            calls_str = isempty(callees) ? "" : join(callees, " ")
+            next_line = d_idx < n_defs ? max(line, defs[d_idx + 1].line - 1) : length(lines)
+            fields, lex_callees, params, arity = isempty(lines) ?
+                (String[], String[], String[], 0) :
+                _extract_line_duck_traits(lines, line, next_line)
+            callees = unique!(vcat(get(callees_by_caller, name, String[]), lex_callees))
+            filter!(c -> c != name && !_is_noise_callee(c), callees)
+            mutating = endswith(name, "!")
+            behavior_str = join(vcat(callees, fields, params), " ")
             id = "$(path):$(line):$(name)"
             primary_text = "$(name) $(name) $(name) $(kind) $(lang) $(path)"
-            _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, calls_str)
+            _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, behavior_str)
             meta = Dict{String,Any}(
                 "name" => name,
                 "kind" => kind,
@@ -770,12 +1053,214 @@ function index_codegraph!(store::VecStore, cg)::Int
                 "file" => path,
                 "line" => line,
                 "callees" => callees,
+                "fields" => fields,
+                "params" => params,
+                "arity" => arity,
+                "mutating" => mutating,
             )
             upsert!(store, id, primary_buf; metadata=meta)
             indexed += 1
         end
     end
+
+    if include_polyglot && !isempty(root_dir) && isdir(root_dir)
+        indexed += _index_extra_polyglot_files!(store, root_dir, Set(keys(cg.files)), primary_buf, callee_buf)
+    end
     return indexed
+end
+
+function _index_extra_polyglot_files!(
+    store::VecStore,
+    root_dir::String,
+    already_indexed::Set{String},
+    primary_buf::Vector{Float32},
+    callee_buf::Vector{Float32},
+)::Int
+    indexed = 0
+    for (dir, dirs, files) in walkdir(root_dir; follow_symlinks=false, onerror=_ -> nothing)
+        filter!(d -> !startswith(d, ".") && !(d in _SKIP_SCAN_DIRS), dirs)
+        for fname in sort!(files)
+            _, ext = splitext(fname)
+            lang = get(_POLYGLOT_EXT_LANG, lowercase(ext), nothing)
+            lang === nothing && continue
+            full = joinpath(dir, fname)
+            islink(full) && continue
+            rel = replace(relpath(full, root_dir), '\\' => '/')
+            rel in already_indexed && continue
+            lines = _read_source_lines(root_dir, rel)
+            isempty(lines) && continue
+            defs = _scan_polyglot_defs(lines, lang)
+            n_defs = length(defs)
+            for (d_idx, def) in enumerate(defs)
+                store.count >= _MAX_ITEMS && return indexed
+                name = def.name
+                kind = def.kind
+                line = def.line
+                next_line = d_idx < n_defs ? max(line, defs[d_idx + 1].line - 1) : length(lines)
+                fields, callees, params, arity = _extract_line_duck_traits(lines, line, next_line)
+                filter!(c -> c != name, callees)
+                mutating = endswith(name, "!")
+                behavior_str = join(vcat(callees, fields, params), " ")
+                id = "$(rel):$(line):$(name)"
+                primary_text = "$(name) $(name) $(name) $(kind) $(lang) $(rel)"
+                _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, behavior_str)
+                meta = Dict{String,Any}(
+                    "name" => name,
+                    "kind" => kind,
+                    "language" => lang,
+                    "file" => rel,
+                    "line" => line,
+                    "callees" => callees,
+                    "fields" => fields,
+                    "params" => params,
+                    "arity" => arity,
+                    "mutating" => mutating,
+                )
+                upsert!(store, id, primary_buf; metadata=meta)
+                indexed += 1
+            end
+        end
+    end
+    return indexed
+end
+
+# ---------------------------------------------------------------------------
+# Duck-Type & Structural Subspace Filter Evaluation
+# ---------------------------------------------------------------------------
+
+const _ALLOWED_FILTER_KEYS = (
+    "kind", "language", "file_contains", "mutating",
+    "has_fields", "has_fields_all",
+    "has_callees", "has_callees_all",
+    "has_params", "min_arity", "max_arity", "metadata",
+)
+
+function _to_string_list(val, field_name::String)::Vector{String}
+    if val isa String
+        return String[val]
+    elseif val isa AbstractVector
+        out = String[]
+        for x in val
+            x isa String || throw(ArgumentError("filter.$field_name elements must be strings"))
+            push!(out, x)
+        end
+        return out
+    end
+    throw(ArgumentError("filter.$field_name must be a string or array of strings"))
+end
+
+function _has_any_trait(meta::Dict{String,Any}, key::String, targets::Vector{String})::Bool
+    isempty(targets) && return true
+    arr = get(meta, key, nothing)
+    arr isa AbstractVector || return false
+    for t in targets
+        for item in arr
+            if item == t
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function _has_all_traits(meta::Dict{String,Any}, key::String, targets::Vector{String})::Bool
+    isempty(targets) && return true
+    arr = get(meta, key, nothing)
+    arr isa AbstractVector || return false
+    for t in targets
+        found = false
+        for item in arr
+            if item == t
+                found = true
+                break
+            end
+        end
+        found || return false
+    end
+    return true
+end
+
+"""
+    compute_filter_mask!(store::VecStore, filt::AbstractDict) -> Int
+
+Evaluate structural and duck-type filter predicates across `store.metadata[1:store.count]`
+into `store.filter_mask[1:store.count]`. Returns the number of matching items.
+"""
+function compute_filter_mask!(store::VecStore, filt::AbstractDict)::Int
+    for k in keys(filt)
+        String(k) in _ALLOWED_FILTER_KEYS ||
+            throw(ArgumentError("unsupported filter key '$(k)'; allowed: $(join(_ALLOWED_FILTER_KEYS, ", "))"))
+    end
+    kinds = haskey(filt, "kind") ? _to_string_list(filt["kind"], "kind") : String[]
+    if "function" in kinds && !("fn" in kinds)
+        push!(kinds, "fn")
+    elseif "fn" in kinds && !("function" in kinds)
+        push!(kinds, "function")
+    end
+    langs = haskey(filt, "language") ? _to_string_list(filt["language"], "language") : String[]
+    file_sub = get(filt, "file_contains", nothing)
+    file_sub === nothing || file_sub isa String || throw(ArgumentError("filter.file_contains must be a string"))
+    mut_req = get(filt, "mutating", nothing)
+    mut_req === nothing || mut_req isa Bool || throw(ArgumentError("filter.mutating must be a boolean"))
+    f_any = haskey(filt, "has_fields") ? _to_string_list(filt["has_fields"], "has_fields") : String[]
+    f_all = haskey(filt, "has_fields_all") ? _to_string_list(filt["has_fields_all"], "has_fields_all") : String[]
+    c_any = haskey(filt, "has_callees") ? _to_string_list(filt["has_callees"], "has_callees") : String[]
+    c_all = haskey(filt, "has_callees_all") ? _to_string_list(filt["has_callees_all"], "has_callees_all") : String[]
+    p_any = haskey(filt, "has_params") ? _to_string_list(filt["has_params"], "has_params") : String[]
+    min_ar = haskey(filt, "min_arity") ? _require_int_range(filt["min_arity"], "filter.min_arity", 0, 256) : -1
+    max_ar = haskey(filt, "max_arity") ? _require_int_range(filt["max_arity"], "filter.max_arity", 0, 256) : -1
+    exact_meta = get(filt, "metadata", nothing)
+    exact_meta === nothing || exact_meta isa AbstractDict || throw(ArgumentError("filter.metadata must be an object"))
+
+    matched = 0
+    @inbounds for i in 1:store.count
+        m = store.metadata[i]
+        ok = true
+        if !isempty(kinds) && !(String(get(m, "kind", "")) in kinds)
+            ok = false
+        end
+        if ok && !isempty(langs) && !(String(get(m, "language", "")) in langs)
+            ok = false
+        end
+        if ok && file_sub !== nothing && !occursin(file_sub, String(get(m, "file", "")))
+            ok = false
+        end
+        if ok && mut_req !== nothing && Bool(get(m, "mutating", false)) != mut_req
+            ok = false
+        end
+        if ok && !isempty(f_any) && !_has_any_trait(m, "fields", f_any)
+            ok = false
+        end
+        if ok && !isempty(f_all) && !_has_all_traits(m, "fields", f_all)
+            ok = false
+        end
+        if ok && !isempty(c_any) && !_has_any_trait(m, "callees", c_any)
+            ok = false
+        end
+        if ok && !isempty(c_all) && !_has_all_traits(m, "callees", c_all)
+            ok = false
+        end
+        if ok && !isempty(p_any) && !_has_any_trait(m, "params", p_any)
+            ok = false
+        end
+        if ok && (min_ar >= 0 || max_ar >= 0)
+            ar = Int(get(m, "arity", 0))
+            if (min_ar >= 0 && ar < min_ar) || (max_ar >= 0 && ar > max_ar)
+                ok = false
+            end
+        end
+        if ok && exact_meta !== nothing
+            for (mk, mv) in exact_meta
+                if get(m, String(mk), nothing) != mv
+                    ok = false
+                    break
+                end
+            end
+        end
+        store.filter_mask[i] = ok
+        matched += ifelse(ok, 1, 0)
+    end
+    return matched
 end
 
 # ---------------------------------------------------------------------------
@@ -784,7 +1269,7 @@ end
 
 function _store_memory_bytes(store::VecStore)::Int
     base = sizeof(store.embeddings) + sizeof(store.q_norm) + sizeof(store.scores_buf) +
-           sizeof(store.top_idx_buf) + sizeof(store.top_val_buf)
+           sizeof(store.top_idx_buf) + sizeof(store.top_val_buf) + sizeof(store.filter_mask)
     ivf = store.ivf
     ivf_bytes = sizeof(ivf.centroids) + sizeof(ivf.embeddings_perm) +
                 sizeof(ivf.perm_to_id) + sizeof(ivf.id_to_perm) +
@@ -971,8 +1456,8 @@ function _action_build_ivf(args::Dict{String,Any})
 end
 
 function _action_search(args::Dict{String,Any})
-    _check_allowed_keys(args, ("action", "store", "query_vector", "query_text", "k", "mode", "n_probe"),
-        "search accepts only store, query_vector, query_text, k, mode, and n_probe")
+    _check_allowed_keys(args, ("action", "store", "query_vector", "query_text", "query", "k", "mode", "n_probe", "filter"),
+        "search accepts only store, query_vector, query_text (or query), k, mode, n_probe, and filter")
     store = _get_store(args)
     k = _require_int_range(get(args, "k", 10), "k", 1, _MAX_K)
     mode = get(args, "mode", "auto")
@@ -981,15 +1466,57 @@ function _action_search(args::Dict{String,Any})
     n_probe = _require_int_range(get(args, "n_probe", 0), "n_probe", 0, 4096)
 
     has_vec = haskey(args, "query_vector")
-    has_text = haskey(args, "query_text")
-    (has_vec ⊻ has_text) ||
-        throw(ArgumentError("search requires exactly one of 'query_vector' or 'query_text'"))
+    has_text = haskey(args, "query_text") || haskey(args, "query")
+    has_filter = haskey(args, "filter")
+    !(has_vec && has_text) ||
+        throw(ArgumentError("search cannot specify both 'query_vector' and 'query_text'"))
+    (has_vec || has_text || has_filter) ||
+        throw(ArgumentError("search requires 'query_vector', 'query_text', or 'filter'"))
+
+    allow_mask = nothing
+    filter_matches = store.count
+    if has_filter
+        filt = args["filter"]
+        filt isa AbstractDict || throw(ArgumentError("filter must be an object"))
+        filter_matches = compute_filter_mask!(store, filt)
+        allow_mask = store.filter_mask
+    end
+
+    # Pure structural / duck-type filter mode (when no query_vector or query_text is supplied)
+    if !has_vec && !has_text
+        t0 = time_ns()
+        hits = Vector{Dict{String,Any}}()
+        rank = 0
+        @inbounds for idx in 1:store.count
+            if allow_mask[idx]
+                rank += 1
+                push!(hits, Dict{String,Any}(
+                    "rank" => rank,
+                    "id" => store.ids[idx],
+                    "score" => 1.0,
+                    "metadata" => store.metadata[idx],
+                ))
+                rank >= k && break
+            end
+        end
+        elapsed_ns = Int(time_ns() - t0)
+        return Dict{String,Any}(
+            "status" => "searched",
+            "store" => store.name,
+            "mode_used" => "duck_filter_only",
+            "filter_matches" => filter_matches,
+            "candidates_scored" => filter_matches,
+            "total_items" => store.count,
+            "elapsed_ns" => elapsed_ns,
+            "hits" => hits,
+        )
+    end
 
     if has_vec
         q_vec = _parse_float32_vec(args["query_vector"], store.dim)
         _normalize_copy!(store.q_norm, q_vec)
     else
-        q_text = args["query_text"]
+        q_text = haskey(args, "query_text") ? args["query_text"] : args["query"]
         q_text isa String && !isempty(q_text) && ncodeunits(q_text) <= _MAX_TEXT_BYTES ||
             throw(ArgumentError("query_text must be a non-empty string of at most $_MAX_TEXT_BYTES bytes"))
         embed_text!(store.q_norm, q_text)
@@ -1006,17 +1533,21 @@ function _action_search(args::Dict{String,Any})
 
     actual_k = min(k, store.count)
     t0 = time_ns()
-    scored = if actual_k == 0
+    scored = if actual_k == 0 || filter_matches == 0
+        @inbounds for i in 1:actual_k
+            store.top_idx_buf[i] = 0
+            store.top_val_buf[i] = -Inf32
+        end
         0
     elseif use_ivf
         search_ivf!(
             store.top_idx_buf, store.top_val_buf, store, store.q_norm, actual_k;
-            n_probe=n_probe, normalize_query=false,
+            n_probe=n_probe, normalize_query=false, allow_mask=allow_mask,
         )
     else
         search_exact!(
             store.top_idx_buf, store.top_val_buf, store, store.q_norm, actual_k;
-            normalize_query=false,
+            normalize_query=false, allow_mask=allow_mask,
         )
     end
     elapsed_ns = Int(time_ns() - t0)
@@ -1037,6 +1568,7 @@ function _action_search(args::Dict{String,Any})
         "status" => "searched",
         "store" => store.name,
         "mode_used" => use_ivf ? "ivf_reg4" : "exact_blas",
+        "filter_matches" => filter_matches,
         "candidates_scored" => scored,
         "total_items" => store.count,
         "elapsed_ns" => elapsed_ns,
@@ -1045,14 +1577,16 @@ function _action_search(args::Dict{String,Any})
 end
 
 function _action_index_codegraph(args::Dict{String,Any})
-    _check_allowed_keys(args, ("action", "store", "dim", "build_ivf", "root"),
-        "index_codegraph accepts only store, dim, build_ivf, and root")
+    _check_allowed_keys(args, ("action", "store", "dim", "build_ivf", "root", "include_polyglot"),
+        "index_codegraph accepts only store, dim, build_ivf, root, and include_polyglot")
     isdefined(@__MODULE__, :Palette) && isdefined(Palette, :codegraph) ||
         throw(ArgumentError("Palette.codegraph is not available in this module scope"))
     name = _validate_store_name(args)
     dim = _require_int_range(get(args, "dim", _DEFAULT_DIM), "dim", _MIN_DIM, _MAX_DIM)
     do_ivf = get(args, "build_ivf", true)
     do_ivf isa Bool || throw(ArgumentError("build_ivf must be a boolean"))
+    inc_poly = get(args, "include_polyglot", true)
+    inc_poly isa Bool || throw(ArgumentError("include_polyglot must be a boolean"))
     root = get(args, "root", nothing)
     root === nothing || (root isa String && !isempty(root)) ||
         throw(ArgumentError("root must be a non-empty string"))
@@ -1069,7 +1603,7 @@ function _action_index_codegraph(args::Dict{String,Any})
     cap = clamp(max(est_cap, 32), 32, _MAX_ITEMS)
     store = VecStore(name; dim=dim, capacity=cap)
     _STORES[name] = store
-    indexed = index_codegraph!(store, cg)
+    indexed = index_codegraph!(store, cg; include_polyglot=inc_poly)
     if do_ivf && store.count >= 16
         build_ivf!(store)
     end
@@ -1101,7 +1635,7 @@ end
     vecindex(arguments::Dict{String,Any}) -> Dict{String,Any}
 
 Palette runtime capability entrypoint for `vecindex`.
-Supported actions: `diagnose`, `create`, `upsert`, `build_ivf`, `search`,
+Supported actions: `diagnose`, `create`, `upsert`, `build_ivf`, `search` (or `query`),
 `index_codegraph`, `delete`, `drop`, `stats`.
 """
 function vecindex(arguments::Dict{String,Any})
@@ -1117,7 +1651,7 @@ function vecindex(arguments::Dict{String,Any})
             return _action_upsert(arguments)
         elseif action == "build_ivf"
             return _action_build_ivf(arguments)
-        elseif action == "search"
+        elseif action == "search" || action == "query"
             return _action_search(arguments)
         elseif action == "index_codegraph"
             return _action_index_codegraph(arguments)
@@ -1130,6 +1664,8 @@ function vecindex(arguments::Dict{String,Any})
             store = _get_store(arguments)
             return Dict{String,Any}("status" => "ok", "store" => _store_stats(store))
         end
-        throw(ArgumentError("action must be diagnose, create, upsert, build_ivf, search, index_codegraph, delete, drop, or stats"))
+        throw(ArgumentError("action must be diagnose, create, upsert, build_ivf, search (or query), index_codegraph, delete, drop, or stats"))
     end
 end
+
+vecindex(arguments::AbstractDict) = vecindex(Dict{String,Any}(String(k) => v for (k, v) in arguments))
