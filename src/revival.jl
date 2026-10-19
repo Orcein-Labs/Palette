@@ -607,13 +607,20 @@ end
 # What makes the package environment what it is: data is deserialized only
 # into the same one.
 function environment_identity()
-    manifest = something(Base.project_file_manifest_path(Base.active_project()), "")
+    project = Base.active_project()
+    # A project that is gone (a removed checkout) has no manifest; reading it would end the snapshot.
+    manifest = project !== nothing && isfile(project) ? something(Base.project_file_manifest_path(project), "") : ""
     pkgs = sort!([string(k.name, "@", something(pkgversion(m), "stdlib"))
                   for (k, m) in Base.loaded_modules if k.uuid !== nothing])
     return Dict{String, Any}("julia" => string(VERSION),
                              "manifest" => isfile(manifest) ? file_sha(manifest) : "",
                              "packages" => pkgs)
 end
+
+# A saved project or LOAD_PATH entry this kernel cannot see: after a runtime
+# generation switch, the retired generation's checkout, which this sandbox
+# does not mount.
+unseen_path(p::AbstractString) = !isempty(p) && !startswith(p, "@") && !ispath(p)
 
 # The code that last set `name`, for a binding that cannot be revived.
 one_line(ex) = first(replace(string(ex isa Expr ? Base.remove_linenums!(deepcopy(ex)) : ex), r"#=.*?=#" => "", r"\s+" => " "), MAX_RECIPE_CHARS)
@@ -944,9 +951,10 @@ function revive_state!()
     # Snapshot ENV changes cannot replace this host-selected, read-only mount.
     package_environment = get(INITIAL_ENV[], "PALETTE_PACKAGE_ENVIRONMENT", "")
     # The environment turn code set up: where packages load from, and where it works.
-    empty!(LOAD_PATH); append!(LOAD_PATH, String.(m["load_path"]))
+    # Only what this kernel can see; the rest is named in the report.
+    empty!(LOAD_PATH); append!(LOAD_PATH, filter(!unseen_path, String.(m["load_path"])))
     isempty(package_environment) || package_environment in LOAD_PATH || push!(LOAD_PATH, package_environment)
-    isempty(m["active_project"]) || (Base.ACTIVE_PROJECT[] = m["active_project"])
+    isempty(m["active_project"]) || unseen_path(m["active_project"]) || (Base.ACTIVE_PROJECT[] = m["active_project"])
     isdir(m["cwd"]) && cd(m["cwd"])
     for (k, v) in m["env"]; ENV[k] = v; end
     for k in m["env_removed"]; delete!(ENV, k); end
@@ -1295,6 +1303,10 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
     isempty(rebuilt) || push!(lines, short_list("rebuilt from source", rebuilt))
     isempty(exact) || push!(lines, short_list("restored exactly", exact))
     isempty(bindings) && push!(lines, "  (the previous kernel had no bindings)")
+    unseen = filter(unseen_path, unique!([String(m["active_project"]); String.(m["load_path"])]))
+    isempty(unseen) || push!(lines, "  The saved active project or LOAD_PATH named " * join(("`$p`" for p in unseen), ", ") *
+                                    ", which is not visible to this kernel (a new runtime generation or a removed checkout); " *
+                                    "the kernel keeps its own project.")
     push!(lines, "  Packages were loaded again, and LOAD_PATH, the active project, ENV and the working directory were restored. " *
                  "Other runtime state starts fresh: random number streams, settings changed inside packages, open handles. " *
                  "Files in the workspace are unchanged.")
