@@ -1,0 +1,9 @@
+{
+  "id": "teamlab",
+  "version": "0.1.0",
+  "source": "teamlab.jl",
+  "entrypoint": "teamlab",
+  "dependencies": [],
+  "requires": ["host_command"],
+  "description": "Team Lab content-addressed hot-reload tool shelf and cross-agent mailbox"
+}
