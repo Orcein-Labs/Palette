@@ -127,13 +127,13 @@ function serve_requests(@nospecialize(respond), requests::IO, @nospecialize(requ
             revival_pending = false
         end
         respond(resp)
-        # The model is reading the reply: save the state this call ended with.
-        # A request already waiting goes first, until five calls have gone unsaved.
-        if snapshot_call !== nothing
+        # The model is reading the reply: save the state this call ended with,
+        # and the checkpoint it asked for. A request already waiting goes first,
+        # until five calls have gone unsaved; a checkpoint does not wait.
+        if snapshot_call !== nothing || PENDING_CHECKPOINT[] !== nothing
             try
                 # Latest world: turn code defined methods (show, ==, enum names) since this loop began.
-                # A request that arrives meanwhile goes first, while the last saved state is recent.
-                Base.invokelatest(snapshot_state!, snapshot_call; waiting=request_waiting)
+                Base.invokelatest(save_end_of_call!, snapshot_call; waiting=request_waiting)
             catch e
                 println(stderr, "[saving the state after call $snapshot_call failed: ", first(sprint(showerror, e), 300), "]")
             end

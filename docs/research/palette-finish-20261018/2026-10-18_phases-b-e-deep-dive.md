@@ -45,10 +45,18 @@ Every capability builds on what the kernel already records, so the
       and each data group's sha256.
 5. **Economic metric.**
    - **Time to get back to a known-good world:** the kernel restart cost
-     (about 3 s warm) versus rerunning the analysis.
+     versus rerunning the analysis. Measured on the converge4 analysis
+     (2026-10-18): a restore takes 8.9 to 11.5 s end to end (host start
+     6.9 to 8.7 s, the prepared depot reused), an undo 11.4 s and a fork
+     10.2 s. The first call after a restore takes 3.9 s. Rerunning that
+     analysis takes under 0.01 s once compiled, so for it a restore is the
+     slower way back. A restore pays off when the world takes more than
+     about 10 s to rebuild, or cannot be rebuilt at all.
    - **Storage per checkpoint:** data files are hard-linked, since snapshot
      files are never modified after they are written. Include sources are
-     stored once per content hash.
+     stored once per content hash. Measured: 32 KB per checkpoint and 4 KB
+     per distinct source for the converge4 analysis. Saving one takes no
+     time the call can see (the checkpoint call took 0.05 s).
 6. **Correctness / safety boundary.**
    - A restore never claims an identity it did not check.
    - Workspace files are never rewritten; git owns files. A restored world
@@ -78,7 +86,18 @@ Every capability builds on what the kernel already records, so the
      checks Palette already has.
 9. **Product placement.** Palette, in the kernel and the host control. The
    Gesso roadmap explicitly keeps world snapshots out of Gesso.
-10. **Evidence status.** ENGINEERING CANDIDATE.
+10. **Evidence status.** MEASURED on one workload, 2026-10-18.
+    - The seven steps ran through Palette on the converge4 frame-time
+      analysis: digest `3e05fbdad263066c` before the break and after the
+      restore. Including the changed file again, undoing through the
+      automatic checkpoint (back to digest `7ee6ead301b57ab7`) and forking
+      also ran.
+    - `test_time_machine.py` covers the same steps on a small stand-in
+      analysis, plus the adversarial cases: a damaged checkpoint, a damaged
+      source copy, and code changed before the checkpoint.
+    - The demo found three defects, all fixed: false "stale" reports after
+      a restore, a `const` from an included file revived as a plain global,
+      and nested names for undo checkpoints. See the dogfood friction log.
 11. **Promotion rule.**
     - The seven-step demo passes on a real Luxel analysis, as an automated
       test plus a dogfood run.
@@ -105,15 +124,17 @@ Every capability builds on what the kernel already records, so the
   - The host writes `STATE_DIR/restore.json` and restarts the kernel.
   - Before revival, the starting kernel:
     1. verifies the checkpoint files' hashes;
-    2. saves the current snapshot as `auto-<time>-before-restore`;
+    2. saves the current snapshot as `auto-<time>-before-<name>`, or
+       `auto-<time>-before-undo` when it restores an automatic checkpoint;
     3. swaps the checkpoint's snapshot in, with the manifest as the commit
        point;
     4. updates `world.json`. A fork gets a new world id whose parent is the
        checkpoint.
-  - Revival replays an include from its blob when the workspace file differs
-    or is gone. Those definition entries are pinned to the blob's hash, so
-    later revivals keep running the checkpoint's code until the file is
-    included again.
+  - Revival replays a restored include from its blob, whatever the workspace
+    file holds now. The receipt says whether the workspace file is the same,
+    differs or is gone. Those definition entries are pinned to the blob's
+    hash, so later revivals keep running the checkpoint's code until the file
+    is included again.
   - The revival observation carries a `checkpoint` record with each identity
     and its verdict. That record is also appended to `world.json`'s history,
     which is the durable receipt.

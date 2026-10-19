@@ -24,6 +24,9 @@
 using Serialization
 
 const STATE_DIR = Ref("")
+
+read_json(path) = JSON.parse(read(path, String); dicttype=Dict{String, Any})
+file_sha(path) = bytes2hex(open(sha256, path))
 const REVIVAL_FORMAT = 2
 # Per binding (or group of bindings sharing data) and per snapshot; the
 # environment can lower them, as the tests do.
@@ -64,6 +67,7 @@ function revival_summary()
     for key in ("stale", "lost", "uncertain")
         summary[key] = [first(s, 240) for s in first(get(report, key, String[]), 6)]
     end
+    haskey(report, "checkpoint") && (summary["checkpoint"] = checkpoint_summary(report["checkpoint"]))
     summary["details"] = "Palette.revival()"
     return summary
 end
@@ -308,17 +312,20 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
     return
 end
 
-# Definition forms of an included file, as they are on disk now, with nested
-# includes resolved the same way.
-function file_definitions(path::String, depth::Int=0)
+# Definition forms of an included file, as they are on disk now (or in
+# `sources`, a checkpoint's copies by path), with nested includes resolved the
+# same way.
+function file_definitions(path::String, depth::Int=0; sources=nothing)
     depth > 8 && return Any[]
-    ex = Meta.parseall(read(path, String); filename=path)
+    text = sources !== nothing && haskey(sources, path) ? sources[path] : read(path, String)
+    ex = Meta.parseall(text; filename=path)
     out = Any[]
     for st in top_statements(ex)
         kind = definition_kind(st)
         if kind == "include"
             inner = abspath(dirname(path), st.args[2])
-            isfile(inner) && append!(out, file_definitions(inner, depth + 1))
+            (isfile(inner) || (sources !== nothing && haskey(sources, inner))) &&
+                append!(out, file_definitions(inner, depth + 1; sources))
         elseif kind in ("def", "using")
             push!(out, (path, st))
         end
@@ -604,7 +611,7 @@ function environment_identity()
     pkgs = sort!([string(k.name, "@", something(pkgversion(m), "stdlib"))
                   for (k, m) in Base.loaded_modules if k.uuid !== nothing])
     return Dict{String, Any}("julia" => string(VERSION),
-                             "manifest" => isfile(manifest) ? bytes2hex(sha256(read(manifest))) : "",
+                             "manifest" => isfile(manifest) ? file_sha(manifest) : "",
                              "packages" => pkgs)
 end
 
@@ -745,7 +752,8 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         name = string(sym)
         setcall = get(BINDING_SEEN, sym, (UInt(0), call))[2]
         b = Dict{String, Any}("name" => name, "type" => short_type(v), "call" => setcall,
-                              "const" => name in consts)
+                              # Asked of Julia: a const from an included file has no const entry.
+                              "const" => Base.invokelatest(isconst, mod, sym))
         b["origin"] = get(BINDING_ORIGINS, sym, Dict{String, Any}())
         own = v isa Function ? isdefined(typeof(v), :instance) && parentmodule(v) === mod && nameof(v) === sym :
               v isa Type && Base.unwrap_unionall(v) isa DataType && parentmodule(Base.unwrap_unionall(v)) === mod &&
@@ -868,7 +876,7 @@ of kernel-defined types deserialize only into a module of the same name.
 function revival_module_name()
     path = joinpath(STATE_DIR[], "manifest.json")
     isempty(STATE_DIR[]) || !isfile(path) ? nothing : try
-        m = JSON.parse(read(path, String); dicttype=Dict{String, Any})
+        m = read_json(path)
         get(m, "workspace", nothing) == WORKSPACE_ROOT[] ? String(m["module"]) : nothing
     catch
         nothing
@@ -911,7 +919,7 @@ function revive_state!()
             text=previous ? "[revival] No complete snapshot remains. Prior live state is lost; workspace files remain." : "")
     end
     m = try
-        JSON.parse(read(path, String); dicttype=Dict{String, Any})
+        read_json(path)
     catch e
         return revival_observation!(; lost=["previous bindings (snapshot inventory unreadable)"],
             uncertain=["previous binding inventory could not be established"],
@@ -943,15 +951,36 @@ function revive_state!()
     errors = Dict{String, String}()
     changed_files = Set{String}()
     pending = Any[]
+    # The latest include of a path is the code the world runs for it; an earlier
+    # one still replays (it may define names the latest no longer does), but only
+    # the latest says whether the file changed.
+    latest = Dict(e["path"] => e for e in m["definitions"] if e["kind"] == "include")
     for e in m["definitions"]
         e["kind"] == "const" && continue
         if e["kind"] == "include"
             p = e["path"]
+            superseded = latest[p] !== e
+            pinned = get(e, "pinned", nothing)
+            if pinned isa AbstractDict
+                # A restored checkpoint's include: its code is the checkpoint's
+                # copy, whatever the workspace file says now.
+                sources = pinned_sources(pinned)
+                if sources isa String
+                    foreach(n -> errors[n] = sources, e["names"])
+                    continue
+                end
+                for (file, st) in file_definitions(p; sources)
+                    push!(pending, (file, st, e))
+                end
+                continue
+            end
             if !isfile(p)
                 foreach(n -> errors[n] = "$(relpath(p, WORKSPACE_ROOT[])) is gone", e["names"])
                 continue
             end
-            ((e["stamp"] !== nothing && Tuple(e["stamp"]) != file_stamp(p)) || (get(e, "sha256", nothing) !== nothing && bytes2hex(sha256(read(p))) != e["sha256"])) && push!(changed_files, p)
+            superseded ||
+                ((e["stamp"] !== nothing && Tuple(e["stamp"]) != file_stamp(p)) || (get(e, "sha256", nothing) !== nothing && file_sha(p) != e["sha256"])) &&
+                push!(changed_files, p)
             for (file, st) in file_definitions(p)
                 push!(pending, (file, st, e))
             end
@@ -1037,6 +1066,9 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
     dir = STATE_DIR[]
     lines = String[]
     exact = String[]; rebuilt = String[]; approx = String[]; stale = String[]; lost = String[]
+    # Bindings found the same as when they were saved, for a restore's receipt.
+    same = Set{String}()
+    pins = pinned_files(m["definitions"])
     # Data, when this is the environment it was saved in.
     envnow = environment_identity()
     envthen = m["environment"]
@@ -1159,6 +1191,7 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(approx, "$(fmt_binding(b)): rebuilt from a file that changed since")
             else
                 push!(rebuilt, fmt_binding(b))
+                push!(same, n)
             end
         elseif cls == "import"
             changed = get(get(m, "workspace_packages", Dict()), n, nothing)
@@ -1168,11 +1201,12 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(approx, "$n (module): loaded again from workspace sources that changed since")
             else
                 push!(rebuilt, "$n (module)")
+                push!(same, n)
             end
         elseif cls == "data" && haskey(values, n)
             origin = get(b, "origin", Dict{String, Any}())
             sources = binding_sources(origin, b["call"])
-            changed_paths = [p for (p, evidence) in sources if source_changed(evidence; strong=true)]
+            changed_paths = [p for (p, evidence) in sources if world_source_changed(p, evidence, pins; strong=true)]
             origin["strong_stale_sources"] = changed_paths
             changed = [relpath(p, WORKSPACE_ROOT[]) for p in changed_paths]
             superseded = any(artifact_changed, get(origin, "artifacts", Dict{String, Any}[]))
@@ -1184,8 +1218,11 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(approx, "$(fmt_binding(b)): restored, but it refers to $(join(refers, ", ")), which is not the same as before")
             elseif isempty(changed)
                 push!(exact, fmt_binding(b))
+                push!(same, n)
             else
+                # The value is the one saved; the files it came from changed.
                 push!(stale, "$(fmt_binding(b)): $(join(changed, ", ")) changed since")
+                push!(same, n)
             end
         else
             r = get(b, "recipe", "")
@@ -1206,7 +1243,8 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
     empty!(DEFINITION_LOG)
     append!(DEFINITION_LOG, m["definitions"])
     for (p, s, c) in m["used_files"]
-        USED_FILES[p] = (Tuple(s), c)
+        # A pinned file's values came from the checkpoint copy the world runs.
+        haskey(pins, p) || (USED_FILES[p] = (Tuple(s), c))
     end
     for (n, b) in bindings
         sym = Symbol(n)
@@ -1222,9 +1260,17 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
         end
     end
 
-    push!(lines, "[revival] The previous kernel stopped. This kernel revived the state saved at the end of call $call" *
-                 (data_block === nothing ? "." : "; its data could not be restored because $data_block."))
-    last > call &&
+    restoring = RESTORE_INFO[] !== nothing && !haskey(RESTORE_INFO[], "error")
+    receipt = nothing
+    if restoring
+        receipt, receipt_lines = restore_receipt!(same, envthen, envnow)
+        append!(lines, receipt_lines)
+        data_block === nothing || push!(lines, "  Its data could not be restored because $data_block.")
+    else
+        push!(lines, "[revival] The previous kernel stopped. This kernel revived the state saved at the end of call $call" *
+                     (data_block === nothing ? "." : "; its data could not be restored because $data_block."))
+    end
+    !restoring && last > call &&
         push!(lines, "  $(uppercasefirst(calls_text(call + 1, last))) completed after this state was saved: " *
                      "what $(calls_pronoun(call + 1, last)) changed in the kernel is lost; files written to the workspace remain.")
     if stopped !== nothing
@@ -1248,7 +1294,9 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                  "Other runtime state starts fresh: random number streams, settings changed inside packages, open handles. " *
                  "Files in the workspace are unchanged.")
     uncertain = copy(approx)
-    last > call && push!(uncertain, "$(calls_text(call + 1, last)) completed after the saved snapshot")
+    !restoring && last > call && push!(uncertain, "$(calls_text(call + 1, last)) completed after the saved snapshot")
     stopped === nothing || push!(uncertain, "call $(stopped.call) stopped before it completed")
-    return revival_observation!(; restored=exact, rebuilt, stale, lost, uncertain, saved_call=call, text=join(lines, "\n"))
+    text = revival_observation!(; restored=exact, rebuilt, stale, lost, uncertain, saved_call=call, text=join(lines, "\n"))
+    receipt === nothing || (REVIVAL_OBSERVATION[]["checkpoint"] = receipt)
+    return text
 end

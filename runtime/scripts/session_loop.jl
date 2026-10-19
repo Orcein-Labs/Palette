@@ -133,6 +133,8 @@ Palette.workspace_package_first!(pwd())
 Palette.STATE_DIR[] = get(ENV, "PALETTE_STATE_DIR", "")
 Palette.INITIAL_ENV[] = Dict{String,String}(ENV)
 Palette.LOADABLE[] = Palette.loadable_packages()
+# A restore the host asked for swaps the checkpoint's snapshot in first.
+Palette.apply_pending_restore!()
 let name = Palette.revival_module_name()
     name === nothing || (Palette.GLOBAL_STATE[] = Palette.KernelState(Module(Symbol(name))))
     mod = Palette.get_kernel_state().eval_module
@@ -164,6 +166,7 @@ let state = Palette.get_kernel_state()
             text="[revival] The previous kernel stopped, and reviving its state failed ($(first(sprint(showerror, e), 200))). " *
                  "Partial reconstructed state may remain; inspect bindings. Files in the workspace remain.")
     end
+    Palette.REVIVAL_REPORT[] = Palette.restore_report(Palette.REVIVAL_REPORT[])
 end
 
 respond(Dict{String,Any}("kind" => "HELLO", "epoch" => EPOCH, "schema_revision" => 3,
