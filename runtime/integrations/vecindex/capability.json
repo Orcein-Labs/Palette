@@ -1,0 +1,9 @@
+{
+  "id": "vecindex",
+  "version": "0.1.0",
+  "source": "vecindex.jl",
+  "entrypoint": "vecindex",
+  "dependencies": [],
+  "requires": [],
+  "description": "Zero-allocation pure-Julia Contiguous-IVF and BLAS vector/subspace index with token/n-gram feature hashing and Pharos codegraph indexing"
+}
