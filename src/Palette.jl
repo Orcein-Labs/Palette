@@ -1806,11 +1806,6 @@ with `"lock": "/abs/file"` runs under an exclusive flock on that file, shared
 with work outside Palette (a GPU lock); the wait counts against its timeout.
 `host_commands()` lists the commands this session may run.
 
-`args` are read on the host. The kernel's `homedir()` (`/run/palette/home`)
-and `tempdir()` exist only inside the sandbox, so a path built from them
-names nothing the command can see; a path under a read root is the same on
-both sides.
-
 With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
 KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
 `cancelled` and `seconds`. With `wait=false` returns at once with a `job`

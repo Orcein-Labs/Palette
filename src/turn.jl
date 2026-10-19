@@ -776,14 +776,10 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
     call = length(state.execution_history) + 1
     # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
     # is the first one an agent pays for.
-    ctx = CALL_CONTEXT[]
-    budget = ctx === nothing ? nothing : ctx["budget"]
     costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "first_call_in_kernel" => isempty(TURN_COSTS),
-        "context" => context_name(ctx),
         "execution_seconds" => nothing, "compile_seconds" => nothing,
         "projection_seconds" => nothing, "serialization_seconds" => nothing, "worker_pipe_seconds" => nothing,
-        "gc_seconds" => nothing, "allocated_bytes" => nothing, "run_seconds" => nothing, "session_request" => session_request,
-        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. compile_seconds and gc_seconds are the parts of execution the process spent compiling and collecting garbage, in any task; allocated_bytes is process-wide too. run_seconds = execution - compile - GC. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
+        "limits" => "Execution includes parsing, lowering, import/compilation and bookkeeping. compile_seconds is the part of execution the process spent compiling, in any task. Completed response encoding and worker-pipe write/flush are queryable via Palette.costs(call) on a subsequent call; they exclude runtime/host/MCP delivery. Wall-clock observations include concurrent work.")
     TURN_COSTS[call] = costs
     retain!(TURN_COSTS, call)
     start_xray_record!(call, ctx)
@@ -798,18 +794,14 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
         refresh_workspace_packages!()
         costs["maintenance_seconds"] = (time_ns() - maintained) / 1e9
         costs["phase"] = "execution"
-        turn = run_turn(() -> with_context(ctx) do
+        turn = run_turn(() -> begin
             # Compile timing nests (it counts enables), so user code may still use @time.
             Base.cumulative_compile_timing(true)
             compiled = first(Base.cumulative_compile_time_ns())
-            gc0 = Base.gc_num()
             receipt = try
                 execute(ExecuteCode(code))
             finally
-                gc = Base.GC_Diff(Base.gc_num(), gc0)
                 costs["compile_seconds"] = (first(Base.cumulative_compile_time_ns()) - compiled) / 1e9
-                costs["gc_seconds"] = gc.total_time / 1e9
-                costs["allocated_bytes"] = gc.allocd
                 Base.cumulative_compile_timing(false)
             end
             costs["execution_seconds"] = receipt.duration_ms / 1000
@@ -821,11 +813,7 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
             costs["phase"] = "completed"
             receipt.result.success || (costs["failed_phase"] = "execution")
             receipt
-        end, limit_s; alloc_limit=budget === nothing ? nothing : budget["bytes"], tripped)
-        # The budget, not the request's own limit, stopped the call.
-        if turn[2] && budget !== nothing && (tripped[] === :bytes || limit_s != timeout_s)
-            costs["budget_exceeded"] = String(tripped[])
-        end
+        end, timeout_s)
         # An interrupt that execute() caught leaves its failed receipt and lets
         # the closure finish, so the phase it already recorded is the one to keep.
         turn[2] && get!(costs, "failed_phase", costs["phase"])

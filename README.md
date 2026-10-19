@@ -158,6 +158,11 @@ Pull requests run the process gates against the Rust host; both hosts run nightl
 The Python host is scheduled for removal ([authority](runtime/docs/authority.md)).
 The package manifest declares Julia 1.10+; supervised development and CI are tested on Julia 1.12.
 
+## Explanation for why not just IPython or IJulia or Jupyter
+
+The reason I developed this and didn't simply wrap one of these three, is that Jupyter and IJulia were engineered as chronological presentation layers for human eyes. They treat code execution as a linear notebook, forcing the runtime to store a historical text stream of every cell input and output. If you force an AI agent to use a Jupyter wrapper, it rapidly suffocates its own context window with its own debugging history. Palette.jl is not a notebook UI wrapper; it is a non-linear state architecture built natively for LLM runtimes. Paired with Pharos.jl, it separates code execution logs from semantic working memory. It allows an autonomous agent to spawn sandboxed sub-scopes, programmatically inspect the project's AST graph, and prune its variable footprint dynamically. I didn't build on Jupyter because you can't solve a non-linear, token-constrained machine-learning problem using a linear, human-centric logging protocol. Also, IPython is a scratchpad meant for humans to type lines sequentially. If you give an LLM an IPython cell, it kinda behaves like an automated chatbot trying to navigate a dark room by feeling the walls and there's a rake in the walkway for some reason. Prime-Agent does exceptionally well with IPython, but it showed where the operator surface friction still lives. 
+
+
 ## License
 
 Core: **AGPL-3.0-only**. Identified client/plugin packages and public docs:

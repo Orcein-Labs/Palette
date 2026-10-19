@@ -18,7 +18,6 @@ from source_transport import CONTEXT_SCHEMA, call_limit, normalize_palette_call,
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
 from provisioning import operator_ceiling, palette_version, protected_host_paths
 from runtime_registry import RuntimeRegistry
-import receipt_query
 import time_machine
 from patch_broker import PatchBroker, approval_mode
 from repair_broker import RepairBroker
@@ -414,11 +413,6 @@ def control(args):
         return prepare_session()
     if action == "checkpoints":
         return time_machine.list_checkpoints(STATE_DIR)
-    if action == "receipts":
-        # Call numbers restart in every kernel: call n means this kernel's unless an epoch is named.
-        epoch = args.get("epoch", hello.get("epoch") if hello and "call" in args else None)
-        return receipt_query.query(RECEIPTS_DIR, call=args.get("call"), epoch=epoch, kind=args.get("kind"),
-                                   since=args.get("since"), until=args.get("until"), limit=args.get("limit", 50))
     if action == "restore":
         # The next kernel saves the world it leaves, then revives the checkpoint.
         time_machine.request_restore(STATE_DIR, args.get("checkpoint"), args.get("fork", False))
@@ -439,10 +433,9 @@ def control(args):
 
 schema = {"type": "object", "properties": {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]}, "payload": {"oneOf": [
     {"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
-    "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS), **CONTEXT_SCHEMA}, "additionalProperties": False}
-control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "checkpoints", "restore", "receipts"]},
-    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "checkpoint": {"type": "string"}, "fork": {"type": "boolean"},
-    **receipt_query.QUERY_SCHEMA},
+    "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(TURN_LIMITS)}, "additionalProperties": False}
+control_schema = {"type": "object", "properties": {"action": {"enum": ["status", "prepare", "restart", "checkpoints", "restore"]},
+    "restore": {"type": "boolean"}, "prepare": {"type": "boolean"}, "checkpoint": {"type": "string"}, "fork": {"type": "boolean"}},
     "required": ["action"], "additionalProperties": False}
 
 
@@ -463,8 +456,8 @@ def main():
                     result = {}
                 elif method == "tools/list":
                     result = {"tools": [
-                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call traced (records the method each top-level call dispatched to, see Palette.xray), reference (registered reference implementations replace the fast ones), memoized, or budgeted (budget={seconds, bytes}); Palette.context!(name) sets a session default.", "inputSchema": schema},
-                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, restart, or go back to a checkpoint. restore=false starts a clean world and retires the previous snapshot without deleting workspace files; checkpoints are kept. prepare=false exercises the cold path. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the kernel in that checkpoint's world (fork=true makes it a new world), after saving the current world as an auto- checkpoint. action=receipts returns the host receipts of call=n (this kernel's, unless epoch is given; Palette.xray(n) shows its costs), or filters them by kind and since/until (unix seconds).", "inputSchema": control_schema}]}
+                        {"name": "palette", "description": "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival are wired; inspect restoration evidence after any epoch change. timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; Palette.host_command(name; wait=false) runs longer host work as a job.", "inputSchema": schema},
+                        {"name": "palette_control", "description": "Inspect preparation, prepare offline, restart, or go back to a checkpoint. restore=false starts a clean world and retires the previous snapshot without deleting workspace files; checkpoints are kept. prepare=false exercises the cold path. action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with checkpoint=name restarts the kernel in that checkpoint's world (fork=true makes it a new world), after saving the current world as an auto- checkpoint.", "inputSchema": control_schema}]}
                 elif method == "tools/call":
                     params = msg["params"]
                     args = params.get("arguments", {})
