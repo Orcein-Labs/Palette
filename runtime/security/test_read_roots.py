@@ -5,6 +5,7 @@ Mirrors runtime/host/src/sandbox.rs (parse_read_roots, check_read_roots).
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ import launch_worker  # noqa: E402
 class ReadRootsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="palette-read-roots-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         for name in ("data", "ws", "state", "home/depot", "repo", "project", "toolchain/bin"):
             (self.tmp / name).mkdir(parents=True)
 

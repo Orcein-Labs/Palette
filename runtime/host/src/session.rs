@@ -318,7 +318,7 @@ impl PaletteSession {
         setenv("PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette".into());
         setenv("PALETTE_TURN_TIMEOUT", util::fmt_g(o.turn_timeout));
         setenv("PALETTE_MAX_TURN_TIMEOUT", util::fmt_g(o.max_turn_timeout));
-        for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES"] {
+        for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS"] {
             if let Ok(v) = std::env::var(name) {
                 setenv(name, v);
             }

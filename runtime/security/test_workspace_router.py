@@ -27,6 +27,9 @@ class WorkspaceRouterIntegration(unittest.TestCase):
     def setUp(self):
         self.assertTrue(HOST.is_file(), "Build release palette-host before running integration tests")
 
+        # Registered at once: a setUp that fails later skips tearDown, and the
+        # router's package store is hundreds of MB.
+        self.addCleanup(self.close)
         self.tmp = tempfile.TemporaryDirectory(prefix="palette-workspace-router-")
         root = Path(self.tmp.name)
         self.workspace = root / "project"
@@ -67,7 +70,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
             env=self.env,
         )
 
-    def tearDown(self):
+    def close(self):
         if getattr(self, "proc", None):
             try:
                 self.proc.stdin.close()

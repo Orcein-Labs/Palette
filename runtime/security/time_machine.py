@@ -4,11 +4,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import uuid
 
 from generation_runtime import _atomic_json
 
 CHECKPOINT_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")   # as CHECKPOINT_NAME in src/time_machine.jl
 KEPT_ACROSS_FRESH_WORLDS = ("checkpoints", "blobs")
+KEPT_RETIRED_WORLDS = 3
 
 
 def list_checkpoints(state_dir):
@@ -44,6 +47,23 @@ def request_restore(state_dir, checkpoint, fork=False):
         names = [r["name"] for r in list_checkpoints(state_dir)["checkpoints"]]
         raise ValueError(f"no checkpoint is named {checkpoint!r}; checkpoints: {', '.join(names) or 'none'}")
     _atomic_json(state_dir / "restore.json", {"checkpoint": checkpoint, "fork": fork})
+
+
+def retire_world(state_dir):
+    """Moves the world aside for a fresh one, which keeps its checkpoints, and
+    removes all but the newest KEPT_RETIRED_WORLDS worlds retired before.
+    Returns the path the world was moved to."""
+    state_dir = Path(state_dir)
+    prefix = state_dir.name + ".retired-"
+    retired = state_dir.with_name(prefix + uuid.uuid4().hex)
+    os.replace(state_dir, retired)
+    carry_checkpoints(retired, state_dir)
+    worlds = sorted((p for p in state_dir.parent.iterdir() if p.name.startswith(prefix) and p.is_dir()),
+                    key=lambda p: p.stat().st_mtime)
+    for p in worlds[:-KEPT_RETIRED_WORLDS]:
+        if p != retired:
+            shutil.rmtree(p, ignore_errors=True)
+    return str(retired)
 
 
 def carry_checkpoints(retired, state_dir):

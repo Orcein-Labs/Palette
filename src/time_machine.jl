@@ -17,6 +17,9 @@
 const TIME_MACHINE_FORMAT = 1
 const CHECKPOINT_NAME = r"^[A-Za-z0-9._-]{1,64}$"   # as CHECKPOINT_NAME in time_machine.py
 const MAX_WORLD_HISTORY = 200
+# Automatic checkpoints a restore keeps: the oldest beyond this are removed. At
+# least 1, so the restore's own undo checkpoint survives.
+max_auto_checkpoints() = max(1, something(tryparse(Int, get(ENV, "PALETTE_AUTO_CHECKPOINTS", "")), 5))
 # (name, note, call) of the checkpoint the current call asked for.
 const PENDING_CHECKPOINT = Ref{Union{Nothing, Tuple{String, String, Int}}}(nothing)
 # What the next call is told about the checkpoint the last one asked for.
@@ -252,8 +255,15 @@ function forget_checkpoint(name::AbstractString)
     dir = joinpath(checkpoints_dir(), name)
     isdir(dir) || error("no checkpoint is named `$name`")
     rm(dir; recursive=true)
+    removed = remove_unused_blobs!(DEFINITION_LOG)
+    return "checkpoint `$name` removed, and $removed copied source$(removed == 1 ? "" : "s") no longer used"
+end
+
+# Removes each copied source that no checkpoint and none of `definitions` pins;
+# returns how many.
+function remove_unused_blobs!(definitions)
     used = Set{String}(sha for r in checkpoint_records() for i in r["includes"] for sha in values(i["files"]))
-    for e in DEFINITION_LOG
+    for e in definitions
         pinned = get(e, "pinned", nothing)
         pinned isa AbstractDict && union!(used, values(pinned))
     end
@@ -264,7 +274,22 @@ function forget_checkpoint(name::AbstractString)
             f in used || (rm(joinpath(blobs, f); force=true); removed += 1)
         end
     end
-    return "checkpoint `$name` removed, and $removed copied source$(removed == 1 ? "" : "s") no longer used"
+    return removed
+end
+
+# Removes the automatic checkpoints beyond the newest max_auto_checkpoints(),
+# never `restored`, with the copies only they used, and any checkpoint a
+# crash left half-written. Returns the names removed.
+function prune_auto_checkpoints!(restored::String, definitions)
+    root = checkpoints_dir()
+    isdir(root) || return String[]
+    foreach(n -> rm(joinpath(root, n); recursive=true), filter(n -> endswith(n, ".partial"), readdir(root)))
+    autos = [r["name"] for r in checkpoint_records() if startswith(r["name"], "auto-") && r["name"] != restored]
+    old = autos[1:max(0, length(autos) - max_auto_checkpoints())]
+    isempty(old) && return old
+    foreach(n -> rm(joinpath(root, n); recursive=true), old)
+    remove_unused_blobs!(definitions)
+    return old
 end
 
 # --- restore -------------------------------------------------------------
@@ -276,7 +301,8 @@ Run by a starting kernel before revival. When the host asked for a restore,
 saves the current snapshot as `auto-<time>-before-<name>` (`-before-undo`
 when it restores an automatic one), swaps the
 checkpoint's snapshot in, and records the restore in RESTORE_INFO; revival
-then rebuilds it. On any failure the current snapshot stays as it was, and
+then rebuilds it. Only the newest `PALETTE_AUTO_CHECKPOINTS` (default 5)
+automatic checkpoints are kept. On any failure the current snapshot stays as it was, and
 RESTORE_INFO says why.
 """
 function apply_pending_restore!()
@@ -348,6 +374,8 @@ function swap_in_checkpoint!(name::String, fork::Bool)
     for f in readdir(dir)
         startswith(f, "data-") && !(f in keep) && rm(joinpath(dir, f); force=true)
     end
+    # Clean-up only: the restore has already happened and must not fail on it.
+    pruned = try prune_auto_checkpoints!(name, m["definitions"]) catch; String[] end
     old = world_record()
     if fork
         w = new_world(Dict{String, Any}("world" => old["id"], "checkpoint" => name, "call" => record["call"]))
@@ -355,7 +383,8 @@ function swap_in_checkpoint!(name::String, fork::Bool)
         write_state_file!(dir, "world.json", JSON.json(w))
     end
     return Dict{String, Any}("checkpoint" => name, "fork" => fork, "call" => record["call"], "record" => record,
-                             "saved_before_restore" => saved, "previous_world" => old["id"], "world" => world_record()["id"])
+                             "saved_before_restore" => saved, "pruned" => pruned, "previous_world" => old["id"],
+                             "world" => world_record()["id"])
 end
 
 # The checkpoint's source texts by path, or why they cannot be read.
@@ -420,6 +449,9 @@ function restore_receipt!(same::Set{String}, envthen, envnow)
                                      "so they were not changed): $(join(differs, ", ")). include() one again to use the workspace version.")
     info["saved_before_restore"] === nothing ||
         push!(lines, "  The world it replaced is checkpoint `$(info["saved_before_restore"])`; restoring that undoes this.")
+    pruned = get(info, "pruned", String[])
+    isempty(pruned) || push!(lines, "  Removed the oldest automatic checkpoint$(length(pruned) == 1 ? "" : "s") " *
+                                    "($(join(pruned, ", "))); the newest $(max_auto_checkpoints()) are kept.")
     return receipt, lines
 end
 
