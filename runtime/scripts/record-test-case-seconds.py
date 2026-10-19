@@ -2,7 +2,8 @@
 """Record how long each test case took in CI, for verify_operator.py --shard.
 
 Reads the job logs of a security-suite run (for example
-`gh api repos/OWNER/REPO/actions/jobs/ID/logs > shard1.log`) and merges each
+`gh api --allow-escape-sequences repos/OWNER/REPO/actions/jobs/ID/logs > shard1.log`;
+without the flag gh writes an empty log) and merges each
 case's seconds into runtime/security/test-case-seconds.json. Both hosts share
 a case's record. A case's time runs
 from the end of the case before it, or from the start of its suite, so the first
