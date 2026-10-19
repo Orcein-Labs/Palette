@@ -301,7 +301,8 @@ class PaletteSession:
 
     def turn(self, code: str, *, ephemeral: bool = False, ephemeral_ceiling: dict | None = None,
              payload: str | dict[str, str] | None = None, include_map: bool = False,
-             digest: bool = True, timeout_s: float | None = None) -> dict:
+             digest: bool = True, timeout_s: float | None = None, context: str | None = None,
+             budget: dict | None = None) -> dict:
         """Send one script to the persistent worker and block for its one
         response. Raises SessionDeadError if the process is gone -- never
         silently relaunches; a new process would mean a new epoch, i.e. a
@@ -323,6 +324,10 @@ class PaletteSession:
 
         `timeout_s` is this call's limit, `turn_timeout` when None or the
         call is ephemeral; the caller keeps it within `max_turn_timeout`.
+
+        `context` names the execution context this call runs in, and `budget`
+        ({"seconds", "bytes"}) its limits when that context is budgeted; both
+        are passed to the kernel unchanged.
 
         The worker enforces the limit itself: it interrupts a turn that
         is waiting (sleep, a subprocess, I/O) and keeps the kernel. This call
@@ -352,6 +357,10 @@ class PaletteSession:
                 req["map"] = True
             if not digest:
                 req["digest"] = False
+            if context is not None:
+                req["context"] = context
+            if budget is not None:
+                req["budget"] = budget
             try:
                 self._proc.stdin.write(json.dumps(req) + "\n")
                 self._proc.stdin.flush()
