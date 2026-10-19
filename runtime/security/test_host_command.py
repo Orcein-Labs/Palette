@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import shutil
 import socket
 import sys
 import tempfile
@@ -82,6 +83,7 @@ class HostCommandParity:
         if self.Broker is RustBroker and not (HOST_BIN and Path(HOST_BIN).is_file()):
             raise unittest.SkipTest("no palette-host binary (set PALETTE_HOST_BIN)")
         self.tmp = Path(tempfile.mkdtemp(prefix="palette-hostcmd-")).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         for fifo in ("go", "started", "long-ready"):
             os.mkfifo(self.tmp / fifo)
         d = str(self.tmp)
