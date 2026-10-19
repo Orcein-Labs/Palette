@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,7 @@ from broker import Broker  # noqa: E402
 class FsDigestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="fs-digest-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.receipts = os.path.join(self.tmp, "receipts.jsonl")
         self.dir = os.path.join(self.tmp, "scoped")
         os.makedirs(self.dir)

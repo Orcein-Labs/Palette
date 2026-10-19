@@ -14,6 +14,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -152,6 +153,31 @@ class TimeMachineTest(KernelTestCase):
         # A call that fails still completes: its state, and the checkpoint, are saved.
         self.assertIn("Saved checkpoint `boom`", r[1]["output"])
 
+    def test_unchanged_data_shares_one_file_with_checkpoints(self):
+        self.session('big = collect(1:10_000); small = 1', 'Palette.checkpoint("a")', 'small = 2')
+        data = {tuple(g["names"]): g["file"] for g in self.manifest()["data"]}
+        live = Path(self.state, data[("big",)])
+        kept = Path(self.state, "checkpoints", "a", data[("big",)])
+        # `big` did not change after the checkpoint, so both name the same file, one inode.
+        self.assertEqual(live.stat().st_ino, kept.stat().st_ino)
+        self.assertEqual(sorted(p.name for p in Path(self.state).glob("data-*")), sorted(data.values()))
+
+    def test_restores_keep_only_the_newest_automatic_checkpoints(self):
+        self.good_then_broken()
+        env = {"PALETTE_AUTO_CHECKPOINTS": "2"}
+        for _ in range(3):
+            time_machine.request_restore(self.state, "good")
+            out, r = self.revive("nothing", env=env)
+            self.assertTrue(r["success"], r)
+        autos = [n for n in self.checkpoint_names() if n.startswith("auto-")]
+        self.assertEqual(len(autos), 2, autos)
+        self.assertIn("Removed the oldest automatic checkpoint", out)
+        self.assertIn("good", self.checkpoint_names())   # named checkpoints are never pruned
+        # Each kept checkpoint is still whole.
+        time_machine.request_restore(self.state, autos[0])
+        out, r = self.revive("summarize(data)", env=env)
+        self.assertEqual(r["data"], 3.0, out)
+
 
 class CarryCheckpointsTest(unittest.TestCase):
     def test_fresh_world_keeps_checkpoints(self):
@@ -164,6 +190,23 @@ class CarryCheckpointsTest(unittest.TestCase):
             time_machine.carry_checkpoints(old, new)
             self.assertEqual(sorted(p.name for p in new.iterdir()), ["blobs", "checkpoints"])
             self.assertEqual([c["name"] for c in time_machine.list_checkpoints(new)["checkpoints"]], ["a"])
+
+
+class RetireWorldTest(unittest.TestCase):
+    def test_keeps_checkpoints_and_the_newest_retired_worlds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp, "world")
+            for age in range(4):
+                old = Path(tmp, f"world.retired-{age}")
+                old.mkdir()
+                os.utime(old, (1_000_000 + age, 1_000_000 + age))
+            (state / "checkpoints" / "a").mkdir(parents=True)
+            (state / "manifest.json").write_text("{}")
+            retired = Path(time_machine.retire_world(state))
+            self.assertTrue((retired / "manifest.json").is_file())
+            self.assertEqual([p.name for p in state.iterdir()], ["checkpoints"])
+            kept = {p.name for p in Path(tmp).iterdir() if ".retired-" in p.name}
+            self.assertEqual(kept, {retired.name, "world.retired-2", "world.retired-3"})   # the oldest two went
 
 
 if __name__ == "__main__":
