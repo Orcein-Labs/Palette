@@ -50,16 +50,20 @@ function _default_integrations_dir()::String
     return normpath(joinpath(@__DIR__, ".."))
 end
 
+"""
+    default_teamlab_dir()
+
+`PALETTE_TEAMLAB_DIR` when set (the sandbox binds it writable and identical for
+every agent's worlds). Otherwise a per-sandbox temp directory, which is *not*
+shared across agents; `teamlab(status)` reports this as `shared => false`.
+"""
 function default_teamlab_dir()::String
     env_dir = strip(get(ENV, "PALETTE_TEAMLAB_DIR", ""))
-    !isempty(env_dir) && return env_dir
-    repo_root = normpath(joinpath(_default_integrations_dir(), "..", ".."))
-    cwd = abspath(pwd())
-    if !startswith(cwd, repo_root) && !isdir(joinpath(cwd, ".git"))
-        return joinpath(cwd, ".palette_teamlab")
-    end
-    return joinpath(tempdir(), "palette_teamlab_shared")
+    !isempty(env_dir) && return String(env_dir)
+    return joinpath(tempdir(), "palette_teamlab_local")
 end
+
+teamlab_is_shared() = !isempty(strip(get(ENV, "PALETTE_TEAMLAB_DIR", "")))
 
 function _ensure_lab_dirs(lab_dir::AbstractString)
     mkpath(lab_dir)
@@ -443,6 +447,7 @@ function _teamlab_status(lab_dir::AbstractString)
         "capability" => "teamlab",
         "version" => _TEAMLAB_VERSION,
         "lab_dir" => String(lab_dir),
+        "shared" => teamlab_is_shared() && abspath(lab_dir) == abspath(default_teamlab_dir()),
         "tools_on_shelf" => tools_info,
         "total_messages" => length(st.messages),
     )
