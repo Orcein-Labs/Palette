@@ -146,6 +146,9 @@ pub struct Broker {
     host_bridge: Mutex<Option<HostBridge>>,
     log_lock: Mutex<()>,
     depot_lock: Mutex<()>,
+    // The session_request ("<epoch>:<request id>") of the kernel call being
+    // served, stamped on every receipt written while it is set.
+    in_flight: Mutex<Option<String>>,
     // host_command jobs started with action "start"; dropping the broker
     // (the session ending) kills any still running.
     jobs: Mutex<BTreeMap<String, HostJobEntry>>,
@@ -258,7 +261,7 @@ fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
     if roots.is_empty() {
         return Ok(roots);
     }
-    let mut protected = vec![c.receipt_log_path.clone()];
+    let mut protected = vec![c.receipt_log_path.clone(), calls_log_path(&c.receipt_log_path)];
     protected.extend(c.repo_dir.iter().map(PathBuf::from));
     protected.extend(c.package_depot_dir.as_deref().and_then(|d| Path::new(d).parent()).map(Path::to_path_buf));
     protected.extend(util::installed_checkout());
@@ -301,12 +304,26 @@ impl Broker {
             host_bridge: Mutex::new(None),
             log_lock: Mutex::new(()),
             depot_lock: Mutex::new(()),
+            in_flight: Mutex::new(None),
             jobs: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub fn set_host_bridge(&self, bridge: HostBridge) {
         *self.host_bridge.lock().unwrap() = Some(bridge);
+    }
+
+    pub fn set_in_flight(&self, r: Option<String>) {
+        *self.in_flight.lock().unwrap() = r;
+    }
+
+    pub fn calls_log_path(&self) -> PathBuf {
+        calls_log_path(&self.receipt_log_path)
+    }
+
+    pub fn record_call(&self, rec: Value) -> std::io::Result<()> {
+        let _g = self.log_lock.lock().unwrap();
+        append_line(&self.calls_log_path(), &rec)
     }
 
     fn cap(&self, category: &str) -> Option<Map<String, Value>> {
@@ -409,7 +426,7 @@ impl Broker {
         // prepared cache, but run the installer in its own filesystem (and,
         // when offline, network) namespace with only the durable store writable.
         let store = Path::new(depot).parent().ok_or_else(|| Internal("package depot has no store root".into()))?;
-        let mut protected_paths = vec![self.receipt_log_path.clone()];
+        let mut protected_paths = vec![self.receipt_log_path.clone(), self.calls_log_path()];
         for path in [&self.project_dir, &self.repo_dir].into_iter().flatten() {
             protected_paths.push(PathBuf::from(path));
         }
@@ -778,15 +795,30 @@ impl Broker {
 
     fn write_receipt(&self, req_id: &Value, category: &Value, params: &Value, approved: bool, result: &Value, reason: &Value)
         -> std::io::Result<()> {
+        let session_request = self.in_flight.lock().unwrap().clone();
         let receipt = json!({
             "receipt_id": util::uuid4(), "request_id": req_id, "session_id": self.session_id,
+            "session_request": session_request,
             "timestamp": util::now_secs(), "category": category, "params": params,
             "approved": approved, "result": result, "reason": reason,
         });
         let _g = self.log_lock.lock().unwrap();
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.receipt_log_path)?;
-        writeln!(f, "{receipt}")
+        append_line(&self.receipt_log_path, &receipt)
     }
+}
+
+/// One line per kernel call, beside the receipts: the index that joins a
+/// call to the receipts stamped with its session_request.
+fn calls_log_path(receipt_log: &Path) -> PathBuf {
+    receipt_log.with_file_name("calls.jsonl")
+}
+
+/// Appends `v` as one JSON line in a single write, so a concurrent reader
+/// never sees part of it.
+fn append_line(path: &Path, v: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(v).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    OpenOptions::new().create(true).append(true).open(path)?.write_all(&line)
 }
 
 /// Stream a file through SHA-256 in 1 MiB chunks, as the Python broker does,
@@ -1392,6 +1424,53 @@ mod tests {
             .collect();
         assert!(outcomes.contains(&true));
         assert!(outcomes.contains(&false));
+    }
+
+    #[test]
+    fn receipts_carry_the_call_in_flight_then_null() {
+        let t = tmpdir("in-flight");
+        let receipts = t.0.join("receipts.jsonl");
+        let b = broker(json!({}), &receipts);
+        // An unknown category is denied, and still receipted.
+        let unknown = json!({"category": "no_such_category", "params": {}});
+        b.set_in_flight(Some("7:3".into()));
+        b.handle_request(&unknown);
+        b.set_in_flight(None);
+        b.handle_request(&unknown);
+        let text = fs::read_to_string(&receipts).unwrap();
+        let rs: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0]["session_request"], json!("7:3"));
+        assert_eq!(rs[1]["session_request"], Value::Null);
+    }
+
+    #[test]
+    fn record_call_appends_beside_the_receipts() {
+        let t = tmpdir("calls-log");
+        let receipts = t.0.join("receipts.jsonl");
+        let b = broker(json!({}), &receipts);
+        assert_eq!(b.calls_log_path(), t.0.join("calls.jsonl"));
+        b.record_call(json!({"session_request": "1:1", "call": 1})).unwrap();
+        b.record_call(json!({"session_request": "1:2", "call": null})).unwrap();
+        let text = fs::read_to_string(t.0.join("calls.jsonl")).unwrap();
+        let rs: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0]["session_request"], json!("1:1"));
+        assert_eq!(rs[1]["call"], Value::Null);
+    }
+
+    #[test]
+    fn the_calls_log_is_protected_like_the_receipts() {
+        let t = tmpdir("calls-protected");
+        let receipts = t.0.join("receipts.jsonl");
+        let calls = t.0.join("calls.jsonl");
+        let e = Broker::new(BrokerConfig {
+            ceiling: json!({"external_fs_write": {"allowed_dirs": [calls.to_str().unwrap()]}}),
+            receipt_log_path: receipts, session_id: "test".into(),
+            package_depot_dir: None, package_environment_dir: None, project_dir: None, repo_dir: None,
+            trusted_files: vec![], child_timeout: Duration::from_secs(90),
+        }).err().expect("an allowed_dir holding the calls log was accepted");
+        assert!(e.contains("overlaps the protected host path"), "{e}");
     }
 
     fn cmd_broker(dir: &Path, commands: Value) -> Broker {

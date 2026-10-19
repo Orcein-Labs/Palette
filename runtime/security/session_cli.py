@@ -20,9 +20,11 @@ simple to spawn, simple to pipe, no new transport to build.
 
 Protocol (all newline-delimited JSON):
 
-  Request:   {"request_id": "...", "code": "...", "ephemeral": bool?, "ceiling": {...}?, "payload": str | {name: str}?}
+  Request:   {"request_id": "...", "code": "...", "ephemeral": bool?, "ceiling": {...}?, "payload": str | {name: str}?,
+              "context": str?, "budget": {"seconds": n, "bytes": n}?}
   Response:  {"request_id": "...", "success": bool, "data": ..., "display": str?, "output": str?,
-              "error": ..., "epoch": "...", "interrupted": bool, "call": int?, "bindings": [str]?, "session_dead": true?}
+              "error": ..., "epoch": "...", "interrupted": bool, "call": int?, "bindings": [str]?, "context": str?,
+              "session_dead": true?}
              `call` numbers a persistent turn; Palette.output(call) returns everything it printed.
   HELLO:     {"kind": "HELLO", "epoch": "...", "session_id": "..."}  -- printed once, at startup
 
@@ -265,6 +267,14 @@ def main() -> int:
                           "error": "request 'timeout_s' does not apply to an ephemeral call: its broker child "
                                    "is bounded by the session's --turn-timeout"})
                 continue
+            context_error = next((
+                f"request '{field}' must be {kind}" if not isinstance(req[field], expected) else
+                f"request '{field}' does not apply to an ephemeral call: a scratch worker always runs in the normal context"
+                for field, kind, expected in (("context", "a string", str), ("budget", "an object", dict))
+                if req.get(field) is not None and (not isinstance(req[field], expected) or req.get("ephemeral"))), None)
+            if context_error:
+                _respond({"request_id": request_id, "success": False, "data": None, "error": context_error})
+                continue
             limit = args.turn_timeout if limit is None else float(limit)
             bridge.timeout = _bridge_timeout(limit)
 
@@ -277,6 +287,8 @@ def main() -> int:
                     include_map=req.get("map") is True,
                     digest=req.get("digest") is not False,
                     timeout_s=limit,
+                    context=req.get("context"),
+                    budget=req.get("budget"),
                 )
                 _respond({
                     "request_id": request_id,
@@ -292,6 +304,7 @@ def main() -> int:
                     "revival": result.get("revival"),
                     "reloads": result.get("reloads"),
                     "costs": result.get("costs"),
+                    "context": result.get("context"),
                     "transport_shortened": result.get("transport_shortened"),
                 })
             except SessionDeadError as e:

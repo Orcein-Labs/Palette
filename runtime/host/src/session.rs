@@ -60,6 +60,10 @@ pub struct Turn<'a> {
     pub digest: bool,
     /// This call's limit; the session's turn_timeout when None.
     pub timeout_s: Option<f64>,
+    /// The execution context this call runs in; the kernel validates the name.
+    pub context: Option<Value>,
+    /// budgeted context limits: {seconds, bytes}.
+    pub budget: Option<Value>,
 }
 
 pub struct PaletteSession {
@@ -114,6 +118,15 @@ impl PaletteCleanser {
 enum Wait {
     Stopped,
     TimedOut,
+}
+
+/// Clears the broker's in-flight call on every way out of a turn.
+struct InFlight(Arc<Broker>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.set_in_flight(None);
+    }
 }
 
 fn dead(msg: impl Into<String>) -> SessionError {
@@ -441,7 +454,10 @@ impl PaletteSession {
         let limit = if t.ephemeral { self.turn_timeout } else { t.timeout_s.unwrap_or(self.turn_timeout) };
         self.next_request_id += 1;
         let request_id = self.next_request_id.to_string();
-        let mut req = json!({"request_id": request_id, "kind": if t.ephemeral { "EPHEMERAL" } else { "EXECUTE" },
+        // Call numbers restart in every kernel, so the join key carries the epoch.
+        let session_request = format!("{}:{}", self.epoch, request_id);
+        let kind = if t.ephemeral { "EPHEMERAL" } else { "EXECUTE" };
+        let mut req = json!({"request_id": request_id, "session_request": session_request, "kind": kind,
                              "code": t.code, "timeout_s": limit});
         if t.ephemeral {
             if let Some(c) = t.ephemeral_ceiling {
@@ -457,6 +473,15 @@ impl PaletteSession {
         if !t.digest {
             req["digest"] = json!(false);
         }
+        if let Some(c) = &t.context {
+            req["context"] = c.clone();
+        }
+        if let Some(b) = &t.budget {
+            req["budget"] = b.clone();
+        }
+        let started = util::now_secs();
+        self.broker.set_in_flight(Some(session_request.clone()));
+        let _in_flight = InFlight(self.broker.clone());
         let write = self.stdin.as_mut().ok_or_else(|| dead("stdin closed")).and_then(|w| {
             writeln!(w, "{req}").and_then(|_| w.flush()).map_err(|e| dead(format!("session {} pipe broke: {e}", self.session_id)))
         });
@@ -498,6 +523,17 @@ impl PaletteSession {
         }
         if resp.get("request_id").and_then(Value::as_str) != Some(request_id.as_str()) {
             return Err(SessionError::Protocol(format!("response request_id {} != sent '{request_id}'", resp.get("request_id").unwrap_or(&Value::Null))));
+        }
+        // An index, not an effect: a call record that cannot be written does not fail the call.
+        // The context is the kernel's (a session default is known only to it); every receipt
+        // the call caused reaches it through session_request.
+        if let Err(e) = self.broker.record_call(json!({
+            "session_id": self.session_id, "epoch": self.epoch, "session_request": session_request, "kind": kind,
+            "call": resp.get("call").cloned().unwrap_or(Value::Null), "started": started, "finished": util::now_secs(),
+            "success": resp.get("success").and_then(Value::as_bool).unwrap_or(false),
+            "context": resp.pointer("/costs/context").cloned().unwrap_or(Value::Null),
+        })) {
+            eprintln!("palette-host: call record for {session_request} not recorded: {e}");
         }
         if resp.get("kernel_exit").and_then(Value::as_bool).unwrap_or(false) {
             // The worker answered and then exited on purpose; waiting here

@@ -37,19 +37,21 @@ PROJECT_DIR = os.environ.get("PALETTE_TEST_PROJECT_DIR", str(Path.home() / ".pal
 class Kernel:
     """One session_cli process: one kernel, over the given workspace and state directory."""
 
-    def __init__(self, workspace: str, state: str, timeout: float = 20, env: dict | None = None):
+    def __init__(self, workspace: str, state: str, timeout: float = 20, env: dict | None = None,
+                 extra_args: list[str] | None = None, ceiling: dict | None = None):
         self.proc = subprocess.Popen(
-            [*session_cmd(), "--repo-dir", str(Path(__file__).resolve().parents[2]), "--project-dir", PROJECT_DIR, "--ceiling", "{}", "--workspace-dir", workspace,
-             "--turn-timeout", str(timeout), "--state-dir", state],
+            [*session_cmd(), "--repo-dir", str(Path(__file__).resolve().parents[2]), "--project-dir", PROJECT_DIR, "--ceiling", json.dumps(ceiling or {}), "--workspace-dir", workspace,
+             "--turn-timeout", str(timeout), "--state-dir", state, *(extra_args or [])],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
             env={**os.environ, **(env or {})},
         )
         self.hello = json.loads(self.proc.stdout.readline())
         self.n = 0
 
-    def turn(self, code: str) -> dict:
+    def turn(self, code: str, **fields) -> dict:
+        """One call; `fields` are further request fields (context, budget, timeout_s, ...)."""
         self.n += 1
-        self.proc.stdin.write(json.dumps({"request_id": str(self.n), "code": code}) + "\n")
+        self.proc.stdin.write(json.dumps({"request_id": str(self.n), "code": code, **fields}) + "\n")
         self.proc.stdin.flush()
         line = self.proc.stdout.readline()
         assert line, "no reply"
