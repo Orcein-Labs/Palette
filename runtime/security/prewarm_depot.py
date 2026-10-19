@@ -121,14 +121,15 @@ def process_start(pid: int) -> str:
 
 
 def prepare(project_dir: str, repo_dir: str, *, state_dir: str | None = None,
-            host_bin: str | None = None, force: bool = False) -> dict:
+            host_bin: str | None = None, force: bool = False, timeout_s: float | None = None) -> dict:
     with tempfile.TemporaryDirectory(prefix="palette-prewarm-") as workspace:
         return _prepare_in_workspace(project_dir, repo_dir, workspace, state_dir=state_dir,
-                                     host_bin=host_bin, force=force)
+                                     host_bin=host_bin, force=force, timeout_s=timeout_s)
 
 
 def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, state_dir: str | None = None,
-                          host_bin: str | None = None, force: bool = False) -> dict:
+                          host_bin: str | None = None, force: bool = False,
+                          timeout_s: float | None = None) -> dict:
     julia_bin = resolve_real_julia_binary()
     identity = preparation_identity(project_dir, repo_dir, julia_bin)
     path = preparation_path(identity, state_dir)
@@ -163,8 +164,17 @@ def _prepare_in_workspace(project_dir: str, repo_dir: str, workspace: str, *, st
                     package_store_root=package_root, package_depot_dir=package_depot,
                     package_environment_dir=package_environment)
                 argv += ["--", julia_bin, "--startup-file=no", "-e", PREWARM]
-            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True)
-            record.update(state="prepared" if result.returncode == 0 else "failed",
+            timed_out = False
+            try:
+                result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout_s)
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                # A hung prewarm otherwise ends as a cancelled CI step with no output at all.
+                # The partial output is bytes even in text mode.
+                out, err = (t.decode(errors="replace") if isinstance(t, bytes) else (t or "") for t in (exc.stdout, exc.stderr))
+                result = subprocess.CompletedProcess(argv, -9, out, f"prewarm did not finish in {timeout_s:g} s; "
+                                                     f"its output so far:\n{err or out}")
+            record.update(state="prepared" if result.returncode == 0 else "failed", timed_out=timed_out,
                           returncode=result.returncode, output=result.stdout, stderr=result.stderr,
                           error=None if result.returncode == 0 else error_summary(result.stderr or result.stdout))
             loaded_caches = next((json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
@@ -199,11 +209,12 @@ def main() -> int:
     ap.add_argument("--host-bin")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--timeout-s", type=float, help="fail, with the output so far, after this long")
     args = ap.parse_args()
     record = (preparation_status(preparation_identity(args.project_dir, args.repo_dir,
                   resolve_real_julia_binary()), args.state_dir) if args.status else
               prepare(args.project_dir, args.repo_dir, state_dir=args.state_dir,
-                      host_bin=args.host_bin, force=args.force))
+                      host_bin=args.host_bin, force=args.force, timeout_s=args.timeout_s))
     # The record file keeps Julia's full output; the printed record names that
     # file and leads with `error`, the cut-down cause, instead of repeating it.
     summary = {k: v for k, v in record.items() if k not in ("output", "stderr")}
