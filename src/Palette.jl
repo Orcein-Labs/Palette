@@ -2005,6 +2005,10 @@ include("workspace_map.jl")
 include("stress.jl")
 include("session_requests.jl")
 include("pharos.jl")
+# The world binds `Palette` to `Api`, not this package, so the lighthouse has
+# to be copied onto the facade. Function bodies already call Palette.Pharos;
+# without this const, `isdefined(Palette, :Pharos)` is false in turn code.
+Core.eval(Api, :(const Pharos = $(Pharos)))
 include("tools.jl")
 include("precompile_workload.jl")
 

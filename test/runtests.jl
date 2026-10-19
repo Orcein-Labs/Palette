@@ -439,6 +439,8 @@ end
     # and nothing else of the package
     @test execute(EphemeralTool("Palette.request_capability isa Function")).result.data === true
     @test execute(EphemeralTool("Api === Palette")).result.data === true
+    @test execute(EphemeralTool("isdefined(Palette, :Pharos)")).result.data === true
+    @test execute(EphemeralTool("Palette.Pharos isa Module")).result.data === true
     @test !execute(EphemeralTool("Palette.reset_kernel_state()")).result.success
 
     # `import Mod: f` then a bare `function f(...)` is the confirmed real
