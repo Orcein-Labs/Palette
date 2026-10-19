@@ -672,9 +672,19 @@ failures its first run had printed.
 const OUTPUTS = Dict{Int, String}()
 const KEEP_OUTPUTS = 64
 
+# Execution X-Ray: the call whose request is in flight (0 between calls), and
+# per call what Palette.xray reports beyond its costs: "capability_requests"
+# (joined to the host's receipts by id), and the context's "dispatch", "memo"
+# or "references".
+const CURRENT_CALL = Ref(0)
+const XRAY = Dict{Int, Dict{String, Any}}()
+
+# Keeps a per-call table to the last KEEP_OUTPUTS calls.
+retain!(d::AbstractDict{Int}, call::Int) = filter!(kv -> kv.first > call - KEEP_OUTPUTS, d)
+
 function retain_output!(call::Int, text::String)
     isempty(text) || (OUTPUTS[call] = text)
-    filter!(kv -> kv.first > call - KEEP_OUTPUTS, OUTPUTS)
+    retain!(OUTPUTS, call)
     return nothing
 end
 
@@ -747,6 +757,11 @@ worldinfo() = Dict("module" => string(nameof(world())), "epoch" => Palette.TASK_
 read_artifact(path::AbstractString; kwargs...) = Palette.read_artifact(path; kwargs...)
 changes(; acknowledge::Bool=false) = Palette.changes_since_ack(; acknowledge)
 costs() = deepcopy(Palette.TURN_COSTS)
+xray(n::Integer) = Palette.xray(n)
+context!(name; kw...) = Palette.context!(name; kw...)
+reference!(f, sig::Type{<:Tuple}, impl) = Palette.reference!(f, sig, impl)
+references() = Palette.references()
+forget_reference!(f, sig::Type{<:Tuple}) = Palette.forget_reference!(f, sig)
 function costs(n::Integer)
     haskey(Palette.TURN_COSTS, n) || error("no phase observations retained for call $n")
     return deepcopy(Palette.TURN_COSTS[n])
@@ -1715,6 +1730,12 @@ function request_capability(category::String, params::Dict=Dict{String,Any}(); t
     sock_path = get(ENV, "PALETTE_BROKER_SOCKET", "")
     isempty(sock_path) && error("PALETTE_BROKER_SOCKET is not set -- no capability broker is available in this session")
     req = Dict("id" => string(uuid4()), "category" => category, "params" => params)
+    rec = get(XRAY, CURRENT_CALL[], nothing)
+    asked = nothing
+    if rec !== nothing
+        asked = Dict{String, Any}("id" => req["id"], "category" => category, "approved" => nothing)
+        push!(rec["capability_requests"], asked)
+    end
     conn = connect(sock_path)
     # `timeout_s` was accepted but never referenced anywhere in this
     # function -- confirmed by reading it, not assumed: a broker that
@@ -1736,7 +1757,9 @@ function request_capability(category::String, params::Dict=Dict{String,Any}(); t
         line = readline(conn)
         timed_out[] && error("broker did not respond within timeout_s=$(timeout_s)s")
         isempty(line) && error("broker closed the connection without a response")
-        return JSON.parse(line; dicttype=Dict{String, Any})
+        resp = JSON.parse(line; dicttype=Dict{String, Any})
+        asked === nothing || (asked["approved"] = get(resp, "approved", nothing))
+        return resp
     catch e
         timed_out[] && error("broker did not respond within timeout_s=$(timeout_s)s")
         rethrow()
@@ -1782,6 +1805,11 @@ sets `extra_args`. Never a shell. Broker-side ceiling shape:
 with `"lock": "/abs/file"` runs under an exclusive flock on that file, shared
 with work outside Palette (a GPU lock); the wait counts against its timeout.
 `host_commands()` lists the commands this session may run.
+
+`args` are read on the host. The kernel's `homedir()` (`/run/palette/home`)
+and `tempdir()` exist only inside the sandbox, so a path built from them
+names nothing the command can see; a path under a read root is the same on
+both sides.
 
 With `wait=true` returns `returncode`, `stdout`, `stderr` (their last 16
 KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
@@ -1963,6 +1991,7 @@ end
 Exports
 ==============================================================================#
 
+include("contexts.jl")
 include("turn.jl")
 include("revival.jl")
 include("time_machine.jl")

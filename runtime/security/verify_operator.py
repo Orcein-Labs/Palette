@@ -127,13 +127,19 @@ def main():
          "--repo-dir", ROOT, "--host-bin", host], env)
     security = ROOT / "runtime/security"
     runs = [(security / suite, None, env) for suite in
-            ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py")]
+            ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py",
+             "test_receipt_query.py", "test_read_roots.py", "test_palette_daemon.py", "test_palette_service.py")]
     runs.append((ROOT / "runtime/integrations/gesso/test_gesso.py", None, env))
     implementations = ("rust", "python") if args.implementation == "both" else (args.implementation,)
     for implementation in implementations:
         implementation_env = {**env, "PALETTE_HOST_BIN": str(host)} if implementation == "rust" else env
         runs += [(security / suite, implementation, implementation_env) for suite in
-                 ("test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py", "test_host_bridge.py")]
+                 ("test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py", "test_host_bridge.py",
+                  "test_contexts.py", "test_time_machine.py")]
+        # Receipts are the Rust host's, and test_host_command runs the Python broker itself.
+        if implementation == "rust":
+            runs += [(security / suite, implementation, implementation_env) for suite in
+                     ("test_xray.py", "test_host_command.py")]
     shard.run(runs)
     print(f"\nAll operator verification gates passed (shard {shard.index}/{shard.count}).", flush=True)
 
