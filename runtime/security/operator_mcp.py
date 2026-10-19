@@ -425,9 +425,7 @@ def control(args):
         stop()
         retired = None
         if action == "restart" and args.get("restore", True) is False and STATE_DIR.exists():
-            retired = str(STATE_DIR.with_name(STATE_DIR.name + ".retired-" + uuid.uuid4().hex))
-            os.replace(STATE_DIR, retired)
-            time_machine.carry_checkpoints(retired, STATE_DIR)
+            retired = time_machine.retire_world(STATE_DIR)
         start(prepared=args.get("prepare", True))
         result = execute({"code": "nothing"})
         result.update(previous_epoch=previous_epoch, retired_snapshot=retired)
