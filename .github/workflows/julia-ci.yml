@@ -64,6 +64,24 @@ jobs:
           JET.test_package(Palette)
         '
 
+  integrations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v7
+    - uses: julia-actions/setup-julia@v3
+      with:
+        version: '1.12'
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Instantiate project
+      run: julia --project=@. -e 'using Pkg; Pkg.instantiate()'
+    - name: Check the optional vecindex capability
+      working-directory: runtime/integrations/vecindex
+      run: julia --project="$GITHUB_WORKSPACE" test_vecindex.jl
+    - name: Check the optional jrir capability
+      working-directory: runtime/integrations/jrir
+      run: julia --project="$GITHUB_WORKSPACE" test_jrir.jl
+
   ijulia-integration:
     runs-on: ubuntu-latest
 
