@@ -1729,6 +1729,15 @@ mod tests {
 
         let clone = copied_depot(&depot);
         assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "second");
+        // A child another test forks shares this process's open files until it
+        // execs, and with them the snapshot's lock, so a sweep can miss once.
+        for _ in 0..50 {
+            if !first.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            try_sweep_depot_snapshots(&depot);
+        }
         assert!(!first.exists(), "the released snapshot was not swept");
         assert!(second.is_dir());
         fs::remove_dir_all(&root).unwrap();
