@@ -1,0 +1,10 @@
+[package]
+license = "AGPL-3.0-only"
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Palette's development tasks: the operator verification gates and the test-case timings their shards are dealt by"
+
+[dependencies]
+serde_json = "1"

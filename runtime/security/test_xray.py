@@ -2,7 +2,7 @@
 """
 Tests for Execution X-Ray: Palette.xray(n) in the kernel, and the host
 receipts of call n (receipt_query.py, palette_control action=receipts).
-The Rust host stamps the receipts, so verify_operator.py runs these on it only.
+The Rust host stamps the receipts, so `cargo xtask verify` runs these on it only.
 
 The join is the point: every capability request a call made appears in the
 host's receipts for that call, and no receipt is attributed to a call that did
