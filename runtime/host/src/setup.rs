@@ -1,6 +1,7 @@
 //! `palette-host setup`: prepare Palette on Linux, register it with the local
 //! clients, and check it works.
 
+use crate::util::{shjoin, shquote};
 use crate::{broker, cli, sandbox, util};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
@@ -77,21 +78,6 @@ fn read_json(p: &Path) -> Result<Value, String> {
 
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).expect("JSON values serialize") + "\n"
-}
-
-/// A word the shell reads back as `s`, as Python's `shlex.quote`.
-fn shquote(s: &str) -> String {
-    if s.is_empty() {
-        "''".into()
-    } else if s.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
-        s.into()
-    } else {
-        format!("'{}'", s.replace('\'', "'\"'\"'"))
-    }
-}
-
-fn shjoin<S: AsRef<str>>(words: &[S]) -> String {
-    words.iter().map(|w| shquote(w.as_ref())).collect::<Vec<_>>().join(" ")
 }
 
 /// Runs one preparation step, printing elapsed time while it is quiet. A

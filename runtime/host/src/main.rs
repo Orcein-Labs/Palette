@@ -9,11 +9,13 @@
 //!   palette-host teamlab-news [--agent A]
 //!   palette-host setup      [--repo-dir R] [--no-register] [--replace] [--no-check] ... (see setup --help)
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
+//!   palette-host serve      init|inspect|prepare|launch|client --profile P ... (see serve --help)
 
 mod broker;
 mod cli;
 mod receipt_archive;
 mod sandbox;
+mod serve;
 mod service;
 mod session;
 mod setup;
@@ -171,7 +173,8 @@ fn main() {
         Some("teamlab-news") => teamlab_news(rest),
         Some("setup") => setup::main(rest),
         Some("service") => service::main(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news|setup|service ...".into()),
+        Some("serve") => serve::main(rest),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news|setup|service|serve ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
