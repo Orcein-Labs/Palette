@@ -2,9 +2,8 @@
 //! clients, and check it works.
 
 use crate::util::{shjoin, shquote};
-use crate::{broker, cli, sandbox, util};
+use crate::{cli, provisioning, sandbox, util};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -218,109 +217,6 @@ fn deploy_capabilities(repo: &Path, runtime_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-const CATEGORIES: &[&str] = &[
-    "external_fs_write", "fs_digest", "host_command", "host_request", "network_access", "package_management", "spawn_child_worker", "teamlab",
-];
-
-fn string_list<'a>(value: Option<&'a Value>, field: &str, absolute: bool) -> Result<Vec<&'a str>, String> {
-    let items = value
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().map(|v| v.as_str().filter(|s| !s.is_empty())).collect::<Option<Vec<_>>>())
-        .ok_or_else(|| format!("{field} must be a list of non-empty strings"))?;
-    if absolute && items.iter().any(|s| !s.starts_with('/')) {
-        return Err(format!("{field} entries must be absolute paths"));
-    }
-    Ok(items)
-}
-
-fn has_duplicates(items: &[&str]) -> bool {
-    let mut seen = HashSet::new();
-    !items.iter().all(|i| seen.insert(i))
-}
-
-fn julia_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn validate_host_commands(value: Option<&Value>) -> Result<(), String> {
-    let commands = value.and_then(Value::as_object).ok_or("host_command.commands must be an object")?;
-    for (name, spec) in commands {
-        let spec = spec.as_object().filter(|_| !name.is_empty()).ok_or("host_command entries must map non-empty names to objects")?;
-        let argv = string_list(spec.get("argv"), &format!("host_command.commands.{name}.argv"), false)?;
-        if !argv.first().is_some_and(|a| a.starts_with('/')) {
-            return Err(format!("host_command.commands.{name}.argv[0] must be an absolute executable path"));
-        }
-        if !spec.get("cwd").and_then(Value::as_str).is_some_and(|c| c.starts_with('/')) {
-            return Err(format!("host_command.commands.{name}.cwd must be an absolute path"));
-        }
-        if let Some(timeout) = spec.get("timeout_s") {
-            if !timeout.as_f64().is_some_and(|t| t > 0.0 && t <= 14400.0) {
-                return Err(format!("host_command.commands.{name}.timeout_s must be in (0, 14400]"));
-            }
-        }
-        if spec.get("extra_args").is_some_and(|v| !v.is_boolean()) {
-            return Err(format!("host_command.commands.{name}.extra_args must be boolean"));
-        }
-    }
-    Ok(())
-}
-
-/// The operator ceiling's checks, as the Python host's `validate_ceiling`
-/// makes them.
-fn validate_ceiling(value: &Value) -> Result<(), String> {
-    let ceiling = value.as_object().ok_or("capability ceiling must be a JSON object")?;
-    let mut unknown: Vec<&str> = ceiling.keys().map(String::as_str).filter(|k| !CATEGORIES.contains(k)).collect();
-    if !unknown.is_empty() {
-        unknown.sort();
-        return Err(format!("unknown capability categories: {}", broker::ql(&unknown)));
-    }
-    for (category, grant) in ceiling {
-        let grant = grant.as_object().ok_or_else(|| format!("{category} grant must be an object"))?;
-        match category.as_str() {
-            "package_management" => {
-                let packages = string_list(grant.get("allowed_packages"), "package_management.allowed_packages", false)?;
-                let invalid: Vec<&str> = packages.iter().copied().filter(|p| !julia_identifier(p)).collect();
-                if !invalid.is_empty() {
-                    return Err(format!("package_management.allowed_packages has invalid Julia identifiers: {}", broker::ql(&invalid)));
-                }
-                if has_duplicates(&packages) {
-                    return Err("package_management.allowed_packages must not contain duplicates".into());
-                }
-                if grant.get("offline").is_some_and(|v| !v.is_boolean()) {
-                    return Err("package_management.offline must be boolean when provided".into());
-                }
-            }
-            "host_request" => {
-                if has_duplicates(&string_list(grant.get("allowed_types"), "host_request.allowed_types", false)?) {
-                    return Err("host_request.allowed_types must not contain duplicates".into());
-                }
-            }
-            "external_fs_write" => {
-                string_list(grant.get("allowed_dirs"), "external_fs_write.allowed_dirs", true)?;
-            }
-            "fs_digest" => {
-                string_list(grant.get("allowed_paths"), "fs_digest.allowed_paths", true)?;
-            }
-            "network_access" => {
-                if !grant.get("allowed").is_some_and(Value::is_boolean) {
-                    return Err("network_access.allowed must be boolean".into());
-                }
-                if let Some(hosts) = grant.get("allowed_hosts").filter(|h| !h.is_null()) {
-                    string_list(Some(hosts), "network_access.allowed_hosts", false)?;
-                }
-            }
-            "host_command" => validate_host_commands(grant.get("commands"))?,
-            "spawn_child_worker" if !grant.is_empty() => return Err("spawn_child_worker grant must be an empty object".into()),
-            "teamlab" if grant.len() != 1 || !grant.get("dir").and_then(Value::as_str).is_some_and(|d| d.starts_with('/')) => {
-                return Err("teamlab grant must be {\"dir\": <absolute path>}".into());
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 /// Writes the capability ceiling, or adds to the operator's own: a kernel
 /// reaches the runtime's capabilities (TeamLab among them) through the
 /// palette.runtime host request. Nothing else in an existing file changes.
@@ -332,7 +228,7 @@ fn merge_ceiling(path: &Path) -> Result<(), String> {
     } else {
         json!({})
     };
-    validate_ceiling(&ceiling).map_err(invalid)?;
+    provisioning::validate_ceiling(&ceiling).map_err(invalid)?;
     let grant = ceiling.as_object_mut().expect("validated").entry("host_request").or_insert_with(|| json!({"allowed_types": []}));
     let types = grant.get_mut("allowed_types").and_then(Value::as_array_mut).expect("validated");
     if types.iter().any(|t| t == "palette.runtime") {
@@ -891,60 +787,6 @@ mod tests {
             assert_eq!(fs::read_to_string(&ceiling).unwrap(), broken);
         }
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn ceiling_checks_read_as_the_python_host_wrote_them() {
-        let refused = |v: Value| validate_ceiling(&v).unwrap_err();
-        assert_eq!(refused(json!([])), "capability ceiling must be a JSON object");
-        assert_eq!(refused(json!({"zz": {}, "aa": {}})), "unknown capability categories: ['aa', 'zz']");
-        assert_eq!(refused(json!({"fs_digest": []})), "fs_digest grant must be an object");
-        assert_eq!(refused(json!({"host_request": {}})), "host_request.allowed_types must be a list of non-empty strings");
-        assert_eq!(refused(json!({"host_request": {"allowed_types": ["a", ""]}})), "host_request.allowed_types must be a list of non-empty strings");
-        assert_eq!(refused(json!({"host_request": {"allowed_types": ["a", "a"]}})), "host_request.allowed_types must not contain duplicates");
-        assert_eq!(
-            refused(json!({"package_management": {"allowed_packages": ["JSON", "1x", "a-b"]}})),
-            "package_management.allowed_packages has invalid Julia identifiers: ['1x', 'a-b']"
-        );
-        assert_eq!(
-            refused(json!({"package_management": {"allowed_packages": ["JSON", "JSON"]}})),
-            "package_management.allowed_packages must not contain duplicates"
-        );
-        assert_eq!(
-            refused(json!({"package_management": {"allowed_packages": [], "offline": "yes"}})),
-            "package_management.offline must be boolean when provided"
-        );
-        assert_eq!(refused(json!({"external_fs_write": {"allowed_dirs": ["rel"]}})), "external_fs_write.allowed_dirs entries must be absolute paths");
-        assert_eq!(refused(json!({"fs_digest": {"allowed_paths": ["rel"]}})), "fs_digest.allowed_paths entries must be absolute paths");
-        assert_eq!(refused(json!({"network_access": {}})), "network_access.allowed must be boolean");
-        assert_eq!(
-            refused(json!({"network_access": {"allowed": true, "allowed_hosts": "x"}})),
-            "network_access.allowed_hosts must be a list of non-empty strings"
-        );
-        assert_eq!(refused(json!({"host_command": {}})), "host_command.commands must be an object");
-        assert_eq!(refused(json!({"host_command": {"commands": {"": {}}}})), "host_command entries must map non-empty names to objects");
-        let command = |spec: Value| refused(json!({"host_command": {"commands": {"c": spec}}}));
-        assert_eq!(command(json!({"argv": ["rel"], "cwd": "/"})), "host_command.commands.c.argv[0] must be an absolute executable path");
-        assert_eq!(command(json!({"argv": [], "cwd": "/"})), "host_command.commands.c.argv[0] must be an absolute executable path");
-        assert_eq!(command(json!({"argv": ["/bin/true"], "cwd": "rel"})), "host_command.commands.c.cwd must be an absolute path");
-        for timeout in [json!(0), json!(14401), json!(true), json!("5")] {
-            assert_eq!(command(json!({"argv": ["/bin/true"], "cwd": "/", "timeout_s": timeout})), "host_command.commands.c.timeout_s must be in (0, 14400]");
-        }
-        assert_eq!(command(json!({"argv": ["/bin/true"], "cwd": "/", "extra_args": 1})), "host_command.commands.c.extra_args must be boolean");
-        assert_eq!(refused(json!({"spawn_child_worker": {"x": 1}})), "spawn_child_worker grant must be an empty object");
-        assert_eq!(refused(json!({"teamlab": {"dir": "rel"}})), "teamlab grant must be {\"dir\": <absolute path>}");
-        assert_eq!(refused(json!({"teamlab": {"dir": "/a", "x": 1}})), "teamlab grant must be {\"dir\": <absolute path>}");
-        validate_ceiling(&json!({
-            "package_management": {"allowed_packages": ["JSON", "_x1"], "offline": true},
-            "host_request": {"allowed_types": ["palette.runtime"]},
-            "external_fs_write": {"allowed_dirs": ["/a"]},
-            "fs_digest": {"allowed_paths": ["/b"]},
-            "network_access": {"allowed": false, "allowed_hosts": null},
-            "host_command": {"commands": {"c": {"argv": ["/bin/true"], "cwd": "/", "timeout_s": 14400, "extra_args": false}}},
-            "spawn_child_worker": {},
-            "teamlab": {"dir": "/shop"},
-        }))
-        .unwrap();
     }
 
     #[test]
