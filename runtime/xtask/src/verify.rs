@@ -156,30 +156,16 @@ struct Args {
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
-    let (mut project, mut implementation, mut shard) = (None, None, None);
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        let (key, inline) = match arg.split_once('=') {
-            Some((k, v)) if k.starts_with("--") => (k, Some(v.to_string())),
-            _ => (arg.as_str(), None),
-        };
-        let slot = match key {
-            "--project-dir" => &mut project,
-            "--implementation" => &mut implementation,
-            "--shard" => &mut shard,
-            _ => return Err(format!("unrecognized argument: {arg}")),
-        };
-        *slot = Some(inline.or_else(|| it.next().cloned()).ok_or_else(|| format!("{key} needs a value"))?);
-    }
-    let project: String = project.ok_or("--project-dir is required")?;
-    let implementations = match implementation.as_deref().unwrap_or("both") {
+    let mut flags = crate::flags(args, &["--project-dir", "--implementation", "--shard"])?;
+    let project = flags.remove("--project-dir").ok_or("--project-dir is required")?;
+    let implementations = match flags.get("--implementation").map_or("both", String::as_str) {
         "both" => vec!["rust", "python"],
         "rust" => vec!["rust"],
         "python" => vec!["python"],
         other => return Err(format!("--implementation must be both, rust or python, not {other}")),
     };
     let project = std::path::absolute(&project).map_err(|e| format!("{project}: {e}"))?;
-    Ok(Args { project, implementations, shard: Shard::parse(shard.as_deref().unwrap_or("1/1"))? })
+    Ok(Args { project, implementations, shard: Shard::parse(flags.get("--shard").map_or("1/1", String::as_str))? })
 }
 
 pub fn main(args: &[String]) -> Result<(), Fail> {
