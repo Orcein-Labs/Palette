@@ -221,6 +221,34 @@ include("probe.jl")
                 @test probe["pinned_version"] == 3
             end
 
+            @testset "the author decides on a version another agent proposes" begin
+                propose(source) = as(() -> teamlab("action" => "publish", "id" => probe_id, "source" => source, "note" => "triples"), codex)
+                p1 = propose("probe(x) = 3x\n")
+                @test (p1["published"], p1["proposed"], p1["version"], p1["pinned"]) == (true, true, nothing, false)
+                @test p1["author"] == "claude" && occursin("accepts it", p1["next"])
+                @test_throws ErrorException as(() -> teamlab("action" => "pin", "id" => probe_id, "sha256" => p1["sha256"]), codex)
+                @test_throws ErrorException as(() -> teamlab("action" => "accept", "id" => probe_id, "sha256" => p1["sha256"]), codex)
+
+                st = as(() -> teamlab("action" => "status"), claude)
+                @test [(p["id"], p["sha256"], p["author"]) for p in st["proposals"]] == [(probe_id, p1["sha256"], "codex")]
+                mail = only(as(() -> teamlab("action" => "inbox"), claude)["messages"])
+                @test mail["from"] == "codex" && occursin("proposed a new version of probe", mail["subject"])
+                t = as(() -> teamlab("action" => "try", "id" => probe_id, "sha256" => p1["sha256"]), claude)
+                @test t["pending"] === true && occursin("proposal", t["keep"])
+                @test in_world(:(TeamLab.probe(2))) == 6
+
+                d = as(() -> teamlab("action" => "decline", "id" => probe_id, "sha256" => p1["sha256"], "note" => "not yet"), claude)
+                @test (d["declined"], d["withdrawn"]) == (true, false)
+                @test occursin("declined your version of probe", only(as(() -> teamlab("action" => "inbox"), codex)["messages"])["subject"])
+
+                p2 = propose("probe(x) = 3x + 1\n")
+                a = as(() -> teamlab("action" => "accept", "id" => probe_id, "sha256" => p2["sha256"]), claude)
+                @test (a["version"], a["author"], a["pinned"]) == (4, "codex", true)
+                probe = only(filter(t -> t["id"] == probe_id, as(() -> teamlab("action" => "status"), claude)["pinned"]))
+                @test (probe["versions"], probe["pinned_version"]) == (4, 4)
+                @test isempty(as(() -> teamlab("action" => "status"), claude)["proposals"])
+            end
+
             @testset "the kernel side holds no path to the shop" begin
                 # The directory is the host's; a kernel only ever asks for it.
                 @test !occursin("ENV", read(joinpath(@__DIR__, "teamlab.jl"), String))
