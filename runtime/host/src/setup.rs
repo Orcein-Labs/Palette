@@ -861,6 +861,9 @@ mod tests {
         assert_eq!(shquote("it's"), "'it'\"'\"'s'");
         assert_eq!(shjoin(&["claude", "mcp", "add", "/a b"]), "claude mcp add '/a b'");
         assert_eq!(util::expand_user("~/x"), util::home().join("x"));
-        assert_eq!(util::expand_user("~user/x"), PathBuf::from("~user/x"));
+        assert_eq!(util::expand_user("~no-such-user-palette/x"), PathBuf::from("~no-such-user-palette/x"));
+        assert_eq!(util::expand_user("~root/x"), PathBuf::from("/root/x"));
+        assert_eq!(util::expand_user("~root"), PathBuf::from("/root"));
+        assert_eq!(util::expand_user("a/~"), PathBuf::from("a/~"));
     }
 }
