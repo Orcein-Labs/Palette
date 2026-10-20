@@ -134,6 +134,12 @@ to deployment configuration.
 The optional [Gesso integration](runtime/integrations/gesso/README.md) exposes its
 existing tokenizer, CPU inference, fork and profiling through runtime capabilities.
 
+Two more optional capabilities ship beside it:
+[vecindex](runtime/integrations/vecindex/README.md), an in-memory vector index
+with exact and IVF search and a code-symbol indexer, and
+[jrir](runtime/integrations/jrir/README.md), which normalizes Rust/C LLVM IR for
+inlining into Julia through `Base.llvmcall`.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, verification, and research archival.
