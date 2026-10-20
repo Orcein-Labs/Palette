@@ -109,7 +109,7 @@ function stale_type_notice(mod, types_before)
 end
 
 function observed_statement(mod, ex, run; source=nothing)
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     types_before = current_types(mod, ex)
     before = binding_ids(mod)
     inherited = Dict{String, Any}()
@@ -182,7 +182,7 @@ end
 function include_observed(mod, path::AbstractString)
     refresh_workspace_packages!()
     full = abspath(path)
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     note_file!(full, call)
     evidence = source_evidence(full)
     source_reads = get(task_local_storage(), :palette_source_reads, nothing)
