@@ -28,7 +28,8 @@ const TIME_MACHINE_NOTICE = Ref("")
 const RESTORE_INFO = Ref{Union{Nothing, Dict{String, Any}}}(nothing)
 
 checkpoints_dir() = joinpath(STATE_DIR[], "checkpoints")
-blob_path(sha::AbstractString) = joinpath(STATE_DIR[], "blobs", sha)
+blobs_dir() = joinpath(STATE_DIR[], "blobs")
+blob_path(sha::AbstractString) = joinpath(blobs_dir(), sha)
 utc_now() = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 
 # The code a restored world runs: file => sha256 of the checkpoint copy it
@@ -138,7 +139,7 @@ function keep_sources(p::String, sha::String)
     for f in included_files(p)
         bytes = read(f)
         h = bytes2hex(sha256(bytes))
-        isfile(blob_path(h)) || write_state_file!(joinpath(STATE_DIR[], "blobs"), h, String(bytes))
+        isfile(blob_path(h)) || write_state_file!(blobs_dir(), h, String(bytes))
         d[f] = h
     end
     return d
@@ -147,7 +148,7 @@ end
 # Copies each include's sources to the blob store, when the file still has the
 # content the include read; a file changed since cannot be copied as it was.
 function keep_include_sources!(m)
-    mkpath(joinpath(STATE_DIR[], "blobs"))
+    mkpath(blobs_dir())
     out = Dict{String, Any}[]
     kept = Dict{Tuple{String, String}, Any}()   # a file included in many calls is copied once
     for e in m["definitions"]
@@ -267,7 +268,7 @@ function remove_unused_blobs!(definitions)
         pinned = get(e, "pinned", nothing)
         pinned isa AbstractDict && union!(used, values(pinned))
     end
-    blobs = joinpath(STATE_DIR[], "blobs")
+    blobs = blobs_dir()
     removed = 0
     if isdir(blobs)
         for f in readdir(blobs)
