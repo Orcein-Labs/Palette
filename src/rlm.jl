@@ -83,8 +83,10 @@ function runtime(action::AbstractString, payload::AbstractDict=Dict{String,Any}(
             Base.include_string(module_, source, "capability://$(identifier)/$(generation).jl")
             module_
         end
-        isdefined(mod, Symbol(entrypoint)) || error("palette.runtime entrypoint $(entrypoint) was not defined by capability source")
-        fn = getfield(mod, Symbol(entrypoint))
+        # The entrypoint was defined by include_string in a newer world than
+        # this call; Julia 1.12 warns on reading it directly.
+        Base.invokelatest(isdefined, mod, Symbol(entrypoint)) || error("palette.runtime entrypoint $(entrypoint) was not defined by capability source")
+        fn = Base.invokelatest(getglobal, mod, Symbol(entrypoint))
         fn isa Function || error("palette.runtime entrypoint $(entrypoint) is not a function")
         arguments = get(payload, "arguments", Dict{String,Any}())
         arguments isa AbstractDict || throw(ArgumentError("invoke payload.arguments must be an object"))
