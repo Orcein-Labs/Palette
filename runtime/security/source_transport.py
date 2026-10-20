@@ -104,3 +104,34 @@ def timeout_schema(limits: tuple[float, float]) -> dict:
             "description": f"This call's time limit in seconds; default {limits[0]:g}, at most {limits[1]:g}. "
                            "Not for an ephemeral call, which runs under the default. "
                            "Longer work runs as a job: Palette.host_command(name; wait=false)."}
+
+
+def palette_properties(limits: tuple[float, float]) -> dict:
+    """The palette tool's arguments, as both the adapter and the router list them."""
+    return {"code": {"type": "string"}, "source": {"type": "string"}, "view": {"enum": ["quiet", "full"]},
+            "payload": {"oneOf": [{"type": "string"}, {"type": "object", "additionalProperties": {"type": "string"}}]},
+            "ephemeral": {"type": "boolean"}, "timeout_s": timeout_schema(limits), **CONTEXT_SCHEMA}
+
+
+# palette_control's arguments besides action and the receipt query.
+CONTROL_PROPERTIES = {"restore": {"type": "boolean"}, "prepare": {"type": "boolean"},
+                      "checkpoint": {"type": "string", "maxLength": 64}, "fork": {"type": "boolean"}}
+
+# The ends of the two tools' descriptions, the same on both servers.
+PALETTE_GUIDE = ("timeout_s sets this call's time limit; Palette.host_commands() lists the host commands allowed; "
+                 "Palette.host_command(name; wait=false) runs longer host work as a job. context runs this one call "
+                 "traced (records the method each top-level call dispatched to, see Palette.xray), reference "
+                 "(registered reference implementations replace the fast ones), memoized, or budgeted "
+                 "(budget={seconds, bytes}); Palette.context!(name) sets a session default. Api.promote(:f) keeps a "
+                 "helper used in 3 successful calls as a project tool (.palette/tools); Api.tools() lists project and "
+                 "trusted tools, which load on first call; Api.trust(:f) asks a human to approve it as trusted. "
+                 "Api.definitions(name) and Api.callers(name) query the workspace code graph (Api.codegraph()). Each "
+                 "top-level statement sees the methods earlier ones defined; a function body or let block that defines "
+                 "methods with eval or include sees them only through Base.invokelatest(f, args...). A struct "
+                 "redefined with a new layout is a new type: the reply names the values and methods still using the "
+                 "old one.")
+CONTROL_GUIDE = ("action=checkpoints lists the checkpoints Palette.checkpoint(name) saved; action=restore with "
+                 "checkpoint=name restarts the world at that checkpoint (fork=true makes it a new world), after saving "
+                 "the current world as an auto- checkpoint. action=receipts returns the host receipts of call=n (this "
+                 "kernel's, unless epoch is given; Palette.xray(n) shows its costs), or filters them by kind and "
+                 "since/until (unix seconds).")
