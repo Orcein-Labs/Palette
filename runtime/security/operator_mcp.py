@@ -16,7 +16,7 @@ import uuid
 from source_transport import CONTEXT_SCHEMA, call_limit, normalize_palette_call, seconds_text, timeout_schema, turn_limits
 
 from prewarm_depot import prepare, preparation_identity, preparation_status, resolve_real_julia_binary
-from provisioning import operator_ceiling, palette_version, protected_host_paths
+from provisioning import agent_name, operator_ceiling, palette_version, protected_host_paths, with_teamlab
 from runtime_registry import RuntimeRegistry
 import receipt_query
 import time_machine
@@ -40,7 +40,7 @@ connection_failure = None
 # This kernel's start-up, first call and warm calls, which palette_control status reports.
 kernel_costs = None
 WARM_CALLS_KEPT = 20
-FROZEN_CEILING = operator_ceiling()
+FROZEN_CEILING = with_teamlab(operator_ceiling())
 TURN_LIMITS = turn_limits()
 RUNTIME_ROOT = Path(os.environ.get("PALETTE_RUNTIME_ROOT", str(Path(REPO, "runtime/capabilities")))).expanduser().resolve()
 runtime_registry = RuntimeRegistry(RUNTIME_ROOT, FROZEN_CEILING, workspace=WORKSPACE, state_dir=STATE_DIR,
@@ -443,6 +443,9 @@ control_schema = {"type": "object", "properties": {"action": {"enum": ["status",
 
 
 def main():
+    # The router names the agent on each call; a client that talks to this
+    # adapter directly is named from its own initialize.
+    caller = None
     try:
         for raw in sys.stdin:
             mid = None
@@ -453,6 +456,7 @@ def main():
                 if method.startswith("notifications/"):
                     continue
                 if method == "initialize":
+                    caller = agent_name((msg.get("params", {}).get("clientInfo") or {}).get("name"))
                     result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
                               "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}}
                 elif method == "ping":
@@ -469,6 +473,8 @@ def main():
                             event = control(args)
                         elif params["name"] == "palette":
                             args = normalize_palette_call(args)
+                            if caller and "caller" not in args:
+                                args["caller"] = caller
                             start()
                             event = execute(args)
                         else:

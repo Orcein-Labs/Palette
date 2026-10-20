@@ -353,7 +353,12 @@ pub fn main(argv: &[String]) -> i32 {
                                                       a scratch worker always runs in the normal context")),
                 _ => None,
             });
-        if let Some(error) = context_error {
+        let caller_error = match req.get("caller").filter(|v| !v.is_null()) {
+            Some(Value::String(a)) if crate::teamlab::valid_agent(a) => None,
+            Some(_) => Some("request 'caller' must be an agent name: 1-32 of [a-z0-9._-], starting with a letter or digit".to_string()),
+            None => None,
+        };
+        if let Some(error) = context_error.or(caller_error) {
             respond(&json!({"request_id": request_id, "success": false, "data": null, "error": error}));
             continue;
         }
@@ -368,6 +373,7 @@ pub fn main(argv: &[String]) -> i32 {
             timeout_s: Some(limit),
             context: req.get("context").filter(|v| !v.is_null()).cloned(),
             budget: req.get("budget").filter(|v| !v.is_null()).cloned(),
+            caller: req.get("caller").and_then(Value::as_str).map(str::to_string),
         });
         if stop.load(Ordering::SeqCst) {
             break; // shutting down: no reply, as for any process killed mid-call

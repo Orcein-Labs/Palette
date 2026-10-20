@@ -7,7 +7,10 @@ import sys
 import tempfile
 import unittest
 
-from provisioning import OperatorConfigError, operator_ceiling, protected_host_paths
+from unittest import mock
+
+from filesystem_layout import require_disjoint
+from provisioning import OperatorConfigError, agent_name, command_parents, operator_ceiling, protected_host_paths, validate_ceiling, with_teamlab
 
 RUNNER = Path(__file__).with_name("provisioning.py")
 
@@ -91,10 +94,21 @@ class ProvisioningTest(unittest.TestCase):
             ceiling = {"host_command": {"commands": {
                 "inference": {"argv": argv, "cwd": tmp, "extra_args": True}}}}
             protected = set(protected_host_paths(ceiling))
+            parents = command_parents(ceiling)
             for selected in paths:
                 resolved = selected.resolve()
                 self.assertIn(resolved, protected)
-                self.assertIn(resolved.parent, protected)
+                self.assertIn(resolved.parent, parents)
+                with self.assertRaisesRegex(PermissionError, "parent of a host-command path"):
+                    require_disjoint([resolved.parent], protected, parents)
+            # A sibling inside a command's parent cannot rename the command
+            # path, so it may be writable (a store under ~/.local beside a
+            # command that runs in ~/project).
+            sibling = root.resolve().parent / f"{root.name}-sibling"
+            require_disjoint([sibling], protected, parents)
+            self.assertNotIn(root.resolve().parent, protected)
+            with self.assertRaisesRegex(PermissionError, "parent of a host-command path"):
+                require_disjoint([root.resolve().parent], protected, parents)
             caller_input_path = root / "caller-selected-model.gguf"
             ordinary_input = f"--model={caller_input_path}"
             self.assertNotIn(ordinary_input, argv)
@@ -125,6 +139,39 @@ class ProvisioningTest(unittest.TestCase):
             denied = subprocess.run(entry["argv"] + ["--model", str(root / "attacker.bin")],
                 capture_output=True, text=True, timeout=10)
             self.assertNotEqual(denied.returncode, 0)
+
+    def test_case_provisioning_005_teamlab_shelf_defaults_per_user(self):
+        with tempfile.TemporaryDirectory(prefix="palette-teamlab-") as tmp:
+            lab = str(Path(tmp, "lab"))
+            env = {k: v for k, v in os.environ.items() if k not in ("PALETTE_TEAMLAB_DIR", "XDG_DATA_HOME")}
+            with mock.patch.dict(os.environ, {**env, "HOME": tmp}, clear=True):
+                self.assertEqual(with_teamlab({}), {"teamlab": {"dir": str(Path(tmp, ".local/share/palette/teamlab"))}})
+                os.environ["XDG_DATA_HOME"] = str(Path(tmp, "data"))
+                self.assertEqual(with_teamlab({})["teamlab"]["dir"], str(Path(tmp, "data/palette/teamlab")))
+                os.environ["XDG_DATA_HOME"] = "relative/data"
+                self.assertEqual(with_teamlab({})["teamlab"]["dir"], str(Path(tmp, ".local/share/palette/teamlab")))
+                os.environ["PALETTE_TEAMLAB_DIR"] = lab
+                self.assertEqual(with_teamlab({"spawn_child_worker": {}}),
+                                 {"spawn_child_worker": {}, "teamlab": {"dir": lab}})
+                # The operator's own grant wins over the environment.
+                self.assertEqual(with_teamlab({"teamlab": {"dir": "/elsewhere"}}), {"teamlab": {"dir": "/elsewhere"}})
+                self.assertIn(Path(lab).resolve(), protected_host_paths(with_teamlab({})))
+                for off in ("off", "", " "):
+                    os.environ["PALETTE_TEAMLAB_DIR"] = off
+                    self.assertEqual(with_teamlab({}), {})
+                os.environ["PALETTE_TEAMLAB_DIR"] = "lab"
+                with self.assertRaisesRegex(OperatorConfigError, "absolute"):
+                    with_teamlab({})
+        for bad in ({"dir": "lab"}, {"dir": 3}, {}, {"dir": "/lab", "mode": "shared"}):
+            with self.assertRaisesRegex(OperatorConfigError, "teamlab grant"):
+                validate_ceiling({"teamlab": bad})
+
+    def test_case_provisioning_006_agent_names_from_client_info(self):
+        names = {"claude-code": "claude", "codex-mcp-client": "codex", "Grok CLI": "grok",
+                 "gemini-cli-mcp-client": "gemini", "antigravity": "gemini", "Kilo Code": "kilo-code",
+                 "_odd.name_": "odd.name", "x" * 40: "x" * 32, "palette-router": None, "---": None, None: None, 7: None}
+        for client, agent in names.items():
+            self.assertEqual(agent_name(client), agent, client)
 
 
 if __name__ == "__main__":

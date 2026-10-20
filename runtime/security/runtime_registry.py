@@ -21,7 +21,7 @@ CAPABILITY_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 JULIA_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CAPABILITY_FIELDS = {"id", "version", "source", "entrypoint", "dependencies", "requires", "description"}
 FORBIDDEN_FIELDS = {"ceiling", "credentials", "credential", "callback", "callbacks", "host_callback", "host_callbacks", "host_command", "argv", "secret"}
-AUTHORITY_CATEGORIES = {"external_fs_write", "fs_digest", "host_command", "network_access", "package_management", "spawn_child_worker"}
+AUTHORITY_CATEGORIES = {"external_fs_write", "fs_digest", "host_command", "network_access", "package_management", "spawn_child_worker", "teamlab"}
 
 
 class RuntimeRegistryError(ValueError):
@@ -250,7 +250,7 @@ class RuntimeRegistry:
             elif name == "network_access":
                 summary[name] = {"allowed": grant.get("allowed") is True,
                                  "configured_host_count": len(grant.get("allowed_hosts") or [])}
-            elif name == "spawn_child_worker":
+            elif name in ("spawn_child_worker", "teamlab"):
                 summary[name] = {"enabled": True}
         return summary
 
