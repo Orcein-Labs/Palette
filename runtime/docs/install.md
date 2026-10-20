@@ -57,7 +57,7 @@ The installation lives in `PALETTE_HOME` (default `~/.local/share/palette`):
 | `config/ceiling.json` | Capability ceiling (`PALETTE_CAPABILITY_CEILING`), mode 0600; edit it to grant more |
 | `data/`, `depot/` | Workspace, saved worlds and package store; the prepared Julia depot |
 
-The TeamLab shelf and mailbox that the user's agents share are in
+The TeamLab shop and mailbox that the user's agents share are in
 `$XDG_DATA_HOME/palette/teamlab` (`~/.local/share/palette/teamlab`), which is
 inside the default `PALETTE_HOME`; `PALETTE_TEAMLAB_DIR` in the server's
 environment moves it, and `off` leaves TeamLab out.
@@ -103,7 +103,7 @@ Remove the `palette` server from each client
 Claude Desktop's configuration on Windows, run
 `systemctl --user disable --now palette-update.timer`, and delete
 `PALETTE_HOME` (with the default location, this also deletes the TeamLab
-shelf). Julia stays installed
+shop). Julia stays installed
 (`juliaup self uninstall` removes it).
 
 ## Manual installation

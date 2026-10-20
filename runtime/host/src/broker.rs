@@ -117,7 +117,7 @@ pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
                 }
             }
             "teamlab" => {
-                // One shelf per user: a child shares its parent's or has none.
+                // One shop per user: a child shares its parent's or has none.
                 let dirs = (teamlab::ceiling_dir(&json!({"teamlab": rc})), teamlab::ceiling_dir(&json!({"teamlab": pc})));
                 if dirs.0.is_none() || dirs.0 != dirs.1 {
                     return (false, "requested teamlab must name the parent's teamlab dir exactly".into());
@@ -1836,14 +1836,16 @@ mod tests {
         let src = "hello() = 1\n".repeat(50);
         b.set_caller(Some("codex".into()));
         let r = b.handle_request(&json!({"id": "1", "category": "teamlab",
-                                         "params": {"action": "publish", "name": "hello", "source": src}}));
+                                         "params": {"action": "publish", "binding": "hello", "kind": "function",
+                                                    "tag": "Says hello", "source": src}}));
         assert_eq!(r["approved"], true, "{r}");
         b.set_caller(None);
         let s = b.handle_request(&json!({"id": "2", "category": "teamlab", "params": {"action": "status"}}));
         assert_eq!(s["result"]["agent"], teamlab::default_agent());
-        assert_eq!(s["result"]["tools"][0]["latest"]["author"], "codex");
+        assert_eq!(s["result"]["new"][0]["latest"]["author"], "codex");
+        let id = r["result"]["id"].as_str().unwrap();
         b.set_caller(Some("codex".into()));
-        let f = b.handle_request(&json!({"id": "3", "category": "teamlab", "params": {"action": "fetch", "name": "hello"}}));
+        let f = b.handle_request(&json!({"id": "3", "category": "teamlab", "params": {"action": "fetch", "id": id}}));
         assert_eq!(f["result"]["source"], src.as_str(), "the kernel gets the full source");
         let log = read_receipts(&receipts);
         assert_eq!(log[0]["params"]["agent"], "codex");

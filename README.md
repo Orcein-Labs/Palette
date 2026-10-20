@@ -29,8 +29,8 @@ Clients attach over MCP, or over the host session (newline-delimited JSON on std
 
 Linux, or WSL2 on Windows. One command installs Julia if needed, the sandbox
 host and its packages, and [TeamLab](runtime/integrations/teamlab/README.md),
-the tool shelf and mailbox your agents share. It connects the Claude Code,
-Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
+the shop of tools and the mailbox your agents share. It connects the Claude
+Code, Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
 Claude Code, and checks the installation before switching to it.
 
 ```sh
