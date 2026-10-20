@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare Palette on Linux, register it with local clients, and check it works."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -50,9 +51,39 @@ def write_atomic(path, text, mode=0o644):
     """Replace a file in one rename, so a client never starts a half-written one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f'.{path.name}.{os.getpid()}')
-    temporary.write_text(text)
-    temporary.chmod(mode)
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(text)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+@contextlib.contextmanager
+def restored_on_failure(paths):
+    """Put each path back as it was, or remove it if it did not exist, when
+    the block fails."""
+    with tempfile.TemporaryDirectory(prefix='palette-setup-') as keep:
+        kept = [(path, Path(keep)/str(i)) for i, path in enumerate(paths)]
+        for path, copy in kept:
+            if path.is_dir():
+                shutil.copytree(path, copy, symlinks=True)
+            elif path.exists():
+                shutil.copy2(path, copy)
+        try:
+            yield
+        except BaseException:
+            for path, copy in kept:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                if copy.is_dir():
+                    shutil.copytree(copy, path, symlinks=True)
+                elif copy.exists():
+                    shutil.copy2(copy, path)
+            raise
 
 
 def deploy_capabilities(repo, runtime_root):
@@ -309,42 +340,45 @@ def main():
                   **({'PALETTE_READ_ROOTS':':'.join(read_roots)} if read_roots else {}),
                   'JULIA_DEPOT_PATH':str(depot),'JULIA_PKG_OFFLINE':'true',
                   'PATH':str(Path(shutil.which('julia')).parent)+':'+SYSTEM_PATH}
-    # Preparing starts sessions under the environment the server gets, so the
-    # capabilities and ceiling it names exist first.
-    deploy_capabilities(repo, runtime_root)
-    merge_ceiling(repo, ceiling)
-    if not args.connect_only:
-        env = dict(os.environ, **{k: v for k, v in launch_env.items() if k not in ('JULIA_PKG_OFFLINE', 'PATH')})
-        step('Installing Julia packages', ['julia', '--project='+str(repo), '-e', 'using Pkg; Pkg.instantiate()'], env)
-        # A release archive carries a prebuilt host; a checkout builds its own.
-        if (repo/'.git').exists() and shutil.which('cargo') or not host.is_file():
-            if not shutil.which('cargo'):
-                parser.error('This source has no prebuilt host: install Rust (https://rustup.rs) or use the release installer')
-            step('Building the sandbox host', ['cargo','build','--manifest-path',str(repo/'runtime/host/Cargo.toml'),'--release','--locked'], env)
-        step('Preparing the sandbox (the first run takes several minutes)',
-             [sys.executable,str(repo/'runtime/security/prewarm_depot.py'),'--project-dir',str(repo),'--host-bin',str(host)], dict(env, JULIA_PKG_OFFLINE='true'), quiet=True)
-    for path in (repo/'Manifest.toml', host):
-        if not path.is_file():
-            parser.error(f'missing prepared runtime file: {path}')
-    if not os.access(host, os.X_OK):
-        parser.error(f'host is not executable: {host}')
-    (data/'workspace').mkdir(parents=True, exist_ok=True)
-    output.mkdir(parents=True, exist_ok=True)
-    launcher = output/'palette-mcp'
-    entry = {'command':sys.executable,'args':[str(repo/'runtime/security/serve_palette.py')],'env':launch_env}
-    script = ('#!/bin/sh\n# Palette-managed launcher\nexec env '+' '.join(shlex.quote(k+'='+v) for k,v in launch_env.items())
-              +' '+shlex.quote(sys.executable)+' '+shlex.quote(entry['args'][0])+' "$@"\n')
-    if not args.no_check:
-        # Check the new launcher before it replaces the old one, so a failed
-        # update leaves the installation that worked.
-        trial = output/f'.palette-mcp.trial.{os.getpid()}'
-        write_atomic(trial, script, 0o755)
-        try:
-            check(trial)
-        except Exception as exc:
-            raise SystemExit(f'The check failed, so this installation was not switched on: {exc}')
-        finally:
-            trial.unlink(missing_ok=True)
+    # A failed install, build, prewarm or check puts the capabilities and
+    # ceiling back, so the installation that worked keeps a runtime it matches.
+    with restored_on_failure([runtime_root/name for name in BUNDLED_CAPABILITIES] + [ceiling]):
+        # Preparing starts sessions under the environment the server gets, so the
+        # capabilities and ceiling it names exist first.
+        deploy_capabilities(repo, runtime_root)
+        merge_ceiling(repo, ceiling)
+        if not args.connect_only:
+            env = dict(os.environ, **{k: v for k, v in launch_env.items() if k not in ('JULIA_PKG_OFFLINE', 'PATH')})
+            step('Installing Julia packages', ['julia', '--project='+str(repo), '-e', 'using Pkg; Pkg.instantiate()'], env)
+            # A release archive carries a prebuilt host; a checkout builds its own.
+            if (repo/'.git').exists() and shutil.which('cargo') or not host.is_file():
+                if not shutil.which('cargo'):
+                    parser.error('This source has no prebuilt host: install Rust (https://rustup.rs) or use the release installer')
+                step('Building the sandbox host', ['cargo','build','--manifest-path',str(repo/'runtime/host/Cargo.toml'),'--release','--locked'], env)
+            step('Preparing the sandbox (the first run takes several minutes)',
+                 [sys.executable,str(repo/'runtime/security/prewarm_depot.py'),'--project-dir',str(repo),'--host-bin',str(host)], dict(env, JULIA_PKG_OFFLINE='true'), quiet=True)
+        for path in (repo/'Manifest.toml', host):
+            if not path.is_file():
+                parser.error(f'missing prepared runtime file: {path}')
+        if not os.access(host, os.X_OK):
+            parser.error(f'host is not executable: {host}')
+        (data/'workspace').mkdir(parents=True, exist_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
+        launcher = output/'palette-mcp'
+        entry = {'command':sys.executable,'args':[str(repo/'runtime/security/serve_palette.py')],'env':launch_env}
+        script = ('#!/bin/sh\n# Palette-managed launcher\nexec env '+' '.join(shlex.quote(k+'='+v) for k,v in launch_env.items())
+                  +' '+shlex.quote(sys.executable)+' '+shlex.quote(entry['args'][0])+' "$@"\n')
+        if not args.no_check:
+            # Check the new launcher before it replaces the old one, so a failed
+            # update leaves the installation that worked.
+            trial = output/f'.palette-mcp.trial.{os.getpid()}'
+            write_atomic(trial, script, 0o755)
+            try:
+                check(trial)
+            except Exception as exc:
+                raise SystemExit(f'The check failed, so this installation was not switched on: {exc}')
+            finally:
+                trial.unlink(missing_ok=True)
     write_atomic(launcher, script, 0o755)
     plugin = output/'palette-local-plugin'
     # The self-contained upload omits nested plugin declarations from its SDK.
