@@ -76,7 +76,8 @@ class ProvisioningTest(unittest.TestCase):
             generic_config = root / "config" / "runner.toml"
             library = root / "lib"
             executable = root / "bin" / "runner"
-            paths = [model, weights, artifact, tokenizer_config, generic_config, library, executable]
+            lock = root / "locks" / "gpu.lock"
+            paths = [model, weights, artifact, tokenizer_config, generic_config, library, executable, lock]
             for path in paths:
                 path.mkdir(parents=True, exist_ok=True) if path == library else path.parent.mkdir(parents=True, exist_ok=True)
             argv = ["/usr/bin/python3", str(RUNNER), "run",
@@ -92,7 +93,7 @@ class ProvisioningTest(unittest.TestCase):
                     "--fixed-arg=--weights", f"--fixed-arg={weights}",
                     "--fixed-arg", "--library-dir", "--fixed-arg", str(library)]
             ceiling = {"host_command": {"commands": {
-                "inference": {"argv": argv, "cwd": tmp, "extra_args": True}}}}
+                "inference": {"argv": argv, "cwd": tmp, "lock": str(lock), "extra_args": True}}}}
             protected = set(protected_host_paths(ceiling))
             parents = command_parents(ceiling)
             for selected in paths:
