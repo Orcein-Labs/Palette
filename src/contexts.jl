@@ -181,11 +181,15 @@ const FINGERPRINT = Ref{Tuple{UInt, Tuple{UInt, Int, Int}}}((typemax(UInt), (UIn
 """
 What the method table looks like: the newest definition, the method count and
 the number of deleted methods. It changes when any method is defined, replaced
-or deleted. Every top-level statement moves the world counter, so the scan
-(about 10 ms) is cached per world, not keyed on it.
+or deleted. The world counter moves on each of those and, on 1.12, on each new
+global binding too, so it cannot stand in for the fingerprint there; the scan
+(about 10 ms) is cached per world instead. Julia 1.10 has no global method
+table to scan, and its world counter moves only on method changes, so there
+the world is the fingerprint.
 """
 function definitions_fingerprint()
     world = Base.get_world_counter()
+    isdefined(Core, :methodtable) || return (UInt(world), 0, 0)
     FINGERPRINT[][1] == world && return FINGERPRINT[][2]
     newest = Ref(UInt(0)); count = Ref(0); deleted = Ref(0)
     Base.visit(Core.methodtable) do m
