@@ -597,8 +597,12 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.assertIn("teamlab", found["authorized_capabilities"])
         self.assertEqual(found["authorized_ceiling"]["teamlab"], {"enabled": True})
         # The test runs in a second Julia inside the sandbox.
-        published = self.call("palette", {"code": 'tl("action"=>"publish", "tag"=>"Doubles a number and adds one", "source"=>"probe(x) = 2x + 1\\n", '
-                                                  '"test_source"=>"using Test; include(\\"probe.jl\\"); @test probe(20) == 41")'})["data"]
+        # The first invoke defines the capability's module; reading its
+        # entrypoint must not trip Julia 1.12's world-age warning.
+        reply = self.call("palette", {"code": 'tl("action"=>"publish", "tag"=>"Doubles a number and adds one", "source"=>"probe(x) = 2x + 1\\n", '
+                                              '"test_source"=>"using Test; include(\\"probe.jl\\"); @test probe(20) == 41")'})
+        self.assertNotIn("WARNING", reply.get("output") or "")
+        published = reply["data"]
         self.assertEqual(published["published"], True, published)
         synced = self.call("palette", {"code": 'tl("action"=>"sync")'})["data"]
         self.assertEqual([t["binding"] for t in synced["loaded"]], ["probe"], synced)
