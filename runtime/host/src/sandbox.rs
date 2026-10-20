@@ -1005,8 +1005,7 @@ fn identity_base(runtime_dir: Option<&Path>) -> Option<PathBuf> {
 /// could pre-create it and choose the sandbox's passwd, or plant a symlink
 /// where the temp file is written.
 fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let uid = unsafe { libc::getuid() };
     let etc = base.join(format!("palette-etc-{uid}"));
     match fs::DirBuilder::new().mode(0o755).create(&etc) {
@@ -1028,11 +1027,7 @@ fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
         for (name, text) in [("passwd", &passwd), ("group", &group)] {
             let tmp = etc.join(format!(".{name}.{}", std::process::id()));
             let _ = fs::remove_file(&tmp);
-            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW).open(&tmp).map_err(|e| e.to_string())?;
-            f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
-            fs::rename(&tmp, etc.join(name)).map_err(|e| e.to_string())?;
+            util::write_then(&tmp, text.as_bytes(), 0o644, || fs::rename(&tmp, etc.join(name))).map_err(|e| e.to_string())?;
         }
     }
     Ok(etc)
