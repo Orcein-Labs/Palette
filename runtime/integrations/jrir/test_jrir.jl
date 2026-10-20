@@ -357,8 +357,11 @@ end
             @test occursin(Regex("\"entrypoint\"\\s*:\\s*\"$cap\""), txt)
             req = match(r"\"requires\"\s*:\s*\[([^\]]*)\]", txt)
             if req !== nothing
+                src = read(joinpath(dirname(path), cap * ".jl"), String)
                 for m in eachmatch(r"\"([^\"]+)\"", req.captures[1])
                     @test m.captures[1] in authority
+                    # A requirement the source never exercises only hides the capability.
+                    m.captures[1] == "host_command" && @test occursin("host_command(", src)
                 end
             end
         end
