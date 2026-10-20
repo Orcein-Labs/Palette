@@ -347,7 +347,7 @@ end
     @testset "8. Capability manifest matches RuntimeRegistry schema" begin
         allowed = Set(["id", "version", "source", "entrypoint", "dependencies", "requires", "description"])
         authority = Set(["external_fs_write", "fs_digest", "host_command", "network_access",
-                         "package_management", "spawn_child_worker"])
+                         "package_management", "spawn_child_worker", "teamlab"])
         for cap in ("jrir", "vecindex", "teamlab")
             path = joinpath(@__DIR__, "..", cap, "capability.json")
             isfile(path) || continue

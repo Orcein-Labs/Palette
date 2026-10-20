@@ -85,6 +85,22 @@ that runs in `~/project`.
 Commands run with the host process's privilege and environment, outside every
 mount rule above: list only commands you would let the model run unattended.
 
+The `teamlab` category is the shelf of Julia tools and the mailbox that one
+user's agents share (`runtime/integrations/teamlab`). The ceiling grants it
+as `{"teamlab": {"dir": "/abs/shelf"}}`; the operator adds that grant itself
+unless the ceiling names one, using `PALETTE_TEAMLAB_DIR`, else
+`$XDG_DATA_HOME/palette/teamlab` (`~/.local/share/palette/teamlab`), and
+`PALETTE_TEAMLAB_DIR=off` leaves it out. The directory is protected like the
+mounts above, and no read root may contain it or lie inside it: no kernel can
+read or write it, and the host does every read
+and write there, under a lock, with the size limits in
+`runtime/host/src/teamlab.rs`. Each request acts as the agent the session
+was started for: the MCP client's `clientInfo.name` (`claude-code` is
+`claude`), else `PALETTE_AGENT`, else `local`. That name is cooperative. It
+records who published, approved or sent something; it does not authenticate
+anyone, since every agent of the user runs as the same OS user. Only the Rust
+host serves `teamlab`; the Python host denies it.
+
 Each call runs under a time limit. The host's `--turn-timeout` is the default
 and `--max-turn-timeout` (default: the same, at most 7 days) is the longest a
 call may name with its own `timeout_s`; a value outside that range is refused
