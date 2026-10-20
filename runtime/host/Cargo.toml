@@ -14,7 +14,7 @@ url = "2"
 # Pure Rust, zero transitive dependencies (RustCrypto): the broker computes
 # fs_digest itself, outside the sandbox, rather than trusting a digest
 # computed by the agent host it is checking.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [profile.release]
 opt-level = 3
