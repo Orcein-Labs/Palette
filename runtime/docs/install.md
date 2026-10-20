@@ -180,10 +180,10 @@ client only disconnects that client. Install the unit with the same runtime
 checkout and workspace used by the plugin:
 
 ```sh
-python3 runtime/security/palette_service.py install \
+runtime/host/target/release/palette-host service install \
   --repo-dir "$PWD" --workspace-dir /absolute/path/to/workspace
-python3 runtime/security/palette_service.py start
-python3 runtime/security/palette_service.py status
+runtime/host/target/release/palette-host service start
+runtime/host/target/release/palette-host service status
 ```
 
 `palette.service` owns the Julia daemon and its private socket at
@@ -193,8 +193,8 @@ stdio MCP client connects to this socket and exits independently. Restarting
 the tunnel alone leaves the daemon and its workspace state in place; use
 `systemctl --user restart palette-tunnel.service` for that operation. The
 installer writes units but does not enable them for login or boot. Start the
-daemon with `palette_service.py start`; manage the optional tunnel with
-`palette_service.py restart --unit palette-tunnel.service` (the same `--unit`
+daemon with `palette-host service start`; manage the optional tunnel with
+`palette-host service restart --unit palette-tunnel.service` (the same `--unit`
 selector works with `start`, `stop`, and `status`) and enable
 it with `systemctl --user enable palette-tunnel.service` only if the operator
 wants it started with the user manager. The daemon can be enabled separately
@@ -213,7 +213,7 @@ install the tunnel client, choose a profile, or create credentials. When the
 operator already has a tunnel client and profile, generate its unit with:
 
 ```sh
-python3 runtime/security/palette_service.py install \
+runtime/host/target/release/palette-host service install \
   --repo-dir "$PWD" --workspace-dir /absolute/path/to/workspace \
   --tunnel-client /absolute/path/to/tunnel-client --tunnel-profile existing-profile \
   --tunnel-profile-dir /absolute/path/to/profile-directory

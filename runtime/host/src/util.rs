@@ -162,3 +162,36 @@ pub fn fmt_g(x: f64) -> String {
         format!("{x}")
     }
 }
+
+/// `s` with a leading `~` or `~/` taken as the home directory.
+pub fn expand_user(s: &str) -> PathBuf {
+    match s.strip_prefix('~') {
+        Some("") => home(),
+        Some(rest) if rest.starts_with('/') => home().join(&rest[1..]),
+        _ => PathBuf::from(s),
+    }
+}
+
+/// True for a file this user may execute.
+pub fn executable(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    p.is_file()
+        && std::ffi::CString::new(p.as_os_str().as_bytes()).is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
+}
+
+/// The first executable `name` on PATH, as `shutil.which` finds it.
+pub fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()).map(|d| d.join(name)).find(|p| executable(p))
+}
+
+/// Replaces a file in one rename, so a reader never sees a half-written one.
+pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    let at = |e: std::io::Error| format!("{}: {e}", path.display());
+    let parent = path.parent().ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let name = path.file_name().ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let tmp = parent.join(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    write_then(&tmp, contents.as_bytes(), mode, || fs::rename(&tmp, path)).map_err(at)
+}

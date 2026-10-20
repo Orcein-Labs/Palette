@@ -6,7 +6,6 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -64,14 +63,6 @@ fn config_dir() -> PathBuf {
     env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| util::home().join(".config")).join("palette")
 }
 
-fn expand_user(s: &str) -> PathBuf {
-    match s.strip_prefix('~') {
-        Some("") => util::home(),
-        Some(rest) if rest.starts_with('/') => util::home().join(&rest[1..]),
-        _ => PathBuf::from(s),
-    }
-}
-
 fn text(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -86,17 +77,6 @@ fn read_json(p: &Path) -> Result<Value, String> {
 
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).expect("JSON values serialize") + "\n"
-}
-
-fn executable(p: &Path) -> bool {
-    p.is_file()
-        && std::ffi::CString::new(p.as_os_str().as_bytes()).is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
-}
-
-/// The first executable `name` on PATH, as `shutil.which` finds it.
-fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()).map(|d| d.join(name)).find(|p| executable(p))
 }
 
 /// A word the shell reads back as `s`, as Python's `shlex.quote`.
@@ -155,16 +135,6 @@ fn step(title: &str, argv: &[String], env: &[(String, String)], quiet: bool) -> 
         return Err(format!("{title} failed (exit {code}); the output above says why"));
     }
     Ok(())
-}
-
-/// Replaces a file in one rename, so a client never starts a half-written one.
-fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent).map_err(at(parent))?;
-    let name = path.file_name().ok_or_else(|| format!("{} has no file name", path.display()))?;
-    let tmp = parent.join(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    util::write_then(&tmp, contents.as_bytes(), mode, || fs::rename(&tmp, path)).map_err(at(path))
 }
 
 fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -383,7 +353,7 @@ fn merge_ceiling(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     types.push(json!("palette.runtime"));
-    write_atomic(path, &pretty(&ceiling), 0o600)
+    util::write_atomic(path, &pretty(&ceiling), 0o600)
 }
 
 /// One agent client's CLI: how to read the command its server named palette
@@ -493,7 +463,7 @@ fn register(launcher: &str, replace: bool) {
     let wsl = std::env::var_os("WSL_DISTRO_NAME").is_some_and(|v| !v.is_empty());
     for client in CLIENTS {
         // Inside WSL, PATH also lists Windows programs; install.ps1 registers those.
-        match which(client.add[0]) {
+        match util::which(client.add[0]) {
             Some(found) if !(wsl && found.starts_with("/mnt/")) => {}
             _ => continue,
         }
@@ -745,7 +715,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     // An operator file, used when it exists; an empty value means none.
     let operator_file = |key: &str, default: &str| match f.get(key) {
         Some(s) if s.is_empty() => None,
-        Some(s) => Some(expand_user(s)),
+        Some(s) => Some(util::expand_user(s)),
         None => Some(config.join(default)),
     };
     let host_commands = operator_file("host-commands", "host-commands.json").map(|p| util::resolve(&p)).filter(|p| p.is_file());
@@ -755,7 +725,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     };
     let mut tools = Vec::new();
     for name in ["julia", "bwrap", "python3"] {
-        tools.push(which(name).ok_or_else(|| format!("missing prerequisite on PATH: {name}"))?);
+        tools.push(util::which(name).ok_or_else(|| format!("missing prerequisite on PATH: {name}"))?);
     }
     let (julia, python) = (&tools[0], text(&tools[2]));
     if !repo.join("Project.toml").is_file() {
@@ -821,7 +791,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
             let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
             step("Installing Julia packages", &args(&["julia", &format!("--project={}", repo.display()), "-e", "using Pkg; Pkg.instantiate()"]), &env, false)?;
             // A release archive carries a prebuilt host; a checkout builds its own.
-            let cargo = which("cargo");
+            let cargo = util::which("cargo");
             if (repo.join(".git").exists() && cargo.is_some()) || !host.is_file() {
                 if cargo.is_none() {
                     return Err("This source has no prebuilt host: install Rust (https://rustup.rs) or use the release installer".into());
@@ -844,7 +814,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
                 return Err(format!("missing prepared runtime file: {}", path.display()));
             }
         }
-        if !executable(&host) {
+        if !util::executable(&host) {
             return Err(format!("host is not executable: {}", host.display()));
         }
         fs::create_dir_all(&workspace).map_err(at(&workspace))?;
@@ -853,7 +823,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
             // Check the new launcher before it replaces the old one, so a
             // failed update leaves the installation that worked.
             let trial = output.join(format!(".palette-mcp.trial.{}", std::process::id()));
-            write_atomic(&trial, &script, 0o755)?;
+            util::write_atomic(&trial, &script, 0o755)?;
             let checked = check(&trial);
             let _ = fs::remove_file(&trial);
             checked.map_err(|e| format!("The check failed, so this installation was not switched on: {e}"))?;
@@ -866,7 +836,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     drop(snapshot);
     prepared?;
 
-    write_atomic(&launcher, &script, 0o755)?;
+    util::write_atomic(&launcher, &script, 0o755)?;
     let entry = json!({
         "command": python,
         "args": [serve],
@@ -1062,7 +1032,7 @@ mod tests {
         assert_eq!(shquote("/a/project one"), "'/a/project one'");
         assert_eq!(shquote("it's"), "'it'\"'\"'s'");
         assert_eq!(shjoin(&["claude", "mcp", "add", "/a b"]), "claude mcp add '/a b'");
-        assert_eq!(expand_user("~/x"), util::home().join("x"));
-        assert_eq!(expand_user("~user/x"), PathBuf::from("~user/x"));
+        assert_eq!(util::expand_user("~/x"), util::home().join("x"));
+        assert_eq!(util::expand_user("~user/x"), PathBuf::from("~user/x"));
     }
 }
