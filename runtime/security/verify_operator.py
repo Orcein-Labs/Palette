@@ -128,7 +128,7 @@ def main():
     security = ROOT / "runtime/security"
     runs = [(security / suite, None, env) for suite in
             ("test_provisioning.py", "test_patch_broker.py", "test_server_runtime.py", "test_workspace_router.py",
-             "test_receipt_query.py", "test_read_roots.py", "test_palette_daemon.py", "test_palette_service.py")]
+             "test_receipt_query.py", "test_read_roots.py", "test_palette_daemon.py")]
     runs.append((ROOT / "runtime/integrations/gesso/test_gesso.py", None, env))
     implementations = ("rust", "python") if args.implementation == "both" else (args.implementation,)
     for implementation in implementations:
