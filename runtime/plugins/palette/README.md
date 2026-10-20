@@ -1,6 +1,16 @@
 # Palette plugin
 
-This directory supplies the portable Agent Plugins manifest and a stdio MCP
+The [one-command installer](../../docs/install.md) sets up the runtime,
+registers the server with each agent it finds, and installs this plugin for
+Claude Code. To add the plugin to Claude Code by hand, after the runtime is
+installed:
+
+```sh
+claude plugin marketplace add latentcollapse/Palette
+claude plugin install palette@palette
+```
+
+This directory also supplies the portable Agent Plugins manifest and a stdio MCP
 configuration. Install the runtime before enabling it. The template calls
 `palette-mcp` on PATH; the installer creates that command and can generate an
 absolute-path configuration for clients that do not expand plugin paths.
@@ -28,7 +38,8 @@ start the user service described in [installation](../../docs/install.md#user-se
 the launcher connects to its stable runtime socket and does not own the Julia
 daemon lifecycle.
 
-The repository marketplace is `.agents/plugins/marketplace.json`. Install the
+The repository marketplaces are `.claude-plugin/marketplace.json` (Claude Code)
+and `.agents/plugins/marketplace.json`. Install the
 runtime and put the generated `palette-mcp` command on PATH before enabling its
 Palette entry. Marketplace availability depends on the client.
 
