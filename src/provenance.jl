@@ -45,8 +45,72 @@ function binding_ids(mod)
         if session_binding(mod, n) && Base.invokelatest(isdefined, mod, n))
 end
 
+# Since Julia 1.12, a struct redefined with a different layout is a new type
+# (older versions refuse the redefinition). Values made and methods defined
+# before still use the old one, which prints as `@world(Foo, ...)` and fails
+# dispatch against the new one, so the turn says which bindings still refer to it.
+defined_types(ex) = !(ex isa Expr) ? Symbol[] :
+    ex.head in (:toplevel, :block) ? reduce(vcat, map(defined_types, ex.args); init=Symbol[]) :
+    ex.head === :macrocall ? defined_types(ex.args[end]) :
+    ex.head === :struct ? filter(s -> s isa Symbol, [type_head(ex.args[2])]) :
+    ex.head in (:abstract, :primitive) ? filter(s -> s isa Symbol, [type_head(ex.args[1])]) : Symbol[]
+
+function current_types(mod, ex)
+    out = Dict{Symbol, Any}()
+    for name in defined_types(ex)
+        Base.invokelatest(isdefined, mod, name) || continue
+        value = Base.invokelatest(getglobal, mod, name)
+        value isa Type && (out[name] = value)
+    end
+    return out
+end
+
+function mentions_type(@nospecialize(T), tn::Core.TypeName, depth=0)
+    depth > 16 && return false
+    T isa TypeVar && return mentions_type(T.ub, tn, depth + 1)
+    T isa UnionAll && return mentions_type(Base.unwrap_unionall(T), tn, depth + 1)
+    T isa Union && return mentions_type(T.a, tn, depth + 1) || mentions_type(T.b, tn, depth + 1)
+    T isa DataType || return false
+    T.name === tn && return true
+    return any(p -> mentions_type(p, tn, depth + 1), T.parameters)
+end
+
+function stale_type_notice(mod, types_before)
+    lines = String[]
+    for (name, old) in types_before
+        Base.invokelatest(getglobal, mod, name) === old && continue
+        body = Base.unwrap_unionall(old)
+        body isa DataType || continue
+        tn = body.name
+        values, methods_, fields = String[], String[], String[]
+        for sym in Base.invokelatest(names, mod; all=true)
+            (sym in (name, :ans) || !session_binding(mod, sym)) && continue
+            Base.invokelatest(isdefined, mod, sym) || continue
+            v = Base.invokelatest(getglobal, mod, sym)
+            if v isa Type
+                t = Base.unwrap_unionall(v)
+                t isa DataType && isconcretetype(t) || continue
+                any(f -> mentions_type(f, tn), fieldtypes(t)) && push!(fields, string(sym))
+            elseif v isa Function
+                any(m -> mentions_type(m.sig, tn), methods(v)) && push!(methods_, string(sym))
+            elseif mentions_type(typeof(v), tn)
+                push!(values, string(sym))
+            end
+        end
+        stale = String[]
+        isempty(values) || push!(stale, "values " * join(values, ", "))
+        isempty(methods_) || push!(stale, "methods of " * join(methods_, ", "))
+        isempty(fields) || push!(stale, "fields of " * join(fields, ", "))
+        isempty(stale) && continue
+        push!(lines, "[Palette: $name changed layout, so it is a new type. Still using the old $name: " *
+              join(stale, "; ") * ". Re-run those definitions, and rebuild those values, to use the new $name.]")
+    end
+    isempty(lines) || println(join(lines, "\n"))
+end
+
 function observed_statement(mod, ex, run; source=nothing)
     call = length(get_kernel_state().execution_history) + 1
+    types_before = current_types(mod, ex)
     before = binding_ids(mod)
     inherited = Dict{String, Any}()
     artifacts = Dict{String, Any}[]
@@ -66,7 +130,9 @@ function observed_statement(mod, ex, run; source=nothing)
     task_local_storage(:palette_source_reads, source_reads)
     task_local_storage(:palette_artifact_reads, reads)
     try
-        return run()
+        value = run()
+        isempty(types_before) || try stale_type_notice(mod, types_before) catch end
+        return value
     finally
         task_local_storage(:palette_source_reads, outer_sources)
         outer_sources === nothing || append!(outer_sources, source_reads)
