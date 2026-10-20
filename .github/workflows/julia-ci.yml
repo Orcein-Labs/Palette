@@ -225,7 +225,7 @@ jobs:
       run: |
         python3 runtime/security/test_provisioning.py
         sh -n runtime/scripts/install.sh
-        python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/palette-bundles"
+        cargo xtask bundles --output-dir "$RUNNER_TEMP/palette-bundles"
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
     - name: Prepare real operator dependencies and host
