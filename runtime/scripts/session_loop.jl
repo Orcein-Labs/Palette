@@ -1,56 +1,42 @@
 #!/usr/bin/env julia
 #=
-Palette persistent session loop -- runs inside the sandboxed worker, kept
-alive across many turns instead of one `-e script` per launch.
+Palette persistent session loop. It runs inside the sandboxed worker and
+stays alive across many calls.
 
-Protocol: newline-delimited JSON on stdin/stdout, one request per line, one
-response per line, in order. The first thing printed is a HELLO line
-carrying this process's own `epoch` -- a fresh UUID generated here, inside
-this process, not handed in by the orchestrator -- so a caller holding a
-handle from a previous process (this one crashed and got relaunched) gets
-a real, unambiguous mismatch instead of silently talking to a different
-Julia world that happens to share a session_id. See
-`runtime/security/session.py`'s `PaletteSession` for the orchestrator side.
+Protocol: newline-delimited JSON on stdin/stdout, one request per line and
+one response per line, in order. The first line printed is HELLO. Its
+`epoch` is a fresh UUID made in this process, so a caller still holding a
+handle to a previous process gets a clear mismatch. The orchestrator side
+is the Rust host (`runtime/host/src/session.rs`).
 
-Request:  {"request_id": "...", "kind": "EXECUTE" | "EPHEMERAL", "code": "...", "ceiling": {...}?,
-           "payload": "..."?, "timeout_s": number?}
-Response: {"request_id": "...", "epoch": "...", "success": bool, "data": ..., "display": ..., "output": ...,
-           "error": ..., "interrupted": true?, "kernel_exit": true?}
-HELLO:    {"kind": "HELLO", "epoch": "..."}
+HELLO:    {"kind": "HELLO", "epoch", "schema_revision": 3,
+           "capabilities": {"revival_observation_v1", "reload_observation_v1", "phase_costs_v1"}}
+Request:  {"request_id", "kind": "EXECUTE" | "EPHEMERAL", "code",
+           "payload"?, "timeout_s"?, "digest"?, "map"?,
+           "session_request"?, "context"?, "budget"?    (EXECUTE only)
+           "ceiling"?                                    (EPHEMERAL only)}
+Response: {"kind": "RESULT" | "ERROR", "epoch", "request_id", "success", "data", "display",
+           "output", "error", "call", "context", "bindings", "costs",
+           "interrupted"?, "kernel_exit"?, "reloads"?, "revival"?, "transport_shortened"?}
 
-`payload` is bound as `PAYLOAD` for that one EXECUTE turn. At `timeout_s` a
-turn still waiting is interrupted (`interrupted`) and the kernel keeps its
-state; one that ignores the interrupt for INTERRUPT_GRACE_S ends the process
-right after its reply (`kernel_exit`).
+`payload` (a string, or an object of strings) is bound as `PAYLOAD` for that
+one call. `digest: false` drops the output digest; `map: true` puts the
+workspace map before the output. `budget` needs `context: "budgeted"`.
+`revival` appears on the first RESULT after a revival. At `timeout_s` a call
+still running is interrupted (`interrupted`) and the kernel keeps its state;
+one that ignores the interrupt for INTERRUPT_GRACE_S ends the process right
+after its reply (`kernel_exit`).
 
-`kind == "EXECUTE"` evaluates into this session's own persistent
-`eval_module` -- the durable "mind": real state, real bindings, real
-compiled methods, kept for the life of this process.
+EXECUTE evaluates into this session's persistent `eval_module`, kept for the
+life of the process.
 
-`kind == "EPHEMERAL"` does NOT run in this process at all. An earlier
-version of this file ran ephemeral code in a fresh, throwaway `Module`
-in-process (see `Palette.EphemeralTool`/`check_ephemeral_source!`, which
-still exist and are still real, tested, and honestly documented as a
-namespace-HYGIENE measure). That was proven, by direct adversarial
-testing, not sufficient as an authority boundary: `Core.eval(Base,
-:(function show(io::IO, x::Int) ... end))` -- a value only assembled at
-RUNTIME -- extends a foreign module's method table with zero syntactic
-trace in the submitted source for any parse-time check to see. No static
-checker can fully police a language with reflective `eval`, and
-crippling `eval` itself would violate Palette's own "unbounded power
-inside the sandbox" thesis. The fix is not a smarter checker; it's
-putting the boundary underneath the language instead of inside it:
-`EPHEMERAL` spawns a real, disposable, OS-sandboxed CHILD process via the
-already-adversarially-proven `spawn_child_worker` capability (see
-`runtime/security/broker.py` and `runtime/docs/authority.md`). If the child's
-code corrupts its own `Base.show`, that corruption dies with the child
-process -- Linux throws the whole thing away, which is a fundamentally
-stronger guarantee than trying to detect or reverse the corruption
-afterward. `Palette.request_capability("spawn_child_worker", ...)` already
-enforces `C_child ⊆ C_caller`; an ephemeral turn's optional `"ceiling"`
-field (default `{}`, i.e. full language power, zero broker-mediated
-authority) is validated against THIS session's own ceiling exactly like
-any other spawn_child_worker request.
+EPHEMERAL does not run in this process. It runs in a disposable,
+OS-sandboxed child started through `spawn_child_worker`. Code evaluated at
+runtime can change a foreign module's method table (for example
+`Core.eval(Base, ...)`), which no parse-time check can see, so the boundary
+sits under the language: whatever the child changes dies with it. The
+call's optional `ceiling` (default `{}`) must lie within this session's own
+ceiling, as for any other `spawn_child_worker` request.
 =#
 using Palette
 
@@ -65,16 +51,16 @@ Palette.TASK_EPOCH[] = EPOCH
 # The protocol gets its own duplicate of fd 1, and fd 1/fd 2 are then pointed
 # at a sink file. Turn code prints, `run` children inherit fd 1, and tasks
 # left running after a turn all write somewhere; none of it may reach the
-# protocol channel, where one stray `println` used to be parsed as a
-# response and kill the session.
+# protocol channel, where one stray `println` would be parsed as a response
+# and kill the session.
 const PROTO = let fd = ccall(:dup, Cint, (Cint,), 1)
     fd < 0 && error("dup(1) failed")
     fdio(fd, true)
 end
 # Requests arrive on a duplicate of fd 0 for the same reason, and fd 0 itself
-# becomes /dev/null: a `readline()` or a `run(`cat`)` in turn code used to
-# consume the next request and leave the host waiting for a reply until the
-# turn timed out.
+# becomes /dev/null, so a `readline()` or a `run(`cat`)` in turn code cannot
+# consume the next request and leave the host waiting until the turn times
+# out.
 const PROTO_IN_FD = ccall(:dup, Cint, (Cint,), 0)
 PROTO_IN_FD < 0 && error("dup(0) failed")
 const PROTO_IN = open(Base.RawFD(PROTO_IN_FD))
