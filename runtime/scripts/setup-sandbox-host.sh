@@ -15,7 +15,7 @@ check() {
     bwrap --unshare-user --unshare-net --unshare-pid --unshare-ipc \
         --disable-userns --assert-userns-disabled --cap-drop ALL \
         --ro-bind / / --proc /proc --dev /dev --die-with-parent \
-        "$(command -v python3)" -c 'from pathlib import Path; caps = next(line.split()[1] for line in Path("/proc/self/status").read_text().splitlines() if line.startswith("CapEff:")); assert int(caps, 16) == 0, caps' \
+        "$(command -v awk)" '/^CapEff:/ { found = 1; held = $2 ~ /[^0]/ } END { exit !found || held }' /proc/self/status \
         || { echo "bubblewrap cannot create the sandbox's namespaces here" >&2; return 1; }
 }
 
