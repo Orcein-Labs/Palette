@@ -28,7 +28,7 @@ strip_lines!(ex) = ex isa Expr ? (ex.head === :macrocall && length(ex.args) > 1 
                                    (ex.args[2] = nothing); foreach(strip_lines!, ex.args); ex) : ex
 
 is_tool_stub(mod::Module, sym::Symbol) = (f = get(TOOL_STUBS, sym, nothing)) !== nothing &&
-    Base.invokelatest(isdefined, mod, sym) && Base.invokelatest(getglobal, mod, sym) === f && length(methods(f)) == 1
+    latest_isdefined(mod, sym) && latest_global(mod, sym) === f && length(methods(f)) == 1
 
 # The session's own bindings: not the kernel's, not compiler-generated, not a tool stub.
 session_binding(mod::Module, sym::Symbol) =
@@ -106,7 +106,7 @@ function tool_module(name::AbstractString, code::AbstractString, file::AbstractS
     Core.eval(m, :(const Palette = $(Api)))
     Core.eval(m, :(const Api = $(Api)))
     Core.eval(m, parsed)
-    f = Base.invokelatest(isdefined, m, Symbol(name)) ? Base.invokelatest(getglobal, m, Symbol(name)) : nothing
+    f = latest_isdefined(m, Symbol(name)) ? latest_global(m, Symbol(name)) : nothing
     f isa Function || error("$file does not define a function $name")
     return f
 end
@@ -149,7 +149,7 @@ function promote_tool(name::Symbol; doc::Union{Nothing, AbstractString}=nothing)
     # Not session_binding: another tool's stub counts here, since a tool that
     # calls one would not load on its own.
     deps = sort!([string(s) for s in free_globals(ex) if s !== name && !(s in KERNEL_BINDINGS) && !startswith(string(s), '#') &&
-                  Base.invokelatest(isdefined, mod, s) && Base.binding_module(mod, s) === mod])
+                  latest_isdefined(mod, s) && Base.binding_module(mod, s) === mod])
     isempty(deps) || error("$n uses session bindings $(join(deps, ", ")); a tool must stand alone (pass them as arguments or define them inside it)")
     tool_module(n, code, n)
     dir = project_tools_dir()
@@ -234,7 +234,7 @@ function install_tool_stubs!(mod::Module)
     for (n, e) in tool_index()
         e["verified"] || continue
         sym = Symbol(n)
-        Base.invokelatest(isdefined, mod, sym) && continue
+        latest_isdefined(mod, sym) && continue
         TOOL_STUBS[sym] = Core.eval(mod, :(function $sym(args...; kw...)
             $(GlobalRef(Palette, :call_tool))($(QuoteNode(sym)), args, kw)
         end))
