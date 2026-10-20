@@ -279,6 +279,59 @@ function reset_kernel_state()
 end
 
 """
+    reset_kernel_state!(; process=false)
+
+Forgets what earlier calls left behind: call history and receipts, costs,
+definitions, used files, binding records, outputs, task and host-job reports,
+and tool uses, sources and stubs. The session loop runs it after its warm-up
+calls so the first real call is call 1.
+
+`process=true` also forgets what the process was set up with: the state
+directory (removed from disk), the revival report, the kernel state, workspace
+packages and reloads, kept late-output files, the task epoch, restore and
+checkpoint notices, the session context and code graphs. The precompile
+workload runs it so none of its state is baked into the package image.
+"""
+function reset_kernel_state!(; process::Bool=false)
+    state = GLOBAL_STATE[]
+    if state !== nothing
+        empty!(state.execution_history)
+        empty!(state.receipt_log)
+    end
+    empty!(TURN_COSTS)
+    empty!(DEFINITION_LOG); clear_definition_index!()
+    empty!(CALL_FILES); empty!(USED_FILES)
+    empty!(BINDING_SEEN); empty!(BINDING_ORIGINS); empty!(BINDING_IDENTITIES)
+    empty!(OUTPUTS); empty!(XRAY)
+    OBSERVATION_ACK[] = nothing
+    empty!(LAST_RUNNING[])
+    empty!(REPORTED_TASKS); empty!(FINISH_REPORTED); empty!(TASK_OBSERVATIONS)
+    TASK_SEQUENCE[] = 0
+    empty!(HOST_JOBS); empty!(HOST_JOB_RESULTS); empty!(HOST_JOB_RESULT_ORDER)
+    empty!(TOOL_USES); empty!(TOOL_SOURCES); empty!(TOOL_STUBS); empty!(LOADED_TOOLS)
+    process || return nothing
+    isempty(STATE_DIR[]) || rm(STATE_DIR[]; recursive=true, force=true)
+    STATE_DIR[] = ""
+    REVIVAL_REPORT[] = ""
+    revival_observation!()
+    LAST_SAVED_CALL[] = 0
+    LAST_SNAPSHOT_SECONDS[] = 0.0
+    GLOBAL_STATE[] = nothing
+    empty!(WORKSPACE_PACKAGES); empty!(WORKSPACE_DECLARATIONS)
+    empty!(RELOAD_REPORTS)
+    RELOAD_SEQUENCE[] = 0
+    foreach(f -> rm(f[1]; force=true), LATE_FILES)
+    empty!(LATE_FILES)
+    TASK_EPOCH[] = ""
+    RESTORE_INFO[] = nothing
+    PENDING_CHECKPOINT[] = nothing
+    TIME_MACHINE_NOTICE[] = ""
+    SESSION_CONTEXT[] = nothing
+    empty!(CODE_GRAPHS)
+    return nothing
+end
+
+"""
     OperatorVocabulary
 
 Defines the vocabulary/lexicon available to operators.
