@@ -574,6 +574,23 @@ end
     @test get_kernel_state().receipt_log[end].result.data === nothing
 end
 
+@testset "execute_turn names its call while it runs" begin
+    # Callers other than a session request (an ephemeral process, the
+    # warm-up) get capability requests in their X-Ray too.
+    reset_kernel_state()
+    traced = Dict{String, Any}("name" => "traced", "source" => "call", "budget" => nothing)
+    with_fake_broker((t, p) -> ok(nothing)) do seen
+        (receipt, _, _), _ = Palette.execute_turn("Palette.request_capability(\"host_request\", Dict(\"type\" => \"probe\", \"payload\" => nothing)); sum([1, 2])",
+                                                  nothing; context=traced)
+        @test receipt.result.success
+        @test length(seen) == 1
+    end
+    rec = Palette.XRAY[1]
+    @test length(rec["capability_requests"]) == 1 && rec["capability_requests"][1]["approved"] === true
+    @test any(d -> d["function"] == "sum", rec["dispatch"])
+    @test Palette.CURRENT_CALL[] == 0 && Palette.CALL_CONTEXT[] === nothing
+end
+
 @testset "Revival checks see definitions made earlier in the same call" begin
     # Revival rebuilds definitions and checks them in one call, from a world
     # older than the new bindings. Julia 1.12 only warns about such reads and

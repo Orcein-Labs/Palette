@@ -767,18 +767,30 @@ function changes_since_ack(; acknowledge::Bool=false)
 end
 
 """
-    execute_turn(code, timeout_s) -> ((receipt, interrupted, stuck), output)
+    execute_turn(code, timeout_s; context=nothing) -> ((receipt, interrupted, stuck), output)
 
 One persistent turn: report what happened in the background and which used
 files changed, reload edited workspace packages, run `code` under the
-deadline, and capture everything it printed.
+deadline in `context` (nothing is normal), and capture everything it printed.
+While it runs, CURRENT_CALL and CALL_CONTEXT name this call, so its
+capability requests and context records land in its X-Ray.
 """
-function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing)
-    state = get_kernel_state()
+function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing, context=nothing)
     call = next_call()
+    CURRENT_CALL[] = call
+    CALL_CONTEXT[] = context
+    try
+        return run_execute_turn(code, timeout_s, call, context, session_request)
+    finally
+        CURRENT_CALL[] = 0
+        CALL_CONTEXT[] = nothing
+    end
+end
+
+function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call::Int, ctx, session_request)
+    state = get_kernel_state()
     # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
     # is the first one an agent pays for.
-    ctx = CALL_CONTEXT[]
     budget = ctx === nothing ? nothing : ctx["budget"]
     costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "first_call_in_kernel" => isempty(TURN_COSTS),
         "context" => context_name(ctx),
