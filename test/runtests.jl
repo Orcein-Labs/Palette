@@ -657,6 +657,32 @@ end
     @test w.kinds[Vector{Any}] === :object && w.kinds[Int] === nothing
 end
 
+# Julia before 1.12 refuses a struct redefinition that changes the layout.
+VERSION >= v"1.12" && @testset "A struct that changes layout names what still uses the old type" begin
+    reset_kernel_state()
+    printed(code) = mktemp() do path, io
+        r = redirect_stdout(() -> execute(ExecuteCode(code)), io)
+        flush(io)
+        @test r.result.success
+        read(path, String)
+    end
+    @test printed("struct Foo; x::Int; end; a = Foo(1); v = [Foo(2)]; n = 3\n" *
+                  "area(f::Foo) = f.x; struct Bar; f::Foo; end") == ""
+    # The same layout keeps the same type, so nothing is stale.
+    @test printed("struct Foo; x::Int; end") == ""
+    notice = printed("struct Foo; x::Int; y::Int; end")
+    @test occursin("Foo changed layout", notice)
+    @test occursin("values a, v;", notice) && occursin("methods of area;", notice) && occursin("fields of Bar.", notice)
+    @test !occursin("n,", notice) && !occursin("ans", notice)
+    # Once the old values and methods are rebuilt, the next change has nothing to report on them.
+    printed("a = Foo(1, 2); v = [a]; area(f::Foo) = f.x * f.y; struct Bar2; f::Foo; end")
+    notice = printed("Base.@kwdef struct Foo; x::Int = 1; y::Int = 2; z::Int = 3; end")
+    @test occursin("values a, v;", notice) && occursin("methods of area;", notice) && occursin("fields of Bar2.", notice)
+    @test !occursin("Bar,", notice) && !occursin("Bar.", notice)
+    # A type nothing refers to changes without a notice.
+    @test printed("struct Lone; x::Int; end; struct Lone; x::Float64; end") == ""
+end
+
 # The code graph Palette.codegraph() serves, tested on its own.
 const Pharos = Palette.Pharos
 include("pharos.jl")

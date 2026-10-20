@@ -58,8 +58,10 @@ function (f::Base.RedirectStdStream)(w::FdWriter)
 end
 
 # tempdir() is looked up when a turn runs: this file is precompiled, and a
-# constant would hold the build machine's temp directory.
-capture_path() = joinpath(tempdir(), "palette-turn-output")
+# constant would hold the build machine's temp directory. The pid keeps two
+# processes sharing one temp directory (precompiling on the host, or test
+# runs) from removing each other's capture file.
+capture_path() = joinpath(tempdir(), "palette-turn-output-$(getpid())")
 
 # Runs `f` with fd 1 and fd 2 on a fresh append-only file. A process the
 # turn left running keeps its descriptor to that file, now unlinked, so its
