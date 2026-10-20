@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_revival import Kernel, KernelTestCase  # noqa: E402
+from test_revival import KernelTestCase  # noqa: E402
 
 DEFINE = """
 f(xs) = sum(xs)
@@ -48,13 +48,6 @@ n = ccall(:labs, Clong, (Clong,), -3)
 
 
 class ContextsTest(KernelTestCase):
-    def kernel(self):
-        return Kernel(self.ws, self.state)
-
-    def ok(self, r):
-        self.assertTrue(r["success"], r)
-        return r
-
     def xray(self, k, r):
         return self.ok(k.turn(f'Palette.xray({r["call"]})'))["data"]
 

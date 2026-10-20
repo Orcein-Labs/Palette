@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import receipt_query  # noqa: E402
-from test_revival import Kernel, KernelTestCase  # noqa: E402
+from test_revival import KernelTestCase  # noqa: E402
 
 DIGEST = 'Palette.fs_digest([joinpath(pwd(), "a.txt")])'
 DENIED = 'Palette.request_capability("network_access", Dict{String,Any}("host" => "example.com", "port" => 443))'
@@ -46,15 +46,12 @@ class XRayTest(KernelTestCase):
     def setUp(self):
         super().setUp()
         self.receipts = tempfile.mkdtemp(prefix="palette-xray-receipts-")
+        self.addCleanup(shutil.rmtree, self.receipts, True)
         Path(self.ws, "a.txt").write_text("x\n")
 
-    def tearDown(self):
-        shutil.rmtree(self.receipts, ignore_errors=True)
-        super().tearDown()
-
     def kernel(self, state=None):
-        return Kernel(self.ws, state or self.state, extra_args=["--receipts-dir", self.receipts],
-                      ceiling={"fs_digest": {"allowed_paths": [self.ws]}})
+        return super().kernel(state, extra_args=["--receipts-dir", self.receipts],
+                              ceiling={"fs_digest": {"allowed_paths": [self.ws]}})
 
     def test_every_request_of_a_call_joins_its_receipts(self):
         k = self.kernel()
