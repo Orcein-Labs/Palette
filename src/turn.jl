@@ -399,8 +399,8 @@ end
 function bound_tasks(mod::Module)
     byname = IdDict{Task, Symbol}()
     for sym in sort!(Base.invokelatest(names, mod; all=true); by=s -> s === :ans)
-        Base.invokelatest(isdefined, mod, sym) || continue
-        t = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        t = latest_global(mod, sym)
         t isa Task && !haskey(byname, t) && (byname[t] = sym)
     end
     return sort!(collect(byname); by=p -> string(p[2]))
@@ -644,8 +644,8 @@ end
 
 function binding_provenance(name::Symbol; strong::Bool=false)
     mod = get_kernel_state().eval_module
-    Base.invokelatest(isdefined, mod, name) || return Dict("name" => string(name), "state" => "not_bound", "epoch" => TASK_EPOCH[])
-    value = Base.invokelatest(getglobal, mod, name)
+    latest_isdefined(mod, name) || return Dict("name" => string(name), "state" => "not_bound", "epoch" => TASK_EPOCH[])
+    value = latest_global(mod, name)
     seen = get(BINDING_SEEN, name, nothing)
     call = seen === nothing ? nothing : seen[2]
     origin = get(BINDING_ORIGINS, name, Dict{String, Any}())
@@ -694,8 +694,8 @@ function binding_list!(mod::Module, call::Int)
     definitions = IdDict{Any, Any}()
     for sym in sort!(Base.invokelatest(names, mod; all=true))
         session_binding(mod, sym) || continue
-        Base.invokelatest(isdefined, mod, sym) || continue
-        v = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        v = latest_global(mod, sym)
         push!(live, sym)
         id = objectid(v)
         seen = get(BINDING_SEEN, sym, nothing)
