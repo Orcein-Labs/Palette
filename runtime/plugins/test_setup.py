@@ -85,7 +85,7 @@ SERVER = textwrap.dedent('''\
                 reply = {'data': world['x'] + 1} if 'x' in world and os.environ.get('FAKE_PALETTE') != 'forget' \\
                     else {'error': 'UndefVarError: x not defined'}
             elif '"teamlab"' in code:
-                reply = {'data': {'agent': 'palette-setup', 'dir': '/shelf', 'tools': [], 'unread': 0}}
+                reply = {'data': {'agent': 'palette-setup', 'dir': '/shop', 'pinned': [], 'new': [], 'listed': 0, 'unread': 0}}
             result = {'content': [{'type': 'text', 'text': json.dumps(reply)}]}
         print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
 ''')
@@ -215,7 +215,7 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn('Preparing the sandbox', done.stdout)
         self.assertIn('x + 1 = 42', done.stdout)
-        self.assertIn('TeamLab: 0 tools', done.stdout)
+        self.assertIn('TeamLab: 0 listings', done.stdout)
         palette = home/'.local/share/palette'
         launcher = palette/'client/palette-mcp'
         self.assertEqual([self.registered(c) for c in CLIENTS], [str(launcher)]*4)
