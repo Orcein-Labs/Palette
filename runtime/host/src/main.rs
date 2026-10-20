@@ -7,12 +7,14 @@
 //!   palette-host subset     REQUESTED_JSON PARENT_JSON
 //!   palette-host prewarm    --project-dir P [--repo-dir R]
 //!   palette-host teamlab-news [--agent A]
+//!   palette-host setup      [--repo-dir R] [--no-register] [--replace] [--no-check] ... (see setup --help)
 
 mod broker;
 mod cli;
 mod receipt_archive;
 mod sandbox;
 mod session;
+mod setup;
 mod teamlab;
 mod util;
 
@@ -165,7 +167,8 @@ fn main() {
         Some("subset") => subset(rest),
         Some("prewarm") => prewarm(rest),
         Some("teamlab-news") => teamlab_news(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news ...".into()),
+        Some("setup") => setup::main(rest),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news|setup ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,

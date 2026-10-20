@@ -5,9 +5,9 @@ description: Set up the bundled Palette Julia runtime, connect its MCP tools, or
 
 Read the bundled INSTALL.md before setup. On a Linux or WSL2 host, prefer the
 one-command installer it gives: one approval covers the whole install, and it
-registers local clients and checks a call. Otherwise run the bundled setup.py
+registers local clients and checks a call. Otherwise run the bundled setup.sh
 with the documented Julia, Python, Rust and Bubblewrap prerequisites. Preserve
-external workspace state. Use the paths setup.py prints rather than guessing
+external workspace state. Use the paths setup.sh prints rather than guessing
 host paths.
 
 A local client may launch the prepared palette-mcp stdio command. A cloud chat

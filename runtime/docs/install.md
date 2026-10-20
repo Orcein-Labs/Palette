@@ -18,7 +18,7 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
 
 1. Downloads the release archive, which holds the source and a prebuilt
    x86_64 host (glibc 2.35 or newer), and checks it against `SHA256SUMS.txt`.
-   Where the prebuilt host does not run, setup builds it with Rust.
+   Where the prebuilt host does not run, the installer builds it with Rust.
 2. Installs Python 3 and bubblewrap if they are missing and, where AppArmor
    restricts user namespaces (Ubuntu 23.10 and newer), Ubuntu's recommended
    upstream bubblewrap profile, pinned by revision and checksum. This is the
@@ -26,7 +26,7 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
    AppArmor and user-namespace policy is left as it is.
 3. Installs Julia with [juliaup](https://github.com/JuliaLang/juliaup) unless
    Julia 1.10 or newer is on `PATH`.
-4. Runs `runtime/plugins/setup.py`, which instantiates the Julia project,
+4. Runs `palette-host setup`, which instantiates the Julia project,
    prepares the sandbox depot, deploys [TeamLab](../integrations/teamlab/README.md)
    into the capability registry, grants `palette.runtime` in the capability
    ceiling (creating it, or adding to the one there), and writes the client
@@ -95,7 +95,7 @@ Settings, all optional environment variables:
 From a source checkout, `sh runtime/scripts/install.sh` installs the checkout's
 last commit as `versions/git-<commit>`, building the host with `cargo` (into
 `build/`, shared between commits). Uncommitted changes are not installed.
-`python3 runtime/plugins/setup.py --help` lists the setup options, such as
+`sh runtime/plugins/setup.sh --help` lists the setup options, such as
 `--no-register` and `--no-check`, for running that step alone.
 
 ### Removal
