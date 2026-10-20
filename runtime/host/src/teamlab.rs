@@ -31,9 +31,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const FORMAT: u64 = 2;
@@ -49,6 +49,10 @@ const MAX_NOTE_CHARS: usize = 2000;
 const MAX_TAG_WORDS: usize = 15;
 const MAX_TAG_CHARS: usize = 120;
 const MAX_SYNC_BYTES: usize = 32 * 1024 * 1024;
+/// The serialized index, which every change rewrites whole.
+const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+/// The sources of every version the shop keeps, together.
+const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 /// A broadcast someone has read is kept this long before it may be dropped.
 const BROADCAST_KEEP_S: f64 = 7.0 * 86400.0;
 /// How long another agent's new version shows as new in `status`.
@@ -93,16 +97,40 @@ fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if matches!(configured.trim(), "" | "off") {
         return None;
     }
-    let path = match configured.strip_prefix("~/") {
-        Some(rest) => Path::new(&var("HOME")?).join(rest),
+    let path = match configured.strip_prefix('~') {
+        Some(rest) => expand_user(rest, &var)?,
         None => PathBuf::from(&configured),
     };
     path.is_absolute().then_some(path)
 }
 
-/// 1-32 of `[a-z0-9._-]`, starting with a letter or digit.
+/// `~` and `~user` as Python's `expanduser` reads them: `rest` follows the
+/// `~`. None for a user with no home.
+fn expand_user(rest: &str, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let (user, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let home = if user.is_empty() { var("HOME")? } else { home_of(user)? };
+    let home = PathBuf::from(home);
+    Some(if tail.is_empty() { home } else { home.join(tail) })
+}
+
+/// A user's home directory from the password database.
+fn home_of(user: &str) -> Option<String> {
+    let name = std::ffi::CString::new(user).ok()?;
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
+    if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) }.to_str().ok().map(String::from)
+}
+
+/// 1-32 of `[a-z0-9._-]`, starting with a letter or digit, and not "all",
+/// which addresses mail to every agent.
 pub fn valid_agent(name: &str) -> bool {
-    (1..=32).contains(&name.len())
+    name != "all"
+        && (1..=32).contains(&name.len())
         && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
@@ -133,7 +161,7 @@ fn valid_id(s: &str) -> bool {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    util::to_hex(&Sha256::digest(bytes))
 }
 
 /// A new listing's id: the shortest prefix (8 hex digits, then 12, ...) of a
@@ -171,9 +199,21 @@ struct Lab {
 struct LabLock(#[allow(dead_code)] File);
 
 impl Lab {
+    /// The shop at `dir`, created private if it is not there. An existing
+    /// shop directory must be a real directory this user owns that no one
+    /// else can write.
     fn open(dir: &Path) -> Result<Lab, Fail> {
         let blobs = dir.join("blobs");
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&blobs).map_err(io(&blobs))?;
+        for d in [dir, blobs.as_path()] {
+            let meta = fs::symlink_metadata(d).map_err(io(d))?;
+            let uid = unsafe { libc::geteuid() };
+            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+                return Err(Internal(format!(
+                    "teamlab {} must be a directory (not a symlink) owned by uid {uid} that only its owner can write",
+                    d.display())));
+            }
+        }
         Ok(Lab { dir: dir.to_path_buf() })
     }
 
@@ -221,22 +261,24 @@ impl Lab {
         }
         let state = if format == Some(1) { from_format_1(obj(state)) } else { obj(state) };
         let listing_ok = |l: &Value| ["kind", "binding", "tag", "author"].iter().all(|k| l[k].is_string())
-            && l["versions"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(|v| v["sha256"].is_string()));
+            && l["versions"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(|v| v["sha256"].as_str().is_some_and(valid_sha)));
         if let Some(id) = listings(&state).iter().find(|(_, l)| !listing_ok(l)).map(|(id, _)| id) {
             return Err(unreadable(format!("listing {id} is missing its kind, binding, tag, author or versions")));
         }
         Ok(state)
     }
 
-    /// Replaces the index atomically, keeping the one it replaces.
+    /// Replaces the index atomically, keeping the one it replaces. An index
+    /// past MAX_INDEX_BYTES is refused and nothing is written.
     fn save(&self, state: &Map<String, Value>) -> Result<(), Fail> {
         let path = self.state_path();
+        let bytes = serde_json::to_vec(state).map_err(|e| Internal(format!("teamlab index: {e}")))?;
+        if bytes.len() > MAX_INDEX_BYTES {
+            return Err(Denied(format!("the teamlab index would pass {} MiB; ack mail or drop old versions first",
+                                      MAX_INDEX_BYTES >> 20)));
+        }
         let tmp = self.dir.join(format!(".state.{}.tmp", util::hex(12)));
-        let written = (|| {
-            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp)?;
-            f.write_all(&serde_json::to_vec(state).map_err(std::io::Error::other)?)?;
-            f.sync_all()?;
+        util::write_then(&tmp, &bytes, 0o600, || {
             let prev = self.dir.join("state.prev.json");
             match fs::remove_file(&prev) {
                 Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
@@ -248,11 +290,7 @@ impl Lab {
             }
             fs::rename(&tmp, &path)?;
             File::open(&self.dir)?.sync_all()
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        written.map_err(io(&path))
+        }).map_err(io(&path))
     }
 
     fn blob_path(&self, sha: &str) -> PathBuf {
@@ -268,18 +306,7 @@ impl Lab {
         }
         let _ = fs::remove_file(&path);
         let tmp = self.dir.join("blobs").join(format!(".{sha}.{}.tmp", util::hex(8)));
-        let written = (|| {
-            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp)?;
-            f.write_all(source)?;
-            f.sync_all()?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444))?;
-            fs::rename(&tmp, &path)
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        written.map_err(io(&path))
+        util::write_then(&tmp, source, 0o444, || fs::rename(&tmp, &path)).map_err(io(&path))
     }
 
     /// A version's source, refused unless its bytes still hash to its name.
@@ -644,6 +671,10 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
                 };
                 dropped.push(vs.remove(i)["sha256"].as_str().unwrap_or_default().to_string());
             }
+            if blob_bytes_with(state, &sha, source.len()) > MAX_BLOB_BYTES {
+                return Err(Denied(format!("the teamlab shop keeps at most {} MiB of tool source; \
+                                           unpin old versions so they can be dropped", MAX_BLOB_BYTES >> 20)));
+            }
             lab.put_blob(&sha, source.as_bytes())?;
             let version = vs.last().and_then(|v| v["version"].as_u64()).unwrap_or(0) + 1;
             vs.push(json!({
@@ -666,11 +697,25 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
     }))
 }
 
+/// The bytes of every distinct source the index keeps, with `sha` added if
+/// it is not kept yet.
+fn blob_bytes_with(state: &Map<String, Value>, sha: &str, bytes: usize) -> u64 {
+    let mut seen = BTreeSet::new();
+    let mut total = 0;
+    for v in listings(state).values().flat_map(versions) {
+        if seen.insert(text(&v["sha256"])) {
+            total += v["bytes"].as_u64().unwrap_or(0);
+        }
+    }
+    total + if seen.contains(sha) { 0 } else { bytes as u64 }
+}
+
 fn approve(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
     let id = required_id(p)?;
     let note = note_param(p)?;
     let sha = pick(listing(state, id)?, id, str_param(p, "sha256")?)?["sha256"].clone();
-    let v = listings_mut(state)[id]["versions"].as_array_mut().unwrap().iter_mut().find(|v| v["sha256"] == sha).unwrap();
+    let v = listings_mut(state)[id]["versions"].as_array_mut().into_iter().flatten().find(|v| v["sha256"] == sha)
+        .ok_or_else(|| Internal(format!("teamlab listing {id} lost version {sha}")))?;
     if v["author"] == agent {
         return Err(Denied(format!("{agent} wrote listing {id} version {}; another agent has to approve it", v["version"])));
     }
@@ -742,7 +787,8 @@ fn update(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -
 /// hash. A second pinned listing under a binding already sent is left out
 /// and named in `clashes`.
 fn sync(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Result<Value, Fail> {
-    let (mut out, mut missing, mut behind, mut clashes, mut total) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
+    let (mut out, mut missing, mut damaged, mut behind, mut clashes, mut total) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
     let mut bound = BTreeSet::new();
     for (id, sha) in pins_of(state, agent) {
         let Some((l, v)) = listings(state).get(&id).and_then(|l| Some((l, versions(l).iter().find(|v| v["sha256"] == sha)?))) else {
@@ -756,7 +802,13 @@ fn sync(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Result<Value, Fai
         if latest(l)["sha256"] != sha {
             behind.push(json!(id));
         }
-        let source = lab.read_blob(sha.as_str().unwrap_or_default())?;
+        let source = match lab.read_blob(sha.as_str().unwrap_or_default()) {
+            Ok(s) => s,
+            Err(Denied(why) | Internal(why)) => {
+                damaged.push(json!({"id": id, "error": why}));
+                continue;
+            }
+        };
         total += source.len();
         if total > MAX_SYNC_BYTES {
             return Err(Denied(format!("the pinned tools come to more than {} MiB; unpin some", MAX_SYNC_BYTES >> 20)));
@@ -765,7 +817,7 @@ fn sync(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Result<Value, Fai
         t["source"] = json!(source);
         out.push(t);
     }
-    Ok(json!({"agent": agent, "tools": out, "missing": missing, "behind": behind, "clashes": clashes,
+    Ok(json!({"agent": agent, "tools": out, "missing": missing, "damaged": damaged, "behind": behind, "clashes": clashes,
               "unread": unread(state, agent)}))
 }
 
@@ -948,6 +1000,7 @@ pub fn receipt_view(agent: &str, params: &Value, result: &Value) -> (Value, Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     struct TmpDir(PathBuf);
     impl Drop for TmpDir {
@@ -1166,7 +1219,10 @@ mod tests {
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("XDG_DATA_HOME", "rel")])), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab")])), Some(PathBuf::from("/lab")));
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~/lab")])), Some(PathBuf::from("/h/lab")));
-        for off in ["", "off", "relative"] {
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~")])), Some(PathBuf::from("/h")));
+        let root = home_of("root").expect("root has a home");
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~root/lab")])), Some(Path::new(&root).join("lab")));
+        for off in ["", "off", "relative", "~no-such-user-palette/lab"] {
             let pairs: &'static [(&str, &str)] = Box::leak(Box::new([("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", off)]));
             assert_eq!(dir_from_env(env(pairs)), None, "{off:?}");
         }
@@ -1225,6 +1281,11 @@ mod tests {
         fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
         let e = call(&d.0, "codex", json!({"action": "status"})).unwrap_err();
         assert!(e.contains("unreadable") && e.contains(id(&r)), "{e}");
+        state["tools"][id(&r)]["tag"] = json!("restored");
+        state["tools"][id(&r)]["versions"][0]["sha256"] = json!("../../etc/passwd");
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let e = call(&d.0, "codex", json!({"action": "status"})).unwrap_err();
+        assert!(e.contains("unreadable") && e.contains(id(&r)), "a version's sha256 must be a hash: {e}");
     }
 
     #[test]
@@ -1234,10 +1295,14 @@ mod tests {
         let blob = d.0.join("blobs").join(format!("{}.jl", r["sha256"].as_str().unwrap()));
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&blob, "run(`rm -rf ~`)\n").unwrap();
-        for action in ["sync", "fetch"] {
-            let e = call(&d.0, "codex", json!({"action": action, "id": id(&r)})).unwrap_err();
-            assert!(e.contains("tampered"), "{action}: {e}");
-        }
+        let other = list(&d.0, "codex", "other", "other() = 2\n");
+        let e = call(&d.0, "codex", json!({"action": "fetch", "id": id(&r)})).unwrap_err();
+        assert!(e.contains("tampered"), "{e}");
+        let s = ok(&d.0, "codex", json!({"action": "sync"}));
+        assert_eq!(s["tools"].as_array().unwrap().iter().map(|t| t["id"].clone()).collect::<Vec<_>>(), [other["id"].clone()],
+                   "the other pinned tool still loads");
+        assert_eq!(s["damaged"][0]["id"], r["id"]);
+        assert!(s["damaged"][0]["error"].as_str().unwrap().contains("tampered"), "{s}");
         list(&d.0, "codex", "hello", SRC);
         assert_eq!(ok(&d.0, "codex", json!({"action": "sync"}))["tools"][0]["source"], SRC);
     }
@@ -1251,7 +1316,48 @@ mod tests {
         fs::write(&elsewhere, SRC).unwrap();
         fs::remove_file(&blob).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &blob).unwrap();
-        assert!(call(&d.0, "codex", json!({"action": "sync"})).unwrap_err().starts_with("internal"));
+        let s = ok(&d.0, "codex", json!({"action": "sync"}));
+        assert_eq!((s["tools"].as_array().unwrap().len(), s["damaged"][0]["id"].clone()), (0, r["id"].clone()), "{s}");
+        assert!(call(&d.0, "codex", json!({"action": "fetch", "id": id(&r)})).unwrap_err().starts_with("internal"));
+    }
+
+    #[test]
+    fn a_shop_dir_that_is_a_symlink_or_writable_by_others_is_refused() {
+        let d = lab();
+        list(&d.0, "codex", "hello", SRC);
+        let link = d.0.with_extension("link");
+        std::os::unix::fs::symlink(&d.0, &link).unwrap();
+        let e = call(&link, "codex", json!({"action": "status"})).unwrap_err();
+        let _ = fs::remove_file(&link);
+        assert!(e.contains("not a symlink"), "{e}");
+        for dir in [d.0.clone(), d.0.join("blobs")] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o770)).unwrap();
+            let e = call(&d.0, "codex", json!({"action": "status"})).unwrap_err();
+            assert!(e.contains("only its owner can write"), "{}: {e}", dir.display());
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        ok(&d.0, "codex", json!({"action": "status"}));
+    }
+
+    #[test]
+    fn the_index_and_the_kept_source_are_capped() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let l = Lab::open(&d.0).unwrap();
+        let mut state = l.load().unwrap();
+        listings_mut(&mut state)[id(&r)]["versions"][0]["bytes"] = json!(MAX_BLOB_BYTES);
+        l.save(&state).unwrap();
+        let e = call(&d.0, "codex", json!({"action": "publish", "binding": "hello", "source": "hello(x) = 2\n"})).unwrap_err();
+        assert!(e.contains("MiB of tool source"), "{e}");
+        assert_eq!(fs::read_dir(d.0.join("blobs")).unwrap().count(), 1, "no blob is written for a refused version");
+        list(&d.0, "codex", "hello", SRC);
+
+        listings_mut(&mut state)[id(&r)]["tag"] = json!("x".repeat(MAX_INDEX_BYTES));
+        match l.save(&state) {
+            Err(Denied(why)) => assert!(why.contains("index would pass"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(l.load().is_ok(), "the saved index is left as it was");
     }
 
     #[test]
@@ -1410,7 +1516,7 @@ mod tests {
         for good in ["claude", "codex", "gemini", "grok", "local", "a.b-c_d", "x1"] {
             assert!(valid_agent(good), "{good}");
         }
-        for bad in ["", "Claude", "-x", ".x", "a b", "a/b", &"a".repeat(33)] {
+        for bad in ["", "all", "Claude", "-x", ".x", "a b", "a/b", &"a".repeat(33)] {
             assert!(!valid_agent(bad), "{bad}");
         }
     }
