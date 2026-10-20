@@ -241,6 +241,22 @@ def check(launcher):
     server.close()
 
 
+def read_roots_list(path, parser):
+    """The directories in a read-roots file: one absolute path a line, blank
+    lines and lines starting with # skipped."""
+    roots = []
+    for line in path.read_text().splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith('#'):
+            continue
+        if not Path(entry).is_absolute() or ':' in entry:
+            parser.error(f'{path}: read roots must be absolute paths without ":": {entry}')
+        if not Path(entry).is_dir():
+            parser.error(f'{path}: read root is not a directory: {entry}')
+        roots.append(str(Path(entry).resolve()))
+    return roots
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo-dir', type=Path, default=DEFAULT_REPO)
@@ -253,6 +269,8 @@ def main():
                         help='Capability ceiling (PALETTE_CAPABILITY_CEILING); created, or added to')
     parser.add_argument('--host-commands', default=str(CONFIG/'host-commands.json'),
                         help='Host commands file (PALETTE_HOST_COMMANDS), used when it exists; empty for none')
+    parser.add_argument('--read-roots', default=str(CONFIG/'read-roots'),
+                        help='File of host directories the kernel may read (PALETTE_READ_ROOTS), one absolute path a line, used when it exists; empty for none')
     parser.add_argument('--connect-only', action='store_true', help='Use a runtime already built and prewarmed; do not prepare again')
     parser.add_argument('--wsl-distribution', help='Generate Windows Claude configuration targeting this WSL distribution')
     parser.add_argument('--no-register', action='store_true', help='Do not add the server to local agent clients')
@@ -266,6 +284,8 @@ def main():
     host_commands = Path(args.host_commands).expanduser().resolve() if args.host_commands else None
     if host_commands and not host_commands.is_file():
         host_commands = None
+    read_roots_file = Path(args.read_roots).expanduser() if args.read_roots else None
+    read_roots = read_roots_list(read_roots_file, parser) if read_roots_file and read_roots_file.is_file() else []
     for command in ('julia', 'bwrap'):
         if not shutil.which(command):
             parser.error(f'missing prerequisite on PATH: {command}')
@@ -286,6 +306,7 @@ def main():
                   'OPERATOR_WORKSPACE':str(data/'workspace'),'PALETTE_PACKAGE_DEPOT':str(data/'packages'),
                   'PALETTE_RUNTIME_ROOT':str(runtime_root),'PALETTE_CAPABILITY_CEILING':str(ceiling),
                   **({'PALETTE_HOST_COMMANDS':str(host_commands)} if host_commands else {}),
+                  **({'PALETTE_READ_ROOTS':':'.join(read_roots)} if read_roots else {}),
                   'JULIA_DEPOT_PATH':str(depot),'JULIA_PKG_OFFLINE':'true',
                   'PATH':str(Path(shutil.which('julia')).parent)+':'+SYSTEM_PATH}
     # Preparing starts sessions under the environment the server gets, so the
@@ -353,6 +374,8 @@ def main():
         register(launcher, replace=args.replace)
     if host_commands:
         print(f'Host commands: {host_commands}')
+    if read_roots:
+        print(f'Read roots: {", ".join(read_roots)}')
     print(f'Client files: {output}\nstdio MCP command: {launcher}')
 
 if __name__ == '__main__':

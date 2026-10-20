@@ -65,6 +65,10 @@ environment moves it, and `off` leaves TeamLab out.
 When `~/.config/palette/host-commands.json` exists, the launcher passes it as
 `PALETTE_HOST_COMMANDS` (see [authority](authority.md)); create it and run the
 installer again to enable host commands.
+Likewise, when `~/.config/palette/read-roots` exists, the launcher passes its
+directories as `PALETTE_READ_ROOTS`: one absolute path a line, with blank
+lines and lines starting with `#` skipped. Setup refuses a relative path or a
+missing directory.
 
 `install.sh --update` installs a newer release only and leaves registrations
 as they are. It does nothing for a source checkout, and from a
