@@ -28,7 +28,10 @@ Clients attach over MCP, or over the host session (newline-delimited JSON on std
 ## Install
 
 Linux, or WSL2 on Windows. One command installs Julia if needed, the sandbox
-host and its packages, then connects Claude Code and Codex and checks one call.
+host and its packages, and [TeamLab](runtime/integrations/teamlab/README.md),
+the tool shelf and mailbox your agents share. It connects the Claude Code,
+Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
+Claude Code, and checks the installation before switching to it.
 
 ```sh
 curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
@@ -45,9 +48,9 @@ The installer asks for your password once, to install bubblewrap and Python 3
 from your distribution; on Windows it needs none. The first run takes several
 minutes while it prepares the sandbox. Everything else lives in
 `~/.local/share/palette`, runs locally, and needs no account. Run the command
-again to update.
+again to update, or accept the daily update it offers.
 
-Then start a new Claude Code or Codex session and ask it to evaluate `x = 41`,
+Then start a new agent session and ask it to evaluate `x = 41`,
 then `x + 1`. Other MCP clients can run `~/.local/share/palette/client/palette-mcp`
 as a stdio server. The [installation guide](runtime/docs/install.md) covers
 settings, a source checkout, servers and removal.

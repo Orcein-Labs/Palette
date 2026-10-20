@@ -1,0 +1,24 @@
+{
+  "name": "palette",
+  "owner": {
+    "name": "Matt C"
+  },
+  "metadata": {
+    "description": "Palette: a persistent, sandboxed Julia world for coding agents"
+  },
+  "plugins": [
+    {
+      "name": "palette",
+      "source": "./runtime/plugins/palette",
+      "description": "Skills for Palette's persistent Julia world, and a session-start line saying which Palette is installed.",
+      "author": {
+        "name": "Matt C"
+      },
+      "repository": "https://github.com/latentcollapse/Palette",
+      "license": "Apache-2.0",
+      "keywords": ["julia", "mcp", "developer-tools"],
+      "category": "development",
+      "strict": false
+    }
+  ]
+}

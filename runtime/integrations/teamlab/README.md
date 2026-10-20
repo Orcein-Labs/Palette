@@ -12,6 +12,12 @@ configuring: every session the operator starts is granted the user's shelf,
 `PALETTE_TEAMLAB_DIR` to use another directory, or `off` to leave TeamLab out.
 `runtime/docs/authority.md` has the details.
 
+The [installer](../../docs/install.md) puts this directory in the capability
+registry (`PALETTE_RUNTIME_ROOT`) and grants `palette.runtime` in the
+capability ceiling, which is all a session needs to call it. Without the
+installer, do both yourself: copy this directory to `<runtime root>/teamlab`
+and add `"palette.runtime"` to the ceiling's `host_request.allowed_types`.
+
 Each session acts as the agent its MCP client names (`claude-code` is
 `claude`); a standalone host uses `PALETTE_AGENT`. The name records who
 published, approved or sent something. It is not authentication: all of a
