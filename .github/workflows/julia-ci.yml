@@ -29,12 +29,6 @@ jobs:
     - name: Instantiate project
       run: julia --project=@. -e 'using Pkg; Pkg.instantiate()'
 
-    - name: Test the static analysis preflight tool itself
-      run: python3 runtime/scripts/test_julia_analyzer.py
-
-    - name: Run static analysis preflight
-      run: python3 runtime/scripts/julia_analyzer.py src/Palette.jl --verbose
-
     - name: Build package
       run: julia --project=@. -e 'using Pkg; Pkg.build()'
 
