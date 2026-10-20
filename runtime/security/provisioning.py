@@ -142,10 +142,10 @@ def agent_name(client_name: Any) -> str | None:
 
 
 def with_teamlab(ceiling: dict[str, Any]) -> dict[str, Any]:
-    """Grant the user's TeamLab shelf, which every agent of this user shares.
+    """Grant the user's TeamLab shop, which every agent of this user shares.
 
     An operator ceiling that names a teamlab grant keeps it. Otherwise the
-    shelf is ``PALETTE_TEAMLAB_DIR``, else ``$XDG_DATA_HOME/palette/teamlab``;
+    shop is ``PALETTE_TEAMLAB_DIR``, else ``$XDG_DATA_HOME/palette/teamlab``;
     ``PALETTE_TEAMLAB_DIR=off`` (or empty) leaves TeamLab ungranted. Only the
     Rust host serves TeamLab.
     """

@@ -1,17 +1,25 @@
-//! TeamLab: a shelf of Julia tools and a mailbox shared by one user's agents
-//! (Claude, Codex, Gemini, ...). The broker keeps it in a host directory no
-//! kernel can write (the ceiling's `teamlab.dir`), so a kernel reaches it
-//! only through these actions, under the name the session host was given for
-//! the calling agent.
+//! TeamLab: a local shop of Julia tools, and a mailbox, shared by one user's
+//! agents (Claude, Codex, Gemini, ...). Any agent lists a tool it wrote; the
+//! others browse the shop, try a listing and pin the ones they want. The
+//! broker keeps it in a host directory no kernel can write (the ceiling's
+//! `teamlab.dir`), so a kernel reaches it only through these actions, under
+//! the name the session host was given for the calling agent.
 //!
-//! The directory holds `state.json` (the index: tools and their versions,
+//! A listing is not a product name. It has an id (a hash prefix), a kind
+//! (what it is: a function or a module), a tag (what it does, in 15 words or
+//! fewer) and the binding its source defines, which is what a kernel calls.
+//! Each listing keeps its versions; each agent pins at most one version of a
+//! listing, and at most one listing per binding.
+//!
+//! The directory holds `state.json` (the index: listings and their versions,
 //! each agent's pins, the messages), `blobs/<sha256>.jl` (each version's
 //! source, read-only, checked against its name on every read) and
 //! `lab.lock`. Every action holds a flock on the lock file, shared to read
 //! and exclusive to change, so sessions of different agents on one machine
-//! see one consistent shelf. The index is replaced atomically and the one it
+//! see one consistent shop. The index is replaced atomically and the one it
 //! replaced is kept as `state.prev.json`; an index that does not parse is
-//! reported and never overwritten.
+//! reported and never overwritten. A format-1 index (tools keyed by name) is
+//! read as format 2 and written back as format 2 on the next change.
 //!
 //! Agent names are not authenticated: they come from the MCP client's own
 //! name, so they keep honest agents apart (no approving your own tool, no
@@ -21,13 +29,14 @@ use crate::broker::Fail::{self, Denied, Internal};
 use crate::util;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 2;
 const MAX_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_TOOLS: usize = 256;
 const MAX_VERSIONS: usize = 64;
@@ -37,18 +46,25 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_MAIL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SUBJECT_CHARS: usize = 200;
 const MAX_NOTE_CHARS: usize = 2000;
+const MAX_TAG_WORDS: usize = 15;
+const MAX_TAG_CHARS: usize = 120;
 const MAX_SYNC_BYTES: usize = 32 * 1024 * 1024;
 /// A broadcast someone has read is kept this long before it may be dropped.
 const BROADCAST_KEEP_S: f64 = 7.0 * 86400.0;
+/// How long another agent's new version shows as new in `status`.
+const NEW_FOR_S: f64 = 7.0 * 86400.0;
 
-const ACTIONS: &[&str] = &["status", "publish", "approve", "pin", "unpin", "update", "sync", "fetch", "send", "inbox", "ack"];
+const ACTIONS: &[&str] = &[
+    "status", "browse", "publish", "approve", "pin", "unpin", "update", "sync", "fetch", "send", "inbox", "ack",
+];
+const KINDS: &[&str] = &["function", "module"];
 
-/// Words a tool name cannot be: `sync` binds each tool as `const <name>`.
+/// Words a binding cannot be: `sync` binds each tool as `TeamLab.<binding>`.
 const JULIA_RESERVED: &[&str] = &[
     "abstract", "baremodule", "begin", "break", "catch", "const", "continue", "do", "else", "elseif", "end",
     "export", "false", "finally", "for", "function", "global", "if", "import", "in", "isa", "let", "local",
     "macro", "module", "mutable", "outer", "primitive", "public", "quote", "return", "struct", "true", "try",
-    "type", "using", "where", "while",
+    "type", "using", "where", "while", "TeamLab", "Palette", "Base", "Core", "Main",
 ];
 
 /// The lab directory a ceiling grants, when its `teamlab` grant names an
@@ -56,6 +72,32 @@ const JULIA_RESERVED: &[&str] = &[
 pub fn ceiling_dir(ceiling: &Value) -> Option<PathBuf> {
     let dir = ceiling.get("teamlab")?.get("dir")?.as_str()?;
     Path::new(dir).is_absolute().then(|| util::resolve(Path::new(dir)))
+}
+
+/// The shop the operator grants this user's sessions, as provisioning.py's
+/// `with_teamlab` finds it: `PALETTE_TEAMLAB_DIR` (empty or `off` for none),
+/// else `$XDG_DATA_HOME/palette/teamlab`, else `~/.local/share/palette/teamlab`.
+pub fn user_dir() -> Option<PathBuf> {
+    dir_from_env(|k| std::env::var(k).ok())
+}
+
+fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let configured = match var("PALETTE_TEAMLAB_DIR") {
+        Some(d) => d,
+        None => {
+            let data = var("XDG_DATA_HOME").map(PathBuf::from).filter(|d| d.is_absolute())
+                .or_else(|| Some(Path::new(&var("HOME")?).join(".local/share")))?;
+            return Some(data.join("palette/teamlab"));
+        }
+    };
+    if matches!(configured.trim(), "" | "off") {
+        return None;
+    }
+    let path = match configured.strip_prefix("~/") {
+        Some(rest) => Path::new(&var("HOME")?).join(rest),
+        None => PathBuf::from(&configured),
+    };
+    path.is_absolute().then_some(path)
 }
 
 /// 1-32 of `[a-z0-9._-]`, starting with a letter or digit.
@@ -71,19 +113,50 @@ pub fn default_agent() -> String {
     std::env::var("PALETTE_AGENT").ok().filter(|a| valid_agent(a)).unwrap_or_else(|| "local".into())
 }
 
-fn valid_tool_name(name: &str) -> bool {
+fn valid_binding(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !JULIA_RESERVED.contains(&name)
 }
 
+fn is_hex(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+fn valid_sha(s: &str) -> bool {
+    s.len() == 64 && is_hex(s)
+}
+
+fn valid_id(s: &str) -> bool {
+    (8..=64).contains(&s.len()) && is_hex(s)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn valid_sha(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+/// A new listing's id: the shortest prefix (8 hex digits, then 12, ...) of a
+/// hash of who listed it, its binding and its first source that no other
+/// listing has.
+fn new_listing_id(taken: &Map<String, Value>, author: &str, binding: &str, first_sha: &str) -> String {
+    let full = sha256_hex(format!("{author}\n{binding}\n{first_sha}").as_bytes());
+    let mut n = 8;
+    while n < 64 && taken.contains_key(&full[..n]) {
+        n += 4;
+    }
+    full[..n].to_string()
+}
+
+/// A tag with its whitespace normalized, or why it is not one.
+fn tag_of(text: &str) -> Result<String, String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let tag = words.join(" ");
+    if words.is_empty() || words.len() > MAX_TAG_WORDS || tag.chars().count() > MAX_TAG_CHARS {
+        return Err(format!("a teamlab 'tag' says what the tool does in 1 to {MAX_TAG_WORDS} words \
+                            (at most {MAX_TAG_CHARS} characters), not {} words", words.len()));
+    }
+    Ok(tag)
 }
 
 fn io(what: &Path) -> impl Fn(std::io::Error) -> Fail + '_ {
@@ -137,7 +210,8 @@ impl Lab {
             "teamlab index {} is unreadable ({why}); it is left as it is and nothing is written until it is \
              repaired or restored from state.prev.json beside it", path.display()));
         let state: Value = serde_json::from_slice(&text).map_err(|e| unreadable(e.to_string()))?;
-        let well_formed = state.get("format").and_then(Value::as_u64) == Some(FORMAT)
+        let format = state.get("format").and_then(Value::as_u64);
+        let well_formed = matches!(format, Some(1 | 2))
             && state.get("tools").is_some_and(Value::is_object)
             && state.get("pins").is_some_and(Value::is_object)
             && state.get("messages").is_some_and(Value::is_array)
@@ -145,7 +219,13 @@ impl Lab {
         if !well_formed {
             return Err(unreadable(format!("not a format-{FORMAT} index")));
         }
-        Ok(obj(state))
+        let state = if format == Some(1) { from_format_1(obj(state)) } else { obj(state) };
+        let listing_ok = |l: &Value| ["kind", "binding", "tag", "author"].iter().all(|k| l[k].is_string())
+            && l["versions"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(|v| v["sha256"].is_string()));
+        if let Some(id) = listings(&state).iter().find(|(_, l)| !listing_ok(l)).map(|(id, _)| id) {
+            return Err(unreadable(format!("listing {id} is missing its kind, binding, tag, author or versions")));
+        }
+        Ok(state)
     }
 
     /// Replaces the index atomically, keeping the one it replaces.
@@ -215,18 +295,64 @@ impl Lab {
         String::from_utf8(bytes).map_err(|_| Internal(format!("teamlab blob {} is not UTF-8", path.display())))
     }
 
-    /// Removes the blobs of dropped versions that no tool still uses. Run
+    /// Removes the blobs of dropped versions that no listing still uses. Run
     /// after the index is saved, so a crash leaves an unused blob, never an
     /// index entry without its source.
     fn collect(&self, state: &Map<String, Value>, dropped: &[String]) {
         for sha in dropped {
-            let used = tools(state).values().filter_map(Value::as_array).flatten()
-                .any(|v| v.get("sha256").and_then(Value::as_str) == Some(sha));
+            let used = listings(state).values().flat_map(versions).any(|v| v["sha256"] == sha.as_str());
             if !used {
                 let _ = fs::remove_file(self.blob_path(sha));
             }
         }
     }
+}
+
+/// A format-1 index (`tools` keyed by name, pins and messages naming tools)
+/// as format 2. Each tool becomes a function listing tagged with the first
+/// line of its first note, or its name.
+fn from_format_1(mut state: Map<String, Value>) -> Map<String, Value> {
+    let mut listings = Map::new();
+    let mut ids = BTreeMap::new();
+    for (name, vs) in obj(state.remove("tools").unwrap_or_default()) {
+        let Some(first) = vs.as_array().and_then(|v| v.first()).cloned() else { continue };
+        let author = first["author"].as_str().unwrap_or("local").to_string();
+        let id = new_listing_id(&listings, &author, &name, text(&first["sha256"]));
+        let note_line = first["note"].as_str().and_then(|n| n.lines().find(|l| !l.trim().is_empty())).unwrap_or("");
+        let words: Vec<&str> = note_line.split_whitespace().take(MAX_TAG_WORDS).collect();
+        let tag = match util::head(&words.join(" "), MAX_TAG_CHARS) {
+            t if t.is_empty() => name.replace('_', " "),
+            t => t,
+        };
+        listings.insert(id.clone(), json!({
+            "kind": "function", "binding": name, "tag": tag, "author": author,
+            "created_at": first["published_at"], "versions": vs,
+        }));
+        ids.insert(name, id);
+    }
+    let pins: Map<String, Value> = obj(state.remove("pins").unwrap_or_default()).into_iter()
+        .map(|(agent, held)| {
+            let held: Map<String, Value> = obj(held).into_iter()
+                .filter_map(|(name, sha)| Some((ids.get(&name)?.clone(), sha))).collect();
+            (agent, Value::Object(held))
+        })
+        .collect();
+    for m in state.get_mut("messages").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(m) = m.as_object_mut() {
+            let tool = m.remove("tool");
+            let listing = tool.as_ref().and_then(Value::as_str).and_then(|n| ids.get(n)).map_or(Value::Null, |id| json!(id));
+            m.insert("listing".into(), listing);
+        }
+    }
+    state.insert("format".into(), json!(FORMAT));
+    state.insert("tools".into(), Value::Object(listings));
+    state.insert("pins".into(), Value::Object(pins));
+    state
+}
+
+/// A string field, or "" (for messages: a Value prints with quotes).
+fn text(v: &Value) -> &str {
+    v.as_str().unwrap_or_default()
 }
 
 fn obj(v: Value) -> Map<String, Value> {
@@ -236,12 +362,24 @@ fn obj(v: Value) -> Map<String, Value> {
     }
 }
 
-fn tools(state: &Map<String, Value>) -> &Map<String, Value> {
+fn listings(state: &Map<String, Value>) -> &Map<String, Value> {
     state["tools"].as_object().expect("checked when loaded")
 }
 
-fn tools_mut(state: &mut Map<String, Value>) -> &mut Map<String, Value> {
+fn listings_mut(state: &mut Map<String, Value>) -> &mut Map<String, Value> {
     state.get_mut("tools").and_then(Value::as_object_mut).expect("checked when loaded")
+}
+
+fn versions(listing: &Value) -> &Vec<Value> {
+    listing["versions"].as_array().expect("checked when loaded")
+}
+
+fn latest(listing: &Value) -> &Value {
+    versions(listing).last().expect("checked when loaded")
+}
+
+fn listing<'a>(state: &'a Map<String, Value>, id: &str) -> Result<&'a Value, Fail> {
+    listings(state).get(id).ok_or_else(|| Denied(format!("no listing {id} is in the teamlab shop")))
 }
 
 fn pins_of(state: &Map<String, Value>, agent: &str) -> Map<String, Value> {
@@ -257,13 +395,15 @@ fn pins_mut<'a>(state: &'a mut Map<String, Value>, agent: &str) -> &'a mut Map<S
     entry.as_object_mut().unwrap()
 }
 
-fn messages_mut(state: &mut Map<String, Value>) -> &mut Vec<Value> {
-    state.get_mut("messages").and_then(Value::as_array_mut).expect("checked when loaded")
+/// Another listing this agent pins under `binding`, which `id` would clash with.
+fn clash_with(state: &Map<String, Value>, agent: &str, binding: &str, id: &str) -> Option<String> {
+    pins_of(state, agent).keys()
+        .find(|other| *other != id && listings(state).get(*other).is_some_and(|l| l["binding"] == binding))
+        .cloned()
 }
 
-fn versions<'a>(state: &'a Map<String, Value>, name: &str) -> Result<&'a Vec<Value>, Fail> {
-    tools(state).get(name).and_then(Value::as_array).filter(|v| !v.is_empty())
-        .ok_or_else(|| Denied(format!("no tool named {name:?} is on the teamlab shelf")))
+fn messages_mut(state: &mut Map<String, Value>) -> &mut Vec<Value> {
+    state.get_mut("messages").and_then(Value::as_array_mut).expect("checked when loaded")
 }
 
 fn str_param<'a>(p: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>, Fail> {
@@ -274,12 +414,15 @@ fn str_param<'a>(p: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>
     }
 }
 
-fn tool_param<'a>(p: &'a Map<String, Value>) -> Result<&'a str, Fail> {
-    let name = str_param(p, "name")?.ok_or_else(|| Denied("teamlab requires a tool 'name'".into()))?;
-    if !valid_tool_name(name) {
-        return Err(Denied(format!("teamlab tool name {name:?} must be a Julia identifier (ASCII letters, digits and _, at most 64, not a keyword)")));
+fn id_param<'a>(p: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str>, Fail> {
+    match str_param(p, key)? {
+        Some(id) if !valid_id(id) => Err(Denied(format!("teamlab '{key}' {id:?} is not a listing id (8 to 64 lowercase hex digits)"))),
+        id => Ok(id),
     }
-    Ok(name)
+}
+
+fn required_id<'a>(p: &'a Map<String, Value>) -> Result<&'a str, Fail> {
+    id_param(p, "id")?.ok_or_else(|| Denied("teamlab requires a listing 'id' (see browse)".into()))
 }
 
 fn note_param(p: &Map<String, Value>) -> Result<Value, Fail> {
@@ -290,13 +433,21 @@ fn note_param(p: &Map<String, Value>) -> Result<Value, Fail> {
     }
 }
 
+fn test_param(p: &Map<String, Value>) -> Result<Value, Fail> {
+    let Some(t) = p.get("test").filter(|t| !t.is_null()) else { return Ok(Value::Null) };
+    match (t.get("passed").and_then(Value::as_bool), t.get("summary").map_or(Some(""), Value::as_str)) {
+        (Some(passed), Some(s)) => Ok(json!({"passed": passed, "summary": util::head(s, 4000)})),
+        _ => Err(Denied("teamlab 'test' must be {\"passed\": bool, \"summary\": string}".into())),
+    }
+}
+
 /// The version `sha256` names, or the newest.
-fn pick<'a>(versions: &'a [Value], name: &str, sha: Option<&str>) -> Result<&'a Value, Fail> {
+fn pick<'a>(listing: &'a Value, id: &str, sha: Option<&str>) -> Result<&'a Value, Fail> {
     match sha {
-        None => Ok(versions.last().expect("versions are never empty")),
+        None => Ok(latest(listing)),
         Some(s) if !valid_sha(s) => Err(Denied("teamlab 'sha256' must be 64 lowercase hex digits".into())),
-        Some(s) => versions.iter().find(|v| v["sha256"] == s)
-            .ok_or_else(|| Denied(format!("tool {name:?} has no version {s}"))),
+        Some(s) => versions(listing).iter().find(|v| v["sha256"] == s)
+            .ok_or_else(|| Denied(format!("listing {id} has no version {s}"))),
     }
 }
 
@@ -307,18 +458,49 @@ fn summary(v: &Value) -> Value {
     })
 }
 
+/// A version with what a kernel needs to load it: the listing's id, kind,
+/// binding and tag.
+fn loadable(id: &str, listing: &Value, v: &Value) -> Value {
+    let mut t = summary(v);
+    for k in ["kind", "binding", "tag"] {
+        t[k] = listing[k].clone();
+    }
+    t["id"] = json!(id);
+    t
+}
+
+/// A listing as `browse` and `status` show it to `agent`.
+fn view(state: &Map<String, Value>, agent: &str, id: &str, listing: &Value) -> Value {
+    let newest = latest(listing);
+    let pinned = pins_of(state, agent).get(id).and_then(|sha| versions(listing).iter().find(|v| &v["sha256"] == sha));
+    let pinned_by: Vec<&String> = state["pins"].as_object().into_iter().flatten()
+        .filter(|(_, held)| held.get(id).is_some()).map(|(a, _)| a).collect();
+    json!({
+        "id": id, "kind": listing["kind"], "binding": listing["binding"], "tag": listing["tag"],
+        "author": listing["author"], "versions": versions(listing).len(), "latest": summary(newest),
+        "pinned_by": pinned_by, "pinned": pinned.map(|v| v["sha256"].clone()),
+        "pinned_version": pinned.map(|v| v["version"].clone()),
+        "behind": pinned.is_some_and(|v| v["sha256"] != newest["sha256"]),
+    })
+}
+
+fn published_at(listing: &Value) -> f64 {
+    latest(listing)["published_at"].as_f64().unwrap_or(0.0)
+}
+
 pub fn handle(dir: &Path, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
     let action = str_param(p, "action")?.unwrap_or("");
     if !ACTIONS.contains(&action) {
         return Err(Denied(format!("teamlab 'action' must be one of {}", ACTIONS.join(", "))));
     }
     let lab = Lab::open(dir)?;
-    let reading = matches!(action, "status" | "sync" | "fetch" | "inbox");
+    let reading = matches!(action, "status" | "browse" | "sync" | "fetch" | "inbox");
     let _lock = lab.lock(!reading)?;
     let mut state = lab.load()?;
     if reading {
         return match action {
             "status" => Ok(status(&lab, &state, agent)),
+            "browse" => browse(&state, agent, p),
             "sync" => sync(&lab, &state, agent),
             "fetch" => fetch(&lab, &state, p),
             _ => inbox(&state, agent, p),
@@ -351,168 +533,248 @@ fn acked_by(m: &Value, agent: &str) -> bool {
     m["acked_by"].as_array().is_some_and(|a| a.iter().any(|x| x == agent))
 }
 
+/// What this agent pins, what is new in the shop, and unread mail. A listing
+/// is new while its newest version is another agent's, at most a week old,
+/// and this agent does not pin it.
 fn status(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Value {
     let pins = pins_of(state, agent);
-    let listed: Vec<Value> = tools(state).iter().filter_map(|(name, vs)| {
-        let vs = vs.as_array().filter(|v| !v.is_empty())?;
-        let latest = vs.last().unwrap();
-        let pinned = pins.get(name).and_then(|sha| vs.iter().find(|v| &v["sha256"] == sha));
-        Some(json!({
-            "name": name, "versions": vs.len(), "latest": summary(latest),
-            "pinned": pinned.map(|v| v["sha256"].clone()), "pinned_version": pinned.map(|v| v["version"].clone()),
-            "behind": pinned.is_some_and(|v| v["sha256"] != latest["sha256"]),
-        }))
-    }).collect();
-    json!({"agent": agent, "dir": lab.dir, "tools": listed, "unread": unread(state, agent)})
+    let now = util::now_secs();
+    let pinned: Vec<Value> = pins.keys().filter_map(|id| Some(view(state, agent, id, listings(state).get(id)?))).collect();
+    let mut new: Vec<(&String, &Value)> = listings(state).iter()
+        .filter(|(id, l)| !pins.contains_key(*id) && latest(l)["author"] != agent && now - published_at(l) <= NEW_FOR_S)
+        .collect();
+    new.sort_by(|a, b| published_at(b.1).total_cmp(&published_at(a.1)));
+    let new: Vec<Value> = new.into_iter().map(|(id, l)| view(state, agent, id, l)).collect();
+    json!({"agent": agent, "dir": lab.dir, "pinned": pinned, "new": new, "listed": listings(state).len(),
+           "unread": unread(state, agent)})
 }
 
+/// The listings whose kind, binding, tag, author or id hold every word of
+/// `query` (all of them without one), newest first.
+fn browse(state: &Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
+    let query = str_param(p, "query")?.unwrap_or("");
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut found: Vec<(&String, &Value)> = listings(state).iter().filter(|(id, l)| {
+        let hay = format!("{} {} {} {} {id}", text(&l["kind"]), text(&l["binding"]), text(&l["tag"]), text(&l["author"])).to_lowercase();
+        words.iter().all(|w| hay.contains(w.as_str()))
+    }).collect();
+    found.sort_by(|a, b| published_at(b.1).total_cmp(&published_at(a.1)));
+    let found: Vec<Value> = found.into_iter().map(|(id, l)| view(state, agent, id, l)).collect();
+    Ok(json!({"agent": agent, "query": query, "listings": found, "listed": listings(state).len()}))
+}
+
+/// Adds a version to a listing: the one `id` names (anyone may), else this
+/// agent's listing of the same binding, else a new listing, which needs a
+/// `kind` and a `tag`. The author pins it, unless they pin another listing
+/// with the same binding.
 fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>, dropped: &mut Vec<String>)
     -> Result<Value, Fail> {
-    let name = tool_param(p)?;
+    let binding = str_param(p, "binding")?.ok_or_else(|| Denied("teamlab publish requires the 'binding' the source defines".into()))?;
+    if !valid_binding(binding) {
+        return Err(Denied(format!("teamlab binding {binding:?} must be a Julia identifier (ASCII letters, digits and _, \
+                                   at most 64, not a keyword or TeamLab, Palette, Base, Core or Main)")));
+    }
     let source = str_param(p, "source")?.ok_or_else(|| Denied("teamlab publish requires the tool's 'source'".into()))?;
     if source.trim().is_empty() || source.len() > MAX_SOURCE_BYTES {
         return Err(Denied(format!("teamlab source must be non-empty and at most {} KiB", MAX_SOURCE_BYTES / 1024)));
     }
-    let note = note_param(p)?;
-    let test = match p.get("test") {
-        None | Some(Value::Null) => Value::Null,
-        Some(t) => {
-            let passed = t.get("passed").and_then(Value::as_bool);
-            let summary = t.get("summary").map_or(Some(""), Value::as_str);
-            match (passed, summary) {
-                (Some(passed), Some(s)) => json!({"passed": passed, "summary": util::head(s, 4000)}),
-                _ => return Err(Denied("teamlab 'test' must be {\"passed\": bool, \"summary\": string}".into())),
+    let kind = match str_param(p, "kind")? {
+        Some(k) if !KINDS.contains(&k) => return Err(Denied(format!("teamlab 'kind' must be one of {}", KINDS.join(", ")))),
+        k => k,
+    };
+    let tag = str_param(p, "tag")?.map(tag_of).transpose().map_err(Denied)?;
+    let (note, test) = (note_param(p)?, test_param(p)?);
+    let sha = sha256_hex(source.as_bytes());
+
+    let id = match id_param(p, "id")? {
+        Some(id) => Some(id.to_string()),
+        None => listings(state).iter().find(|(_, l)| l["author"] == agent && l["binding"] == binding).map(|(id, _)| id.clone()),
+    };
+    let new_listing = id.is_none();
+    let id = match id {
+        Some(id) => {
+            let l = listing(state, &id)?;
+            if l["binding"] != binding {
+                return Err(Denied(format!("listing {id} binds {}, not {binding}", text(&l["binding"]))));
             }
+            if kind.is_some_and(|k| l["kind"] != k) {
+                return Err(Denied(format!("listing {id} is a {}, not a {}", text(&l["kind"]), kind.unwrap_or_default())));
+            }
+            if let Some(tag) = tag.as_ref().filter(|t| l["tag"] != t.as_str()) {
+                if l["author"] != agent {
+                    return Err(Denied(format!("only {}, who listed {id}, changes its tag", text(&l["author"]))));
+                }
+                listings_mut(state)[&id]["tag"] = json!(tag);
+            }
+            id
+        }
+        None => {
+            let (Some(kind), Some(tag)) = (kind, tag.as_ref()) else {
+                return Err(Denied(format!("a new teamlab listing needs a 'kind' ({}) and a 'tag': what it does, \
+                                           in {MAX_TAG_WORDS} words or fewer", KINDS.join(" or "))));
+            };
+            if listings(state).len() >= MAX_TOOLS {
+                return Err(Denied(format!("the teamlab shop holds at most {MAX_TOOLS} listings")));
+            }
+            let id = new_listing_id(listings(state), agent, binding, &sha);
+            listings_mut(state).insert(id.clone(), json!({
+                "kind": kind, "binding": binding, "tag": tag, "author": agent,
+                "created_at": util::now_secs(), "versions": [],
+            }));
+            id
         }
     };
-    let sha = sha256_hex(source.as_bytes());
-    let existing = tools(state).get(name).and_then(Value::as_array).cloned().unwrap_or_default();
-    if let Some(v) = existing.iter().find(|v| v["sha256"] == sha.as_str()) {
+
+    let mut vs = listings(state)[&id]["versions"].as_array().cloned().unwrap_or_default();
+    let existing = vs.iter().find(|v| v["sha256"] == sha.as_str()).map(|v| v["version"].clone());
+    let is_new = existing.is_none();
+    let version = match existing {
         // Republishing a version restores its blob if it was damaged.
-        lab.put_blob(&sha, source.as_bytes())?;
-        pins_mut(state, agent).insert(name.into(), json!(sha));
-        return Ok(json!({"name": name, "sha256": sha, "version": v["version"], "new": false, "pinned": true}));
+        Some(version) => {
+            lab.put_blob(&sha, source.as_bytes())?;
+            version
+        }
+        None => {
+            if vs.len() >= MAX_VERSIONS {
+                // The oldest version no agent has pinned makes room.
+                let pinned: Vec<Value> = state["pins"].as_object().into_iter().flat_map(|m| m.values())
+                    .filter_map(|held| held.get(&id).cloned()).collect();
+                let Some(i) = vs.iter().position(|v| !pinned.contains(&v["sha256"])) else {
+                    return Err(Denied(format!("listing {id} has {MAX_VERSIONS} versions and every one is pinned; unpin one first")));
+                };
+                dropped.push(vs.remove(i)["sha256"].as_str().unwrap_or_default().to_string());
+            }
+            lab.put_blob(&sha, source.as_bytes())?;
+            let version = vs.last().and_then(|v| v["version"].as_u64()).unwrap_or(0) + 1;
+            vs.push(json!({
+                "sha256": sha, "version": version, "author": agent, "published_at": util::now_secs(),
+                "bytes": source.len(), "note": note, "test": test, "approvals": [],
+            }));
+            listings_mut(state)[&id]["versions"] = Value::Array(vs);
+            json!(version)
+        }
+    };
+    let clash = clash_with(state, agent, binding, &id);
+    if clash.is_none() {
+        pins_mut(state, agent).insert(id.clone(), json!(sha));
     }
-    if existing.is_empty() && tools(state).len() >= MAX_TOOLS {
-        return Err(Denied(format!("the teamlab shelf holds at most {MAX_TOOLS} tools")));
-    }
-    let mut vs = existing;
-    if vs.len() >= MAX_VERSIONS {
-        // The oldest version no agent has pinned makes room.
-        let pinned: Vec<Value> = state["pins"].as_object().into_iter().flat_map(|m| m.values())
-            .filter_map(|tools| tools.get(name).cloned()).collect();
-        let Some(i) = vs.iter().position(|v| !pinned.contains(&v["sha256"])) else {
-            return Err(Denied(format!("tool {name:?} has {MAX_VERSIONS} versions and every one is pinned; unpin one first")));
-        };
-        dropped.push(vs.remove(i)["sha256"].as_str().unwrap_or_default().to_string());
-    }
-    lab.put_blob(&sha, source.as_bytes())?;
-    let version = vs.last().and_then(|v| v["version"].as_u64()).unwrap_or(0) + 1;
-    vs.push(json!({
-        "sha256": sha, "version": version, "author": agent, "published_at": util::now_secs(),
-        "bytes": source.len(), "note": note, "test": test, "approvals": [],
-    }));
-    tools_mut(state).insert(name.into(), Value::Array(vs));
-    pins_mut(state, agent).insert(name.into(), json!(sha));
-    Ok(json!({"name": name, "sha256": sha, "version": version, "new": true, "pinned": true,
-              "dropped_versions": dropped.len()}))
+    let l = &listings(state)[&id];
+    Ok(json!({
+        "id": id, "kind": l["kind"], "binding": binding, "tag": l["tag"], "sha256": sha, "version": version,
+        "new": is_new, "new_listing": new_listing, "pinned": clash.is_none(), "clash": clash,
+        "dropped_versions": dropped.len(),
+    }))
 }
 
 fn approve(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
-    let name = tool_param(p)?;
+    let id = required_id(p)?;
     let note = note_param(p)?;
-    let sha = pick(versions(state, name)?, name, str_param(p, "sha256")?)?["sha256"].as_str().unwrap_or_default().to_string();
-    let v = tools_mut(state)[name].as_array_mut().unwrap().iter_mut().find(|v| v["sha256"] == sha.as_str()).unwrap();
+    let sha = pick(listing(state, id)?, id, str_param(p, "sha256")?)?["sha256"].clone();
+    let v = listings_mut(state)[id]["versions"].as_array_mut().unwrap().iter_mut().find(|v| v["sha256"] == sha).unwrap();
     if v["author"] == agent {
-        return Err(Denied(format!("{agent} wrote {name} version {}; another agent has to approve it", v["version"])));
+        return Err(Denied(format!("{agent} wrote listing {id} version {}; another agent has to approve it", v["version"])));
     }
     let approvals = v["approvals"].as_array_mut().ok_or_else(|| Internal("teamlab version without approvals".into()))?;
     let new = !approvals.iter().any(|a| a["by"] == agent);
     if new {
         approvals.push(json!({"by": agent, "at": util::now_secs(), "note": note}));
     }
-    Ok(json!({"name": name, "sha256": sha, "version": v["version"], "new": new, "approvals": v["approvals"]}))
+    Ok(json!({"id": id, "sha256": sha, "version": v["version"], "new": new, "approvals": v["approvals"]}))
 }
 
 fn pin(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
-    let name = tool_param(p)?;
-    let v = pick(versions(state, name)?, name, str_param(p, "sha256")?)?.clone();
-    pins_mut(state, agent).insert(name.into(), v["sha256"].clone());
-    Ok(json!({"name": name, "sha256": v["sha256"], "version": v["version"]}))
+    let id = required_id(p)?;
+    let l = listing(state, id)?;
+    let v = pick(l, id, str_param(p, "sha256")?)?.clone();
+    let binding = text(&l["binding"]).to_string();
+    if let Some(other) = clash_with(state, agent, &binding, id) {
+        return Err(Denied(format!("{agent} already pins listing {other} as {binding}; unpin it first")));
+    }
+    pins_mut(state, agent).insert(id.into(), v["sha256"].clone());
+    Ok(json!({"id": id, "binding": binding, "sha256": v["sha256"], "version": v["version"]}))
 }
 
 fn unpin(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
-    let name = tool_param(p)?;
-    let was = pins_mut(state, agent).remove(name);
-    Ok(json!({"name": name, "unpinned": was.is_some()}))
+    let id = required_id(p)?;
+    let was = pins_mut(state, agent).remove(id);
+    Ok(json!({"id": id, "unpinned": was.is_some()}))
 }
 
-/// Moves pins to each tool's newest version: the named tools (pinned or
-/// not), else every tool this agent has pinned.
+/// Moves pins to each listing's newest version: the listed `ids` (pinned or
+/// not), else every listing this agent pins.
 fn update(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
-    let names: Vec<String> = match p.get("names") {
+    let bad = || Denied("teamlab 'ids' must be a list of listing ids".into());
+    let ids: Vec<String> = match p.get("ids") {
         None | Some(Value::Null) => pins_of(state, agent).keys().cloned().collect(),
-        Some(Value::Array(a)) => a.iter().map(|n| match n.as_str() {
-            Some(n) if valid_tool_name(n) => Ok(n.to_string()),
-            _ => Err(Denied("teamlab 'names' must be a list of tool names".into())),
-        }).collect::<Result<_, _>>()?,
-        Some(_) => return Err(Denied("teamlab 'names' must be a list of tool names".into())),
+        Some(Value::Array(a)) => a.iter().map(|i| i.as_str().filter(|i| valid_id(i)).map(String::from).ok_or_else(bad))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(bad()),
     };
-    let (mut updated, mut current) = (Vec::new(), Vec::new());
-    for name in names {
-        let Ok(vs) = versions(state, &name) else {
-            // A pin on a tool that is gone is dropped rather than kept dangling.
-            pins_mut(state, agent).remove(&name);
+    let (mut updated, mut current, mut gone, mut clashes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for id in ids {
+        let Some(l) = listings(state).get(&id) else {
+            // A pin on a listing that is gone is dropped rather than kept dangling.
+            if pins_mut(state, agent).remove(&id).is_some() {
+                gone.push(json!(id));
+            }
             continue;
         };
-        let latest = vs.last().unwrap().clone();
-        let before = pins_of(state, agent).get(&name).cloned();
-        if before.as_ref() == Some(&latest["sha256"]) {
-            current.push(json!(name));
+        let newest = latest(l).clone();
+        let before = pins_of(state, agent).get(&id).cloned();
+        if before.as_ref() == Some(&newest["sha256"]) {
+            current.push(json!(id));
             continue;
         }
-        let from_version = before.as_ref().and_then(|sha| vs.iter().find(|v| &v["sha256"] == sha)).map(|v| v["version"].clone());
-        pins_mut(state, agent).insert(name.clone(), latest["sha256"].clone());
-        updated.push(json!({"name": name, "from": before, "from_version": from_version,
-                            "to": latest["sha256"], "to_version": latest["version"], "author": latest["author"]}));
+        let binding = l["binding"].clone();
+        if let Some(other) = clash_with(state, agent, binding.as_str().unwrap_or_default(), &id) {
+            clashes.push(json!({"id": id, "binding": binding, "pinned": other}));
+            continue;
+        }
+        let from_version = before.as_ref().and_then(|sha| versions(l).iter().find(|v| &v["sha256"] == sha)).map(|v| v["version"].clone());
+        pins_mut(state, agent).insert(id.clone(), newest["sha256"].clone());
+        updated.push(json!({"id": id, "binding": binding, "from": before, "from_version": from_version,
+                            "to": newest["sha256"], "to_version": newest["version"], "author": newest["author"]}));
     }
-    Ok(json!({"updated": updated, "current": current}))
+    Ok(json!({"updated": updated, "current": current, "gone": gone, "clashes": clashes}))
 }
 
-/// The source of every tool this agent has pinned, each checked against its hash.
+/// The source of every listing this agent pins, each checked against its
+/// hash. A second pinned listing under a binding already sent is left out
+/// and named in `clashes`.
 fn sync(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Result<Value, Fail> {
-    let (mut out, mut missing, mut behind, mut total) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
-    for (name, sha) in pins_of(state, agent) {
-        let Some(vs) = tools(state).get(&name).and_then(Value::as_array).filter(|v| !v.is_empty()) else {
-            missing.push(json!(name));
+    let (mut out, mut missing, mut behind, mut clashes, mut total) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0usize);
+    let mut bound = BTreeSet::new();
+    for (id, sha) in pins_of(state, agent) {
+        let Some((l, v)) = listings(state).get(&id).and_then(|l| Some((l, versions(l).iter().find(|v| v["sha256"] == sha)?))) else {
+            missing.push(json!(id));
             continue;
         };
-        let Some(v) = vs.iter().find(|v| v["sha256"] == sha) else {
-            missing.push(json!(name));
+        if !bound.insert(text(&l["binding"])) {
+            clashes.push(json!(id));
             continue;
-        };
-        if vs.last().unwrap()["sha256"] != sha {
-            behind.push(json!(name));
+        }
+        if latest(l)["sha256"] != sha {
+            behind.push(json!(id));
         }
         let source = lab.read_blob(sha.as_str().unwrap_or_default())?;
         total += source.len();
         if total > MAX_SYNC_BYTES {
             return Err(Denied(format!("the pinned tools come to more than {} MiB; unpin some", MAX_SYNC_BYTES >> 20)));
         }
-        let mut t = summary(v);
-        t["name"] = json!(name);
+        let mut t = loadable(&id, l, v);
         t["source"] = json!(source);
         out.push(t);
     }
-    Ok(json!({"agent": agent, "tools": out, "missing": missing, "behind": behind, "unread": unread(state, agent)}))
+    Ok(json!({"agent": agent, "tools": out, "missing": missing, "behind": behind, "clashes": clashes,
+              "unread": unread(state, agent)}))
 }
 
 fn fetch(lab: &Lab, state: &Map<String, Value>, p: &Map<String, Value>) -> Result<Value, Fail> {
-    let name = tool_param(p)?;
-    let v = pick(versions(state, name)?, name, str_param(p, "sha256")?)?;
-    let mut t = summary(v);
-    t["name"] = json!(name);
-    t["source"] = json!(lab.read_blob(v["sha256"].as_str().unwrap_or_default())?);
+    let id = required_id(p)?;
+    let l = listing(state, id)?;
+    let v = pick(l, id, str_param(p, "sha256")?)?;
+    let mut t = loadable(id, l, v);
+    t["source"] = json!(lab.read_blob(text(&v["sha256"]))?);
     Ok(t)
 }
 
@@ -541,15 +803,9 @@ fn send(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> 
     if body.len() > MAX_BODY_BYTES {
         return Err(Denied(format!("teamlab 'body' is limited to {} KiB", MAX_BODY_BYTES / 1024)));
     }
-    let (tool, sha) = match str_param(p, "tool")? {
+    let (about, sha) = match id_param(p, "listing")? {
         None => (Value::Null, Value::Null),
-        Some(name) => {
-            if !valid_tool_name(name) {
-                return Err(Denied("teamlab 'tool' must name a tool on the shelf".into()));
-            }
-            let v = pick(versions(state, name)?, name, str_param(p, "sha256")?)?;
-            (json!(name), v["sha256"].clone())
-        }
+        Some(id) => (json!(id), pick(listing(state, id)?, id, str_param(p, "sha256")?)?["sha256"].clone()),
     };
     let now = util::now_secs();
     let messages = messages_mut(state);
@@ -565,7 +821,7 @@ fn send(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> 
     state.insert("next_message_id".into(), json!(id + 1));
     messages_mut(state).push(json!({
         "id": id, "from": agent, "to": to, "subject": subject, "body": body,
-        "tool": tool, "sha256": sha, "sent_at": now, "acked_by": [],
+        "listing": about, "sha256": sha, "sent_at": now, "acked_by": [],
     }));
     Ok(json!({"id": id, "to": to}))
 }
@@ -611,6 +867,49 @@ fn ack(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> R
     }
     let unknown: Vec<u64> = ids.unwrap_or_default().into_iter().filter(|i| !acked.contains(i)).collect();
     Ok(json!({"acked": acked, "unknown": unknown}))
+}
+
+/// One line for the start of an agent's session: what is new in the shop,
+/// how many pinned listings have newer versions, and unread mail. None when
+/// there is no shop yet or nothing to report. It only reads.
+pub fn news_line(dir: &Path, agent: &str) -> Option<String> {
+    let lab = Lab { dir: dir.to_path_buf() };
+    if !lab.state_path().exists() {
+        return None;
+    }
+    let state = match lab.load() {
+        Ok(s) => s,
+        Err(Denied(why) | Internal(why)) => return Some(format!("TeamLab: {why}")),
+    };
+    let st = status(&lab, &state, agent);
+    let mut parts = Vec::new();
+    let new = st["new"].as_array().cloned().unwrap_or_default();
+    if !new.is_empty() {
+        let shown: Vec<String> = new.iter().take(3).map(|l| format!(
+            "a {} from {} that {} (id {})", text(&l["kind"]),
+            text(&l["latest"]["author"]), lowercase_first(text(&l["tag"])),
+            text(&l["id"]))).collect();
+        let more = if new.len() > 3 { format!(", and {} more", new.len() - 3) } else { String::new() };
+        parts.push(format!("new in the shop: {}{more}", shown.join("; ")));
+    }
+    let behind = st["pinned"].as_array().into_iter().flatten().filter(|l| l["behind"] == true).count();
+    if behind > 0 {
+        parts.push(format!("{behind} of your pinned tools {} a newer version", if behind == 1 { "has" } else { "have" }));
+    }
+    let unread = st["unread"].as_u64().unwrap_or(0);
+    if unread > 0 {
+        parts.push(format!("{unread} unread message{}", if unread == 1 { "" } else { "s" }));
+    }
+    (!parts.is_empty()).then(|| format!("TeamLab: {}.", parts.join("; ")))
+}
+
+fn lowercase_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        // "Parses TOML" reads on after "that"; an acronym like "TOML" keeps its case.
+        Some(f) if c.clone().next().is_some_and(char::is_lowercase) => f.to_lowercase().chain(c).collect(),
+        _ => s.to_string(),
+    }
 }
 
 /// What a receipt keeps of a teamlab call: tool sources and message bodies,
@@ -659,8 +958,7 @@ mod tests {
     }
 
     fn lab() -> TmpDir {
-        let d = std::env::temp_dir().join(format!("teamlab-test-{}", util::hex(8)));
-        TmpDir(d)
+        TmpDir(std::env::temp_dir().join(format!("teamlab-test-{}", util::hex(8))))
     }
 
     fn call(dir: &Path, agent: &str, p: Value) -> Result<Value, String> {
@@ -674,81 +972,280 @@ mod tests {
         call(dir, agent, p.clone()).unwrap_or_else(|e| panic!("{p}: {e}"))
     }
 
+    /// Lists (or adds a version to) `agent`'s function bound as `binding`.
+    fn list(dir: &Path, agent: &str, binding: &str, source: &str) -> Value {
+        ok(dir, agent, json!({"action": "publish", "kind": "function", "binding": binding, "source": source,
+                              "tag": format!("Does what {binding} does")}))
+    }
+
+    fn id(r: &Value) -> &str {
+        r["id"].as_str().unwrap()
+    }
+
     const SRC: &str = "hello(x) = \"hello, $x\"\n";
 
     #[test]
-    fn publish_pins_for_the_author_and_sync_returns_verified_source() {
+    fn publish_lists_and_pins_for_the_author_and_sync_returns_verified_source() {
         let d = lab();
-        let r = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC, "note": "first"}));
-        assert_eq!(r["version"], 1);
-        assert_eq!(r["new"], true);
-        let again = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
-        assert_eq!(again["new"], false, "publishing the same source is idempotent");
+        let r = list(&d.0, "codex", "hello", SRC);
+        assert!(valid_id(id(&r)) && id(&r).len() == 8, "{r}");
+        assert_eq!((r["version"].clone(), r["new"].clone(), r["new_listing"].clone(), r["pinned"].clone()),
+                   (json!(1), json!(true), json!(true), json!(true)));
+        let again = list(&d.0, "codex", "hello", SRC);
+        assert_eq!((id(&again), again["new"].clone()), (id(&r), json!(false)), "the same source is idempotent");
+        let v2 = ok(&d.0, "codex", json!({"action": "publish", "binding": "hello", "source": "hello(x) = 1\n"}));
+        assert_eq!((id(&v2), v2["version"].clone(), v2["new_listing"].clone()), (id(&r), json!(2), json!(false)),
+                   "the author's next version needs no kind or tag");
         let s = ok(&d.0, "codex", json!({"action": "sync"}));
-        assert_eq!(s["tools"][0]["source"], SRC);
-        assert_eq!(s["tools"][0]["author"], "codex");
-        // Another agent sees the tool but has not pinned it.
-        let st = ok(&d.0, "claude", json!({"action": "status"}));
-        assert_eq!(st["tools"][0]["name"], "hello");
-        assert_eq!(st["tools"][0]["pinned"], Value::Null);
+        assert_eq!(s["tools"][0]["source"], "hello(x) = 1\n");
+        assert_eq!((s["tools"][0]["binding"].clone(), s["tools"][0]["kind"].clone(), s["tools"][0]["id"].clone()),
+                   (json!("hello"), json!("function"), json!(id(&r))));
+        // Another agent sees the listing in the shop but has not pinned it.
+        let b = ok(&d.0, "claude", json!({"action": "browse"}));
+        assert_eq!((b["listed"].clone(), b["listings"][0]["tag"].clone()), (json!(1), json!("Does what hello does")));
+        assert_eq!(b["listings"][0]["pinned"], Value::Null);
+        assert_eq!(b["listings"][0]["pinned_by"], json!(["codex"]));
         assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"], json!([]));
         let blob = d.0.join("blobs").join(format!("{}.jl", r["sha256"].as_str().unwrap()));
         assert_eq!(fs::metadata(blob).unwrap().permissions().mode() & 0o777, 0o444);
     }
 
     #[test]
-    fn an_author_cannot_approve_their_own_tool_but_another_agent_can_once() {
+    fn a_new_listing_needs_a_kind_and_a_short_tag() {
         let d = lab();
-        ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
-        let e = call(&d.0, "codex", json!({"action": "approve", "name": "hello"})).unwrap_err();
+        let e = call(&d.0, "codex", json!({"action": "publish", "binding": "f", "source": "f() = 1\n"})).unwrap_err();
+        assert!(e.contains("needs a 'kind'"), "{e}");
+        let e = call(&d.0, "codex", json!({"action": "publish", "binding": "f", "source": "f() = 1\n", "kind": "function"})).unwrap_err();
+        assert!(e.contains("'tag'"), "{e}");
+        let long = vec!["word"; MAX_TAG_WORDS + 1].join(" ");
+        let e = call(&d.0, "codex", json!({"action": "publish", "binding": "f", "source": "f() = 1\n", "kind": "function", "tag": long})).unwrap_err();
+        assert!(e.contains("1 to 15 words"), "{e}");
+        let e = call(&d.0, "codex", json!({"action": "publish", "binding": "f", "source": "f() = 1\n", "kind": "macro", "tag": "x"})).unwrap_err();
+        assert!(e.contains("function, module"), "{e}");
+        let r = ok(&d.0, "codex", json!({"action": "publish", "binding": "F", "source": "module F end\n", "kind": "module",
+                                          "tag": "  Parses\nTOML   files "}));
+        assert_eq!((r["tag"].clone(), r["kind"].clone()), (json!("Parses TOML files"), json!("module")));
+    }
+
+    #[test]
+    fn anyone_adds_versions_by_id_but_only_the_author_retags() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let v2 = ok(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": "hello(x) = 2\n"}));
+        assert_eq!((v2["version"].clone(), v2["new_listing"].clone(), v2["pinned"].clone()), (json!(2), json!(false), json!(true)));
+        assert_eq!(ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r)}))["author"], "claude");
+        let e = call(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": SRC, "tag": "Something else"})).unwrap_err();
+        assert!(e.contains("only codex"), "{e}");
+        let e = call(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "other", "source": SRC})).unwrap_err();
+        assert!(e.contains("binds"), "{e}");
+        let e = call(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "hello", "kind": "module", "source": SRC})).unwrap_err();
+        assert!(e.contains("is a"), "{e}");
+        let t = ok(&d.0, "codex", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": SRC, "tag": "Greets  someone"}));
+        assert_eq!(t["tag"], "Greets someone");
+    }
+
+    #[test]
+    fn two_listings_of_one_binding_never_both_load() {
+        let d = lab();
+        let a = list(&d.0, "codex", "hello", SRC);
+        let b = list(&d.0, "gemini", "hello", "hello(x) = 3\n");
+        assert_ne!(id(&a), id(&b));
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&a)}));
+        let e = call(&d.0, "claude", json!({"action": "pin", "id": id(&b)})).unwrap_err();
+        assert!(e.contains("unpin it first"), "{e}");
+        // claude lists its own hello while pinning codex's: it is listed, not pinned.
+        let c = list(&d.0, "claude", "hello", "hello(x) = 4\n");
+        assert_eq!((c["pinned"].clone(), c["clash"].clone()), (json!(false), json!(id(&a))));
+        let u = ok(&d.0, "claude", json!({"action": "update", "ids": [id(&b)]}));
+        assert_eq!(u["clashes"][0]["pinned"], id(&a));
+        // A hand-edited index with two pins on one binding syncs only one.
+        let mut state: Value = serde_json::from_slice(&fs::read(d.0.join("state.json")).unwrap()).unwrap();
+        state["pins"]["claude"][id(&b)] = b["sha256"].clone();
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let s = ok(&d.0, "claude", json!({"action": "sync"}));
+        assert_eq!(s["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(s["clashes"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_author_cannot_approve_their_own_version_but_another_agent_can_once() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let e = call(&d.0, "codex", json!({"action": "approve", "id": id(&r)})).unwrap_err();
         assert!(e.contains("another agent has to approve"), "{e}");
-        assert_eq!(ok(&d.0, "claude", json!({"action": "approve", "name": "hello", "note": "read it"}))["new"], true);
-        assert_eq!(ok(&d.0, "claude", json!({"action": "approve", "name": "hello"}))["new"], false);
-        let st = ok(&d.0, "gemini", json!({"action": "status"}));
-        assert_eq!(st["tools"][0]["latest"]["approvals"][0]["by"], "claude");
-        assert_eq!(st["tools"][0]["latest"]["approvals"].as_array().unwrap().len(), 1);
+        assert_eq!(ok(&d.0, "claude", json!({"action": "approve", "id": id(&r), "note": "read it"}))["new"], true);
+        assert_eq!(ok(&d.0, "claude", json!({"action": "approve", "id": id(&r)}))["new"], false);
+        let b = ok(&d.0, "gemini", json!({"action": "browse"}));
+        assert_eq!(b["listings"][0]["latest"]["approvals"][0]["by"], "claude");
+        assert_eq!(b["listings"][0]["latest"]["approvals"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn pins_hold_a_version_until_update_moves_them() {
         let d = lab();
-        let v1 = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
-        ok(&d.0, "claude", json!({"action": "pin", "name": "hello"}));
-        let v2 = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": "hello(x) = 2\n"}));
+        let v1 = list(&d.0, "codex", "hello", SRC);
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&v1)}));
+        let v2 = list(&d.0, "codex", "hello", "hello(x) = 2\n");
         let s = ok(&d.0, "claude", json!({"action": "sync"}));
         assert_eq!(s["tools"][0]["sha256"], v1["sha256"], "a pin does not follow new versions");
-        assert_eq!(s["behind"], json!(["hello"]));
+        assert_eq!(s["behind"], json!([id(&v1)]));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "status"}))["pinned"][0]["behind"], true);
         let u = ok(&d.0, "claude", json!({"action": "update"}));
-        assert_eq!(u["updated"][0]["to"], v2["sha256"]);
-        assert_eq!(u["updated"][0]["from_version"], 1);
+        assert_eq!((u["updated"][0]["to"].clone(), u["updated"][0]["from_version"].clone()), (v2["sha256"].clone(), json!(1)));
         assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"][0]["source"], "hello(x) = 2\n");
-        // Pin back to the first version by hash, then unpin.
-        ok(&d.0, "claude", json!({"action": "pin", "name": "hello", "sha256": v1["sha256"]}));
-        assert_eq!(ok(&d.0, "claude", json!({"action": "status"}))["tools"][0]["pinned_version"], 1);
-        assert_eq!(ok(&d.0, "claude", json!({"action": "unpin", "name": "hello"}))["unpinned"], true);
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&v1), "sha256": v1["sha256"]}));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "status"}))["pinned"][0]["pinned_version"], 1);
+        assert_eq!(ok(&d.0, "claude", json!({"action": "unpin", "id": id(&v1)}))["unpinned"], true);
         assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"], json!([]));
+    }
+
+    #[test]
+    fn browse_matches_every_query_word_newest_first() {
+        let d = lab();
+        let toml = ok(&d.0, "codex", json!({"action": "publish", "kind": "function", "binding": "parse_toml",
+                                             "source": "parse_toml(s) = s\n", "tag": "Parses TOML text into a Dict"}));
+        let csv = ok(&d.0, "gemini", json!({"action": "publish", "kind": "module", "binding": "Csv",
+                                            "source": "module Csv end\n", "tag": "Reads CSV files into named tuples"}));
+        let all = ok(&d.0, "claude", json!({"action": "browse"}));
+        let order: Vec<&str> = all["listings"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+        assert_eq!(order, [id(&csv), id(&toml)]);
+        for (q, want) in [("toml dict", vec![id(&toml)]), ("MODULE", vec![id(&csv)]), ("gemini files", vec![id(&csv)]),
+                          (&id(&toml)[..6], vec![id(&toml)]), ("toml csv", vec![])] {
+            let b = ok(&d.0, "claude", json!({"action": "browse", "query": q}));
+            let got: Vec<&str> = b["listings"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+            assert_eq!(got, want, "{q}");
+        }
+    }
+
+    #[test]
+    fn status_shows_other_agents_new_listings_until_pinned() {
+        let d = lab();
+        let mine = list(&d.0, "claude", "mine", "mine() = 1\n");
+        let theirs = list(&d.0, "codex", "theirs", "theirs() = 1\n");
+        let st = ok(&d.0, "claude", json!({"action": "status"}));
+        assert_eq!(st["new"].as_array().unwrap().iter().map(|l| l["id"].clone()).collect::<Vec<_>>(), [json!(id(&theirs))]);
+        assert_eq!((st["listed"].clone(), st["pinned"][0]["id"].clone()), (json!(2), json!(id(&mine))));
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&theirs)}));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "status"}))["new"], json!([]));
+        // A week-old listing is no longer new.
+        let mut state: Value = serde_json::from_slice(&fs::read(d.0.join("state.json")).unwrap()).unwrap();
+        state["tools"][id(&mine)]["versions"][0]["published_at"] = json!(util::now_secs() - NEW_FOR_S - 60.0);
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(ok(&d.0, "codex", json!({"action": "status"}))["new"], json!([]));
+    }
+
+    #[test]
+    fn news_line_reports_new_listings_stale_pins_and_mail() {
+        let d = lab();
+        assert_eq!(news_line(&d.0, "claude"), None, "no shop yet");
+        assert!(!d.0.exists(), "news_line creates nothing");
+        let a = ok(&d.0, "codex", json!({"action": "publish", "kind": "function", "binding": "parse_toml",
+                                          "source": "parse_toml(s) = s\n", "tag": "Parses TOML text"}));
+        assert_eq!(news_line(&d.0, "codex"), None, "nothing new for the author");
+        let line = news_line(&d.0, "claude").unwrap();
+        assert_eq!(line, format!("TeamLab: new in the shop: a function from codex that parses TOML text (id {}).", id(&a)));
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&a)}));
+        ok(&d.0, "codex", json!({"action": "publish", "binding": "parse_toml", "source": "parse_toml(s) = 2s\n"}));
+        ok(&d.0, "codex", json!({"action": "send", "to": "claude", "subject": "v2 is out"}));
+        assert_eq!(news_line(&d.0, "claude").unwrap(), "TeamLab: 1 of your pinned tools has a newer version; 1 unread message.");
+        for i in 0..4 {
+            list(&d.0, "gemini", &format!("tool{i}"), &format!("tool{i}() = 1\n"));
+        }
+        assert!(news_line(&d.0, "claude").unwrap().contains(", and 1 more;"));
+        fs::write(d.0.join("state.json"), b"{").unwrap();
+        assert!(news_line(&d.0, "claude").unwrap().starts_with("TeamLab: teamlab index"));
+    }
+
+    #[test]
+    fn the_shop_dir_follows_provisioning() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| {
+            pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(dir_from_env(env(&[("HOME", "/h")])), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("XDG_DATA_HOME", "/x")])), Some(PathBuf::from("/x/palette/teamlab")));
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("XDG_DATA_HOME", "rel")])), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab")])), Some(PathBuf::from("/lab")));
+        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~/lab")])), Some(PathBuf::from("/h/lab")));
+        for off in ["", "off", "relative"] {
+            let pairs: &'static [(&str, &str)] = Box::leak(Box::new([("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", off)]));
+            assert_eq!(dir_from_env(env(pairs)), None, "{off:?}");
+        }
+    }
+
+    #[test]
+    fn a_format_1_index_reads_as_listings_and_is_written_back_as_format_2() {
+        let d = lab();
+        let l = Lab::open(&d.0).unwrap();
+        let sha = sha256_hex(SRC.as_bytes());
+        l.put_blob(&sha, SRC.as_bytes()).unwrap();
+        let v = |note: Value| json!({"sha256": sha, "version": 1, "author": "codex", "published_at": 100.0, "bytes": SRC.len(),
+                                     "note": note, "test": null, "approvals": []});
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&json!({
+            "format": 1, "next_message_id": 2,
+            "tools": {"hello": [v(json!("\nGreets a name, politely and at length\nmore"))], "two_words": [v(Value::Null)]},
+            "pins": {"claude": {"hello": sha, "gone": sha}},
+            "messages": [{"id": 1, "from": "codex", "to": "claude", "subject": "s", "body": "", "tool": "hello",
+                          "sha256": sha, "sent_at": 100.0, "acked_by": []}],
+        })).unwrap()).unwrap();
+        let b = ok(&d.0, "claude", json!({"action": "browse"}));
+        let by: BTreeMap<&str, &Value> = b["listings"].as_array().unwrap().iter().map(|l| (l["binding"].as_str().unwrap(), l)).collect();
+        assert_eq!(by["hello"]["tag"], "Greets a name, politely and at length");
+        assert_eq!(by["two_words"]["tag"], "two words");
+        assert_eq!((by["hello"]["kind"].clone(), by["hello"]["author"].clone()), (json!("function"), json!("codex")));
+        assert_eq!(by["hello"]["pinned"], json!(sha));
+        let hello = by["hello"]["id"].as_str().unwrap().to_string();
+        assert_eq!(ok(&d.0, "claude", json!({"action": "inbox"}))["messages"][0]["listing"], json!(hello));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"][0]["source"], SRC);
+        // Reads leave it as format 1; the first change writes format 2.
+        assert!(fs::read_to_string(d.0.join("state.json")).unwrap().contains("\"format\":1"));
+        ok(&d.0, "claude", json!({"action": "ack", "ids": "all"}));
+        let saved: Value = serde_json::from_slice(&fs::read(d.0.join("state.json")).unwrap()).unwrap();
+        assert_eq!(saved["format"], 2);
+        assert_eq!(saved["pins"]["claude"], json!({hello.clone(): sha}));
+        // The author's next publish of the binding lands on the migrated listing.
+        let r = ok(&d.0, "codex", json!({"action": "publish", "binding": "hello", "source": "hello(x) = 2\n"}));
+        assert_eq!((r["id"].clone(), r["version"].clone()), (json!(hello), json!(2)));
+    }
+
+    #[test]
+    fn listing_ids_grow_until_unique() {
+        let full = sha256_hex(b"codex\nhello\nabc");
+        let mut taken = Map::new();
+        assert_eq!(new_listing_id(&taken, "codex", "hello", "abc"), full[..8]);
+        taken.insert(full[..8].to_string(), json!({}));
+        assert_eq!(new_listing_id(&taken, "codex", "hello", "abc"), full[..12]);
+    }
+
+    #[test]
+    fn a_listing_missing_its_fields_makes_the_index_unreadable() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let mut state: Value = serde_json::from_slice(&fs::read(d.0.join("state.json")).unwrap()).unwrap();
+        state["tools"][id(&r)].as_object_mut().unwrap().remove("tag");
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let e = call(&d.0, "codex", json!({"action": "status"})).unwrap_err();
+        assert!(e.contains("unreadable") && e.contains(id(&r)), "{e}");
     }
 
     #[test]
     fn a_tampered_blob_is_refused_not_loaded() {
         let d = lab();
-        let r = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
+        let r = list(&d.0, "codex", "hello", SRC);
         let blob = d.0.join("blobs").join(format!("{}.jl", r["sha256"].as_str().unwrap()));
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(&blob, "run(`rm -rf ~`)\n").unwrap();
         for action in ["sync", "fetch"] {
-            let e = call(&d.0, "codex", json!({"action": action, "name": "hello"})).unwrap_err();
+            let e = call(&d.0, "codex", json!({"action": action, "id": id(&r)})).unwrap_err();
             assert!(e.contains("tampered"), "{action}: {e}");
         }
-        // Publishing the real source again repairs the blob.
-        ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
+        list(&d.0, "codex", "hello", SRC);
         assert_eq!(ok(&d.0, "codex", json!({"action": "sync"}))["tools"][0]["source"], SRC);
     }
 
     #[test]
     fn a_symlinked_blob_is_refused() {
         let d = lab();
-        let r = ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
+        let r = list(&d.0, "codex", "hello", SRC);
         let blob = d.0.join("blobs").join(format!("{}.jl", r["sha256"].as_str().unwrap()));
         let elsewhere = d.0.join("elsewhere.jl");
         fs::write(&elsewhere, SRC).unwrap();
@@ -760,47 +1257,46 @@ mod tests {
     #[test]
     fn an_unreadable_index_is_never_overwritten() {
         let d = lab();
-        ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
-        ok(&d.0, "claude", json!({"action": "pin", "name": "hello"}));
-        fs::write(d.0.join("state.json"), b"{\"format\": 1, \"tools\": {\"hel").unwrap();
-        for p in [json!({"action": "status"}), json!({"action": "publish", "name": "other", "source": SRC}),
+        let r = list(&d.0, "codex", "hello", SRC);
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&r)}));
+        fs::write(d.0.join("state.json"), b"{\"format\": 2, \"tools\": {\"hel").unwrap();
+        for p in [json!({"action": "status"}), json!({"action": "browse"}),
+                  json!({"action": "publish", "binding": "other", "source": SRC}),
                   json!({"action": "send", "to": "all", "subject": "hi"})] {
             let e = call(&d.0, "codex", p).unwrap_err();
             assert!(e.contains("unreadable") && e.contains("state.prev.json"), "{e}");
         }
-        assert_eq!(fs::read(d.0.join("state.json")).unwrap(), b"{\"format\": 1, \"tools\": {\"hel");
-        // The previous index is there to restore from.
+        assert_eq!(fs::read(d.0.join("state.json")).unwrap(), b"{\"format\": 2, \"tools\": {\"hel");
         fs::copy(d.0.join("state.prev.json"), d.0.join("state.json")).unwrap();
-        assert_eq!(ok(&d.0, "codex", json!({"action": "status"}))["tools"][0]["name"], "hello");
+        assert_eq!(ok(&d.0, "codex", json!({"action": "browse"}))["listings"][0]["id"], id(&r));
     }
 
     #[test]
     fn the_oldest_unpinned_version_makes_room_and_its_blob_goes() {
         let d = lab();
-        let first = ok(&d.0, "codex", json!({"action": "publish", "name": "t", "source": "t() = 0\n"}));
-        ok(&d.0, "claude", json!({"action": "pin", "name": "t"}));
-        let second = ok(&d.0, "codex", json!({"action": "publish", "name": "t", "source": "t() = 1\n"}));
+        let first = list(&d.0, "codex", "t", "t() = 0\n");
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&first)}));
+        let second = list(&d.0, "codex", "t", "t() = 1\n");
         for i in 2..=MAX_VERSIONS {
-            ok(&d.0, "codex", json!({"action": "publish", "name": "t", "source": format!("t() = {i}\n")}));
+            list(&d.0, "codex", "t", &format!("t() = {i}\n"));
         }
-        let st = ok(&d.0, "codex", json!({"action": "status"}));
-        assert_eq!(st["tools"][0]["versions"], MAX_VERSIONS);
-        assert_eq!(st["tools"][0]["latest"]["version"], MAX_VERSIONS as u64 + 1);
-        // claude's pin kept version 1; version 2 was the oldest unpinned.
+        let b = ok(&d.0, "codex", json!({"action": "browse"}));
+        assert_eq!(b["listings"][0]["versions"], MAX_VERSIONS);
+        assert_eq!(b["listings"][0]["latest"]["version"], MAX_VERSIONS as u64 + 1);
         assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"][0]["sha256"], first["sha256"]);
-        assert!(call(&d.0, "claude", json!({"action": "fetch", "name": "t", "sha256": second["sha256"]})).is_err());
+        assert!(call(&d.0, "claude", json!({"action": "fetch", "id": id(&first), "sha256": second["sha256"]})).is_err());
         assert!(!d.0.join("blobs").join(format!("{}.jl", second["sha256"].as_str().unwrap())).exists());
     }
 
     #[test]
     fn mail_reaches_the_addressee_and_broadcasts_reach_everyone_else() {
         let d = lab();
-        ok(&d.0, "codex", json!({"action": "publish", "name": "hello", "source": SRC}));
-        let m1 = ok(&d.0, "codex", json!({"action": "send", "to": "claude", "subject": "review hello?", "tool": "hello"}));
-        ok(&d.0, "codex", json!({"action": "send", "to": "all", "subject": "new shelf", "body": "see status"}));
+        let r = list(&d.0, "codex", "hello", SRC);
+        let m1 = ok(&d.0, "codex", json!({"action": "send", "to": "claude", "subject": "review hello?", "listing": id(&r)}));
+        ok(&d.0, "codex", json!({"action": "send", "to": "all", "subject": "new in the shop", "body": "see browse"}));
         let c = ok(&d.0, "claude", json!({"action": "inbox"}));
         assert_eq!(c["unread"], 2);
-        assert_eq!(c["messages"][0]["tool"], "hello");
+        assert_eq!(c["messages"][0]["listing"], id(&r));
         assert!(c["messages"][0]["sha256"].as_str().is_some_and(valid_sha));
         assert_eq!(ok(&d.0, "gemini", json!({"action": "inbox"}))["unread"], 1);
         assert_eq!(ok(&d.0, "codex", json!({"action": "inbox"}))["unread"], 0, "own mail is not news");
@@ -812,6 +1308,7 @@ mod tests {
         assert_eq!(ok(&d.0, "claude", json!({"action": "inbox", "all": true}))["messages"].as_array().unwrap().len(), 2);
         assert!(call(&d.0, "claude", json!({"action": "send", "to": "claude", "subject": "x"})).is_err());
         assert!(call(&d.0, "claude", json!({"action": "send", "to": "Bad Name", "subject": "x"})).is_err());
+        assert!(call(&d.0, "claude", json!({"action": "send", "to": "codex", "subject": "x", "listing": "deadbeef"})).is_err());
     }
 
     #[test]
@@ -845,16 +1342,22 @@ mod tests {
     }
 
     #[test]
-    fn bad_names_sizes_and_actions_are_denied() {
+    fn bad_bindings_ids_sizes_and_actions_are_denied() {
         let d = lab();
+        let new = |binding: &str, source: &str| json!({"action": "publish", "kind": "function", "tag": "t", "binding": binding, "source": source});
         for (p, want) in [
             (json!({"action": "nope"}), "must be one of"),
-            (json!({"action": "publish", "name": "end", "source": SRC}), "Julia identifier"),
-            (json!({"action": "publish", "name": "a-b", "source": SRC}), "Julia identifier"),
-            (json!({"action": "publish", "name": "x", "source": "x".repeat(MAX_SOURCE_BYTES + 1)}), "KiB"),
-            (json!({"action": "publish", "name": "x", "source": "  "}), "non-empty"),
-            (json!({"action": "publish", "name": "x", "source": SRC, "test": {"passed": "yes"}}), "'test'"),
-            (json!({"action": "pin", "name": "missing"}), "no tool named"),
+            (json!({"action": "publish", "source": SRC}), "requires the 'binding'"),
+            (new("end", SRC), "Julia identifier"),
+            (new("TeamLab", SRC), "Julia identifier"),
+            (new("a-b", SRC), "Julia identifier"),
+            (new("x", &"x".repeat(MAX_SOURCE_BYTES + 1)), "KiB"),
+            (new("x", "  "), "non-empty"),
+            (json!({"action": "publish", "kind": "function", "tag": "t", "binding": "x", "source": SRC, "test": {"passed": "yes"}}), "'test'"),
+            (json!({"action": "pin", "id": "0123abcd"}), "no listing 0123abcd"),
+            (json!({"action": "pin", "id": "hello"}), "not a listing id"),
+            (json!({"action": "pin"}), "requires a listing 'id'"),
+            (json!({"action": "update", "ids": ["x"]}), "list of listing ids"),
             (json!({"action": "ack"}), "requires 'ids'"),
         ] {
             let e = call(&d.0, "codex", p.clone()).unwrap_err();
@@ -871,8 +1374,8 @@ mod tests {
             std::thread::spawn(move || {
                 for i in 0..10 {
                     let agent = format!("agent{t}");
-                    handle(&dir, &agent, json!({"action": "publish", "name": format!("tool{t}"), "source": format!("f() = {i}\n")})
-                        .as_object().unwrap()).unwrap();
+                    handle(&dir, &agent, json!({"action": "publish", "kind": "function", "tag": "Counts", "binding": format!("tool{t}"),
+                                                "source": format!("f() = {i}\n")}).as_object().unwrap()).unwrap();
                     handle(&dir, &agent, json!({"action": "send", "to": "all", "subject": format!("{t}/{i}")})
                         .as_object().unwrap()).unwrap();
                 }
@@ -881,17 +1384,17 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        let st = ok(&dir, "observer", json!({"action": "status"}));
-        assert_eq!(st["tools"].as_array().unwrap().len(), 8);
-        assert!(st["tools"].as_array().unwrap().iter().all(|t| t["versions"] == 10));
-        assert_eq!(st["unread"], 80);
+        let b = ok(&dir, "observer", json!({"action": "browse"}));
+        assert_eq!(b["listings"].as_array().unwrap().len(), 8);
+        assert!(b["listings"].as_array().unwrap().iter().all(|l| l["versions"] == 10));
+        assert_eq!(ok(&dir, "observer", json!({"action": "status"}))["unread"], 80);
     }
 
     #[test]
     fn receipts_keep_sources_and_bodies_by_hash() {
         let (p, r) = receipt_view("claude",
-            &json!({"action": "publish", "name": "hello", "source": SRC}),
-            &json!({"tools": [{"name": "hello", "source": SRC}], "messages": [{"body": "long"}]}));
+            &json!({"action": "publish", "binding": "hello", "source": SRC}),
+            &json!({"tools": [{"binding": "hello", "source": SRC}], "messages": [{"body": "long"}]}));
         assert_eq!(p["agent"], "claude");
         assert_eq!(p["source"]["bytes"], SRC.len());
         assert!(p["source"]["sha256"].as_str().is_some_and(valid_sha));

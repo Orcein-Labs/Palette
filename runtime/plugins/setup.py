@@ -222,7 +222,7 @@ class Server:
 
 
 def check(launcher):
-    """Evaluate x = 41, then x + 1 in a second call, and read the TeamLab shelf."""
+    """Evaluate x = 41, then x + 1 in a second call, and read the TeamLab shop."""
     print('==> Checking the installation: x = 41, then x + 1', flush=True)
     server = Server(launcher)
     try:
@@ -232,9 +232,9 @@ def check(launcher):
         print('    x + 1 = 42: state persists between calls.')
         status = server.evaluate('Palette.runtime("invoke", Dict("id"=>"teamlab", '
                                  '"arguments"=>Dict{String,Any}("action"=>"status")))["result"]')
-        if not isinstance(status, dict) or 'tools' not in status:
+        if not isinstance(status, dict) or 'listed' not in status:
             raise RuntimeError(f'TeamLab status returned {status!r}')
-        print(f'    TeamLab: {len(status["tools"])} tools on the shelf at {status["dir"]}.')
+        print(f'    TeamLab: {status["listed"]} listings in the shop at {status["dir"]}.')
     except Exception:
         server.close(failed=True)
         raise

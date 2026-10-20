@@ -85,9 +85,9 @@ that runs in `~/project`.
 Commands run with the host process's privilege and environment, outside every
 mount rule above: list only commands you would let the model run unattended.
 
-The `teamlab` category is the shelf of Julia tools and the mailbox that one
+The `teamlab` category is the shop of Julia tools and the mailbox that one
 user's agents share (`runtime/integrations/teamlab`). The ceiling grants it
-as `{"teamlab": {"dir": "/abs/shelf"}}`; the operator adds that grant itself
+as `{"teamlab": {"dir": "/abs/shop"}}`; the operator adds that grant itself
 unless the ceiling names one, using `PALETTE_TEAMLAB_DIR`, else
 `$XDG_DATA_HOME/palette/teamlab` (`~/.local/share/palette/teamlab`), and
 `PALETTE_TEAMLAB_DIR=off` leaves it out. The directory is protected like the
