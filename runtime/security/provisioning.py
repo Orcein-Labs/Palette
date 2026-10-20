@@ -33,7 +33,7 @@ _PATH_ARGUMENT_OPTIONS = {
 }
 _CATEGORIES = {
     "external_fs_write", "fs_digest", "host_command", "host_request",
-    "network_access", "package_management", "spawn_child_worker",
+    "network_access", "package_management", "spawn_child_worker", "teamlab",
 }
 
 
@@ -113,7 +113,55 @@ def validate_ceiling(value: Any) -> dict[str, Any]:
             _validate_host_commands(grant.get("commands"))
         elif category == "spawn_child_worker" and grant:
             raise OperatorConfigError("spawn_child_worker grant must be an empty object")
+        elif category == "teamlab":
+            if set(grant) != {"dir"} or not isinstance(grant["dir"], str) or not Path(grant["dir"]).is_absolute():
+                raise OperatorConfigError("teamlab grant must be {\"dir\": <absolute path>}")
     return ceiling
+
+
+_AGENT_MARKS = (("claude", ("claude",)), ("codex", ("codex",)), ("grok", ("grok",)),
+                ("gemini", ("gemini", "antigravity")))
+
+
+def agent_name(client_name: Any) -> str | None:
+    """The TeamLab agent name for an MCP client's ``clientInfo.name``.
+
+    Known clients map to one name each (``claude-code`` -> ``claude``); any
+    other name is reduced to ``[a-z0-9._-]``. The name is cooperative: it
+    labels who published or sent something, it does not authenticate anyone.
+    """
+    if not isinstance(client_name, str):
+        return None
+    name = client_name.strip().lower()
+    if name == "palette-router":
+        return None
+    for agent, marks in _AGENT_MARKS:
+        if any(mark in name for mark in marks):
+            return agent
+    return re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")[:32].rstrip("-._") or None
+
+
+def with_teamlab(ceiling: dict[str, Any]) -> dict[str, Any]:
+    """Grant the user's TeamLab shelf, which every agent of this user shares.
+
+    An operator ceiling that names a teamlab grant keeps it. Otherwise the
+    shelf is ``PALETTE_TEAMLAB_DIR``, else ``$XDG_DATA_HOME/palette/teamlab``;
+    ``PALETTE_TEAMLAB_DIR=off`` (or empty) leaves TeamLab ungranted. Only the
+    Rust host serves TeamLab.
+    """
+    if "teamlab" in ceiling:
+        return ceiling
+    configured = os.environ.get("PALETTE_TEAMLAB_DIR")
+    if configured is None:
+        data_home = os.environ.get("XDG_DATA_HOME", "")
+        base = Path(data_home) if Path(data_home).is_absolute() else Path.home() / ".local/share"
+        configured = str(base / "palette" / "teamlab")
+    if configured.strip() in ("", "off"):
+        return ceiling
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise OperatorConfigError(f"PALETTE_TEAMLAB_DIR must be an absolute path, not {configured!r}")
+    return validate_ceiling({**ceiling, "teamlab": {"dir": str(path)}})
 
 
 def operator_ceiling(config_path: str | Path | None = None) -> dict[str, Any]:
@@ -189,6 +237,8 @@ def protected_host_paths(
     trusted_tools = os.environ.get("PALETTE_TRUSTED_TOOLS")
     if trusted_tools:
         paths.add(Path(trusted_tools).expanduser().resolve(strict=False))
+    if "teamlab" in checked:
+        paths.add(Path(checked["teamlab"]["dir"]).resolve(strict=False))
     commands = checked.get("host_command", {}).get("commands", {})
     for spec in commands.values():
         argv = spec["argv"]

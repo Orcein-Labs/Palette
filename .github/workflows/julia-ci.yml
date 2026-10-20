@@ -84,6 +84,11 @@ jobs:
         rustc --version || true
         clang --version | head -1 || true
         julia --project="$GITHUB_WORKSPACE" test_jrir.jl
+    - name: Check the optional teamlab capability
+      working-directory: runtime/integrations/teamlab
+      run: |
+        cargo build --manifest-path "$GITHUB_WORKSPACE/runtime/host/Cargo.toml" --release --locked
+        julia --project="$GITHUB_WORKSPACE" test_teamlab.jl
 
   ijulia-integration:
     runs-on: ubuntu-latest

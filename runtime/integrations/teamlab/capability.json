@@ -1,9 +1,9 @@
 {
   "id": "teamlab",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "source": "teamlab.jl",
   "entrypoint": "teamlab",
   "dependencies": [],
-  "requires": ["host_command"],
-  "description": "Team Lab content-addressed hot-reload tool shelf and cross-agent mailbox"
+  "requires": ["teamlab"],
+  "description": "A shelf of Julia tools and a mailbox shared by one user's agents, kept by the session host"
 }

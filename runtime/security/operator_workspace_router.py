@@ -24,7 +24,7 @@ import uuid
 
 from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode, patch_roots_from_env
 from filesystem_layout import require_disjoint
-from provisioning import operator_ceiling, palette_version, protected_host_paths
+from provisioning import agent_name, operator_ceiling, palette_version, protected_host_paths, with_teamlab
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
 from generation_runtime import GenerationStore
 from source_transport import CONTEXT_SCHEMA, call_limit, normalize_palette_call, timeout_schema, turn_limits
@@ -54,7 +54,7 @@ def workspace_protected_paths():
     protected = [BASE, REPO, ROOT, LEGACY, LEGACY_RECEIPTS,
                  Path(os.environ.get("PALETTE_SCRATCH_ROOT", str(ROOT / "scratch")))]
     protected.extend(Path(root) for root in os.environ.get("PALETTE_READ_ROOTS", "").split(":") if root)
-    protected.extend(protected_host_paths(operator_ceiling()))
+    protected.extend(protected_host_paths(with_teamlab(operator_ceiling())))
     # The default depot stays protected even when JULIA_DEPOT_PATH points
     # elsewhere: it holds juliaup toolchains and config/startup.jl, which a
     # host started without the override would still run.
@@ -525,9 +525,10 @@ def validate(args, schema):
 
 def serve_stream(stdin, stdout):
     capabilities = {}
+    caller = None
     roots = patch_roots_from_env()
     require_disjoint(roots.values(), [ROOT, LEGACY, LEGACY_RECEIPTS])
-    ceiling = operator_ceiling()
+    ceiling = with_teamlab(operator_ceiling())
     repair_config_path = os.environ.get("PALETTE_REPAIR_CONFIG")
     repair_config = json.loads(Path(repair_config_path).expanduser().read_text(encoding="utf-8")) if repair_config_path else {}
     if not isinstance(repair_config, dict) or set(repair_config) - {"test_recipes", "auto_apply_prefixes", "sandbox_source_paths"}:
@@ -547,6 +548,7 @@ def serve_stream(stdin, stdout):
             if method.startswith("notifications/"):
                 continue
             if method == "initialize":
+                caller = agent_name((msg.get("params", {}).get("clientInfo") or {}).get("name"))
                 capabilities = msg.get("params", {}).get("capabilities", {})
                 atomic_json(ROOT / "client-capabilities.json", {"elicitation": capabilities.get("elicitation"), "protocolVersion": msg.get("params", {}).get("protocolVersion")})
                 result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "palette", "version": palette_version(REPO)}, "instructions": "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities."}
@@ -576,6 +578,8 @@ def serve_stream(stdin, stdout):
                             result = text_result(generation_control(args, entry))
                         else:
                             forwarded = {k: v for k, v in args.items() if k not in ("workspace_id", "context_id")}
+                            if name == "palette" and caller:
+                                forwarded["caller"] = caller
                             result = child_for(entry).call(name, forwarded)
                             value = json.loads(result["content"][0]["text"])
                             child = child_for(entry)

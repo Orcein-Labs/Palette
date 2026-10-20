@@ -1,130 +1,180 @@
+# End to end: two agents' kernels against real `palette-host broker`
+# processes that share one shelf directory, as two agents' sessions would.
+# Set PALETTE_HOST to a built palette-host, or build runtime/host first.
+
 using Test
+using Palette
 
-module TeamLabTestMod
-    include("teamlab.jl")
+const HOST = let
+    root = normpath(joinpath(@__DIR__, "..", "..", "host", "target"))
+    candidates = filter(!isempty, [get(ENV, "PALETTE_HOST", ""),
+                                   joinpath(root, "release", "palette-host"),
+                                   joinpath(root, "debug", "palette-host")])
+    i = findfirst(isfile, candidates)
+    i === nothing && error("no palette-host: set PALETTE_HOST or run `cargo build --manifest-path runtime/host/Cargo.toml`")
+    candidates[i]
 end
-const TL = TeamLabTestMod
 
-@testset "TeamLab Hot-Reload Shelf & Cross-Agent Mailbox Suite" begin
-    mktempdir() do tmp_lab
-        @testset "1. Bootstrap Default Shelf (vecindex, jrir, teamlab)" begin
-            st = TL.teamlab(Dict("action" => "status", "lab_dir" => tmp_lab))
-            @test st["status"] == "ok"
-            tool_names = [t["name"] for t in st["tools_on_shelf"]]
-            @test "vecindex" in tool_names
-            @test "jrir" in tool_names
-            @test "teamlab" in tool_names
-        end
+# The capability, loaded the way the runtime loads one.
+const TL = let m = Module(:PaletteCapability_teamlab_test)
+    Core.eval(m, :(const Palette = $Palette))
+    Base.include(m, joinpath(@__DIR__, "teamlab.jl"))
+    m
+end
+teamlab(args...) = Base.invokelatest(TL.teamlab, Dict{String,Any}(args...))
 
-        @testset "2. Publish Custom Tool with QA Test Gate & Hot-Reload Sync" begin
-            tool_file = joinpath(tmp_lab, "custom_probe.jl")
-            test_file = joinpath(tmp_lab, "test_custom_probe.jl")
-            write(tool_file, """
-            custom_probe(x::Int) = x * 2 + 1
-            """)
-            write(test_file, """
-            using Test
-            include("custom_probe.jl")
-            @test custom_probe(20) == 41
-            """)
+struct Broker
+    proc::Base.Process
+    socket::String
+end
 
-            pub = TL.teamlab(Dict(
-                "action" => "publish",
-                "tool" => "custom_probe",
-                "entrypoint" => tool_file,
-                "test_path" => test_file,
-                "author" => "gemini",
-                "version" => "0.1.0",
-                "notify" => "grok",
-                "lab_dir" => tmp_lab,
-            ))
-            @test pub["status"] == "published"
-            @test pub["qa_passed"] == true
-            sha_v1 = pub["sha256"]
+function start_broker(tmp, agent, lab)
+    socket = joinpath(tmp, "$agent.sock")
+    ispath(socket) && rm(socket)
+    ceiling = Palette.JSON.json(Dict("teamlab" => Dict("dir" => lab)))
+    cmd = `$HOST broker --ceiling $ceiling --receipts $(joinpath(tmp, "$agent-receipts.jsonl")) --socket $socket`
+    env = merge(ENV, Dict("PALETTE_AGENT" => agent, "PALETTE_PACKAGE_DEPOT" => joinpath(tmp, "depot")))
+    proc = open(pipeline(setenv(cmd, env); stderr=joinpath(tmp, "$agent-stderr.txt")), "r+")
+    line = readline(proc)
+    occursin("READY", line) || error("the $agent broker did not start: $line\n$(read(joinpath(tmp, "$agent-stderr.txt"), String))")
+    return Broker(proc, socket)
+end
 
-            # Sync into an isolated simulated Grok bench module (zero CLI restart)
-            GrokBench = Module(:GrokBench)
-            sync_v1 = TL.teamlab_sync!("grok"; tools=["custom_probe"], target_mod=GrokBench, lab_dir=tmp_lab)
-            @test sync_v1["status"] == "synced"
-            @test length(sync_v1["reloaded_tools"]) == 1
-            @test sync_v1["reloaded_tools"][1]["tool"] == "custom_probe"
-            @test sync_v1["unread_count"] == 1
-            @test Core.eval(GrokBench, :(custom_probe(10))) == 21
+function stop(b::Broker)
+    close(b.proc.in)
+    wait(b.proc)
+end
 
-            # Second sync without changes -> already_current_tools
-            sync_noop = TL.teamlab_sync!("grok"; tools=["custom_probe"], target_mod=GrokBench, lab_dir=tmp_lab)
-            @test isempty(sync_noop["reloaded_tools"])
-            @test "custom_probe" in sync_noop["already_current_tools"]
+as(f, b::Broker) = withenv(f, "PALETTE_BROKER_SOCKET" => b.socket)
 
-            # Update tool to v0.2.0 and hot-reload into the same GrokBench module without restart
-            write(tool_file, """
-            custom_probe(x::Int) = x * 10 + 7
-            """)
-            write(test_file, """
-            using Test
-            include("custom_probe.jl")
-            @test custom_probe(10) == 107
-            """)
-            pub_v2 = TL.teamlab(Dict(
-                "action" => "publish",
-                "tool" => "custom_probe",
-                "entrypoint" => tool_file,
-                "test_path" => test_file,
-                "author" => "gemini",
-                "version" => "0.2.0",
-                "notify" => "grok",
-                "lab_dir" => tmp_lab,
-            ))
-            @test pub_v2["sha256"] != sha_v1
+world() = Palette.get_kernel_state().eval_module
+in_world(ex) = Core.eval(world(), ex)
 
-            sync_v2 = TL.teamlab_sync!("grok"; tools=["custom_probe"], target_mod=GrokBench, ack_synced=true, lab_dir=tmp_lab)
-            @test length(sync_v2["reloaded_tools"]) == 1
-            @test Core.eval(GrokBench, :(custom_probe(10))) == 107
+const PROBE_V1 = "probe(x) = 2x + 1\n"
+const PROBE_V2 = "probe(x) = 10x + 7\n"
+const PROBE_TEST = """
+using Test
+include("probe.jl")
+@test probe(20) == 41
+"""
 
-            # Verify ack_synced cleared grok's inbox
-            inb = TL.teamlab(Dict("action" => "inbox", "agent" => "grok", "lab_dir" => tmp_lab))
-            @test inb["unread_count"] == 0
-        end
+@testset "TeamLab over the session host" begin
+    mktempdir() do tmp
+        lab = joinpath(tmp, "lab")
+        claude, codex = start_broker(tmp, "claude", lab), start_broker(tmp, "codex", lab)
+        try
+            @testset "publish checks the tool first" begin
+                pub = as(claude) do
+                    teamlab("action" => "publish", "name" => "probe", "source" => PROBE_V1, "test_source" => PROBE_TEST, "note" => "first cut")
+                end
+                @test pub["published"] === true
+                @test pub["version"] == 1
+                @test pub["new"] === true
+                @test pub["pinned"] === true
 
-        @testset "3. Cross-Agent Mailbox (claude <-> gemini <-> grok <-> codex)" begin
-            sent = TL.teamlab(Dict(
-                "action" => "send",
-                "sender" => "claude",
-                "recipient" => "all",
-                "subject" => "task:gesso-audit",
-                "body" => "Please verify softmax_n and Python callees on Gesso.",
-                "lab_dir" => tmp_lab,
-            ))
-            @test sent["status"] == "sent"
+                bad = as(claude) do
+                    teamlab("action" => "publish", "name" => "probe", "source" => PROBE_V2, "test_source" => PROBE_TEST)
+                end
+                @test bad["published"] === false
+                @test occursin("Test Failed", bad["test_output"]) || occursin("Error", bad["test_output"])
 
-            # Sender (claude) already acked own message; grok and gemini see it as unread
-            inb_claude = TL.teamlab(Dict("action" => "inbox", "agent" => "claude", "lab_dir" => tmp_lab))
-            @test inb_claude["unread_count"] == 0
+                # A tool must define the binding it is named after.
+                @test_throws ArgumentError as(() -> teamlab("action" => "publish", "name" => "nobody", "source" => "somebody() = 1"), claude)
+                @test_throws ArgumentError as(() -> teamlab("action" => "publish", "name" => "probe", "source" => PROBE_V1, "lab_dir" => tmp), claude)
+                @test_throws ArgumentError as(() -> teamlab("action" => "publish", "name" => "probe"), claude)
+                @test_throws ArgumentError as(() -> teamlab("action" => "explode"), claude)
 
-            inb_grok = TL.teamlab(Dict("action" => "inbox", "agent" => "grok", "lab_dir" => tmp_lab))
-            @test inb_grok["unread_count"] == 1
-            @test inb_grok["messages"][1]["subject"] == "task:gesso-audit"
+                st = as(() -> teamlab("action" => "status"), claude)
+                @test st["agent"] == "claude"
+                @test [t["name"] for t in st["tools"]] == ["probe"]
+                @test st["tools"][1]["versions"] == 1
+                @test st["tools"][1]["latest"]["test"]["passed"] === true
+            end
 
-            ack_res = TL.teamlab(Dict("action" => "ack", "agent" => "grok", "ids" => [sent["id"]], "lab_dir" => tmp_lab))
-            @test ack_res["acked_count"] == 1
+            @testset "a file and its test can be published by path" begin
+                dir = mkpath(joinpath(tmp, "src"))
+                write(joinpath(dir, "twice.jl"), "twice(x) = 2x\n")
+                write(joinpath(dir, "test_twice.jl"), "using Test; include(\"twice.jl\"); @test twice(4) == 8\n")
+                pub = as(codex) do
+                    teamlab("action" => "publish", "name" => "twice", "path" => joinpath(dir, "twice.jl"), "test" => joinpath(dir, "test_twice.jl"))
+                end
+                @test pub["published"] === true
+                @test as(() -> teamlab("action" => "fetch", "name" => "twice"), claude)["author"] == "codex"
+            end
 
-            # Grok is now at 0 unread, while gemini still has 1 unread
-            @test TL.teamlab(Dict("action" => "inbox", "agent" => "grok", "lab_dir" => tmp_lab))["unread_count"] == 0
-            @test TL.teamlab(Dict("action" => "inbox", "agent" => "gemini", "lab_dir" => tmp_lab))["unread_count"] == 1
-        end
+            @testset "approval is someone else's" begin
+                @test_throws ErrorException as(() -> teamlab("action" => "approve", "name" => "probe"), claude)
+                as(() -> teamlab("action" => "approve", "name" => "probe", "note" => "read it"), codex)
+                fetched = as(() -> teamlab("action" => "fetch", "name" => "probe"), claude)
+                @test [a["by"] for a in fetched["approvals"]] == ["codex"]
+                @test fetched["source"] == PROBE_V1
+            end
 
-        @testset "4. Failing QA Gate Rejects Publication" begin
-            bad_tool = joinpath(tmp_lab, "bad_tool.jl")
-            bad_test = joinpath(tmp_lab, "test_bad_tool.jl")
-            write(bad_tool, "bad_fn() = 1\n")
-            write(bad_test, "using Test; @test 1 == 2\n")
-            @test_throws ErrorException TL.teamlab(Dict(
-                "action" => "publish",
-                "tool" => "bad_tool",
-                "entrypoint" => bad_tool,
-                "test_path" => bad_test,
-                "lab_dir" => tmp_lab,
-            ))
+            @testset "sync binds pinned tools into the world and hot-reloads them" begin
+                s1 = as(() -> teamlab("action" => "sync"), claude)
+                @test [l["name"] for l in s1["loaded"]] == ["probe"]
+                @test isempty(s1["failed"])
+                @test in_world(:(TeamLab.probe(10))) == 21
+
+                s2 = as(() -> teamlab("action" => "sync"), claude)
+                @test isempty(s2["loaded"])
+                @test s2["current"] == ["probe"]
+
+                pub = as(() -> teamlab("action" => "publish", "name" => "probe", "source" => PROBE_V2), claude)
+                @test pub["version"] == 2
+                s3 = as(() -> teamlab("action" => "sync"), claude)
+                @test [l["version"] for l in s3["loaded"]] == [2]
+                @test in_world(:(TeamLab.probe(10))) == 107
+            end
+
+            @testset "another agent pins, falls behind, and updates" begin
+                as(() -> teamlab("action" => "pin", "name" => "probe", "sha256" => as(() -> teamlab("action" => "fetch", "name" => "probe"), claude)["sha256"]), codex)
+                st = as(() -> teamlab("action" => "status"), codex)
+                probe = only(filter(t -> t["name"] == "probe", st["tools"]))
+                @test probe["pinned_version"] == 2
+                @test probe["behind"] === false
+
+                v3 = as(() -> teamlab("action" => "publish", "name" => "probe", "source" => "probe(x) = x\n"), claude)
+                @test as(() -> teamlab("action" => "sync"), codex)["behind"] == ["probe"]
+                up = as(() -> teamlab("action" => "update", "names" => ["probe"]), codex)
+                @test only(up["updated"])["to"] == v3["sha256"]
+                @test only(up["updated"])["from_version"] == 2
+                as(() -> teamlab("action" => "unpin", "name" => "probe"), codex)
+                st = as(() -> teamlab("action" => "status"), codex)
+                @test only(filter(t -> t["name"] == "probe", st["tools"]))["pinned"] === nothing
+                s = as(() -> teamlab("action" => "sync"), codex)
+                @test !("probe" in s["current"]) && !("probe" in [l["name"] for l in s["loaded"]])
+            end
+
+            @testset "mailbox" begin
+                sent = as(() -> teamlab("action" => "send", "to" => "codex", "subject" => "probe v3", "body" => "it is the identity now", "tool" => "probe"), claude)
+                @test_throws ErrorException as(() -> teamlab("action" => "send", "to" => "claude", "subject" => "me"), claude)
+                inbox = as(() -> teamlab("action" => "inbox"), codex)
+                @test inbox["unread"] == 1
+                @test only(inbox["messages"])["subject"] == "probe v3"
+                @test as(() -> teamlab("action" => "inbox"), claude)["unread"] == 0
+                ack = as(() -> teamlab("action" => "ack", "ids" => [sent["id"]]), codex)
+                @test ack["acked"] == [sent["id"]]
+                @test as(() -> teamlab("action" => "inbox"), codex)["unread"] == 0
+            end
+
+            @testset "the shelf outlives a session" begin
+                stop(claude)
+                claude = start_broker(tmp, "claude", lab)
+                st = as(() -> teamlab("action" => "status"), claude)
+                probe = only(filter(t -> t["name"] == "probe", st["tools"]))
+                @test probe["versions"] == 3
+                @test probe["pinned_version"] == 3
+            end
+
+            @testset "the kernel side holds no path to the shelf" begin
+                # The directory is the host's; a kernel only ever asks for it.
+                @test !occursin("ENV", read(joinpath(@__DIR__, "teamlab.jl"), String))
+                @test filemode(lab) & 0o077 == 0
+            end
+        finally
+            stop(claude)
+            stop(codex)
         end
     end
 end
