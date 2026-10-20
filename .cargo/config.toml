@@ -1,0 +1,4 @@
+# `cargo xtask <task>` from the checkout root runs Palette's development tasks
+# (runtime/xtask). They are not part of the host or the bundles.
+[alias]
+xtask = "run --quiet --locked --manifest-path runtime/xtask/Cargo.toml --"

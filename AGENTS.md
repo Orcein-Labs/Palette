@@ -26,7 +26,7 @@ stage internal research or credentials into the public release.
   This standalone Julia/Rust repository does not have npm package scripts.
 - Run every modified test file directly. Run Julia package tests for Julia changes
   and Rust tests for host changes. Real process/conformance entrypoints are in
-  `runtime/security/verify_operator.py`; its prepared test environment must point here.
+  `cargo xtask verify` (`runtime/xtask`); its prepared test environment must point here.
 - Tests must fail on broken behavior. Prove regressions with negative controls.
 - No fabricated results, retries, weakened assertions, conditional skips, optional
   assertions, or environment-gated success paths. Record every failed attempt.
