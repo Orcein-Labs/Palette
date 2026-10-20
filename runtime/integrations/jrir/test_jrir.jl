@@ -175,6 +175,51 @@ end
         @test !occursin("callq", asm)
 
         J.jrir(Dict("action" => "drop", "module" => "particle_mod"))
+
+        # clang ≤ 18 (Ubuntu 24.04's default) indexes fields through a named
+        # struct type, so the normalizer must keep the type definition.
+        raw_clang_18_particle = """
+        ; ModuleID = 'jrir_kern.c'
+        source_filename = "jrir_kern.c"
+        target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+        target triple = "x86_64-pc-linux-gnu"
+
+        %struct.Particle = type { float, float, float, float }
+
+        ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite) uwtable
+        define dso_local float @step_particle(ptr nocapture noundef %0, float noundef %1) local_unnamed_addr #0 {
+          %3 = getelementptr inbounds %struct.Particle, ptr %0, i64 0, i32 2
+          %4 = load float, ptr %3, align 4, !tbaa !5
+          %5 = load float, ptr %0, align 4, !tbaa !10
+          %6 = tail call float @llvm.fmuladd.f32(float %4, float %1, float %5)
+          store float %6, ptr %0, align 4, !tbaa !10
+          %7 = getelementptr inbounds %struct.Particle, ptr %0, i64 0, i32 3
+          %8 = load float, ptr %7, align 4, !tbaa !11
+          %9 = getelementptr inbounds %struct.Particle, ptr %0, i64 0, i32 1
+          %10 = load float, ptr %9, align 4, !tbaa !12
+          %11 = tail call float @llvm.fmuladd.f32(float %8, float %1, float %10)
+          store float %11, ptr %9, align 4, !tbaa !12
+          %12 = fmul float %11, %11
+          %13 = tail call float @llvm.fmuladd.f32(float %6, float %6, float %12)
+          ret float %13
+        }
+
+        ; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+        declare float @llvm.fmuladd.f32(float, float, float) #1
+
+        attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite) uwtable }
+        !5 = !{!6, !7, i64 8}
+        """
+        @test occursin("%struct.Particle = type { float, float, float, float }",
+                       J.normalize_llvm_ir(raw_clang_18_particle; entry_fn="step_particle"))
+        mod18 = J.compile_jrir_module!("particle_clang18"; rust_source=rust_src, llvm_ir=raw_clang_18_particle)
+        loop18! = J.build_simd_struct_loop!(mod18, "step_particle", J.JRIRParticle)
+        ref18 = copy(init)
+        cand18 = copy(init)
+        ref18_e = J.oracle_step_particles(ref18, 0.016f0)
+        @test isapprox(loop18!(cand18, 0.016f0), ref18_e; rtol=1f-5)
+        @test cand18 == ref18
+        J.jrir(Dict("action" => "drop", "module" => "particle_clang18"))
     end
 
     @testset "4. Live Source Compilation (rustc or clang C99 fallback) & Capability API" begin

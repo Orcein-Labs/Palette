@@ -80,7 +80,10 @@ jobs:
       run: julia --project="$GITHUB_WORKSPACE" test_vecindex.jl
     - name: Check the optional jrir capability
       working-directory: runtime/integrations/jrir
-      run: julia --project="$GITHUB_WORKSPACE" test_jrir.jl
+      run: |
+        rustc --version || true
+        clang --version | head -1 || true
+        julia --project="$GITHUB_WORKSPACE" test_jrir.jl
 
   ijulia-integration:
     runs-on: ubuntu-latest
