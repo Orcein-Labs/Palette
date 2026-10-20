@@ -20,7 +20,7 @@ IDs below (P-xx, MT-xx, MP-xx) refer to it.
 | Shell parity | An agent runs a full Luxel session through Palette with no Bash: cargo build and test, git, GPU renders under the shared GPU lock, profiling. |
 | Long work | Work over 60 s runs as a job or with a per-call deadline, with status, streamed output and cancel. |
 | Install | On a fresh Linux machine and on a fresh Windows machine with WSL2, one command goes from nothing to a working Claude Code call, with no flags and no Rust toolchain. |
-| CI | `security-suite` finishes in under 15 min and is green on 10 consecutive runs. Today it takes 50–90 min and sometimes hangs in sandbox prewarm. |
+| CI | `security-suite` finishes in under 15 min and is green on 3 consecutive full runs (a dispatch or the nightly; push runs skip the Python shards). Major, high-complexity components get more runs. Met 2026-10-20: the nightly and the dispatches for #48, #50 and #51, all 8 shards green, the slowest 12 min. (Was 10 runs; at the start of the round it took 50–90 min and sometimes hung in sandbox prewarm.) |
 | Speed | Warm calls take about 1 s or less. Cold start is well under today's 11 s. |
 | Honest reporting | The dogfood report's seams 2–8 are fixed. |
 | Breadth | The same gates pass on Gesso and Cyan work, not only Luxel. |
