@@ -179,10 +179,13 @@ pub fn executable(p: &Path) -> bool {
         && std::ffi::CString::new(p.as_os_str().as_bytes()).is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0)
 }
 
-/// The first executable `name` on PATH, as `shutil.which` finds it.
+/// The first executable `name` on PATH, as `shutil.which` finds it, made
+/// absolute: callers write it into units and registrations that run from
+/// another directory, where a relative PATH entry would name something else.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()).map(|d| d.join(name)).find(|p| executable(p))
+    let found = std::env::split_paths(&path).filter(|d| !d.as_os_str().is_empty()).map(|d| d.join(name)).find(|p| executable(p))?;
+    std::path::absolute(&found).ok()
 }
 
 /// Replaces a file in one rename, so a reader never sees a half-written one.

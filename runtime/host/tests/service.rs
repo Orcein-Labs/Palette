@@ -171,6 +171,15 @@ fn install_updates_only_owned_units_and_runs_fake_systemctl() {
 }
 
 #[test]
+fn install_writes_an_absolute_interpreter_found_through_a_relative_path_entry() {
+    let f = Fixture::new();
+    let out = f.command(&args(&f.install_args())).env("PATH", "bin:/usr/bin:/bin").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let unit = fs::read_to_string(f.units().join("palette.service")).unwrap();
+    assert!(unit.contains(&format!("ExecStart=\"{}\" ", f.bin().join("python3").display())), "{unit}");
+}
+
+#[test]
 fn install_writes_tunnel_unit_after_checking_both() {
     let f = Fixture::new();
     let client = f.root.join("tunnel client");
