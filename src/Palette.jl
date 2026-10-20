@@ -203,24 +203,16 @@ mutable struct KernelState
         # workload passes a module of this package's own instead, because
         # precompilation refuses evaluation into any other module.
         state.eval_module = something(eval_module, Module(Symbol("KernelScope_$(replace(string(state.id), '-' => '_'))")))
-        # `Core.eval`'d code lands in this fresh module, not Main -- `using
-        # Palette` at Main scope (e.g. in runtime/scripts/session_loop.jl) does not
-        # make `Palette` visible here (confirmed by direct testing: a real
-        # UndefVarError for `Palette` from inside eval_module otherwise).
-        # Bound once here so turn code can call
-        # `Palette.request_capability(...)` without re-importing it on every
-        # single turn just to reach the one function that's the entire
-        # point of the authority fence.
+        # Turn code runs in this module, not Main, so `using Palette` at Main
+        # scope (as in runtime/scripts/session_loop.jl) does not reach it.
+        # Binding `Palette` here lets turn code call
+        # `Palette.request_capability(...)` without importing it each turn.
         Core.eval(state.eval_module, :(const Palette = $(Api)))
         Core.eval(state.eval_module, :(const Api = $(Api)))
         Core.eval(state.eval_module, :(const Main = $(state.eval_module)))
-        # A bare `Module(...)` never gets `include` for free (confirmed by
-        # direct testing across all constructor flag combinations -- this
-        # is not a Julia version regression, it never worked the way an
-        # earlier comment in this file assumed). Needed so promoted, kit-
-        # scope code (written to disk via a real broker-mediated
-        # external_fs_write, then loaded back with `include`) can actually
-        # be loaded into the persistent mind's own module, not just Main.
+        # A bare `Module(...)` has no `include` of its own. This one loads
+        # files into the eval module, not Main, so code written to disk
+        # through the broker can be loaded back into the session.
         # It first reloads edited workspace packages, so a call that edits a
         # package and then includes its tests runs the edited code.
         # Every ordinary module has `eval`; this one did not, and turn code calling it failed.
@@ -268,6 +260,14 @@ function get_kernel_state()::KernelState
     return state
 end
 
+# The number of the call in flight, or of the next one between calls.
+next_call() = length(get_kernel_state().execution_history) + 1
+
+# Session code defines globals after the kernel's own world was fixed, so
+# reads of them go through the latest world.
+latest_isdefined(m::Module, s::Symbol) = Base.invokelatest(isdefined, m, s)
+latest_global(m::Module, s::Symbol) = Base.invokelatest(getglobal, m, s)
+
 """
     reset_kernel_state()
 
@@ -275,6 +275,59 @@ Resets the kernel state (useful for testing or clean restarts).
 """
 function reset_kernel_state()
     GLOBAL_STATE[] = nothing
+    return nothing
+end
+
+"""
+    reset_kernel_state!(; process=false)
+
+Forgets what earlier calls left behind: call history and receipts, costs,
+definitions, used files, binding records, outputs, task and host-job reports,
+and tool uses, sources and stubs. The session loop runs it after its warm-up
+calls so the first real call is call 1.
+
+`process=true` also forgets what the process was set up with: the state
+directory (removed from disk), the revival report, the kernel state, workspace
+packages and reloads, kept late-output files, the task epoch, restore and
+checkpoint notices, the session context and code graphs. The precompile
+workload runs it so none of its state is baked into the package image.
+"""
+function reset_kernel_state!(; process::Bool=false)
+    state = GLOBAL_STATE[]
+    if state !== nothing
+        empty!(state.execution_history)
+        empty!(state.receipt_log)
+    end
+    empty!(TURN_COSTS)
+    empty!(DEFINITION_LOG); clear_definition_index!()
+    empty!(CALL_FILES); empty!(USED_FILES)
+    empty!(BINDING_SEEN); empty!(BINDING_ORIGINS); empty!(BINDING_IDENTITIES)
+    empty!(OUTPUTS); empty!(XRAY)
+    OBSERVATION_ACK[] = nothing
+    empty!(LAST_RUNNING[])
+    empty!(REPORTED_TASKS); empty!(FINISH_REPORTED); empty!(TASK_OBSERVATIONS)
+    TASK_SEQUENCE[] = 0
+    empty!(HOST_JOBS); empty!(HOST_JOB_RESULTS); empty!(HOST_JOB_RESULT_ORDER)
+    empty!(TOOL_USES); empty!(TOOL_SOURCES); empty!(TOOL_STUBS); empty!(LOADED_TOOLS)
+    process || return nothing
+    isempty(STATE_DIR[]) || rm(STATE_DIR[]; recursive=true, force=true)
+    STATE_DIR[] = ""
+    REVIVAL_REPORT[] = ""
+    revival_observation!()
+    LAST_SAVED_CALL[] = 0
+    LAST_SNAPSHOT_SECONDS[] = 0.0
+    GLOBAL_STATE[] = nothing
+    empty!(WORKSPACE_PACKAGES); empty!(WORKSPACE_DECLARATIONS)
+    empty!(RELOAD_REPORTS)
+    RELOAD_SEQUENCE[] = 0
+    foreach(f -> rm(f[1]; force=true), LATE_FILES)
+    empty!(LATE_FILES)
+    TASK_EPOCH[] = ""
+    RESTORE_INFO[] = nothing
+    PENDING_CHECKPOINT[] = nothing
+    TIME_MACHINE_NOTICE[] = ""
+    SESSION_CONTEXT[] = nothing
+    empty!(CODE_GRAPHS)
     return nothing
 end
 
@@ -546,8 +599,8 @@ function reload_observation(mod::Module)
     bindings = Dict{String, Any}()
     observed_methods = Dict{Any, Method}()
     for sym in Base.invokelatest(names, mod; all=true)
-        Base.invokelatest(isdefined, mod, sym) || continue
-        value = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        value = latest_global(mod, sym)
         bindings[string(sym)] = (id=objectid(value), kind=value isa Type ? "type" : value isa Module ? "module" : "value",
                                 identity=value isa Union{Type, Module} ? value : nothing)
         value isa Union{Function, Type} || continue
@@ -725,9 +778,9 @@ end
     Api
 
 What turn code sees as `Palette`: the one entry point to broker-mediated
-authority. The whole package used to be bound there, so a model exploring it
-found `reset_kernel_state()`, which silently discarded every binding, and
-`discover()`, which listed operators that do not exist.
+authority. It is not the whole package: a model exploring that would find
+`reset_kernel_state()`, which silently discards every binding, and
+`discover()`, which lists operators that do not exist.
 """
 module Api
 import ..Palette
@@ -836,8 +889,8 @@ function varinfo(mod::Module=get_kernel_state().eval_module)
     rows = NTuple{3,String}[]
     for sym in sort!(Base.invokelatest(names, mod; all=true))
         session_binding(mod, sym) || continue
-        Base.invokelatest(isdefined, mod, sym) || continue
-        v = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        v = latest_global(mod, sym)
         size = try
             Base.format_bytes(Base.summarysize(v))
         catch
@@ -1016,7 +1069,7 @@ function execute(op::ExecuteCode)::OperationReceipt
 
     result = OperationResult(nothing, true, nothing)
     error_msg = nothing
-    call_file = "call $(length(state.execution_history) + 1)"
+    call_file = "call $(next_call())"
 
     try
         # Meta.parse only parses a single top-level statement and throws on
@@ -1040,20 +1093,18 @@ function execute(op::ExecuteCode)::OperationReceipt
         # `names(module; all=true)` reports exactly what Julia itself
         # considers a top-level binding in this module, which is the
         # actual question being asked here.
-        # World-age note: Core.eval above ran in a compiled function, so it
-        # defines eval_module's new bindings in a NEW world age -- plain
-        # names/isdefined/getfield here would still see the OLD world and
-        # miss bindings that unquestionably exist (confirmed by direct
-        # testing, not assumed). Base.invokelatest forces resolution
-        # against the current world.
+        # World age: Core.eval above defined eval_module's new bindings in a
+        # newer world than this function runs in, so plain
+        # names/isdefined/getfield here would miss them. Base.invokelatest
+        # reads the current world.
         for sym in Base.invokelatest(names, state.eval_module; all=true)
             # :Palette is the constant KernelState's constructor binds here so
             # turn code can reach `Palette.request_capability` without
             # re-importing it every turn -- not a user variable, must not
             # show up in GetState/discovery any more than :eval or :include do.
             session_binding(state.eval_module, sym) || continue
-            if Base.invokelatest(isdefined, state.eval_module, sym)
-                state.variables[string(sym)] = Base.invokelatest(getfield, state.eval_module, sym)
+            if latest_isdefined(state.eval_module, sym)
+                state.variables[string(sym)] = latest_global(state.eval_module, sym)
             end
         end
     catch e
@@ -1100,10 +1151,9 @@ Base.showerror(io::IO, e::EphemeralToolViolation) = print(io, "EphemeralToolViol
 True if a function-definition call head is a dotted/qualified name
 (`function Mod.name(...)`), i.e. defines a method on a generic function
 that belongs to another module, reachable and permanent from anywhere in
-the process the instant it's evaluated -- confirmed by direct testing:
-`Core.eval` of `function Base.show(io, x::Int) ... end` into a brand new,
-otherwise-unrelated module still adds a real, permanent method to
-`Base.show`, with no `import` needed at all.
+the process the instant it's evaluated: `Core.eval` of
+`function Base.show(io, x::Int) ... end` into a brand new, unrelated module
+adds a permanent method to `Base.show`, with no `import` needed.
 """
 _qualified_def_target(head) = false
 _qualified_def_target(head::Expr) = head.head === :(.)
@@ -1148,15 +1198,13 @@ before any of it is ever evaluated, for the real ways this process
 confirmed can extend a foreign generic function's method table
 permanently:
 
-1. Any `import` statement. `using Mod: f` alone is already blocked by
-   Julia itself for bare-name extension (confirmed by direct testing --
-   "function Base.show must be explicitly imported to be extended") --
-   but `import Mod: f` followed by a bare `function f(...)` succeeds and
+1. Any `import` statement. Julia itself blocks bare-name extension after
+   `using Mod: f` ("function Base.show must be explicitly imported to be
+   extended"), but `import Mod: f` followed by a bare `function f(...)` succeeds and
    is exactly the pattern that needs to be stopped before eval, since
    Julia's own runtime won't stop it once `import` has run.
 2. Any qualified function definition head (`function Mod.name(...)`),
-   which extends `Mod`'s generic function directly, no `import` required
-   at all -- also confirmed by direct testing.
+   which extends `Mod`'s generic function directly, no `import` required.
 3. Any qualified call to `.include` (`Base.include(@__MODULE__, path)`),
    confirmed to load and run a file's contents with zero syntactic trace
    in the calling code itself -- the whole point of this check is to
@@ -1264,8 +1312,8 @@ function execute(op::EphemeralTool)::OperationReceipt
     # code would dynamically `include` at runtime, so granting `include`
     # here would be a silent bypass of the whole namespace-pollution guard
     # (load a file containing `import Base: show; function show(...)`, and
-    # the guard never looked at it). Kit code loads into the durable mind
-    # deliberately, not into disposable ephemeral tool code.
+    # the guard never looked at it). Files load into the persistent eval
+    # module, not into disposable ephemeral tool code.
 
     try
         parsed = parse_complete(op.code)
@@ -1324,11 +1372,8 @@ function record_tool_capsule(tool_id::String, code::String, result::OperationRes
         "error" => result.error,
         "duration_ms" => duration_ms,
         "retired_at" => string(Dates.now()),
-        # Reflects the real outcome -- confirmed by direct testing that
-        # this was previously hardcoded to "RETIRED" regardless of
-        # result.success, so a failed ephemeral tool's capsule looked
-        # indistinguishable from a successful one to anything reading the
-        # provenance log later.
+        # The real outcome, so a failed ephemeral tool's capsule is told
+        # apart from a successful one in the provenance log.
         "disposition" => result.success ? "RETIRED" : "FAILED",
     )
     open(joinpath(dir, "provenance.jsonl"), "a") do io
@@ -1620,10 +1665,10 @@ end
 """
     SafetyGuard
 
-Enforces safety constraints on operations. NOTE: this is an
-allowlist/pattern-blocklist toy, not the authority fence -- see the
-repository README's Authority philosophy section. It exists to demonstrate
-failure containment (Phase 9), not to be relied on as a security boundary.
+Enforces safety constraints on operations. It is an allowlist and pattern
+blocklist, not a security boundary: authority is enforced by the broker (see
+the repository README's Authority philosophy section). It demonstrates
+failure containment.
 """
 struct SafetyGuard
     max_execution_time_ms::Int
@@ -1643,11 +1688,8 @@ end
     validate(op, guard::SafetyGuard)::Bool
 
 Validates that an operation passes safety checks. Dispatches on the
-operation's actual type against a `Set{DataType}` -- this used to stringify
-`typeof(op)` and look it up in a `Set{String}`, which is duck-typing
-grafted onto a language whose type system already answers "is this op one
-of the allowed kinds" directly, without an allocation or a name-collision
-risk between unrelated types that happen to share a short name.
+operation's actual type against a `Set{DataType}`, so two unrelated types
+that share a short name are never confused.
 """
 function validate(op, guard::SafetyGuard)::Bool
     return typeof(op) in guard.allowed_operations
@@ -1741,14 +1783,10 @@ function request_capability(category::String, params::Dict=Dict{String,Any}(); t
         push!(rec["capability_requests"], asked)
     end
     conn = connect(sock_path)
-    # `timeout_s` was accepted but never referenced anywhere in this
-    # function -- confirmed by reading it, not assumed: a broker that
-    # hung mid-effect (a stuck Pkg.add, a network call that never returns)
-    # would hang this call, and therefore this whole worker/turn, forever,
-    # with no way for the documented parameter to prevent it. Same
-    # Timer-based cancellation pattern already used for ShellEscape's
-    # timeout: closing the socket while `readline` blocks on it forces
-    # that read to error out instead of hanging indefinitely.
+    # A broker that hangs mid-effect (a stuck Pkg.add, a network call that
+    # never returns) must not hang the call forever. At `timeout_s` a Timer
+    # closes the socket, which makes the blocked `readline` fail, as in
+    # ShellEscape's timeout.
     timed_out = Ref(false)
     timer = Timer(timeout_s) do _
         if isopen(conn)
@@ -2035,7 +2073,7 @@ Entry point of an ephemeral child worker. Runs `code` as a persistent turn
 would and prints one JSON line last: success, data, display and error. The
 display is the same `text/plain` rendering a persistent turn returns, and
 `data` falls back to it when the value has no JSON form (NaN, a function),
-which used to crash the child after the code had already succeeded.
+so such a value does not crash the child after the code succeeded.
 """
 function ephemeral_main(code::AbstractString; payload=nothing, timeout_s=nothing, startup_seconds=nothing)
     redirect_stderr(stdout)

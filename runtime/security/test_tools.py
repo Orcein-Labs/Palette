@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from patch_broker import PatchBroker, TRUSTED_TOOLS_TARGET, patch_roots_from_env  # noqa: E402
-from test_revival import Kernel, KernelTestCase  # noqa: E402
+from test_revival import KernelTestCase  # noqa: E402
 
 DEFINE = '''
 "Twice x, plus an offset."
@@ -40,16 +40,12 @@ class ToolsTest(KernelTestCase):
         self.env = {"PALETTE_TRUSTED_TOOLS": str(self.trusted)}
 
     def kernel(self, state=None):
-        return Kernel(self.ws, state or self.state, env=self.env)
+        return super().kernel(state, env=self.env)
 
     def fresh_state(self):
         state = tempfile.mkdtemp(prefix="palette-tools-state-")
         self.addCleanup(shutil.rmtree, state, True)
         return state
-
-    def ok(self, r):
-        self.assertTrue(r["success"], r)
-        return r
 
     def fails(self, r, text):
         self.assertFalse(r["success"], r)

@@ -28,7 +28,8 @@ const TIME_MACHINE_NOTICE = Ref("")
 const RESTORE_INFO = Ref{Union{Nothing, Dict{String, Any}}}(nothing)
 
 checkpoints_dir() = joinpath(STATE_DIR[], "checkpoints")
-blob_path(sha::AbstractString) = joinpath(STATE_DIR[], "blobs", sha)
+blobs_dir() = joinpath(STATE_DIR[], "blobs")
+blob_path(sha::AbstractString) = joinpath(blobs_dir(), sha)
 utc_now() = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 
 # The code a restored world runs: file => sha256 of the checkpoint copy it
@@ -81,7 +82,7 @@ function checkpoint(name::AbstractString; note::AbstractString="")
     startswith(name, "auto-") && error("names starting with `auto-` are kept for the checkpoints a restore saves")
     isdir(joinpath(checkpoints_dir(), name)) &&
         error("checkpoint `$name` exists; Palette.forget_checkpoint(\"$name\") removes it")
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     PENDING_CHECKPOINT[] = (String(name), String(note), call)
     return "checkpoint `$name` is saved when this call (call $call) completes"
 end
@@ -138,7 +139,7 @@ function keep_sources(p::String, sha::String)
     for f in included_files(p)
         bytes = read(f)
         h = bytes2hex(sha256(bytes))
-        isfile(blob_path(h)) || write_state_file!(joinpath(STATE_DIR[], "blobs"), h, String(bytes))
+        isfile(blob_path(h)) || write_state_file!(blobs_dir(), h, String(bytes))
         d[f] = h
     end
     return d
@@ -147,7 +148,7 @@ end
 # Copies each include's sources to the blob store, when the file still has the
 # content the include read; a file changed since cannot be copied as it was.
 function keep_include_sources!(m)
-    mkpath(joinpath(STATE_DIR[], "blobs"))
+    mkpath(blobs_dir())
     out = Dict{String, Any}[]
     kept = Dict{Tuple{String, String}, Any}()   # a file included in many calls is copied once
     for e in m["definitions"]
@@ -222,13 +223,28 @@ end
 
 # --- listing and forgetting ----------------------------------------------
 
-function checkpoint_records(dir::String=STATE_DIR[])
+# Every checkpoint's record, oldest first, and how many records could not be
+# read. A corrupt checkpoint.json is skipped rather than failing the listing.
+function read_checkpoint_records(dir::String=STATE_DIR[])
     root = joinpath(dir, "checkpoints")
-    isdir(root) || return Dict{String, Any}[]
-    records = [read_json(joinpath(root, n, "checkpoint.json")) for n in readdir(root)
-               if isfile(joinpath(root, n, "checkpoint.json"))]
-    return sort!(records; by=r -> (r["created"], r["name"]))
+    records = Dict{String, Any}[]
+    unreadable = 0
+    isdir(root) || return records, unreadable
+    for n in readdir(root)
+        path = joinpath(root, n, "checkpoint.json")
+        isfile(path) || continue
+        r = try read_json(path) catch; nothing end
+        if r isa AbstractDict && all(k -> haskey(r, k), ("name", "created", "includes")) &&
+           r["name"] isa String && r["created"] isa String && r["includes"] isa AbstractVector
+            push!(records, r)
+        else
+            unreadable += 1
+        end
+    end
+    return sort!(records; by=r -> (r["created"], r["name"])), unreadable
 end
+
+checkpoint_records(dir::String=STATE_DIR[]) = first(read_checkpoint_records(dir))
 
 """
     Palette.checkpoints() -> (; world, checkpoints)
@@ -240,7 +256,7 @@ and time.
 function checkpoints()
     isempty(STATE_DIR[]) && error("this kernel has no state directory, so it keeps no checkpoints")
     # Dicts, like the world record and the host's listing.
-    list = [Dict{String, Any}(k => r[k] for k in ("name", "call", "created", "note", "world")) for r in checkpoint_records()]
+    list = [Dict{String, Any}(k => get(r, k, nothing) for k in ("name", "call", "created", "note", "world")) for r in checkpoint_records()]
     return (world=world_record(), checkpoints=list)
 end
 
@@ -260,14 +276,17 @@ function forget_checkpoint(name::AbstractString)
 end
 
 # Removes each copied source that no checkpoint and none of `definitions` pins;
-# returns how many.
+# returns how many. While a checkpoint's record cannot be read, the sources it
+# uses are unknown, so none is removed.
 function remove_unused_blobs!(definitions)
-    used = Set{String}(sha for r in checkpoint_records() for i in r["includes"] for sha in values(i["files"]))
+    records, unreadable = read_checkpoint_records()
+    unreadable > 0 && return 0
+    used = Set{String}(sha for r in records for i in r["includes"] for sha in values(i["files"]))
     for e in definitions
         pinned = get(e, "pinned", nothing)
         pinned isa AbstractDict && union!(used, values(pinned))
     end
-    blobs = joinpath(STATE_DIR[], "blobs")
+    blobs = blobs_dir()
     removed = 0
     if isdir(blobs)
         for f in readdir(blobs)
