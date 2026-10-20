@@ -233,11 +233,19 @@ class SetupTest(unittest.TestCase):
                          ['generic-mcp.json', 'palette-launch.json', 'palette-local-plugin', 'palette-mcp'])
 
         # An update whose server loses state between calls is not switched on.
+        # It keeps the capabilities the working installation runs with.
         second = make_repo(self.tmp/'sdk-2')
+        source = json.loads((second/'runtime/integrations/teamlab/capability.json').read_text())['source']
+        deployed = palette/'capabilities/teamlab'/source
+        kept = deployed.read_text()
+        with open(second/'runtime/integrations/teamlab'/source, 'a') as f:
+            f.write('# sdk-2\n')
         failed = run(second, FAKE_PALETTE='forget')
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn('was not switched on', failed.stderr)
         self.assertIn(str(first), launcher.read_text())
+        self.assertEqual(deployed.read_text(), kept)
+        self.assertEqual([p.name for p in (palette/'capabilities').iterdir()], ['teamlab'])
         self.assertNotIn(str(second), (palette/'client/palette-launch.json').read_text())
 
         # Host commands are passed on when the operator's file exists.

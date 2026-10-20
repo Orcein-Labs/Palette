@@ -192,7 +192,8 @@ function _sync(args)
     end
     return Dict{String,Any}(
         "agent" => reply["agent"], "loaded" => done, "current" => current, "failed" => failed,
-        "missing" => reply["missing"], "behind" => reply["behind"], "clashes" => reply["clashes"],
+        "missing" => reply["missing"], "damaged" => get(reply, "damaged", Any[]),
+        "behind" => reply["behind"], "clashes" => reply["clashes"],
         "unread" => reply["unread"], "use" => _USE,
     )
 end

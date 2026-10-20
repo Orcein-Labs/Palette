@@ -76,7 +76,8 @@ class ProvisioningTest(unittest.TestCase):
             generic_config = root / "config" / "runner.toml"
             library = root / "lib"
             executable = root / "bin" / "runner"
-            paths = [model, weights, artifact, tokenizer_config, generic_config, library, executable]
+            lock = root / "locks" / "gpu.lock"
+            paths = [model, weights, artifact, tokenizer_config, generic_config, library, executable, lock]
             for path in paths:
                 path.mkdir(parents=True, exist_ok=True) if path == library else path.parent.mkdir(parents=True, exist_ok=True)
             argv = ["/usr/bin/python3", str(RUNNER), "run",
@@ -92,7 +93,7 @@ class ProvisioningTest(unittest.TestCase):
                     "--fixed-arg=--weights", f"--fixed-arg={weights}",
                     "--fixed-arg", "--library-dir", "--fixed-arg", str(library)]
             ceiling = {"host_command": {"commands": {
-                "inference": {"argv": argv, "cwd": tmp, "extra_args": True}}}}
+                "inference": {"argv": argv, "cwd": tmp, "lock": str(lock), "extra_args": True}}}}
             protected = set(protected_host_paths(ceiling))
             parents = command_parents(ceiling)
             for selected in paths:
@@ -169,7 +170,7 @@ class ProvisioningTest(unittest.TestCase):
     def test_case_provisioning_006_agent_names_from_client_info(self):
         names = {"claude-code": "claude", "codex-mcp-client": "codex", "Grok CLI": "grok",
                  "gemini-cli-mcp-client": "gemini", "antigravity": "gemini", "Kilo Code": "kilo-code",
-                 "_odd.name_": "odd.name", "x" * 40: "x" * 32, "palette-router": None, "---": None, None: None, 7: None}
+                 "_odd.name_": "odd.name", "x" * 40: "x" * 32, "palette-router": None, "all": None, "All.": None, "---": None, None: None, 7: None}
         for client, agent in names.items():
             self.assertEqual(agent_name(client), agent, client)
 

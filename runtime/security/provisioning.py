@@ -138,7 +138,8 @@ def agent_name(client_name: Any) -> str | None:
     for agent, marks in _AGENT_MARKS:
         if any(mark in name for mark in marks):
             return agent
-    return re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")[:32].rstrip("-._") or None
+    name = re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")[:32].rstrip("-._")
+    return name if name not in ("", "all") else None
 
 
 def with_teamlab(ceiling: dict[str, Any]) -> dict[str, Any]:
@@ -256,10 +257,18 @@ def command_parents(ceiling: dict[str, Any]) -> list[Path]:
     return sorted({path.parent for path in _command_paths(validate_ceiling(ceiling))}, key=str)
 
 
+def command_paths(ceiling: dict[str, Any]) -> list[Path]:
+    """The operator-owned host-command paths: each command's cwd, lock file
+    and configured path arguments."""
+    return sorted(_command_paths(validate_ceiling(ceiling)), key=str)
+
+
 def _command_paths(checked: dict[str, Any]) -> set[Path]:
     paths: set[Path] = set()
     for spec in checked.get("host_command", {}).get("commands", {}).values():
-        for candidate in (spec["cwd"], *_configured_path_arguments(spec["argv"])):
+        lock = spec.get("lock")
+        locks = (lock,) if isinstance(lock, str) else ()
+        for candidate in (spec["cwd"], *locks, *_configured_path_arguments(spec["argv"])):
             path = Path(candidate)
             if path.is_absolute():
                 paths.add(path.resolve(strict=False))

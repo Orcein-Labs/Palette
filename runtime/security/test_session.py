@@ -346,6 +346,20 @@ class TestHostCommand(SessionTestCase):
     """host_command end to end: turn code -> broker -> a host process the
     sandbox could not start itself."""
 
+    def test_a_workspace_holding_a_host_command_path_never_starts(self):
+        workspace = Path(tempfile.mkdtemp(prefix="palette-host-command-ws-", dir=str(Path.home())))
+        elsewhere = Path(tempfile.mkdtemp(prefix="palette-host-command-cwd-", dir=str(Path.home())))
+        self.addCleanup(shutil.rmtree, workspace, True)
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        (workspace / "project").mkdir()
+        specs = {"cwd": {"argv": ["/bin/true"], "cwd": str(workspace / "project")},
+                 "lock": {"argv": ["/bin/true"], "cwd": str(elsewhere), "lock": str(workspace / "gpu.lock")}}
+        for name, spec in specs.items():
+            with self.subTest(name), self.assertRaisesRegex(Exception, "host-command path"):
+                with PaletteSession(project_dir=PROJECT_DIR, ceiling={"host_command": {"commands": {"build": spec}}},
+                                    task_workspace_dir=str(workspace)):
+                    pass
+
     def test_turn_code_runs_only_the_commands_its_ceiling_names(self):
         outside = Path(tempfile.mkdtemp(prefix="palette-host-command-", dir=str(Path.home())))
         (outside / "marker.txt").write_text("host side\n")

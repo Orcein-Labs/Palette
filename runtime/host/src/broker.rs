@@ -899,7 +899,7 @@ fn sha256_file(path: &Path) -> std::io::Result<(String, u64, f64)> {
         hasher.update(&buf[..n]);
         size += n as u64;
     }
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let hex = util::to_hex(&hasher.finalize());
     let mtime = file
         .metadata()?
         .modified()
@@ -1084,7 +1084,7 @@ mod tests {
     fn expected_sha256(path: &Path) -> String {
         let mut h = Sha256::new();
         h.update(fs::read(path).unwrap());
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        util::to_hex(&h.finalize())
     }
 
     fn net_req(url: &str) -> Value {
