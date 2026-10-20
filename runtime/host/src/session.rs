@@ -291,6 +291,12 @@ impl PaletteSession {
             sandbox::check_hidden_from_read_roots("team lab", lab).map_err(err)?;
         }
         sandbox::check_writable_mounts_disjoint(&writable, &protected).map_err(err)?;
+        let commands = sandbox::protected_command_paths(&o.ceiling);
+        for (name, path) in &writable {
+            if let Some(hit) = sandbox::command_overlap(path, &commands) {
+                return Err(err(format!("writable {name} mount {} overlaps the protected host-command path {}", path.display(), hit.display())));
+            }
+        }
         let receipts = receipts_root.join("receipts.jsonl");
         let broker = Arc::new(Broker::new(BrokerConfig {
             ceiling: o.ceiling.clone(),

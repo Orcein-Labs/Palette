@@ -187,10 +187,12 @@ class SessionDeadError(Exception):
 class RustSession:
     """A whole session through the Rust bridge, with PaletteSession's surface."""
 
-    def __init__(self, *, project_dir, ceiling, workspace_dir=None, turn_timeout=60.0, **_ignored):
+    def __init__(self, *, project_dir, ceiling, workspace_dir=None, turn_timeout=60.0, task_workspace_dir=None, **_ignored):
         workspace_dir = workspace_dir or scratch_root()
         argv = session_cmd(workspace_dir) + ["--project-dir", project_dir, "--ceiling", json.dumps(ceiling),
                                 "--turn-timeout", str(turn_timeout)]
+        if task_workspace_dir is not None:
+            argv += ["--workspace-dir", task_workspace_dir]
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      text=True, bufsize=1)
         hello = json.loads(self.proc.stdout.readline() or "{}")

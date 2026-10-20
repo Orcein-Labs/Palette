@@ -256,6 +256,12 @@ def command_parents(ceiling: dict[str, Any]) -> list[Path]:
     return sorted({path.parent for path in _command_paths(validate_ceiling(ceiling))}, key=str)
 
 
+def command_paths(ceiling: dict[str, Any]) -> list[Path]:
+    """The operator-owned host-command paths: each command's cwd, lock file
+    and configured path arguments."""
+    return sorted(_command_paths(validate_ceiling(ceiling)), key=str)
+
+
 def _command_paths(checked: dict[str, Any]) -> set[Path]:
     paths: set[Path] = set()
     for spec in checked.get("host_command", {}).get("commands", {}).values():
