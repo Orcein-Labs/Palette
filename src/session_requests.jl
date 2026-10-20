@@ -193,8 +193,6 @@ function handle_request(@nospecialize(respond), line::AbstractString, epoch::Str
         resp["data"] = nothing
         resp["error"] = sprint(showerror, e)
     end
-    CURRENT_CALL[] = 0
-    CALL_CONTEXT[] = nothing
 
     resp["error"] = with_hint(get(resp, "error", nothing), code isa String ? code : "")
     if RELOAD_SEQUENCE[] > previous_reload_sequence
@@ -285,10 +283,8 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
     ctx = select_context(req)
     call = next_call()
     note_started_call!(call, code)
-    CURRENT_CALL[] = call
-    CALL_CONTEXT[] = ctx
     (receipt, interrupted, stuck), output = execute_turn(code, timeout_s === nothing ? nothing : Float64(timeout_s);
-                                                         session_request=get(req, "session_request", nothing))
+                                                         session_request=get(req, "session_request", nothing), context=ctx)
     printed = task_notice_hint(scrub(output))
     resp["call"] = call
     resp["context"] = context_note(ctx)
