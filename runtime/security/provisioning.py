@@ -259,7 +259,9 @@ def command_parents(ceiling: dict[str, Any]) -> list[Path]:
 def _command_paths(checked: dict[str, Any]) -> set[Path]:
     paths: set[Path] = set()
     for spec in checked.get("host_command", {}).get("commands", {}).values():
-        for candidate in (spec["cwd"], *_configured_path_arguments(spec["argv"])):
+        lock = spec.get("lock")
+        locks = (lock,) if isinstance(lock, str) else ()
+        for candidate in (spec["cwd"], *locks, *_configured_path_arguments(spec["argv"])):
             path = Path(candidate)
             if path.is_absolute():
                 paths.add(path.resolve(strict=False))
