@@ -612,6 +612,30 @@ end
     end
 end
 
+@testset "The definition index follows appends and a replaced log" begin
+    entry(call, kind, names...) = Dict{String, Any}("call" => call, "kind" => kind, "names" => collect(names))
+    log = Palette.DEFINITION_LOG
+    saved = copy(log)
+    try
+        empty!(log)
+        push!(log, entry(1, "def", "f"), entry(1, "const", "K"))
+        ix = Palette.definition_index()
+        @test ix.defs == Dict("f" => [1])
+        @test ix.by_call[1] == Set(["f", "K"])
+        push!(log, entry(2, "def", "f", "g"))
+        ix = Palette.definition_index()
+        @test ix.defs == Dict("f" => [1, 3], "g" => [3])
+        # The same length with other entries, as after a revival.
+        empty!(log)
+        append!(log, [entry(5, "def", "h"), entry(5, "def", "h"), entry(6, "include", "i")])
+        ix = Palette.definition_index()
+        @test ix.defs == Dict("h" => [1, 2])
+        @test ix.by_call == Dict(5 => Set(["h"]), 6 => Set(["i"]))
+    finally
+        empty!(log); append!(log, saved)
+    end
+end
+
 @testset "Revival checks see definitions made earlier in the same call" begin
     # Revival rebuilds definitions and checks them in one call, from a world
     # older than the new bindings. Julia 1.12 only warns about such reads and
