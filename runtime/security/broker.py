@@ -59,7 +59,7 @@ from launch_worker import (
     build_package_installer_argv, create_session_depot, default_depot, package_store_lock, package_store_paths,
     remove_session_depot, resolve_real_julia_binary, run_worker,
 )
-from provisioning import protected_host_paths
+from provisioning import command_parents, protected_host_paths
 
 
 class CapabilityDenied(Exception):
@@ -445,7 +445,10 @@ class Broker:
             protected.append(checkout)
         protected += [Path(path) for path in self.trusted_files]
         protected += protected_host_paths(self.ceiling)
+        parents = command_parents(self.ceiling)
         for root in roots:
+            if root in parents:
+                raise RuntimeError(f"external_fs_write allowed_dir {root} is the parent of a host-command path")
             for path in protected:
                 path = path.resolve()
                 if root == path or path.is_relative_to(root) or root.is_relative_to(path):

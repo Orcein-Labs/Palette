@@ -1146,6 +1146,26 @@ pub(crate) fn check_read_roots(
     Ok(())
 }
 
+/// A host directory no kernel may see, such as the team lab: no read root
+/// (PALETTE_READ_ROOTS or the trusted tool directory) may contain it or lie
+/// inside it.
+pub(crate) fn check_hidden_from_read_roots(name: &str, hidden: &Path) -> Result<(), String> {
+    let mut roots = parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?;
+    roots.extend(std::env::var("PALETTE_TRUSTED_TOOLS").ok().filter(|t| Path::new(t).is_absolute()).map(PathBuf::from));
+    check_unreadable(name, hidden, &roots)
+}
+
+fn check_unreadable(name: &str, hidden: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| util::resolve(p));
+    let hidden = real(hidden);
+    for root in roots.iter().map(|r| real(r)) {
+        if hidden.starts_with(&root) || root.starts_with(&hidden) {
+            return Err(format!("read root {} would let the kernel read the {name} {}", root.display(), hidden.display()));
+        }
+    }
+    Ok(())
+}
+
 pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     let toolchain = Path::new(s.julia_bin).parent().and_then(Path::parent).unwrap_or(Path::new("/"));
     let workspace = canonical_dir("workspace", Path::new(s.workspace_dir))?;
@@ -1393,6 +1413,19 @@ mod tests {
         let file = root.join("file");
         fs::write(&file, "x").unwrap();
         assert!(parse_read_roots(Some(&file.to_string_lossy())).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_read_root_may_contain_or_lie_inside_a_hidden_directory() {
+        let root = fs::canonicalize(util::mkdtemp("palette-hidden-").unwrap()).unwrap();
+        let lab = root.join("share").join("teamlab");
+        fs::create_dir_all(lab.join("blobs")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        assert!(check_unreadable("team lab", &lab, &[root.join("other")]).is_ok());
+        assert!(check_unreadable("team lab", &lab, &[root.join("share")]).unwrap_err().contains("team lab"));
+        assert!(check_unreadable("team lab", &lab, &[lab.join("blobs")]).is_err());
+        assert!(check_unreadable("team lab", &lab, &[lab.clone()]).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

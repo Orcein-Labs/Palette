@@ -64,6 +64,9 @@ pub struct Turn<'a> {
     pub context: Option<Value>,
     /// budgeted context limits: {seconds, bytes}.
     pub budget: Option<Value>,
+    /// The agent this call acts as on the team lab; the session's default
+    /// when None.
+    pub caller: Option<String>,
 }
 
 pub struct PaletteSession {
@@ -126,6 +129,7 @@ struct InFlight(Arc<Broker>);
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.set_in_flight(None);
+        self.0.set_caller(None);
     }
 }
 
@@ -197,6 +201,8 @@ impl PaletteSession {
         if let Some(tw) = task_workspace.as_deref() { protected_layout.push(("task workspace", tw)); }
         if let Some(state) = state_dir.as_deref() { protected_layout.push(("persistent state directory", state)); }
         protected_layout.push(("persistent package store", package_store.root.as_path()));
+        let team_lab = crate::teamlab::ceiling_dir(&o.ceiling);
+        if let Some(lab) = team_lab.as_deref() { protected_layout.push(("team lab", lab)); }
         // Resolve the future scratch path before creating it so rejecting a
         // caller-owned workspace or durable state cannot transfer it to recursive cleanup.
         let planned_root = util::resolve(&tmp_root);
@@ -278,9 +284,13 @@ impl PaletteSession {
         let writable_state = state_dir;
         let mut writable = vec![("workspace", writable_workspace.as_path())];
         if let Some(state) = writable_state.as_deref() { writable.push(("state directory", state)); }
-        sandbox::check_writable_mounts_disjoint(&writable,
-            &[("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path()),
-              ("persistent package store", package_store.root.as_path())]).map_err(err)?;
+        let mut protected = vec![("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path()),
+                                 ("persistent package store", package_store.root.as_path())];
+        if let Some(lab) = team_lab.as_deref() {
+            protected.push(("team lab", lab));
+            sandbox::check_hidden_from_read_roots("team lab", lab).map_err(err)?;
+        }
+        sandbox::check_writable_mounts_disjoint(&writable, &protected).map_err(err)?;
         let receipts = receipts_root.join("receipts.jsonl");
         let broker = Arc::new(Broker::new(BrokerConfig {
             ceiling: o.ceiling.clone(),
@@ -481,6 +491,7 @@ impl PaletteSession {
         }
         let started = util::now_secs();
         self.broker.set_in_flight(Some(session_request.clone()));
+        self.broker.set_caller(t.caller);
         let _in_flight = InFlight(self.broker.clone());
         let write = self.stdin.as_mut().ok_or_else(|| dead("stdin closed")).and_then(|w| {
             writeln!(w, "{req}").and_then(|_| w.flush()).map_err(|e| dead(format!("session {} pipe broke: {e}", self.session_id)))

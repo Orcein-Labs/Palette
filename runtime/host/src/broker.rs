@@ -7,6 +7,7 @@
 //! for every request, approved or not.
 
 use crate::sandbox::{self, RunWorker};
+use crate::teamlab;
 use crate::util;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -26,13 +27,13 @@ use std::time::Duration;
 pub type HostBridge = Arc<dyn Fn(&str, &Value) -> Value + Send + Sync>;
 
 #[derive(Debug)]
-enum Fail {
+pub(crate) enum Fail {
     /// A policy decision.
     Denied(String),
     /// A bug or an effect that failed; receipted as such, not as policy.
     Internal(String),
 }
-use Fail::{Denied, Internal};
+pub(crate) use Fail::{Denied, Internal};
 
 fn obj(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
@@ -115,6 +116,13 @@ pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
                     }
                 }
             }
+            "teamlab" => {
+                // One shelf per user: a child shares its parent's or has none.
+                let dirs = (teamlab::ceiling_dir(&json!({"teamlab": rc})), teamlab::ceiling_dir(&json!({"teamlab": pc})));
+                if dirs.0.is_none() || dirs.0 != dirs.1 {
+                    return (false, "requested teamlab must name the parent's teamlab dir exactly".into());
+                }
+            }
             "host_request" => {
                 let Some(rt) = str_list(rc.get("allowed_types")).filter(|_| rc.get("allowed_types").is_some_and(Value::is_array)) else {
                     return (false, "requested host_request must name allowed_types explicitly (no unrestricted child grant)".into());
@@ -149,6 +157,8 @@ pub struct Broker {
     // The session_request ("<epoch>:<request id>") of the kernel call being
     // served, stamped on every receipt written while it is set.
     in_flight: Mutex<Option<String>>,
+    // The agent the kernel call being served acts as on the team lab.
+    caller: Mutex<Option<String>>,
     // host_command jobs started with action "start"; dropping the broker
     // (the session ending) kills any still running.
     jobs: Mutex<BTreeMap<String, HostJobEntry>>,
@@ -266,6 +276,7 @@ fn write_roots(c: &BrokerConfig) -> Result<Vec<PathBuf>, String> {
     protected.extend(c.package_depot_dir.as_deref().and_then(|d| Path::new(d).parent()).map(Path::to_path_buf));
     protected.extend(util::installed_checkout());
     protected.extend(c.trusted_files.iter().cloned());
+    protected.extend(teamlab::ceiling_dir(&c.ceiling));
     for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR", "PALETTE_PACKAGE_DEPOT"] {
         if let Ok(path) = std::env::var(key) {
             if !path.is_empty() { protected.push(PathBuf::from(path)); }
@@ -305,6 +316,7 @@ impl Broker {
             log_lock: Mutex::new(()),
             depot_lock: Mutex::new(()),
             in_flight: Mutex::new(None),
+            caller: Mutex::new(None),
             jobs: Mutex::new(BTreeMap::new()),
         })
     }
@@ -315,6 +327,16 @@ impl Broker {
 
     pub fn set_in_flight(&self, r: Option<String>) {
         *self.in_flight.lock().unwrap() = r;
+    }
+
+    /// Names the agent the next kernel calls act as; None returns to the
+    /// session's default (PALETTE_AGENT, else "local").
+    pub fn set_caller(&self, agent: Option<String>) {
+        *self.caller.lock().unwrap() = agent;
+    }
+
+    pub fn caller(&self) -> String {
+        self.caller.lock().unwrap().clone().unwrap_or_else(teamlab::default_agent)
     }
 
     pub fn calls_log_path(&self) -> PathBuf {
@@ -503,6 +525,7 @@ impl Broker {
                 trusted_files: self.trusted_files.clone(),
                 child_timeout: Duration::from_secs(90),
             }).map_err(Internal)?);
+            child.set_caller(self.caller.lock().unwrap().clone());
             let server = serve(&sock_dir.join("broker.sock"), child).map_err(Internal)?;
             let r = sandbox::run_worker(&RunWorker {
                 workspace_dir: &ws.to_string_lossy(),
@@ -754,6 +777,15 @@ impl Broker {
         Ok(v)
     }
 
+    /// The team lab: tools and mail shared by this user's agents, kept in the
+    /// ceiling's `teamlab.dir`, where no kernel can write.
+    fn teamlab(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
+        let Some(dir) = teamlab::ceiling_dir(&self.ceiling) else {
+            return Err(Denied("teamlab is not granted by this session's ceiling".into()));
+        };
+        teamlab::handle(&dir, &self.caller(), p)
+    }
+
     pub fn handle_request(&self, req: &Value) -> Value {
         let req_id = req.get("id").cloned().unwrap_or_else(|| json!(util::uuid4()));
         let category = req.get("category").cloned().unwrap_or(Value::Null);
@@ -767,6 +799,7 @@ impl Broker {
             Some("host_request") => self.host_request(&p),
             Some("fs_digest") => self.fs_digest(&p),
             Some("host_command") => self.host_command(&p),
+            Some("teamlab") => self.teamlab(&p),
             _ => Err(Denied(format!("unknown capability category: {}", py_repr(&category)))),
         };
         let (approved, result, reason) = match outcome {
@@ -777,7 +810,14 @@ impl Broker {
                 (false, Value::Null, json!(r))
             }
         };
-        if let Err(e) = self.write_receipt(&req_id, &category, &params, approved, &result, &reason) {
+        // Tool sources and message bodies are receipted by hash, not copied
+        // into every receipt that carries them.
+        let (params, logged) = if category == "teamlab" {
+            teamlab::receipt_view(&self.caller(), &params, &result)
+        } else {
+            (params, result.clone())
+        };
+        if let Err(e) = self.write_receipt(&req_id, &category, &params, approved, &logged, &reason) {
             // Fail closed, as the Python broker does: no result leaves the
             // broker without its receipt. The effect may already have happened,
             // so the operator hears about it as well as the worker.
@@ -1648,18 +1688,22 @@ mod tests {
         let r = cmd(&b, json!({"name": "job", "action": "start"}));
         let id = r["result"]["job"].as_str().unwrap().to_string();
         assert_eq!(r["result"]["running"], json!(true));
-        assert_eq!(cmd(&b, json!({"action": "poll", "job": id}))["result"]["running"], json!(true));
+        let first = cmd(&b, json!({"action": "poll", "job": id}));
+        assert_eq!(first["result"]["running"], json!(true));
         // Poll until the job finishes; a fixed sleep raced the job under load.
+        // Each poll returns only the output since the last, so collect it.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stdout = first["result"]["stdout"].as_str().unwrap_or("").to_string();
         let r = loop {
             let r = cmd(&b, json!({"action": "poll", "job": id}));
+            stdout.push_str(r["result"]["stdout"].as_str().unwrap_or(""));
             if r["result"]["running"] != json!(true) || std::time::Instant::now() > deadline {
                 break r;
             }
             std::thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(r["result"]["running"], json!(false), "{r}");
-        assert_eq!(r["result"]["stdout"], json!("done\n"));
+        assert_eq!(stdout, "done\n");
         assert!(cmd(&b, json!({"action": "poll", "job": id}))["reason"].as_str().unwrap().contains("no running"));
         // A session that ends kills the jobs it started.
         cmd(&b, json!({"name": "long", "action": "start"}));
@@ -1779,4 +1823,74 @@ mod tests {
         assert!(!ceiling_is_subset(&parent, &json!({})).0);
     }
 
+    fn read_receipts(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn teamlab_acts_as_the_caller_and_receipts_sources_by_hash() {
+        let d = tmpdir("teamlab");
+        let lab = d.0.join("lab");
+        let receipts = d.0.join("receipts.jsonl");
+        let b = broker(json!({"teamlab": {"dir": lab}}), &receipts);
+        let src = "hello() = 1\n".repeat(50);
+        b.set_caller(Some("codex".into()));
+        let r = b.handle_request(&json!({"id": "1", "category": "teamlab",
+                                         "params": {"action": "publish", "name": "hello", "source": src}}));
+        assert_eq!(r["approved"], true, "{r}");
+        b.set_caller(None);
+        let s = b.handle_request(&json!({"id": "2", "category": "teamlab", "params": {"action": "status"}}));
+        assert_eq!(s["result"]["agent"], teamlab::default_agent());
+        assert_eq!(s["result"]["tools"][0]["latest"]["author"], "codex");
+        b.set_caller(Some("codex".into()));
+        let f = b.handle_request(&json!({"id": "3", "category": "teamlab", "params": {"action": "fetch", "name": "hello"}}));
+        assert_eq!(f["result"]["source"], src.as_str(), "the kernel gets the full source");
+        let log = read_receipts(&receipts);
+        assert_eq!(log[0]["params"]["agent"], "codex");
+        assert_eq!(log[0]["params"]["source"]["bytes"], src.len());
+        assert_eq!(log[2]["result"]["source"]["bytes"], src.len());
+        assert!(!fs::read_to_string(&receipts).unwrap().contains("hello() = 1"), "no receipt holds the source");
+    }
+
+    #[test]
+    fn teamlab_needs_its_grant() {
+        let d = tmpdir("teamlab-none");
+        let b = broker(json!({}), &d.0.join("r.jsonl"));
+        let r = b.handle_request(&json!({"id": "1", "category": "teamlab", "params": {"action": "status"}}));
+        assert_eq!(r["approved"], false);
+        assert!(r["reason"].as_str().unwrap().contains("not granted"), "{r}");
+        let b = broker(json!({"teamlab": {"dir": "relative/lab"}}), &d.0.join("r.jsonl"));
+        let r = b.handle_request(&json!({"id": "2", "category": "teamlab", "params": {"action": "status"}}));
+        assert_eq!(r["approved"], false, "a relative dir is no grant");
+    }
+
+    #[test]
+    fn a_child_keeps_the_parents_teamlab_or_none() {
+        let parent = json!({"teamlab": {"dir": "/home/u/.local/share/palette/teamlab"}});
+        assert!(ceiling_is_subset(&json!({}), &parent).0);
+        assert!(ceiling_is_subset(&parent, &parent).0);
+        assert!(!ceiling_is_subset(&json!({"teamlab": {"dir": "/home/u/other"}}), &parent).0);
+        assert!(!ceiling_is_subset(&json!({"teamlab": {}}), &parent).0);
+        assert!(!ceiling_is_subset(&parent, &json!({})).0);
+    }
+
+    #[test]
+    fn a_write_grant_cannot_reach_the_teamlab() {
+        let d = tmpdir("teamlab-protect");
+        let lab = d.0.join("share/palette/teamlab");
+        for dir in [d.0.join("share"), lab.clone(), lab.join("blobs")] {
+            let e = Broker::new(BrokerConfig {
+                ceiling: json!({"teamlab": {"dir": lab}, "external_fs_write": {"allowed_dirs": [dir]}}),
+                receipt_log_path: d.0.join("r.jsonl"),
+                session_id: "test".into(),
+                package_depot_dir: None,
+                package_environment_dir: None,
+                project_dir: None,
+                repo_dir: None,
+                trusted_files: vec![],
+                child_timeout: Duration::from_secs(90),
+            }).err().unwrap_or_else(|| panic!("{} was writable", dir.display()));
+            assert!(e.contains("protected host path"), "{e}");
+        }
+    }
 }

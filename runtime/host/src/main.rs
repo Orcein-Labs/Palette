@@ -12,6 +12,7 @@ mod cli;
 mod receipt_archive;
 mod sandbox;
 mod session;
+mod teamlab;
 mod util;
 
 use serde_json::{json, Value};
