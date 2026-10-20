@@ -215,8 +215,10 @@ def protected_host_paths(
 ) -> list[Path]:
     """Return canonical trusted config/store and host-command paths.
 
-    Config files are protected as exact files. Host-selected binaries,
-    artifacts, libraries, and command working roots also protect their parents.
+    Config files are protected as exact files. A writable path may not equal,
+    contain or lie inside any of them. The parents of host-command paths are
+    protected only against being a writable root themselves: see
+    ``command_parents``.
     """
     checked = validate_ceiling(ceiling)
     paths: set[Path] = set()
@@ -239,17 +241,29 @@ def protected_host_paths(
         paths.add(Path(trusted_tools).expanduser().resolve(strict=False))
     if "teamlab" in checked:
         paths.add(Path(checked["teamlab"]["dir"]).resolve(strict=False))
-    commands = checked.get("host_command", {}).get("commands", {})
-    for spec in commands.values():
-        argv = spec["argv"]
-        candidates = [spec["cwd"], *_configured_path_arguments(argv)]
-        for candidate in candidates:
+    paths.update(_command_paths(checked))
+    return sorted(paths, key=str)
+
+
+def command_parents(ceiling: dict[str, Any]) -> list[Path]:
+    """The parent directories of host-command paths.
+
+    A writable root equal to one could rename the command's binary, artifact
+    or working directory. A root that contains one already contains the
+    command path, and a root beside the command path inside the same parent
+    cannot rename it, so only equality is refused (as the Rust host does).
+    """
+    return sorted({path.parent for path in _command_paths(validate_ceiling(ceiling))}, key=str)
+
+
+def _command_paths(checked: dict[str, Any]) -> set[Path]:
+    paths: set[Path] = set()
+    for spec in checked.get("host_command", {}).get("commands", {}).values():
+        for candidate in (spec["cwd"], *_configured_path_arguments(spec["argv"])):
             path = Path(candidate)
             if path.is_absolute():
-                resolved = path.resolve(strict=False)
-                paths.add(resolved)
-                paths.add(resolved.parent)
-    return sorted(paths, key=str)
+                paths.add(path.resolve(strict=False))
+    return paths
 
 
 def _configured_path_arguments(argv: list[str]) -> list[str]:

@@ -24,7 +24,7 @@ import uuid
 
 from patch_broker import PatchBroker, PATCH_SCHEMA, approval_mode, patch_roots_from_env
 from filesystem_layout import require_disjoint
-from provisioning import agent_name, operator_ceiling, palette_version, protected_host_paths, with_teamlab
+from provisioning import agent_name, command_parents, operator_ceiling, palette_version, protected_host_paths, with_teamlab
 from project_lineage import ensure_project_lineage, lineage_id, normalize_entry as normalize_lineage_entry, project_state_dir, workspace_state_dir
 from generation_runtime import GenerationStore
 from source_transport import CONTEXT_SCHEMA, call_limit, normalize_palette_call, timeout_schema, turn_limits
@@ -48,6 +48,9 @@ require_disjoint([ROOT, LEGACY, LEGACY_RECEIPTS], [REPO])
 require_disjoint([LEGACY, LEGACY_RECEIPTS], [ROOT])
 # A missing default workspace failed the first call, not start-up.
 BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+COMMAND_PARENTS = command_parents(operator_ceiling())
 
 
 def workspace_protected_paths():
@@ -100,7 +103,7 @@ def configured_project_roots():
         if not path.is_dir():
             raise ValueError(f"Project root {identifier} is not a directory")
         try:
-            require_disjoint([path], [*protected, *roots.values()])
+            require_disjoint([path], [*protected, *roots.values()], COMMAND_PARENTS)
         except PermissionError as exc:
             raise PermissionError(
                 f"Project root {identifier}: {exc}. Host-command directories and binaries, their parents, "
@@ -219,7 +222,7 @@ class Child:
             protected = [path for path in protected if path != BASE]
         else:
             protected.append(BASE)
-        require_disjoint([workspace], protected)
+        require_disjoint([workspace], protected, COMMAND_PARENTS)
         require_disjoint([state], [REPO, generation_repo] + [ROOT / name for name in ("patches", "registry.json", "registry.lock", "client-capabilities.json", "scratch", "runtime-generations")])
         state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Outside the state mount; a worker cannot unlink its ownership lock.

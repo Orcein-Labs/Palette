@@ -9,7 +9,8 @@ import unittest
 
 from unittest import mock
 
-from provisioning import OperatorConfigError, agent_name, operator_ceiling, protected_host_paths, validate_ceiling, with_teamlab
+from filesystem_layout import require_disjoint
+from provisioning import OperatorConfigError, agent_name, command_parents, operator_ceiling, protected_host_paths, validate_ceiling, with_teamlab
 
 RUNNER = Path(__file__).with_name("provisioning.py")
 
@@ -93,10 +94,21 @@ class ProvisioningTest(unittest.TestCase):
             ceiling = {"host_command": {"commands": {
                 "inference": {"argv": argv, "cwd": tmp, "extra_args": True}}}}
             protected = set(protected_host_paths(ceiling))
+            parents = command_parents(ceiling)
             for selected in paths:
                 resolved = selected.resolve()
                 self.assertIn(resolved, protected)
-                self.assertIn(resolved.parent, protected)
+                self.assertIn(resolved.parent, parents)
+                with self.assertRaisesRegex(PermissionError, "parent of a host-command path"):
+                    require_disjoint([resolved.parent], protected, parents)
+            # A sibling inside a command's parent cannot rename the command
+            # path, so it may be writable (a store under ~/.local beside a
+            # command that runs in ~/project).
+            sibling = root.resolve().parent / f"{root.name}-sibling"
+            require_disjoint([sibling], protected, parents)
+            self.assertNotIn(root.resolve().parent, protected)
+            with self.assertRaisesRegex(PermissionError, "parent of a host-command path"):
+                require_disjoint([root.resolve().parent], protected, parents)
             caller_input_path = root / "caller-selected-model.gguf"
             ordinary_input = f"--model={caller_input_path}"
             self.assertNotIn(ordinary_input, argv)
