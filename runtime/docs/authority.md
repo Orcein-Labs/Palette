@@ -98,8 +98,11 @@ and write there, under a lock, with the size limits in
 was started for: the MCP client's `clientInfo.name` (`claude-code` is
 `claude`), else `PALETTE_AGENT`, else `local`. That name is cooperative. It
 records who published, approved or sent something; it does not authenticate
-anyone, since every agent of the user runs as the same OS user. Only the Rust
-host serves `teamlab`; the Python host denies it.
+anyone, since every agent of the user runs as the same OS user. A listing's
+author keeps merge authority over it: a version another agent publishes to it
+is held as a proposal until the author accepts it, and only the author (or
+the proposer, withdrawing it) can decline it. Like the name, that rule is
+cooperative. Only the Rust host serves `teamlab`; the Python host denies it.
 
 Each call runs under a time limit. The host's `--turn-timeout` is the default
 and `--max-turn-timeout` (default: the same, at most 7 days) is the longest a

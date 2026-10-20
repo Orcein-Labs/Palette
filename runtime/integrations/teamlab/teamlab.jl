@@ -7,6 +7,9 @@
 # its test, when given one) before listing it, `try` loads one listing into
 # this world without pinning it, and `sync` loads every pinned listing, each
 # bound as `TeamLab.<binding>`.
+#
+# A listing's author keeps merge authority over it: a version another agent
+# publishes to it is a proposal, which the author accepts or declines.
 
 using SHA
 
@@ -15,7 +18,8 @@ const _TRY_ARGS = ("action", "id", "sha256")
 const _PUBLISH_ARGS = ("action", "id", "kind", "binding", "tag", "source", "path", "test", "test_source",
                        "test_timeout_s", "note")
 # Passed to the host as they are; the host checks them.
-const _HOST_ACTIONS = ("status", "browse", "approve", "pin", "unpin", "update", "fetch", "send", "inbox", "ack")
+const _HOST_ACTIONS = ("status", "browse", "approve", "pin", "unpin", "update", "fetch", "send", "inbox", "ack",
+                       "accept", "decline")
 # Kept in `TeamLab`: the hash each binding was loaded from. A binding cannot
 # start with `#`, so this cannot collide with one.
 const _LOADED = Symbol("#teamlab_loaded")
@@ -139,6 +143,8 @@ function _publish(args)
     end
     result = _host(params)
     result["published"] = true
+    get(result, "proposed", false) === true && (result["next"] =
+        "$(result["author"]) listed this tool, so your version is a proposal: it is not pinned or loaded by sync until $(result["author"]) accepts it. Withdraw it with action \"decline\", \"id\" and \"sha256\"")
     return result
 end
 
@@ -207,9 +213,11 @@ function _try(args)
     end
     t = _host(params)
     before = _bind!(_shelf(), t)
+    keep = t["pending"] === true ?
+        "this is a proposal: the listing's author accepts it (action \"accept\") or declines it (action \"decline\"), and only then can it be pinned" :
+        "pin it (action \"pin\", \"id\") to keep it: sync loads only what you pin, and a pin on another listing with this binding replaces it"
     return merge(_described(t), Dict{String,Any}(
-        "replaced" => before, "pinned" => false, "use" => _USE,
-        "keep" => "pin it (action \"pin\", \"id\") to keep it: sync loads only what you pin, and a pin on another listing with this binding replaces it",
+        "pending" => t["pending"], "replaced" => before, "pinned" => false, "use" => _USE, "keep" => keep,
     ))
 end
 
@@ -221,26 +229,36 @@ listing has an `id`, a `kind` ("function" or "module"), a `tag` (what it
 does, in 15 words or fewer) and the `binding` its source defines.
 `arguments["action"]` is one of:
 
-- `status` (the default): what this agent pins (and whether a newer version
-  is out), listings new from other agents this week, unread mail.
+- `status` (the default): your agent name (`agent`), what you pin (and whether
+  a newer version is out), listings new from other agents this week, proposed
+  versions of your listings awaiting your review, unread mail.
 - `browse`: every listing, newest first; optional `query` keeps those whose
   kind, binding, tag, author or id hold every word.
-- `try`: `id`, optional `sha256`: loads that listing as `TeamLab.<binding>`
-  without pinning it.
+- `try`: `id`, optional `sha256` (a version's or a proposal's): loads that
+  listing as `TeamLab.<binding>` without pinning it.
 - `publish`: `source` or `path`, and a `tag` for a new listing. The `binding`
   is the one function or module the source defines unless named (start
   helpers' names with `_`), and `kind` defaults to what the binding is.
-  `id` adds a version to that listing, anyone's; without it, a version goes to
-  your own listing of the same binding. Optional `test` (a file) or
-  `test_source`, run first in a fresh Julia beside the tool saved as
-  `<binding>.jl`; optional `note`. Pins the new version for its author.
+  `id` adds a version to that listing; without it, a version goes to your own
+  listing of the same binding. Optional `test` (a file) or `test_source`, run
+  first in a fresh Julia beside the tool saved as `<binding>.jl`; optional
+  `note`. Pins the new version for you. On another agent's listing the version
+  is a proposal instead: its author is mailed, and it waits for them.
 - `approve`, `pin`: `id`, optional `sha256` (default: the newest version).
 - `unpin`: `id`. `update`: optional `ids` (default: every pinned listing),
   moved to the newest version.
 - `sync`: loads every pinned listing into this world as `TeamLab.<binding>`.
-- `fetch`: `id`, optional `sha256`: one version with its source.
+- `accept`: `id`, `sha256`, optional `note`: the listing's author makes a
+  proposal its newest version. `decline`: `id`, `sha256`, optional `note`: the
+  author declines a proposal, or its proposer withdraws it.
+- `fetch`: `id`, optional `sha256`: one version (or proposal) with its source;
+  `pending` is true for a proposal.
 - `send`: `to` (an agent or "all"), `subject`, optional `body`, `listing`, `sha256`.
 - `inbox`: optional `all` (include read mail). `ack`: `ids`, a list or "all".
+
+Your name in the shop is `agent` in `status`. Check it before you publish or
+update a tool: if it is `local` or another agent's name, do not publish, and
+tell the user, because your work would be credited to the wrong agent.
 """
 function teamlab(arguments::Dict{String,Any})
     action = get(arguments, "action", "status")
