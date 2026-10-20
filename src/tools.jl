@@ -39,11 +39,49 @@ unref(x) = x isa GlobalRef ? Expr(:., foldl((a, b) -> Expr(:., a, QuoteNode(b)),
            x isa Expr ? Expr(x.head, map(unref, x.args)...) : x
 clean_statement(st) = unref(strip_lines!(Base.remove_linenums!(st)))
 
+# DEFINITION_LOG by name, so a call's tool-use check does not scan the whole
+# log. `defs` holds the positions of the "def" entries naming each name, and
+# `by_call` every name a call's entries define. Entries are only appended
+# between revivals; when the log was emptied or replaced, the index is built
+# again from the start.
+mutable struct DefinitionIndex
+    indexed::Int
+    last::Union{Nothing, Dict{String, Any}}
+    defs::Dict{String, Vector{Int}}
+    by_call::Dict{Int, Set{String}}
+end
+const DEF_INDEX = DefinitionIndex(0, nothing, Dict{String, Vector{Int}}(), Dict{Int, Set{String}}())
+
+function clear_definition_index!()
+    ix = DEF_INDEX
+    ix.indexed = 0; ix.last = nothing; empty!(ix.defs); empty!(ix.by_call)
+    return ix
+end
+
+function definition_index()
+    ix, log = DEF_INDEX, DEFINITION_LOG
+    (length(log) < ix.indexed || (ix.indexed > 0 && log[ix.indexed] !== ix.last)) && clear_definition_index!()
+    for i in ix.indexed+1:length(log)
+        e = log[i]
+        names = get!(Set{String}, ix.by_call, e["call"])
+        for n in e["names"]
+            push!(names, n)
+            if e["kind"] == "def"
+                positions = get!(Vector{Int}, ix.defs, n)
+                (isempty(positions) || positions[end] != i) && push!(positions, i)
+            end
+        end
+    end
+    ix.indexed = length(log)
+    ix.last = isempty(log) ? nothing : log[end]
+    return ix
+end
+
 # Definition statements a call's top-level code made for `name`, in order, as
 # source without line comments, and its hash. `nothing` when there are none or
 # one does not print back as source. Computed again only when the entries change.
 function tool_source(name::AbstractString)
-    entries = [e for e in DEFINITION_LOG if e["kind"] == "def" && name in e["names"]]
+    entries = [DEFINITION_LOG[i] for i in get(definition_index().defs, name, Int[])]
     isempty(entries) && return nothing
     cached = get(TOOL_SOURCES, name, nothing)
     cached !== nothing && length(cached[1]) == length(entries) && all(map(===, cached[1], entries)) && return cached[2]
@@ -66,16 +104,16 @@ source. Uses live in the kernel's memory only.
 """
 function note_tool_uses!(ex, call::Int, session_request)
     ex === nothing && return
-    defined = Set(n for e in DEFINITION_LOG if e["kind"] == "def" && e["call"] != call for n in e["names"])
-    isempty(defined) && return
-    here = Set(n for e in DEFINITION_LOG if e["call"] == call for n in e["names"])
+    ix = definition_index()
+    isempty(ix.defs) && return
+    here = get(ix.by_call, call, Set{String}())
     refs = Set{Symbol}()
     for st in top_statements(ex)
         definition_kind(st) === nothing && symbol_references(st, refs)
     end
     for sym in refs
         name = string(sym)
-        name in defined && !(name in here) || continue
+        haskey(ix.defs, name) && !(name in here) || continue
         src = tool_source(name)
         src === nothing && continue
         uses = get!(Vector{Dict{String, Any}}, TOOL_USES, name)
