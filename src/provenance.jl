@@ -45,10 +45,10 @@ function binding_ids(mod)
         if session_binding(mod, n) && Base.invokelatest(isdefined, mod, n))
 end
 
-# A struct redefined with a different layout is a new type. Values made and
-# methods defined before still use the old one, which prints as
-# `@world(Foo, ...)` and fails dispatch against the new one, so the turn says
-# which bindings still refer to it.
+# Since Julia 1.12, a struct redefined with a different layout is a new type
+# (older versions refuse the redefinition). Values made and methods defined
+# before still use the old one, which prints as `@world(Foo, ...)` and fails
+# dispatch against the new one, so the turn says which bindings still refer to it.
 defined_types(ex) = !(ex isa Expr) ? Symbol[] :
     ex.head in (:toplevel, :block) ? reduce(vcat, map(defined_types, ex.args); init=Symbol[]) :
     ex.head === :macrocall ? defined_types(ex.args[end]) :

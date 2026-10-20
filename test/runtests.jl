@@ -657,7 +657,8 @@ end
     @test w.kinds[Vector{Any}] === :object && w.kinds[Int] === nothing
 end
 
-@testset "A struct that changes layout names what still uses the old type" begin
+# Julia before 1.12 refuses a struct redefinition that changes the layout.
+VERSION >= v"1.12" && @testset "A struct that changes layout names what still uses the old type" begin
     reset_kernel_state()
     printed(code) = mktemp() do path, io
         r = redirect_stdout(() -> execute(ExecuteCode(code)), io)
