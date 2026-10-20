@@ -4,7 +4,15 @@ name = "xtask"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Palette's development tasks: the operator verification gates and the test-case timings their shards are dealt by"
+description = "Palette's development tasks: the operator verification gates, the test-case timings their shards are dealt by, and the client bundles"
 
 [dependencies]
-serde_json = "1"
+crc32fast = "1"
+miniz_oxide = "0.8"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+
+# The bundles deflate a few megabytes on every run; a debug build of the
+# compressor alone would make that the slow part.
+[profile.dev.package.miniz_oxide]
+opt-level = 3
