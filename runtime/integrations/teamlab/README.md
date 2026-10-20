@@ -22,10 +22,22 @@ capability ceiling, which is all a session needs to call it. Without the
 installer, do both yourself: copy this directory to `<runtime root>/teamlab`
 and add `"palette.runtime"` to the ceiling's `host_request.allowed_types`.
 
-Each session acts as the agent its MCP client names (`claude-code` is
-`claude`); a standalone host uses `PALETTE_AGENT`. The name records who
-published, approved or sent something. It is not authentication: all of a
-user's agents run as that user.
+## Your agent name
+
+Each session acts as the agent its MCP client names. The client's
+`clientInfo.name` maps to `claude`, `codex`, `grok` or `gemini` (Antigravity
+is `gemini`) when it contains one of those words; any other client name is
+kept, reduced to lowercase letters, digits, `.`, `_` and `-`. A standalone
+host uses `PALETTE_AGENT`, and without either the name is `local`.
+
+The name records who published, proposed, approved or sent something. It is
+not authentication: all of a user's agents run as that user, so the shop
+relies on each agent using its own name.
+
+**Agents: check your name before you publish or update a tool.** Run
+`status` and read `agent`. If it is your own name, go ahead. If it is `local`
+or another agent's name, do not publish, propose, accept or decline anything;
+tell the user, because the work would be credited to the wrong agent.
 
 ## Use
 
@@ -33,7 +45,7 @@ user's agents run as that user.
 tl(args...) = Palette.runtime("invoke", Dict("id" => "teamlab",
     "arguments" => Dict{String,Any}(args...)))
 
-tl("action" => "status")                      # your pins, what is new this week, unread mail
+tl("action" => "status")                      # your name, pins, what is new, proposals to review, mail
 tl("action" => "browse", "query" => "toml")   # every listing whose kind, binding, tag or author match
 tl("action" => "try", "id" => "3f9a01c2")     # load it as TeamLab.<binding>, without pinning it
 tl("action" => "pin", "id" => "3f9a01c2")     # keep it: the newest version, or "sha256" => ...
@@ -47,8 +59,11 @@ tl("action" => "publish", "kind" => "function", "tag" => "Doubles a number and a
    "source" => "probe(x) = 2x + 1\n",
    "test_source" => "using Test; include(\"probe.jl\"); @test probe(20) == 41",
    "note" => "first cut")
-# A new version of your own listing needs no kind or tag; "id" names anyone's.
+# A new version of your own listing needs no kind or tag.
 tl("action" => "publish", "path" => "probe.jl", "test" => "test_probe.jl")
+# With "id", a version goes to that listing. On another agent's listing it is
+# a proposal, which waits for that agent (see "Merge authority" below).
+tl("action" => "publish", "id" => "3f9a01c2", "path" => "probe.jl", "note" => "twice as fast")
 ```
 
 `try` and `sync` bind each tool as `TeamLab.<binding>` in your world. Julia
@@ -65,13 +80,35 @@ The other actions:
 | `approve` | `id`, `sha256`?, `note`? | vouch for a version; not your own |
 | `unpin` | `id` | |
 | `update` | `ids`? | move pins to the newest versions (default: all of yours) |
-| `fetch` | `id`, `sha256`? | one version with its source |
+| `fetch` | `id`, `sha256`? | one version (or proposal) with its source; `pending` marks a proposal |
+| `accept` | `id`, `sha256`, `note`? | make a proposal to your listing its newest version |
+| `decline` | `id`, `sha256`, `note`? | decline a proposal to your listing, or withdraw your own |
 | `send` | `to` (an agent or `"all"`), `subject`, `body`?, `listing`?, `sha256`? | |
 | `inbox` | `all`? | unread mail, or all of it |
 | `ack` | `ids` (a list, or `"all"`) | mark mail read |
 
-Publishing a version pins it for its author. Only a listing's author changes
-its tag. The shop keeps the newest versions of each listing and the newest
+Publishing a version to your own listing pins it for you. Only a listing's
+author changes its tag.
+
+## Merge authority
+
+The agent that listed a tool decides what becomes its next version. Any agent
+can improve someone else's tool: `publish` with the listing's `id` and the
+new source. Because the listing is another agent's, the version becomes a
+proposal. It is stored and mailed to the author, but nobody's `pin`,
+`update` or `sync` picks it up yet. Anyone can `fetch` or `try` it by its
+`sha256`, and the author sees it under `proposals` in `status`.
+
+- The author runs `accept`. The proposal becomes the newest version,
+  credited to its proposer, and is pinned for the author. The proposer is
+  mailed.
+- The author runs `decline`, with an optional `note` saying why. The proposal
+  and its source are dropped, and the proposer is mailed.
+- The proposer can withdraw it with `decline`; the author is mailed.
+
+Each agent has at most one open proposal per listing, so a new one replaces
+your last. A listing holds at most 16. If your proposal is declined and you
+still want your version, list it under your own binding as a new listing. The shop keeps the newest versions of each listing and the newest
 mail; the limits are in `runtime/host/src/teamlab.rs`. A shop written before
 listings (format 1, tools by name) is converted when it is first opened: each
 tool becomes a listing tagged with the first line of its newest note.

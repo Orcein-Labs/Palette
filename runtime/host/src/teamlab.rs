@@ -11,6 +11,11 @@
 //! Each listing keeps its versions; each agent pins at most one version of a
 //! listing, and at most one listing per binding.
 //!
+//! A listing's author keeps merge authority over it. A version another agent
+//! publishes to it is a proposal: it is kept beside the versions, the author
+//! is mailed, and it becomes the newest version only when the author accepts
+//! it. The author can decline it, and its proposer can withdraw it.
+//!
 //! The directory holds `state.json` (the index: listings and their versions,
 //! each agent's pins, the messages), `blobs/<sha256>.jl` (each version's
 //! source, read-only, checked against its name on every read) and
@@ -40,6 +45,8 @@ const FORMAT: u64 = 2;
 const MAX_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_TOOLS: usize = 256;
 const MAX_VERSIONS: usize = 64;
+/// Pending proposals on one listing; each agent has at most one.
+const MAX_PROPOSALS: usize = 16;
 const MAX_MESSAGES: usize = 512;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 /// All kept message bodies together; the index is rewritten on every change.
@@ -59,7 +66,8 @@ const BROADCAST_KEEP_S: f64 = 7.0 * 86400.0;
 const NEW_FOR_S: f64 = 7.0 * 86400.0;
 
 const ACTIONS: &[&str] = &[
-    "status", "browse", "publish", "approve", "pin", "unpin", "update", "sync", "fetch", "send", "inbox", "ack",
+    "status", "browse", "publish", "accept", "decline", "approve", "pin", "unpin", "update", "sync", "fetch", "send",
+    "inbox", "ack",
 ];
 const KINDS: &[&str] = &["function", "module"];
 
@@ -235,10 +243,13 @@ impl Lab {
             return Err(unreadable(format!("not a format-{FORMAT} index")));
         }
         let state = if format == Some(1) { from_format_1(obj(state)) } else { obj(state) };
+        let version_ok = |v: &Value| v["sha256"].as_str().is_some_and(valid_sha);
         let listing_ok = |l: &Value| ["kind", "binding", "tag", "author"].iter().all(|k| l[k].is_string())
-            && l["versions"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(|v| v["sha256"].as_str().is_some_and(valid_sha)));
+            && l["versions"].as_array().is_some_and(|v| !v.is_empty() && v.iter().all(version_ok))
+            && l.get("proposals").is_none_or(|p| p.as_array().is_some_and(|p| p.iter().all(|v| version_ok(v) && v["author"].is_string())));
         if let Some(id) = listings(&state).iter().find(|(_, l)| !listing_ok(l)).map(|(id, _)| id) {
-            return Err(unreadable(format!("listing {id} is missing its kind, binding, tag, author or versions")));
+            return Err(unreadable(format!("listing {id} is missing its kind, binding, tag, author or versions, \
+                                           or has a malformed proposal")));
         }
         Ok(state)
     }
@@ -297,12 +308,12 @@ impl Lab {
         String::from_utf8(bytes).map_err(|_| Internal(format!("teamlab blob {} is not UTF-8", path.display())))
     }
 
-    /// Removes the blobs of dropped versions that no listing still uses. Run
-    /// after the index is saved, so a crash leaves an unused blob, never an
-    /// index entry without its source.
+    /// Removes the blobs of dropped versions and proposals that no listing
+    /// still keeps. Run after the index is saved, so a crash leaves an unused
+    /// blob, never an index entry without its source.
     fn collect(&self, state: &Map<String, Value>, dropped: &[String]) {
         for sha in dropped {
-            let used = listings(state).values().flat_map(versions).any(|v| v["sha256"] == sha.as_str());
+            let used = listings(state).values().flat_map(kept).any(|v| v["sha256"] == sha.as_str());
             if !used {
                 let _ = fs::remove_file(self.blob_path(sha));
             }
@@ -380,6 +391,16 @@ fn latest(listing: &Value) -> &Value {
     versions(listing).last().expect("checked when loaded")
 }
 
+/// Versions other agents proposed that the author has not accepted or declined.
+fn proposals(listing: &Value) -> &[Value] {
+    listing["proposals"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// Every source a listing keeps a blob for: its versions and its proposals.
+fn kept(listing: &Value) -> impl Iterator<Item = &Value> {
+    versions(listing).iter().chain(proposals(listing))
+}
+
 fn listing<'a>(state: &'a Map<String, Value>, id: &str) -> Result<&'a Value, Fail> {
     listings(state).get(id).ok_or_else(|| Denied(format!("no listing {id} is in the teamlab shop")))
 }
@@ -453,6 +474,24 @@ fn pick<'a>(listing: &'a Value, id: &str, sha: Option<&str>) -> Result<&'a Value
     }
 }
 
+/// Like `pick`, but `sha256` may also name a pending proposal.
+fn pick_kept<'a>(listing: &'a Value, id: &str, sha: Option<&str>) -> Result<&'a Value, Fail> {
+    match sha.and_then(|s| proposals(listing).iter().find(|v| v["sha256"] == s)) {
+        Some(v) => Ok(v),
+        None => pick(listing, id, sha),
+    }
+}
+
+/// The pending proposal `sha256` names, and where it sits.
+fn pending<'a>(listing: &'a Value, id: &str, p: &Map<String, Value>) -> Result<(usize, &'a Value), Fail> {
+    let sha = str_param(p, "sha256")?.ok_or_else(|| Denied("teamlab requires the proposal's 'sha256' (see status)".into()))?;
+    if !valid_sha(sha) {
+        return Err(Denied("teamlab 'sha256' must be 64 lowercase hex digits".into()));
+    }
+    proposals(listing).iter().enumerate().find(|(_, v)| v["sha256"] == sha)
+        .ok_or_else(|| Denied(format!("listing {id} has no pending proposal {sha}")))
+}
+
 fn summary(v: &Value) -> Value {
     json!({
         "sha256": v["sha256"], "version": v["version"], "author": v["author"], "published_at": v["published_at"],
@@ -483,6 +522,7 @@ fn view(state: &Map<String, Value>, agent: &str, id: &str, listing: &Value) -> V
         "pinned_by": pinned_by, "pinned": pinned.map(|v| v["sha256"].clone()),
         "pinned_version": pinned.map(|v| v["version"].clone()),
         "behind": pinned.is_some_and(|v| v["sha256"] != newest["sha256"]),
+        "proposals": proposals(listing).iter().map(summary).collect::<Vec<_>>(),
     })
 }
 
@@ -511,6 +551,8 @@ pub fn handle(dir: &Path, agent: &str, p: &Map<String, Value>) -> Result<Value, 
     let mut dropped = Vec::new();
     let result = match action {
         "publish" => publish(&lab, &mut state, agent, p, &mut dropped)?,
+        "accept" => accept(&mut state, agent, p, &mut dropped)?,
+        "decline" => decline(&mut state, agent, p, &mut dropped)?,
         "approve" => approve(&mut state, agent, p)?,
         "pin" => pin(&mut state, agent, p)?,
         "unpin" => unpin(&mut state, agent, p)?,
@@ -535,9 +577,9 @@ fn acked_by(m: &Value, agent: &str) -> bool {
     m["acked_by"].as_array().is_some_and(|a| a.iter().any(|x| x == agent))
 }
 
-/// What this agent pins, what is new in the shop, and unread mail. A listing
-/// is new while its newest version is another agent's, at most a week old,
-/// and this agent does not pin it.
+/// What this agent pins, what is new in the shop, proposals awaiting this
+/// agent's review, and unread mail. A listing is new while its newest version
+/// is another agent's, at most a week old, and this agent does not pin it.
 fn status(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Value {
     let pins = pins_of(state, agent);
     let now = util::now_secs();
@@ -547,8 +589,10 @@ fn status(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Value {
         .collect();
     new.sort_by(|a, b| published_at(b.1).total_cmp(&published_at(a.1)));
     let new: Vec<Value> = new.into_iter().map(|(id, l)| view(state, agent, id, l)).collect();
-    json!({"agent": agent, "dir": lab.dir, "pinned": pinned, "new": new, "listed": listings(state).len(),
-           "unread": unread(state, agent)})
+    let review: Vec<Value> = listings(state).iter().filter(|(_, l)| l["author"] == agent)
+        .flat_map(|(id, l)| proposals(l).iter().map(move |v| loadable(id, l, v))).collect();
+    json!({"agent": agent, "dir": lab.dir, "pinned": pinned, "new": new, "proposals": review,
+           "listed": listings(state).len(), "unread": unread(state, agent)})
 }
 
 /// The listings whose kind, binding, tag, author or id hold every word of
@@ -565,10 +609,10 @@ fn browse(state: &Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Re
     Ok(json!({"agent": agent, "query": query, "listings": found, "listed": listings(state).len()}))
 }
 
-/// Adds a version to a listing: the one `id` names (anyone may), else this
-/// agent's listing of the same binding, else a new listing, which needs a
-/// `kind` and a `tag`. The author pins it, unless they pin another listing
-/// with the same binding.
+/// Adds a version to a listing: the one `id` names, else this agent's listing
+/// of the same binding, else a new listing, which needs a `kind` and a `tag`.
+/// The author pins it, unless they pin another listing with the same binding.
+/// A new version of another agent's listing is a proposal instead.
 fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>, dropped: &mut Vec<String>)
     -> Result<Value, Fail> {
     let binding = str_param(p, "binding")?.ok_or_else(|| Denied("teamlab publish requires the 'binding' the source defines".into()))?;
@@ -627,8 +671,11 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
         }
     };
 
-    let mut vs = listings(state)[&id]["versions"].as_array().cloned().unwrap_or_default();
+    let mut vs = versions(&listings(state)[&id]).clone();
     let existing = vs.iter().find(|v| v["sha256"] == sha.as_str()).map(|v| v["version"].clone());
+    if existing.is_none() && listings(state)[&id]["author"] != agent {
+        return propose(lab, state, agent, &id, source, &sha, note, test, dropped);
+    }
     let is_new = existing.is_none();
     let version = match existing {
         // Republishing a version restores its blob if it was damaged.
@@ -637,19 +684,8 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
             version
         }
         None => {
-            if vs.len() >= MAX_VERSIONS {
-                // The oldest version no agent has pinned makes room.
-                let pinned: Vec<Value> = state["pins"].as_object().into_iter().flat_map(|m| m.values())
-                    .filter_map(|held| held.get(&id).cloned()).collect();
-                let Some(i) = vs.iter().position(|v| !pinned.contains(&v["sha256"])) else {
-                    return Err(Denied(format!("listing {id} has {MAX_VERSIONS} versions and every one is pinned; unpin one first")));
-                };
-                dropped.push(vs.remove(i)["sha256"].as_str().unwrap_or_default().to_string());
-            }
-            if blob_bytes_with(state, &sha, source.len()) > MAX_BLOB_BYTES {
-                return Err(Denied(format!("the teamlab shop keeps at most {} MiB of tool source; \
-                                           unpin old versions so they can be dropped", MAX_BLOB_BYTES >> 20)));
-            }
+            make_room(state, &id, &mut vs, dropped)?;
+            check_budget(state, &sha, source.len())?;
             lab.put_blob(&sha, source.as_bytes())?;
             let version = vs.last().and_then(|v| v["version"].as_u64()).unwrap_or(0) + 1;
             vs.push(json!({
@@ -667,9 +703,155 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
     let l = &listings(state)[&id];
     Ok(json!({
         "id": id, "kind": l["kind"], "binding": binding, "tag": l["tag"], "sha256": sha, "version": version,
-        "new": is_new, "new_listing": new_listing, "pinned": clash.is_none(), "clash": clash,
+        "new": is_new, "new_listing": new_listing, "proposed": false, "pinned": clash.is_none(), "clash": clash,
         "dropped_versions": dropped.len(),
     }))
+}
+
+/// Drops the oldest version no agent pins from a full listing, so one more fits.
+fn make_room(state: &Map<String, Value>, id: &str, vs: &mut Vec<Value>, dropped: &mut Vec<String>) -> Result<(), Fail> {
+    if vs.len() < MAX_VERSIONS {
+        return Ok(());
+    }
+    let pinned: Vec<&Value> = state["pins"].as_object().into_iter().flat_map(|m| m.values())
+        .filter_map(|held| held.get(id)).collect();
+    let Some(i) = vs.iter().position(|v| !pinned.contains(&&v["sha256"])) else {
+        return Err(Denied(format!("listing {id} has {MAX_VERSIONS} versions and every one is pinned; unpin one first")));
+    };
+    dropped.push(text(&vs.remove(i)["sha256"]).to_string());
+    Ok(())
+}
+
+fn check_budget(state: &Map<String, Value>, sha: &str, bytes: usize) -> Result<(), Fail> {
+    if blob_bytes_with(state, sha, bytes) > MAX_BLOB_BYTES {
+        return Err(Denied(format!("the teamlab shop keeps at most {} MiB of tool source; \
+                                   unpin old versions so they can be dropped", MAX_BLOB_BYTES >> 20)));
+    }
+    Ok(())
+}
+
+/// Keeps another agent's version of a listing as a proposal and mails the
+/// author, who accepts or declines it. Each agent keeps one proposal per
+/// listing: a new one supersedes it.
+#[allow(clippy::too_many_arguments)]
+fn propose(lab: &Lab, state: &mut Map<String, Value>, agent: &str, id: &str, source: &str, sha: &str, note: Value,
+           test: Value, dropped: &mut Vec<String>) -> Result<Value, Fail> {
+    let l = &listings(state)[id];
+    let (author, binding) = (text(&l["author"]).to_string(), text(&l["binding"]).to_string());
+    let mut ps = proposals(l).to_vec();
+    let reply = |l: &Value, new: bool, notified: bool, superseded: Value| json!({
+        "id": id, "kind": l["kind"], "binding": binding, "tag": l["tag"], "sha256": sha, "version": null,
+        "new": new, "new_listing": false, "proposed": true, "author": author, "pinned": false, "clash": null,
+        "notified": notified, "superseded": superseded, "dropped_versions": 0,
+    });
+    if ps.iter().any(|v| v["sha256"] == sha) {
+        // Proposing it again restores its blob if it was damaged.
+        lab.put_blob(sha, source.as_bytes())?;
+        return Ok(reply(l, false, false, Value::Null));
+    }
+    let superseded = ps.iter().position(|v| v["author"] == agent).map(|i| ps.remove(i)["sha256"].clone());
+    if ps.len() >= MAX_PROPOSALS {
+        return Err(Denied(format!("listing {id} already has {MAX_PROPOSALS} proposals awaiting {author}")));
+    }
+    if let Some(old) = superseded.as_ref() {
+        dropped.push(text(old).to_string());
+    }
+    listings_mut(state)[id]["proposals"] = Value::Array(ps);
+    check_budget(state, sha, source.len())?;
+    lab.put_blob(sha, source.as_bytes())?;
+    let proposal = json!({
+        "sha256": sha, "version": null, "author": agent, "published_at": util::now_secs(),
+        "bytes": source.len(), "note": note, "test": test, "approvals": [],
+    });
+    listings_mut(state)[id]["proposals"].as_array_mut().expect("just set").push(proposal);
+    let mut body = format!("{agent} proposed a new version of {binding}, your listing {id}. Fetch it with this id and \
+                            sha256 to review it, then accept or decline it.");
+    if let Some(n) = note.as_str() {
+        body = format!("{body}\n\n{n}");
+    }
+    let subject = format!("proposed a new version of {binding} ({id})");
+    let notified = post(state, agent, &author, &subject, &body, json!(id), json!(sha)).is_ok();
+    Ok(reply(&listings(state)[id], true, notified, superseded.unwrap_or(Value::Null)))
+}
+
+/// The author makes a proposal the listing's newest version, credited to the
+/// agent that proposed it, and pins it.
+fn accept(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>, dropped: &mut Vec<String>)
+    -> Result<Value, Fail> {
+    let id = required_id(p)?;
+    let note = note_param(p)?;
+    let l = listing(state, id)?;
+    let (i, _) = pending(l, id, p)?;
+    if l["author"] != agent {
+        return Err(Denied(format!("only {}, who listed {id}, accepts proposals for it", text(&l["author"]))));
+    }
+    let binding = text(&l["binding"]).to_string();
+    let mut ps = proposals(l).to_vec();
+    let mut v = ps.remove(i);
+    let (sha, proposer) = (text(&v["sha256"]).to_string(), text(&v["author"]).to_string());
+    let mut vs = versions(l).clone();
+    // The author may have published the same source since; then it is already a version.
+    let version = match vs.iter().find(|x| x["sha256"] == sha.as_str()) {
+        Some(x) => x["version"].clone(),
+        None => {
+            make_room(state, id, &mut vs, dropped)?;
+            let version = json!(vs.last().and_then(|x| x["version"].as_u64()).unwrap_or(0) + 1);
+            v["version"] = version.clone();
+            v["proposed_at"] = v["published_at"].take();
+            v["published_at"] = json!(util::now_secs());
+            vs.push(v);
+            version
+        }
+    };
+    let l = &mut listings_mut(state)[id];
+    l["versions"] = Value::Array(vs);
+    l["proposals"] = Value::Array(ps);
+    let clash = clash_with(state, agent, &binding, id);
+    if clash.is_none() {
+        pins_mut(state, agent).insert(id.into(), json!(sha));
+    }
+    let mut body = format!("{agent} accepted your proposal for {binding} as version {version} of listing {id}.");
+    if let Some(n) = note.as_str() {
+        body = format!("{body}\n\n{n}");
+    }
+    let subject = format!("accepted your version of {binding} ({id})");
+    let notified = post(state, agent, &proposer, &subject, &body, json!(id), json!(sha)).is_ok();
+    Ok(json!({"id": id, "binding": binding, "sha256": sha, "version": version, "author": proposer,
+              "pinned": clash.is_none(), "clash": clash, "notified": notified}))
+}
+
+/// Drops a proposal: its listing's author declines it, or the agent that
+/// proposed it withdraws it. The other one is mailed.
+fn decline(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>, dropped: &mut Vec<String>)
+    -> Result<Value, Fail> {
+    let id = required_id(p)?;
+    let note = note_param(p)?;
+    let l = listing(state, id)?;
+    let (i, v) = pending(l, id, p)?;
+    let (author, proposer) = (text(&l["author"]).to_string(), text(&v["author"]).to_string());
+    if agent != author && agent != proposer {
+        return Err(Denied(format!("only {author}, who listed {id}, or {proposer}, who proposed it, declines it")));
+    }
+    let binding = text(&l["binding"]).to_string();
+    let sha = text(&v["sha256"]).to_string();
+    let withdrawn = agent == proposer;
+    let mut ps = proposals(l).to_vec();
+    ps.remove(i);
+    listings_mut(state)[id]["proposals"] = Value::Array(ps);
+    dropped.push(sha.clone());
+    let (to, subject, mut body) = if withdrawn {
+        (author, format!("withdrew a proposed version of {binding} ({id})"),
+         format!("{agent} withdrew the version of {binding} it proposed for your listing {id}."))
+    } else {
+        (proposer, format!("declined your version of {binding} ({id})"),
+         format!("{agent} declined the version of {binding} you proposed for listing {id}. You may still list it \
+                  as your own tool under a different binding."))
+    };
+    if let Some(n) = note.as_str() {
+        body = format!("{body}\n\n{n}");
+    }
+    let notified = post(state, agent, &to, &subject, &body, json!(id), json!(sha)).is_ok();
+    Ok(json!({"id": id, "sha256": sha, "declined": !withdrawn, "withdrawn": withdrawn, "notified": notified}))
 }
 
 /// The bytes of every distinct source the index keeps, with `sha` added if
@@ -677,7 +859,7 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
 fn blob_bytes_with(state: &Map<String, Value>, sha: &str, bytes: usize) -> u64 {
     let mut seen = BTreeSet::new();
     let mut total = 0;
-    for v in listings(state).values().flat_map(versions) {
+    for v in listings(state).values().flat_map(kept) {
         if seen.insert(text(&v["sha256"])) {
             total += v["bytes"].as_u64().unwrap_or(0);
         }
@@ -799,8 +981,9 @@ fn sync(lab: &Lab, state: &Map<String, Value>, agent: &str) -> Result<Value, Fai
 fn fetch(lab: &Lab, state: &Map<String, Value>, p: &Map<String, Value>) -> Result<Value, Fail> {
     let id = required_id(p)?;
     let l = listing(state, id)?;
-    let v = pick(l, id, str_param(p, "sha256")?)?;
+    let v = pick_kept(l, id, str_param(p, "sha256")?)?;
     let mut t = loadable(id, l, v);
+    t["pending"] = json!(v["version"].is_null());
     t["source"] = json!(lab.read_blob(text(&v["sha256"]))?);
     Ok(t)
 }
@@ -832,8 +1015,15 @@ fn send(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> 
     }
     let (about, sha) = match id_param(p, "listing")? {
         None => (Value::Null, Value::Null),
-        Some(id) => (json!(id), pick(listing(state, id)?, id, str_param(p, "sha256")?)?["sha256"].clone()),
+        Some(id) => (json!(id), pick_kept(listing(state, id)?, id, str_param(p, "sha256")?)?["sha256"].clone()),
     };
+    let id = post(state, agent, to, subject, body, about, sha)?;
+    Ok(json!({"id": id, "to": to}))
+}
+
+/// Adds a message to the mailbox, dropping read mail first if it is full.
+fn post(state: &mut Map<String, Value>, from: &str, to: &str, subject: &str, body: &str, about: Value, sha: Value)
+    -> Result<u64, Fail> {
     let now = util::now_secs();
     let messages = messages_mut(state);
     let body_bytes = |ms: &Vec<Value>| ms.iter().map(|m| m["body"].as_str().map_or(0, str::len)).sum::<usize>();
@@ -847,10 +1037,10 @@ fn send(state: &mut Map<String, Value>, agent: &str, p: &Map<String, Value>) -> 
     let id = state["next_message_id"].as_u64().unwrap_or(1);
     state.insert("next_message_id".into(), json!(id + 1));
     messages_mut(state).push(json!({
-        "id": id, "from": agent, "to": to, "subject": subject, "body": body,
+        "id": id, "from": from, "to": to, "subject": subject, "body": body,
         "listing": about, "sha256": sha, "sent_at": now, "acked_by": [],
     }));
-    Ok(json!({"id": id, "to": to}))
+    Ok(id)
 }
 
 fn inbox(state: &Map<String, Value>, agent: &str, p: &Map<String, Value>) -> Result<Value, Fail> {
@@ -922,6 +1112,11 @@ pub fn news_line(dir: &Path, agent: &str) -> Option<String> {
     let behind = st["pinned"].as_array().into_iter().flatten().filter(|l| l["behind"] == true).count();
     if behind > 0 {
         parts.push(format!("{behind} of your pinned tools {} a newer version", if behind == 1 { "has" } else { "have" }));
+    }
+    let review = st["proposals"].as_array().map_or(0, Vec::len);
+    if review > 0 {
+        parts.push(format!("{review} proposed version{} of your tools {} your review", if review == 1 { "" } else { "s" },
+                           if review == 1 { "awaits" } else { "await" }));
     }
     let unread = st["unread"].as_u64().unwrap_or(0);
     if unread > 0 {
@@ -1059,9 +1254,10 @@ mod tests {
     fn anyone_adds_versions_by_id_but_only_the_author_retags() {
         let d = lab();
         let r = list(&d.0, "codex", "hello", SRC);
+        // Another agent's version waits for the author as a proposal; the proposals tests cover the rest.
         let v2 = ok(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": "hello(x) = 2\n"}));
-        assert_eq!((v2["version"].clone(), v2["new_listing"].clone(), v2["pinned"].clone()), (json!(2), json!(false), json!(true)));
-        assert_eq!(ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r)}))["author"], "claude");
+        assert_eq!((v2["version"].clone(), v2["proposed"].clone(), v2["pinned"].clone()), (Value::Null, json!(true), json!(false)));
+        assert_eq!(ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r)}))["author"], "codex");
         let e = call(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": SRC, "tag": "Something else"})).unwrap_err();
         assert!(e.contains("only codex"), "{e}");
         let e = call(&d.0, "claude", json!({"action": "publish", "id": id(&r), "binding": "other", "source": SRC})).unwrap_err();
@@ -1070,6 +1266,112 @@ mod tests {
         assert!(e.contains("is a"), "{e}");
         let t = ok(&d.0, "codex", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": SRC, "tag": "Greets  someone"}));
         assert_eq!(t["tag"], "Greets someone");
+    }
+
+    fn blob(dir: &Path, r: &Value) -> PathBuf {
+        dir.join("blobs").join(format!("{}.jl", r["sha256"].as_str().unwrap()))
+    }
+
+    /// `agent` proposes `source` as a new version of codex's `hello` listing `id`.
+    fn propose(dir: &Path, agent: &str, id: &str, source: &str) -> Value {
+        ok(dir, agent, json!({"action": "publish", "id": id, "binding": "hello", "source": source, "note": "faster"}))
+    }
+
+    #[test]
+    fn a_proposal_waits_for_the_author_who_is_mailed() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        ok(&d.0, "claude", json!({"action": "pin", "id": id(&r)}));
+        let pr = propose(&d.0, "claude", id(&r), "hello(x) = 2\n");
+        assert_eq!((pr["author"].clone(), pr["notified"].clone(), pr["new"].clone()), (json!("codex"), json!(true), json!(true)));
+        assert_eq!(propose(&d.0, "claude", id(&r), "hello(x) = 2\n")["new"], false, "proposing it again changes nothing");
+        // Not the newest version: update and sync keep the author's.
+        assert_eq!(ok(&d.0, "claude", json!({"action": "update"}))["current"], json!([id(&r)]));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "sync"}))["tools"][0]["sha256"], r["sha256"]);
+        let b = ok(&d.0, "gemini", json!({"action": "browse"}));
+        assert_eq!((b["listings"][0]["versions"].clone(), b["listings"][0]["proposals"][0]["author"].clone()), (json!(1), json!("claude")));
+        // Anyone can fetch it to review it.
+        let f = ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r), "sha256": pr["sha256"]}));
+        assert_eq!((f["pending"].clone(), f["source"].clone(), f["author"].clone()), (json!(true), json!("hello(x) = 2\n"), json!("claude")));
+        assert_eq!(ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r)}))["pending"], false);
+        let st = ok(&d.0, "codex", json!({"action": "status"}));
+        assert_eq!((st["proposals"][0]["sha256"].clone(), st["proposals"][0]["binding"].clone()), (pr["sha256"].clone(), json!("hello")));
+        assert_eq!(ok(&d.0, "claude", json!({"action": "status"}))["proposals"], json!([]));
+        let mail = &ok(&d.0, "codex", json!({"action": "inbox"}))["messages"][0];
+        assert_eq!((mail["from"].clone(), mail["listing"].clone(), mail["sha256"].clone()), (json!("claude"), json!(id(&r)), pr["sha256"].clone()));
+        assert!(mail["subject"].as_str().unwrap().contains("proposed a new version of hello"));
+        assert!(mail["body"].as_str().unwrap().ends_with("faster"));
+        assert_eq!(news_line(&d.0, "codex").unwrap(), "TeamLab: 1 proposed version of your tools awaits your review; 1 unread message.");
+    }
+
+    #[test]
+    fn accepting_a_proposal_makes_it_newest_credited_to_its_proposer() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let pr = propose(&d.0, "claude", id(&r), "hello(x) = 2\n");
+        let accept = json!({"action": "accept", "id": id(&r), "sha256": pr["sha256"], "note": "thanks"});
+        let e = call(&d.0, "gemini", accept.clone()).unwrap_err();
+        assert!(e.contains("only codex, who listed"), "{e}");
+        assert!(call(&d.0, "claude", accept.clone()).unwrap_err().contains("only codex"));
+        let a = ok(&d.0, "codex", accept.clone());
+        assert_eq!((a["version"].clone(), a["author"].clone(), a["pinned"].clone(), a["notified"].clone()),
+                   (json!(2), json!("claude"), json!(true), json!(true)));
+        let f = ok(&d.0, "gemini", json!({"action": "fetch", "id": id(&r)}));
+        assert_eq!((f["version"].clone(), f["author"].clone(), f["pending"].clone()), (json!(2), json!("claude"), json!(false)));
+        let b = ok(&d.0, "codex", json!({"action": "browse"}));
+        assert_eq!((b["listings"][0]["pinned_version"].clone(), b["listings"][0]["proposals"].clone()), (json!(2), json!([])));
+        assert!(call(&d.0, "codex", accept).unwrap_err().contains("no pending proposal"));
+        let mail = &ok(&d.0, "claude", json!({"action": "inbox"}))["messages"][0];
+        assert!(mail["subject"].as_str().unwrap().starts_with("accepted your version of hello"));
+        assert!(mail["body"].as_str().unwrap().contains("as version 2"));
+        // The proposer's approval of their own version is still refused.
+        assert!(call(&d.0, "claude", json!({"action": "approve", "id": id(&r)})).unwrap_err().contains("another agent"));
+    }
+
+    #[test]
+    fn declining_or_withdrawing_a_proposal_drops_it_and_its_blob() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let pc = propose(&d.0, "claude", id(&r), "hello(x) = 2\n");
+        let pg = propose(&d.0, "gemini", id(&r), "hello(x) = 3\n");
+        assert!(blob(&d.0, &pc).exists() && blob(&d.0, &pg).exists());
+        let e = call(&d.0, "gemini", json!({"action": "decline", "id": id(&r), "sha256": pc["sha256"]})).unwrap_err();
+        assert!(e.contains("only codex, who listed"), "{e}");
+        let x = ok(&d.0, "codex", json!({"action": "decline", "id": id(&r), "sha256": pc["sha256"], "note": "too clever"}));
+        assert_eq!((x["declined"].clone(), x["withdrawn"].clone(), x["notified"].clone()), (json!(true), json!(false), json!(true)));
+        assert!(!blob(&d.0, &pc).exists());
+        let mail = &ok(&d.0, "claude", json!({"action": "inbox"}))["messages"][0];
+        assert!(mail["subject"].as_str().unwrap().starts_with("declined your version") && mail["body"].as_str().unwrap().ends_with("too clever"));
+        let w = ok(&d.0, "gemini", json!({"action": "decline", "id": id(&r), "sha256": pg["sha256"]}));
+        assert_eq!((w["declined"].clone(), w["withdrawn"].clone()), (json!(false), json!(true)));
+        assert!(!blob(&d.0, &pg).exists());
+        let subjects: Vec<Value> = ok(&d.0, "codex", json!({"action": "inbox"}))["messages"].as_array().unwrap().iter().map(|m| m["subject"].clone()).collect();
+        assert!(subjects.last().unwrap().as_str().unwrap().starts_with("withdrew a proposed version"), "{subjects:?}");
+        assert_eq!(ok(&d.0, "codex", json!({"action": "status"}))["proposals"], json!([]));
+        assert!(blob(&d.0, &r).exists(), "the listed version stays");
+    }
+
+    #[test]
+    fn a_new_proposal_supersedes_the_agents_last_and_proposals_are_capped() {
+        let d = lab();
+        let r = list(&d.0, "codex", "hello", SRC);
+        let first = propose(&d.0, "claude", id(&r), "hello(x) = 2\n");
+        let second = propose(&d.0, "claude", id(&r), "hello(x) = 3\n");
+        assert_eq!(second["superseded"], first["sha256"]);
+        assert!(!blob(&d.0, &first).exists() && blob(&d.0, &second).exists());
+        assert_eq!(ok(&d.0, "codex", json!({"action": "status"}))["proposals"].as_array().unwrap().len(), 1);
+        for i in 1..MAX_PROPOSALS {
+            propose(&d.0, &format!("agent{i}"), id(&r), &format!("hello(x) = {}\n", 10 + i));
+        }
+        let e = call(&d.0, "late", json!({"action": "publish", "id": id(&r), "binding": "hello", "source": "hello(x) = 0\n"})).unwrap_err();
+        assert!(e.contains(&format!("already has {MAX_PROPOSALS} proposals awaiting codex")), "{e}");
+        // An agent replacing its own proposal still fits.
+        propose(&d.0, "claude", id(&r), "hello(x) = 4\n");
+        // A malformed proposal makes the index unreadable rather than loading half of it.
+        let mut state: Value = serde_json::from_slice(&fs::read(d.0.join("state.json")).unwrap()).unwrap();
+        state["tools"][id(&r)]["proposals"][0]["sha256"] = json!("nope");
+        fs::write(d.0.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(call(&d.0, "codex", json!({"action": "status"})).unwrap_err().contains("malformed proposal"));
     }
 
     #[test]
