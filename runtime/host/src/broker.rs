@@ -920,7 +920,7 @@ fn q(s: &str) -> String {
     format!("'{s}'")
 }
 
-fn ql<S: AsRef<str>>(xs: &[S]) -> String {
+pub(crate) fn ql<S: AsRef<str>>(xs: &[S]) -> String {
     format!("[{}]", xs.iter().map(|x| q(x.as_ref())).collect::<Vec<_>>().join(", "))
 }
 

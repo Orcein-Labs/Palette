@@ -69,7 +69,7 @@ def main():
     shared={
         **{'sdk/'+n:d for n,d in source.items() if n not in excluded},
         'templates/palette-plugin.json':source['runtime/plugins/palette/plugin.json'],
-        'setup.py':source['runtime/plugins/setup.py'],
+        'setup.sh':source['runtime/plugins/setup.sh'],
         'INSTALL.md':source['runtime/plugins/DISTRIBUTION.md'],
         'BRAIN_BLAST.md':source['BRAIN_BLAST.md'].replace(b'(runtime/docs/', b'(sdk/runtime/docs/'),
         'LICENSE':license_text,
