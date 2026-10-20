@@ -750,14 +750,14 @@ const _POLYGLOT_EXT_LANG = Dict{String,String}(
 
 const _SKIP_SCAN_DIRS = Set([
     ".git", "vendor", "target", "node_modules", "__pycache__", "build", "dist", "_build", "venv", ".venv",
-    "scratch", "archive", "backup", "tmp", "old", "work(from chatgpt)",
+    "scratch", "archive", "backup", "tmp", "old",
 ])
 
 function _is_scratch_dir(d::AbstractString)::Bool
     startswith(d, ".") && return true
     d in _SKIP_SCAN_DIRS && return true
     dl = lowercase(d)
-    (startswith(dl, "work(") || occursin("(from ", dl) || startswith(dl, "backup_") || startswith(dl, "scratch_")) && return true
+    (startswith(dl, "backup_") || startswith(dl, "scratch_")) && return true
     return false
 end
 
@@ -767,6 +767,11 @@ function _is_scratch_path(rel::AbstractString)::Bool
     end
     return false
 end
+
+# Git's own ignore rules decide when the root is a repository; the name
+# heuristics above decide otherwise.
+_skip_path(rel::AbstractString, git_allowed::Union{Nothing,Set{String}}) =
+    git_allowed === nothing ? _is_scratch_path(rel) : !(rel in git_allowed)
 
 
 const _NOISE_CALLEES = Set([
@@ -1050,12 +1055,7 @@ function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
     indexed = 0
 
     for path in sort!(collect(keys(cg.files)))
-        norm_p = replace(String(path), '\\' => '/')
-        if git_allowed !== nothing
-            !(norm_p in git_allowed) && continue
-        else
-            _is_scratch_path(norm_p) && continue
-        end
+        _skip_path(replace(String(path), '\\' => '/'), git_allowed) && continue
         entry = cg.files[path]
         lang = string(entry.language)
         lines = _read_source_lines(root_dir, path)
@@ -1127,11 +1127,7 @@ function _index_extra_polyglot_files!(
             islink(full) && continue
             rel = replace(relpath(full, root_dir), '\\' => '/')
             rel in already_indexed && continue
-            if git_allowed !== nothing
-                !(rel in git_allowed) && continue
-            else
-                _is_scratch_path(rel) && continue
-            end
+            _skip_path(rel, git_allowed) && continue
             lines = _read_source_lines(root_dir, rel)
             isempty(lines) && continue
             defs = _scan_polyglot_defs(lines, lang)
