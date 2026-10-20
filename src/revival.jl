@@ -305,7 +305,7 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
             # A method of another module's function (`Base.show`) cannot be
             # looked up by name here, so it is kept.
             bound = kind == "using" ? imported_names(st) : entry["names"]
-            !isempty(bound) && !any(n -> occursin('.', n) || Base.invokelatest(isdefined, failed_in, Symbol(n)), bound) && continue
+            !isempty(bound) && !any(n -> occursin('.', n) || latest_isdefined(failed_in, Symbol(n)), bound) && continue
         end
         push!(DEFINITION_LOG, entry)
     end
@@ -386,12 +386,12 @@ function current_definition(T::DataType)
     while true
         parent = parentmodule(ancestor)
         (parent === ancestor || parent === Main || parent === Core || parent === Base) && break
-        Base.invokelatest(isdefined, parent, nameof(ancestor)) || return false
-        Base.invokelatest(getglobal, parent, nameof(ancestor)) === ancestor || return false
+        latest_isdefined(parent, nameof(ancestor)) || return false
+        latest_global(parent, nameof(ancestor)) === ancestor || return false
         ancestor = parent
     end
-    Base.invokelatest(isdefined, m, nameof(T)) || return false
-    b = Base.invokelatest(getglobal, m, nameof(T))
+    latest_isdefined(m, nameof(T)) || return false
+    b = latest_global(m, nameof(T))
     b isa Type || return false
     return Base.unwrap_unionall(b) isa DataType && Base.unwrap_unionall(b).name === T.name
 end
@@ -572,22 +572,22 @@ function type_fingerprint(mod::Module, name::String)
         length(loaded) == 1 || return nothing
         owner = only(loaded)
         for part in parts[2:end-1]
-            Base.invokelatest(isdefined, owner, Symbol(part)) || return nothing
-            owner = Base.invokelatest(getglobal, owner, Symbol(part))
+            latest_isdefined(owner, Symbol(part)) || return nothing
+            owner = latest_global(owner, Symbol(part))
             owner isa Module || return nothing
         end
         return type_fingerprint(owner, String(parts[end]))
     end
     parts = split(name, '.')
     for part in parts[1:end-1]
-        Base.invokelatest(isdefined, mod, Symbol(part)) || return nothing
-        owner = Base.invokelatest(getglobal, mod, Symbol(part))
+        latest_isdefined(mod, Symbol(part)) || return nothing
+        owner = latest_global(mod, Symbol(part))
         owner isa Module || return nothing
         mod = owner
     end
     name = String(parts[end])
-    Base.invokelatest(isdefined, mod, Symbol(name)) || return nothing
-    t = Base.invokelatest(getglobal, mod, Symbol(name))
+    latest_isdefined(mod, Symbol(name)) || return nothing
+    t = latest_global(mod, Symbol(name))
     t isa Function && return "function"
     u = Base.unwrap_unionall(t)
     u isa DataType || return nothing
@@ -598,8 +598,8 @@ end
 
 # Every method of a kernel function, as text, to compare after a rebuild.
 function method_set(mod::Module, name::String)
-    Base.invokelatest(isdefined, mod, Symbol(name)) || return nothing
-    f = Base.invokelatest(getglobal, mod, Symbol(name))
+    latest_isdefined(mod, Symbol(name)) || return nothing
+    f = latest_global(mod, Symbol(name))
     f isa Function || return nothing
     return sort!([string(m.sig) for m in Base.invokelatest(methods, f) if m.module === mod])
 end
@@ -754,8 +754,8 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
     for (k, sym) in enumerate(sort!(Base.invokelatest(names, mod; all=true)))
         k % 32 == 0 && give_way() && return nothing
         session_binding(mod, sym) || continue
-        Base.invokelatest(isdefined, mod, sym) || continue
-        v = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        v = latest_global(mod, sym)
         name = string(sym)
         setcall = get(BINDING_SEEN, sym, (UInt(0), call))[2]
         b = Dict{String, Any}("name" => name, "type" => short_type(v), "call" => setcall,
@@ -815,7 +815,7 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         end
         bytes = UInt8[]
         ok = try
-            bytes = snapshot_bytes(mod, Dict(n => Base.invokelatest(getglobal, mod, Symbol(n)) for n in g.names))
+            bytes = snapshot_bytes(mod, Dict(n => latest_global(mod, Symbol(n)) for n in g.names))
             true
         catch e
             for n in g.names
@@ -1044,7 +1044,7 @@ function revive_state!()
         end
         failures = Any[]
         while !isempty(waiting)
-            ready = sort!([i for i in waiting if issubset(dependencies[i], done) && all(n -> Base.invokelatest(isdefined, mod, Symbol(n)), value_dependencies[i])])
+            ready = sort!([i for i in waiting if issubset(dependencies[i], done) && all(n -> latest_isdefined(mod, Symbol(n)), value_dependencies[i])])
             isempty(ready) && break
             for i in ready
                 delete!(waiting, i); push!(attempted, i)
@@ -1061,7 +1061,7 @@ function revive_state!()
         end
         for i in sort!(collect(waiting))
             roots = [join(names_by_item[j], ",") for j in sort!(collect(setdiff(dependencies[i], done)))]
-            append!(roots, [n for n in value_dependencies[i] if !Base.invokelatest(isdefined, mod, Symbol(n))])
+            append!(roots, [n for n in value_dependencies[i] if !latest_isdefined(mod, Symbol(n))])
             push!(failures, (pending[i], "unavailable reconstruction prerequisites: " * join(roots, "; ")))
         end
         return failures
@@ -1190,8 +1190,8 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
         cls = b["class"]
         if cls == "definition"
             now = b["check"] isa String && startswith(b["check"], "value:") ?
-                  (Base.invokelatest(isdefined, mod, Symbol(n)) ?
-                   "value:" * Base.invokelatest(repr, Base.invokelatest(getglobal, mod, Symbol(n))) : nothing) :
+                  (latest_isdefined(mod, Symbol(n)) ?
+                   "value:" * Base.invokelatest(repr, latest_global(mod, Symbol(n))) : nothing) :
                   startswith(b["type"], "function") ? method_set(mod, n) : type_fingerprint(mod, n)
             if haskey(errors, n) || now === nothing
                 push!(inexact, n)
@@ -1208,9 +1208,9 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
             end
         elseif cls == "import"
             changed = get(get(m, "workspace_packages", Dict()), n, nothing)
-            if !Base.invokelatest(isdefined, mod, Symbol(n))
+            if !latest_isdefined(mod, Symbol(n))
                 push!(lost, "$n (module): its `using`/`import` was not found")
-            elseif changed !== nothing && Dict(k => Tuple(v) for (k, v) in changed) != source_snapshot(dirname(something(pathof(Base.invokelatest(getglobal, mod, Symbol(n))), "/x/x")))
+            elseif changed !== nothing && Dict(k => Tuple(v) for (k, v) in changed) != source_snapshot(dirname(something(pathof(latest_global(mod, Symbol(n))), "/x/x")))
                 push!(approx, "$n (module): loaded again from workspace sources that changed since")
             else
                 push!(rebuilt, "$n (module)")
@@ -1261,8 +1261,8 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
     end
     for (n, b) in bindings
         sym = Symbol(n)
-        if (haskey(values, n) || b["class"] == "definition") && Base.invokelatest(isdefined, mod, sym)
-            value = Base.invokelatest(getglobal, mod, sym)
+        if (haskey(values, n) || b["class"] == "definition") && latest_isdefined(mod, sym)
+            value = latest_global(mod, sym)
             BINDING_SEEN[sym] = (objectid(value), b["call"])
             BINDING_ORIGINS[sym] = Dict{String, Any}(get(b, "origin", Dict()))
             origin = BINDING_ORIGINS[sym]

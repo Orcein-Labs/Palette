@@ -41,8 +41,8 @@ function assigned_symbols(ex)
 end
 
 function binding_ids(mod)
-    return Dict(n => objectid(Base.invokelatest(getglobal, mod, n)) for n in Base.invokelatest(names, mod; all=true)
-        if session_binding(mod, n) && Base.invokelatest(isdefined, mod, n))
+    return Dict(n => objectid(latest_global(mod, n)) for n in Base.invokelatest(names, mod; all=true)
+        if session_binding(mod, n) && latest_isdefined(mod, n))
 end
 
 # Since Julia 1.12, a struct redefined with a different layout is a new type
@@ -58,8 +58,8 @@ defined_types(ex) = !(ex isa Expr) ? Symbol[] :
 function current_types(mod, ex)
     out = Dict{Symbol, Any}()
     for name in defined_types(ex)
-        Base.invokelatest(isdefined, mod, name) || continue
-        value = Base.invokelatest(getglobal, mod, name)
+        latest_isdefined(mod, name) || continue
+        value = latest_global(mod, name)
         value isa Type && (out[name] = value)
     end
     return out
@@ -78,15 +78,15 @@ end
 function stale_type_notice(mod, types_before)
     lines = String[]
     for (name, old) in types_before
-        Base.invokelatest(getglobal, mod, name) === old && continue
+        latest_global(mod, name) === old && continue
         body = Base.unwrap_unionall(old)
         body isa DataType || continue
         tn = body.name
         values, methods_, fields = String[], String[], String[]
         for sym in Base.invokelatest(names, mod; all=true)
             (sym in (name, :ans) || !session_binding(mod, sym)) && continue
-            Base.invokelatest(isdefined, mod, sym) || continue
-            v = Base.invokelatest(getglobal, mod, sym)
+            latest_isdefined(mod, sym) || continue
+            v = latest_global(mod, sym)
             if v isa Type
                 t = Base.unwrap_unionall(v)
                 t isa DataType && isconcretetype(t) || continue

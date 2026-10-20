@@ -271,6 +271,11 @@ end
 # The number of the call in flight, or of the next one between calls.
 next_call() = length(get_kernel_state().execution_history) + 1
 
+# Session code defines globals after the kernel's own world was fixed, so
+# reads of them go through the latest world.
+latest_isdefined(m::Module, s::Symbol) = Base.invokelatest(isdefined, m, s)
+latest_global(m::Module, s::Symbol) = Base.invokelatest(getglobal, m, s)
+
 """
     reset_kernel_state()
 
@@ -549,8 +554,8 @@ function reload_observation(mod::Module)
     bindings = Dict{String, Any}()
     observed_methods = Dict{Any, Method}()
     for sym in Base.invokelatest(names, mod; all=true)
-        Base.invokelatest(isdefined, mod, sym) || continue
-        value = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        value = latest_global(mod, sym)
         bindings[string(sym)] = (id=objectid(value), kind=value isa Type ? "type" : value isa Module ? "module" : "value",
                                 identity=value isa Union{Type, Module} ? value : nothing)
         value isa Union{Function, Type} || continue
@@ -839,8 +844,8 @@ function varinfo(mod::Module=get_kernel_state().eval_module)
     rows = NTuple{3,String}[]
     for sym in sort!(Base.invokelatest(names, mod; all=true))
         session_binding(mod, sym) || continue
-        Base.invokelatest(isdefined, mod, sym) || continue
-        v = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        v = latest_global(mod, sym)
         size = try
             Base.format_bytes(Base.summarysize(v))
         catch
@@ -1055,8 +1060,8 @@ function execute(op::ExecuteCode)::OperationReceipt
             # re-importing it every turn -- not a user variable, must not
             # show up in GetState/discovery any more than :eval or :include do.
             session_binding(state.eval_module, sym) || continue
-            if Base.invokelatest(isdefined, state.eval_module, sym)
-                state.variables[string(sym)] = Base.invokelatest(getfield, state.eval_module, sym)
+            if latest_isdefined(state.eval_module, sym)
+                state.variables[string(sym)] = latest_global(state.eval_module, sym)
             end
         end
     catch e
