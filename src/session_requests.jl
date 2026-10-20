@@ -1,8 +1,7 @@
 # The request handling of runtime/scripts/session_loop.jl, which owns the
 # process set-up: the protocol descriptors, the output sink and the warm-up.
-# It lives in the package so the package image holds its native code. As a
-# script loop it compiled in full on the first request, about 1.1 s that the
-# first call of every kernel paid.
+# It lives in the package so the package image holds its native code and a
+# kernel's first call does not compile it.
 
 # `display(x)` goes through the display stack, whose TextDisplay was built at
 # startup around the original stdout, which is the protocol pipe: one
@@ -27,8 +26,8 @@ pkg_offline() = get(INITIAL_ENV[], "JULIA_PKG_OFFLINE", "") == "true"
 # parser reports these as "Expected `end`" several columns away.
 const RESERVED_AS_NAME = r"(?:^|[(,;\s])(quote|end|begin|let|local|global|module|baremodule|struct|macro|do|try|catch|finally|export|import|using|const|return|break|continue|function|if|elseif|else|while|for|abstract|primitive|mutable|public)\s*(?:::|=(?!=)|,\s*\w|\s+in\s)"
 # Source with a docstring, embedded in a triple-quoted string: the docstring's
-# own """ line ends the string, and the lines after it run as code. In the
-# endurance runs this failed as `invalid keyword argument name "last::Bool"`
+# own """ line ends the string, and the lines after it run as code. In long
+# trial runs this failed as `invalid keyword argument name "last::Bool"`
 # or an undefined name, far from the cause. Returns the line the string began
 # on and the line that ended it, when the error is in the lines that leaked.
 function docstring_closed_string(err::AbstractString, code::AbstractString)
@@ -48,8 +47,8 @@ function docstring_closed_string(err::AbstractString, code::AbstractString)
     return nothing
 end
 
-# An undefined name that the call's code interpolates into a string. In the
-# endurance runs 13 of 18 UndefVarErrors were this: Julia source for a file,
+# An undefined name that the call's code interpolates into a string. In long
+# trial runs 13 of 18 UndefVarErrors were this: Julia source for a file,
 # written as a string literal, whose `$K` and `$new` ran in the kernel.
 function interpolated_undefined_name(err::AbstractString, code::AbstractString)
     m = match(r"UndefVarError: `([^`]+)`", err)
@@ -179,13 +178,8 @@ function handle_request(@nospecialize(respond), line::AbstractString, epoch::Str
         elseif kind == "EXECUTE"
             snapshot_call = execute_reply!(respond, resp, req, code, payload, timeout_s)
         else
-            # Fail closed on an unrecognized `kind` -- confirmed by direct
-            # testing that an earlier version of this branch ran ANY
-            # non-"EPHEMERAL" kind (a typo, a missing field, a future
-            # protocol version this process doesn't understand) as durable
-            # ExecuteCode against the persistent mind. A malformed or
-            # unrecognized request must be rejected, not silently treated
-            # as "the durable default."
+            # An unrecognized kind (a typo, a missing field, a later protocol)
+            # fails closed rather than running as EXECUTE.
             error("unrecognized request 'kind': $(repr(kind)) (expected \"EXECUTE\" or \"EPHEMERAL\")")
         end
     catch e
@@ -208,24 +202,15 @@ function ephemeral_reply!(resp, req, code::String, payload, timeout_s)
     request_id = get(req, "request_id", nothing)
     requested_ceiling = get(req, "ceiling", Dict{String,Any}())
     requested_ceiling isa AbstractDict || error("request 'ceiling' must be an object")
-    # The child's own script: runs `code` through the SAME
-    # ExecuteCode/execute path (real Core.eval, real receipt) as a
-    # persistent turn would, but inside its own disposable process
-    # -- then prints exactly one JSON line this process parses back.
-    # `repr(code)` produces a safely re-escaped Julia string literal
-    # (that's what `repr` is for); this is textual generation of
-    # trusted host-side code embedding untrusted content as DATA,
-    # not string-building a shell command.
+    # The child runs `code` through the same execute path as a persistent
+    # call, then prints one JSON line that is parsed back here. `repr`
+    # embeds the code as an escaped Julia string literal: data, not code.
     child_script = string("__palette_child_started__=time_ns(); using Palette; Palette.ephemeral_main(", repr(code),
         "; payload=", repr(payload), ", timeout_s=", repr(timeout_s),
         ", startup_seconds=(time_ns()-__palette_child_started__)/1e9)")
-    # `child_workspace`/`child_project`/`child_repo` are no longer
-    # part of this request: the broker now always allocates the
-    # child's workspace itself and uses its own session-established
-    # project/repo paths -- a request can no longer choose WHERE a
-    # child's filesystem view points, only WHICH capabilities it
-    # gets (see broker.py's _handle_spawn_child_worker docstring
-    # for the exploit this closed).
+    # The broker allocates the child's workspace and uses the session's own
+    # project and repo paths: a request chooses only the child's
+    # capabilities, never where its filesystem view points.
     child_started = time_ns()
     spawn_resp = request_capability("spawn_child_worker", Dict(
         "ceiling" => requested_ceiling,

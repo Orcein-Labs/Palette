@@ -1,8 +1,8 @@
-# Runs only while the package is being precompiled. A new kernel used to
-# compile its whole turn path while the model waited for the first reply:
-# JSON both ways, execute's success and error paths, output capture, the
-# deadline machinery and the shaping of values for the protocol. Running
-# representative turns here caches that native code with the package.
+# Runs only while the package is being precompiled. Representative turns here
+# cache the native code of the whole turn path with the package, so a new
+# kernel does not compile it while the model waits for the first reply: JSON
+# both ways, execute's success and error paths, output capture, the deadline
+# machinery and the shaping of values for the protocol.
 #
 # Every failure is swallowed: a workload problem must never fail the build,
 # only leave some code uncompiled. Turn code runs in WorkloadScope, since
