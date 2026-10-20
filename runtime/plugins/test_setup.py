@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -227,6 +228,7 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(served['PALETTE_CAPABILITY_CEILING'], str(palette/'config/ceiling.json'))
         self.assertNotIn('PALETTE_TEAMLAB_DIR', served)
         self.assertNotIn('PALETTE_HOST_COMMANDS', served)
+        self.assertNotIn('PALETTE_READ_ROOTS', served)
         self.assertEqual(sorted(p.name for p in (palette/'client').iterdir()),
                          ['generic-mcp.json', 'palette-launch.json', 'palette-local-plugin', 'palette-mcp'])
 
@@ -246,6 +248,22 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(str(second), launcher.read_text())
         self.assertEqual(json.loads(env_out.read_text())['PALETTE_HOST_COMMANDS'], str(commands))
+
+        # So are read roots, one a line; a relative or missing one is refused.
+        readable = [self.tmp/'project one', self.tmp/'project-two']
+        for path in readable:
+            path.mkdir()
+        roots = home/'.config/palette/read-roots'
+        for bad in ('relative/dir', str(self.tmp/'missing')):
+            roots.write_text(bad + '\n')
+            refused = run(second, '--no-check')
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('read root', refused.stderr)
+        roots.write_text(f'# projects the kernel reads\n{readable[0]}\n\n  {readable[1]}  \n')
+        done = run(second)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(json.loads(env_out.read_text())['PALETTE_READ_ROOTS'], ':'.join(map(str, readable)))
+        self.assertIn(shlex.quote(f'PALETTE_READ_ROOTS={readable[0]}:{readable[1]}'), launcher.read_text())
         self.assertFalse([p for p in (palette/'client').iterdir() if p.name.startswith('.')], 'no trial files left behind')
 
 
