@@ -591,6 +591,27 @@ end
     @test Palette.CURRENT_CALL[] == 0 && Palette.CALL_CONTEXT[] === nothing
 end
 
+@testset "A corrupt checkpoint record is skipped and keeps every copied source" begin
+    old_state = Palette.STATE_DIR[]
+    Palette.STATE_DIR[] = mktempdir()
+    try
+        for (name, text) in (("good", """{"name": "good", "created": "2026-01-01T00:00:00Z", "includes": []}"""),
+                             ("torn", """{"name": "torn", "crea"""))
+            mkpath(joinpath(Palette.checkpoints_dir(), name))
+            write(joinpath(Palette.checkpoints_dir(), name, "checkpoint.json"), text)
+        end
+        mkpath(Palette.blobs_dir())
+        write(Palette.blob_path("abc"), "source")
+        @test [r["name"] for r in Palette.checkpoint_records()] == ["good"]
+        @test Palette.remove_unused_blobs!(Dict{String, Any}[]) == 0
+        @test isfile(Palette.blob_path("abc"))
+        rm(joinpath(Palette.checkpoints_dir(), "torn"); recursive=true)
+        @test Palette.remove_unused_blobs!(Dict{String, Any}[]) == 1
+    finally
+        Palette.STATE_DIR[] = old_state
+    end
+end
+
 @testset "Revival checks see definitions made earlier in the same call" begin
     # Revival rebuilds definitions and checks them in one call, from a world
     # older than the new bindings. Julia 1.12 only warns about such reads and
