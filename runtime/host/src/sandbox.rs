@@ -1005,7 +1005,7 @@ fn identity_base(runtime_dir: Option<&Path>) -> Option<PathBuf> {
 /// could pre-create it and choose the sandbox's passwd, or plant a symlink
 /// where the temp file is written.
 fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     let uid = unsafe { libc::getuid() };
     let etc = base.join(format!("palette-etc-{uid}"));
     match fs::DirBuilder::new().mode(0o755).create(&etc) {
@@ -1013,13 +1013,7 @@ fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(format!("creating {}: {e}", etc.display())),
     }
-    let meta = fs::symlink_metadata(&etc).map_err(|e| format!("checking {}: {e}", etc.display()))?;
-    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
-        return Err(format!(
-            "refusing sandbox identity dir {}: it must be a directory owned by uid {uid} and writable only by its owner",
-            etc.display()
-        ));
-    }
+    util::check_private_dir(&etc).map_err(|e| format!("refusing sandbox identity dir: {e}"))?;
     let passwd = format!("{SANDBOX_USER}:x:1000:1000:Palette sandbox:/run/palette/home:/bin/bash\n");
     let group = format!("{SANDBOX_USER}:x:1000:\n");
     let current = |name: &str| fs::read_to_string(etc.join(name)).ok();

@@ -84,9 +84,9 @@ if ($launch.command -ne 'wsl.exe') { Stop-Install 'the Linux installer did not w
 
 # Each client is left alone when it already runs this installation, and when
 # its palette server runs something else, unless PALETTE_REPLACE is 1.
-$wanted = (@($launch.command) + @($launch.args)) -join ' '
-$replace = $env:PALETTE_REPLACE -eq '1'
 function Join-Command($command, $arguments) { (@($command) + @($arguments | Where-Object { $null -ne $_ })) -join ' ' }
+$wanted = Join-Command $launch.command $launch.args
+$replace = $env:PALETTE_REPLACE -eq '1'
 function Say-Kept($name) {
     Write-Host "$name already has a server named palette; left as it is. To use this one, run the installer again with PALETTE_REPLACE=1."
 }
@@ -106,8 +106,7 @@ if (Test-Path $desktopDir) {
         Say-Kept 'Claude Desktop'
     } else {
         if (Test-Path $desktopFile) { Copy-Item $desktopFile "$desktopFile.before-palette" -Force }
-        if ($have) { $config.mcpServers.PSObject.Properties.Remove('palette') }
-        $config.mcpServers | Add-Member palette $launch
+        $config.mcpServers | Add-Member palette $launch -Force
         [IO.File]::WriteAllText($desktopFile, ($config | ConvertTo-Json -Depth 32), (New-Object Text.UTF8Encoding $false))
         Write-Host "$(if ($have) { 'Moved' } else { 'Registered' }) Claude Desktop to this installation; restart it to load Palette."
     }
