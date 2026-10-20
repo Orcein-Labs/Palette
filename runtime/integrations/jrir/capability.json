@@ -4,6 +4,6 @@
   "source": "jrir.jl",
   "entrypoint": "jrir",
   "dependencies": [],
-  "requires": ["host_command"],
+  "requires": [],
   "description": "Julia-Rust Intermediate Representation, C-ABI layout verifier, cross-version LLVM 19-23 to LLVM 18 normalizer, and zero-allocation Base.llvmcall loop fuser"
 }
