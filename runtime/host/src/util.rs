@@ -163,6 +163,21 @@ pub fn fmt_g(x: f64) -> String {
     }
 }
 
+/// A word the shell reads back as `s`, as Python's `shlex.quote`.
+pub fn shquote(s: &str) -> String {
+    if s.is_empty() {
+        "''".into()
+    } else if s.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
+        s.into()
+    } else {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+pub fn shjoin<S: AsRef<str>>(words: &[S]) -> String {
+    words.iter().map(|w| shquote(w.as_ref())).collect::<Vec<_>>().join(" ")
+}
+
 /// `s` with a leading `~` or `~/` taken as the home directory.
 pub fn expand_user(s: &str) -> PathBuf {
     match s.strip_prefix('~') {
