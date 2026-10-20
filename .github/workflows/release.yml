@@ -69,7 +69,7 @@ jobs:
           gh release create "$TAG" "$RELEASE_DIR"/* --title "$TAG" --generate-notes $pre
         fi
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: palette-release
         path: ${{ env.RELEASE_DIR }}
