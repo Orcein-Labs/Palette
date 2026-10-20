@@ -22,6 +22,15 @@ Eliminates FFI/ABI boilerplate and dynamic library (`callq` / PLT) barriers betw
    - `jrir_crc32_ieee(data, seed::UInt32=0x00000000) -> UInt32`: Zero-allocation SIMD `<4 x i32>` xor-reduction IEEE 802.3 CRC32 kernel compiled from `runtime/host/src/receipt_archive.rs:288-319`.
    - `jrir_strip_ansi!(dst::Vector{UInt8}, src)` / `jrir_strip_ansi(s::AbstractString)`: Closes the `src/digest.jl:14` `strip_ansi` regex allocation seam, achieving a **`12.8x` speedup** (`51.34 µs` vs `658.13 µs` on a 69 KB ANSI log) with **`0 B` allocated** in-place.
 
+## Requirements
+
+The manifest requires no grant. The layout verifier, the IR normalizer and the
+built-in seam kernels need no compiler. `compile_rust_to_llvm_ir` runs `rustc`
+(or, failing that, `clang`) as a subprocess of the kernel, so it works only
+where the sandbox can see one; the `diagnose` action reports `rustc_available`
+and `clang_available`. Without either, compile on the host and pass the `.ll`
+text to the `normalize_ir` or `compile` action.
+
 ## Benchmarks ($N = 100,000$ `Particle` Struct Updates, `Float32`)
 
 | Execution Path | Post-Warmup Latency | Heap Allocations | Speedup vs Naive FFI | Speedup vs Cached `.so` Loop | `callq` in Loop |
