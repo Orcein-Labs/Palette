@@ -1,7 +1,8 @@
 //! Small helpers shared by the sandbox, broker and session.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,13 +20,38 @@ pub fn uuid4() -> String {
     let mut b = random_bytes::<16>();
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let h = to_hex(&b);
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
+/// `n` random lowercase hex digits (at most 64).
 pub fn hex(n: usize) -> String {
-    let b = random_bytes::<32>();
-    b.iter().map(|x| format!("{x:02x}")).collect::<String>()[..n].to_string()
+    to_hex(&random_bytes::<32>())[..n].to_string()
+}
+
+/// Bytes as lowercase hex, two digits each.
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Writes `bytes` to the new file `tmp` (never through a symlink), syncs it,
+/// gives it `mode`, then runs `place` to move it where it belongs. `tmp` is
+/// removed if any step fails.
+pub fn write_then(tmp: &Path, bytes: &[u8], mode: u32, place: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    let written = (|| {
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        if mode != 0o600 {
+            fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
+        }
+        place()
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    written
 }
 
 pub fn now_secs() -> f64 {
