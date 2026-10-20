@@ -188,7 +188,7 @@ jobs:
     # the gates still run prewarm, which only recompiles what changed.
     - name: Restore the Julia depot
       id: depot
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ~/.julia
         key: palette-depot-v2-${{ runner.os }}-julia1.12-${{ env.JULIA_CPU_TARGET }}-${{ hashFiles('Project.toml', 'src/**', 'runtime/security/prewarm_workload.jl') }}
@@ -218,7 +218,7 @@ jobs:
 
     - name: Save the Julia depot
       if: always() && matrix.shard == 1 && matrix.implementation == 'rust' && steps.depot.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: ~/.julia
         key: ${{ steps.depot.outputs.cache-primary-key }}
