@@ -1,20 +1,23 @@
-# TeamLab client: a kernel's view of the shelf of Julia tools and the mailbox
-# that one user's agents share. The shelf itself is kept by the session host
+# TeamLab client: a kernel's view of the shop of Julia tools and the mailbox
+# that one user's agents share. The shop itself is kept by the session host
 # (the `teamlab` broker category) in a directory no kernel can write, under the
 # name the host was given for the calling agent; this file only asks for it.
 #
-# Two actions do work here as well. `publish` checks a tool loads (and runs
-# its test, when given one) before sending it, and `sync` loads each pinned
-# tool into this world, bound as `TeamLab.<name>`.
+# Three actions do work here as well. `publish` checks a tool loads (and runs
+# its test, when given one) before listing it, `try` loads one listing into
+# this world without pinning it, and `sync` loads every pinned listing, each
+# bound as `TeamLab.<binding>`.
 
 using SHA
 
 const _SYNC_ARGS = ("action",)
-const _PUBLISH_ARGS = ("action", "name", "source", "path", "test", "test_source", "test_timeout_s", "note")
+const _TRY_ARGS = ("action", "id", "sha256")
+const _PUBLISH_ARGS = ("action", "id", "kind", "binding", "tag", "source", "path", "test", "test_source",
+                       "test_timeout_s", "note")
 # Passed to the host as they are; the host checks them.
-const _HOST_ACTIONS = ("status", "approve", "pin", "unpin", "update", "fetch", "send", "inbox", "ack")
-# Kept in `TeamLab`: the hash each bound tool was loaded from. A tool name
-# cannot start with `#`, so this cannot collide with one.
+const _HOST_ACTIONS = ("status", "browse", "approve", "pin", "unpin", "update", "fetch", "send", "inbox", "ack")
+# Kept in `TeamLab`: the hash each binding was loaded from. A binding cannot
+# start with `#`, so this cannot collide with one.
 const _LOADED = Symbol("#teamlab_loaded")
 
 function _host(params::Dict{String,Any})
@@ -32,25 +35,53 @@ end
 _text(args, key) = (v = get(args, key, nothing); v === nothing || v isa AbstractString ? v :
                     throw(ArgumentError("teamlab '$key' must be a string")))
 
-# Loads `source` into a fresh module and returns the
-# tool: the module's binding of that name.
-function _load(name::AbstractString, source::AbstractString, label::AbstractString)
-    mod = Module(Symbol("TeamLab_", name))  # not `name`: a module binds its own name
+_kind_of(value) = value isa Module ? "module" : value isa Function ? "function" : nothing
+
+# The names a tool's module defines that could be the tool: its own functions
+# and submodules, not `_helpers`, imports or the module's own plumbing.
+function _candidates(mod::Module)
+    skip = (:eval, :include, :Palette, nameof(mod))
+    found = Pair{String,Any}[]
+    for sym in Base.invokelatest(names, mod; all=true)
+        name = String(sym)
+        (sym in skip || startswith(name, '_') || startswith(name, '#')) && continue
+        Base.invokelatest(isdefined, mod, sym) || continue
+        value = Base.invokelatest(getglobal, mod, sym)
+        _kind_of(value) !== nothing && value !== mod && parentmodule(value) === mod && push!(found, name => value)
+    end
+    return found
+end
+
+# Loads `source` into a fresh module and returns the tool's binding and value:
+# `binding` when given, else the one function (or module, for kind "module")
+# the source defines.
+function _load(kind, binding, source::AbstractString, label::AbstractString)
+    mod = Module(Symbol("#teamlab_tool"))  # a name no source can define
     world = Palette.get_kernel_state().eval_module
     Core.eval(mod, :(const Palette = $(Base.invokelatest(getglobal, world, :Palette))))
     Base.include_string(mod, source, label)
-    sym = Symbol(name)
-    Base.invokelatest(isdefined, mod, sym) ||
-        throw(ArgumentError("a TeamLab tool named $name must define `$name`; the source defines no such binding"))
-    return Base.invokelatest(getglobal, mod, sym)
+    if binding === nothing
+        found = [c for c in _candidates(mod) if kind === nothing || _kind_of(c.second) == kind]
+        what = kind === nothing ? "function or module" : kind
+        isempty(found) && throw(ArgumentError("the source defines no $what to list; name it with 'binding'"))
+        length(found) > 1 && throw(ArgumentError(
+            "the source defines several: $(join(first.(found), ", ")). Pass 'binding' to say which is the tool, or start the helpers' names with _"))
+        binding = only(found).first
+    end
+    sym = Symbol(binding)
+    Base.invokelatest(isdefined, mod, sym) || throw(ArgumentError("the source defines no `$binding`"))
+    value = Base.invokelatest(getglobal, mod, sym)
+    kind === nothing || _kind_of(value) == kind ||
+        throw(ArgumentError("`$binding` is a $(something(_kind_of(value), typeof(value))), not a $kind"))
+    return String(binding), value
 end
 
 # Runs the tool's test in a fresh Julia process, beside a copy of the tool
-# saved as `<name>.jl`, so the test can `include("<name>.jl")`.
-function _run_test(name::AbstractString, source::AbstractString, test::AbstractString, timeout_s::Real)
+# saved as `<binding>.jl`, so the test can `include("<binding>.jl")`.
+function _run_test(binding::AbstractString, source::AbstractString, test::AbstractString, timeout_s::Real)
     mktempdir() do dir
-        write(joinpath(dir, "$name.jl"), source)
-        script = joinpath(dir, "test_$name.jl")
+        write(joinpath(dir, "$binding.jl"), source)
+        script = joinpath(dir, "test_$binding.jl")
         write(script, test)
         project = Base.active_project()
         flags = project === nothing ? String[] : ["--project=$project"]
@@ -77,8 +108,12 @@ end
 
 function _publish(args)
     _check_keys(args, _PUBLISH_ARGS)
-    name = _text(args, "name")
-    name === nothing && throw(ArgumentError("teamlab publish requires the tool's 'name'"))
+    id, kind, binding = _text(args, "id"), _text(args, "kind"), _text(args, "binding")
+    if id !== nothing
+        listing = _host(Dict{String,Any}("action" => "fetch", "id" => id))
+        kind, binding = something(kind, listing["kind"]), something(binding, listing["binding"])
+    end
+    kind === nothing || kind in ("function", "module") || throw(ArgumentError("teamlab 'kind' must be function or module"))
     source, path = _text(args, "source"), _text(args, "path")
     (source === nothing) == (path === nothing) &&
         throw(ArgumentError("teamlab publish takes the tool as 'source' (its code) or 'path' (a file this kernel can read), one of them"))
@@ -91,12 +126,14 @@ function _publish(args)
     timeout_s isa Real && 0 < timeout_s <= 300 || throw(ArgumentError("teamlab 'test_timeout_s' must be a number of seconds, at most 300"))
 
     # A tool that does not load in its author's world would not load in anyone's.
-    _load(name, source, "teamlab-check://$name.jl")
-    params = Dict{String,Any}("action" => "publish", "name" => name, "source" => source)
-    haskey(args, "note") && (params["note"] = args["note"])
+    binding, value = _load(kind, binding, source, "teamlab-check://$(something(binding, "tool")).jl")
+    params = Dict{String,Any}("action" => "publish", "kind" => _kind_of(value), "binding" => binding, "source" => source)
+    for key in ("id", "tag", "note")
+        haskey(args, key) && (params[key] = args[key])
+    end
     if test_source !== nothing
-        passed, summary = _run_test(name, source, test_source, timeout_s)
-        passed || return Dict{String,Any}("published" => false, "name" => name,
+        passed, summary = _run_test(binding, source, test_source, timeout_s)
+        passed || return Dict{String,Any}("published" => false, "binding" => binding,
                                          "reason" => "its test failed, so it was not published", "test_output" => summary)
         params["test"] = Dict("passed" => true, "summary" => summary)
     end
@@ -118,6 +155,23 @@ function _shelf()
     return shelf
 end
 
+# Loads one version the host sent into `TeamLab`, checking its hash first.
+# Returns the hash the binding held before, or nothing.
+function _bind!(shelf::Module, t)
+    binding, sha, source = t["binding"], t["sha256"], t["source"]
+    bytes2hex(SHA.sha256(source)) == sha || error("the host sent source that does not match its hash")
+    _, tool = _load(t["kind"], binding, source, "teamlab://$(t["id"])/$(first(sha, 12)).jl")
+    loaded = Base.invokelatest(getglobal, shelf, _LOADED)
+    before = get(loaded, binding, nothing)
+    Core.eval(shelf, :(global $(Symbol(binding)) = $tool))
+    loaded[binding] = sha
+    return before
+end
+
+_described(t) = Dict{String,Any}(k => t[k] for k in ("id", "kind", "binding", "tag", "version", "author", "sha256"))
+
+const _USE = "call it as TeamLab.<binding>(...) from your next call; in this one, Base.invokelatest(TeamLab.<binding>, ...)"
+
 function _sync(args)
     _check_keys(args, _SYNC_ARGS)
     reply = _host(Dict{String,Any}("action" => "sync"))
@@ -125,47 +179,66 @@ function _sync(args)
     loaded = Base.invokelatest(getglobal, shelf, _LOADED)
     done, current, failed = Dict{String,Any}[], String[], Dict{String,Any}[]
     for t in reply["tools"]
-        name, sha, source = t["name"], t["sha256"], t["source"]
-        if bytes2hex(SHA.sha256(source)) != sha
-            push!(failed, Dict("name" => name, "error" => "the host sent source that does not match its hash"))
-            continue
-        end
-        if get(loaded, name, nothing) == sha
-            push!(current, name)
+        if get(loaded, t["binding"], nothing) == t["sha256"]
+            push!(current, t["binding"])
             continue
         end
         try
-            tool = _load(name, source, "teamlab://$name/$(first(sha, 12)).jl")
-            Core.eval(shelf, :(global $(Symbol(name)) = $tool))
-            loaded[name] = sha
-            push!(done, Dict{String,Any}("name" => name, "version" => t["version"], "author" => t["author"], "sha256" => sha))
+            _bind!(shelf, t)
+            push!(done, _described(t))
         catch e
-            push!(failed, Dict("name" => name, "error" => sprint(showerror, e)))
+            push!(failed, Dict("id" => t["id"], "binding" => t["binding"], "error" => sprint(showerror, e)))
         end
     end
     return Dict{String,Any}(
         "agent" => reply["agent"], "loaded" => done, "current" => current, "failed" => failed,
-        "missing" => reply["missing"], "behind" => reply["behind"], "unread" => reply["unread"],
-        "use" => "call a tool as TeamLab.<name>(...) from your next call; in this one, Base.invokelatest(TeamLab.<name>, ...)",
+        "missing" => reply["missing"], "behind" => reply["behind"], "clashes" => reply["clashes"],
+        "unread" => reply["unread"], "use" => _USE,
     )
+end
+
+# Loads one listing to try it, without pinning it.
+function _try(args)
+    _check_keys(args, _TRY_ARGS)
+    params = Dict{String,Any}("action" => "fetch")
+    for key in ("id", "sha256")
+        haskey(args, key) && (params[key] = args[key])
+    end
+    t = _host(params)
+    before = _bind!(_shelf(), t)
+    return merge(_described(t), Dict{String,Any}(
+        "replaced" => before, "pinned" => false, "use" => _USE,
+        "keep" => "pin it (action \"pin\", \"id\") to keep it: sync loads only what you pin, and a pin on another listing with this binding replaces it",
+    ))
 end
 
 """
     teamlab(arguments::Dict{String,Any}) -> Dict{String,Any}
 
-The `teamlab` capability. `arguments["action"]` is one of:
+The `teamlab` capability: a shop of Julia tools this user's agents share. A
+listing has an `id`, a `kind` ("function" or "module"), a `tag` (what it
+does, in 15 words or fewer) and the `binding` its source defines.
+`arguments["action"]` is one of:
 
-- `status` (the default): the shelf's tools, which version this agent has
-  pinned and whether it is behind, unread mail.
-- `publish`: `name` and `source` or `path`; optional `test` (a file) or
+- `status` (the default): what this agent pins (and whether a newer version
+  is out), listings new from other agents this week, unread mail.
+- `browse`: every listing, newest first; optional `query` keeps those whose
+  kind, binding, tag, author or id hold every word.
+- `try`: `id`, optional `sha256`: loads that listing as `TeamLab.<binding>`
+  without pinning it.
+- `publish`: `source` or `path`, and a `tag` for a new listing. The `binding`
+  is the one function or module the source defines unless named (start
+  helpers' names with `_`), and `kind` defaults to what the binding is.
+  `id` adds a version to that listing, anyone's; without it, a version goes to
+  your own listing of the same binding. Optional `test` (a file) or
   `test_source`, run first in a fresh Julia beside the tool saved as
-  `<name>.jl`; optional `note`. Pins the new version for its author.
-- `approve`, `pin`: `name`, optional `sha256` (default: the newest version).
-- `unpin`: `name`. `update`: optional `names` (default: every pinned tool),
+  `<binding>.jl`; optional `note`. Pins the new version for its author.
+- `approve`, `pin`: `id`, optional `sha256` (default: the newest version).
+- `unpin`: `id`. `update`: optional `ids` (default: every pinned listing),
   moved to the newest version.
-- `sync`: loads every pinned tool into this world as `TeamLab.<name>`.
-- `fetch`: `name`, optional `sha256`: one version with its source.
-- `send`: `to` (an agent or "all"), `subject`, optional `body`, `tool`, `sha256`.
+- `sync`: loads every pinned listing into this world as `TeamLab.<binding>`.
+- `fetch`: `id`, optional `sha256`: one version with its source.
+- `send`: `to` (an agent or "all"), `subject`, optional `body`, `listing`, `sha256`.
 - `inbox`: optional `all` (include read mail). `ack`: `ids`, a list or "all".
 """
 function teamlab(arguments::Dict{String,Any})
@@ -173,6 +246,7 @@ function teamlab(arguments::Dict{String,Any})
     action isa AbstractString || throw(ArgumentError("teamlab 'action' must be a string"))
     action == "publish" && return _publish(arguments)
     action == "sync" && return _sync(arguments)
-    action in _HOST_ACTIONS || throw(ArgumentError("teamlab 'action' must be one of publish, sync, $(join(_HOST_ACTIONS, ", "))"))
+    action == "try" && return _try(arguments)
+    action in _HOST_ACTIONS || throw(ArgumentError("teamlab 'action' must be one of publish, try, sync, $(join(_HOST_ACTIONS, ", "))"))
     return _host(Dict{String,Any}(arguments..., "action" => action))
 end

@@ -53,7 +53,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
             "PALETTE_PROJECT_ROOTS": "{}",
             "PALETTE_PATCH_ROOTS": "{}",
             "PALETTE_READ_ROOTS": "",
-            # Never the user's own shelf.
+            # Never the user's own shop.
             "PALETTE_TEAMLAB_DIR": str(root / "teamlab"),
         }
         for key in ("PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG",
@@ -597,14 +597,14 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.assertIn("teamlab", found["authorized_capabilities"])
         self.assertEqual(found["authorized_ceiling"]["teamlab"], {"enabled": True})
         # The test runs in a second Julia inside the sandbox.
-        published = self.call("palette", {"code": 'tl("action"=>"publish", "name"=>"probe", "source"=>"probe(x) = 2x + 1\\n", '
+        published = self.call("palette", {"code": 'tl("action"=>"publish", "tag"=>"Doubles a number and adds one", "source"=>"probe(x) = 2x + 1\\n", '
                                                   '"test_source"=>"using Test; include(\\"probe.jl\\"); @test probe(20) == 41")'})["data"]
         self.assertEqual(published["published"], True, published)
         synced = self.call("palette", {"code": 'tl("action"=>"sync")'})["data"]
-        self.assertEqual([t["name"] for t in synced["loaded"]], ["probe"], synced)
+        self.assertEqual([t["binding"] for t in synced["loaded"]], ["probe"], synced)
         self.assertEqual(synced["agent"], "claude")
         self.assertEqual(self.call("palette", {"code": "TeamLab.probe(10)"})["data"], 21)
-        # The kernel cannot reach the shelf itself.
+        # The kernel cannot reach the shop itself.
         lab = Path(self.env["PALETTE_TEAMLAB_DIR"])
         self.assertTrue(lab.is_dir())
         unseen = self.call("palette", {"code": f"isdir({json.dumps(str(lab))})"})["data"]

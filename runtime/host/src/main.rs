@@ -6,6 +6,7 @@
 //!   palette-host broker     --socket PATH --ceiling C --receipts FILE [--session-id ID] [--project P --repo R --depot D]
 //!   palette-host subset     REQUESTED_JSON PARENT_JSON
 //!   palette-host prewarm    --project-dir P [--repo-dir R]
+//!   palette-host teamlab-news [--agent A]
 
 mod broker;
 mod cli;
@@ -143,6 +144,17 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
     Ok(code)
 }
 
+/// One line of TeamLab news for a session-start hook, or nothing. It never
+/// fails the hook: any problem prints nothing and exits 0.
+fn teamlab_news(argv: &[String]) -> Result<i32, String> {
+    let agent = flags(argv, &[]).ok().and_then(|f| f.get("agent").cloned())
+        .filter(|a| teamlab::valid_agent(a)).unwrap_or_else(teamlab::default_agent);
+    if let Some(line) = teamlab::user_dir().and_then(|dir| teamlab::news_line(&dir, &agent)) {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let rest = argv.get(2..).unwrap_or(&[]);
@@ -152,7 +164,8 @@ fn main() {
         Some("broker") => run_broker(rest),
         Some("subset") => subset(rest),
         Some("prewarm") => prewarm(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm ...".into()),
+        Some("teamlab-news") => teamlab_news(rest),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
