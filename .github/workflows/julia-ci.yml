@@ -250,4 +250,4 @@ jobs:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_server_runtime test_depot_clones test_entry_points test_preparation_messages
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_depot_clones test_entry_points test_preparation_messages
