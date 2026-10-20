@@ -1,0 +1,258 @@
+//! The operator verification gates: Julia, Rust and the real conformance
+//! suites, against both hosts or one, whole or as shard I of N.
+
+use crate::timings::{self, Shard};
+use crate::Fail;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// Prints a unittest module's case ids as `Class.method`. The suites stay
+/// Python until they move into the host's own tests.
+const LIST_TESTS: &str = r#"
+import json, sys, unittest
+def ids(suite):
+    for test in suite:
+        yield from ids(test) if isinstance(test, unittest.TestSuite) else [test.id().split(".", 1)[1]]
+print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[1])))))
+"#;
+
+/// Suites that start no session host.
+const SHARED_SUITES: [&str; 7] = [
+    "runtime/security/test_provisioning.py",
+    "runtime/security/test_patch_broker.py",
+    "runtime/security/test_workspace_router.py",
+    "runtime/security/test_receipt_query.py",
+    "runtime/security/test_read_roots.py",
+    "runtime/security/test_palette_daemon.py",
+    "runtime/integrations/gesso/test_gesso.py",
+];
+/// Suites run once per host implementation.
+const HOST_SUITES: [&str; 8] = [
+    "test_authority.py",
+    "test_session.py",
+    "test_session_cli.py",
+    "test_revival.py",
+    "test_host_bridge.py",
+    "test_contexts.py",
+    "test_time_machine.py",
+    "test_tools.py",
+];
+/// Receipts are the Rust host's, and test_host_command runs the Python broker itself.
+const RUST_ONLY_SUITES: [&str; 2] = ["test_xray.py", "test_host_command.py"];
+
+macro_rules! argv {
+    ($($word:expr),* $(,)?) => { vec![$(OsString::from($word)),*] };
+}
+
+struct Run {
+    suite: PathBuf,
+    implementation: Option<&'static str>,
+    /// PALETTE_HOST_BIN for the suite: the Rust host, or unset for Python.
+    host: Option<PathBuf>,
+}
+
+struct Gates {
+    root: PathBuf,
+    project: PathBuf,
+}
+
+impl Gates {
+    fn command(&self, argv: &[OsString], host: Option<&Path>) -> Command {
+        let mut c = Command::new(&argv[0]);
+        c.args(&argv[1..])
+            .current_dir(&self.root)
+            .env("PALETTE_REPO_DIR", &self.root)
+            .env("PALETTE_TEST_PROJECT_DIR", &self.project)
+            .stdin(Stdio::null());
+        match host {
+            Some(h) => c.env("PALETTE_HOST_BIN", h),
+            None => c.env_remove("PALETTE_HOST_BIN"),
+        };
+        c
+    }
+
+    fn run(&self, argv: Vec<OsString>, host: Option<&Path>) -> Result<(), Fail> {
+        let shown = argv.iter().map(|w| w.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        println!("\nverification: {shown}");
+        let status = self.command(&argv, host).status().map_err(|e| format!("{shown}: {e}"))?;
+        if !status.success() {
+            return Err(Fail::Failed(format!("verification failed ({status}): {shown}")));
+        }
+        Ok(())
+    }
+
+    /// Every case in `runs`, as (run, `Class.method`), in listing order.
+    fn cases(&self, runs: &[Run]) -> Result<Vec<(usize, String)>, Fail> {
+        let mut cases = Vec::new();
+        for (i, run) in runs.iter().enumerate() {
+            let stem = stem(&run.suite);
+            let out = self
+                .command(&["python3".into(), "-c".into(), LIST_TESTS.into(), stem.into()], run.host.as_deref())
+                .current_dir(run.suite.parent().expect("suites live in a directory"))
+                .stderr(Stdio::inherit())
+                .output()
+                .map_err(|e| format!("listing {stem}: {e}"))?;
+            if !out.status.success() {
+                return Err(Fail::Failed(format!("listing the cases of {stem} failed ({})", out.status)));
+            }
+            let ids: Vec<String> = serde_json::from_slice(&out.stdout).map_err(|e| format!("listing {stem}: {e}"))?;
+            cases.extend(ids.into_iter().map(|id| (i, id)));
+        }
+        Ok(cases)
+    }
+
+    fn run_suites(&self, shard: &Shard, runs: &[Run]) -> Result<(), Fail> {
+        let mine: Option<Vec<(usize, String)>> = if shard.count == 1 {
+            None
+        } else {
+            let cases = self.cases(runs)?;
+            let keys: Vec<String> = cases.iter().map(|(i, id)| format!("{}:{id}", stem(&runs[*i].suite))).collect();
+            let dealt = shard.deal(&keys, &timings::load(&self.root.join(timings::WEIGHTS))?);
+            Some(cases.into_iter().zip(dealt).filter_map(|(case, m)| m.then_some(case)).collect())
+        };
+        let mut current = None;
+        for (i, run) in runs.iter().enumerate() {
+            if run.implementation.is_some() && run.implementation != current {
+                println!("\noperator implementation: {}", run.implementation.unwrap_or_default());
+                current = run.implementation;
+            }
+            let mut words = argv!["python3", &run.suite, "-v"];
+            if let Some(mine) = &mine {
+                let tests: Vec<&String> = mine.iter().filter(|(r, _)| *r == i).map(|(_, id)| id).collect();
+                if tests.is_empty() {
+                    println!("\nverification: {} has no cases in shard {}/{}", file_name(&run.suite), shard.index, shard.count);
+                    continue;
+                }
+                words.extend(tests.into_iter().map(OsString::from));
+            }
+            self.run(words, run.host.as_deref())?;
+        }
+        Ok(())
+    }
+}
+
+fn stem(p: &Path) -> &str {
+    p.file_stem().and_then(|s| s.to_str()).unwrap_or_default()
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .filter(|d| !d.as_os_str().is_empty())
+            .any(|d| d.join(name).metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    })
+}
+
+struct Args {
+    project: PathBuf,
+    implementations: Vec<&'static str>,
+    shard: Shard,
+}
+
+fn parse(args: &[String]) -> Result<Args, String> {
+    let (mut project, mut implementation, mut shard) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) if k.starts_with("--") => (k, Some(v.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let slot = match key {
+            "--project-dir" => &mut project,
+            "--implementation" => &mut implementation,
+            "--shard" => &mut shard,
+            _ => return Err(format!("unrecognized argument: {arg}")),
+        };
+        *slot = Some(inline.or_else(|| it.next().cloned()).ok_or_else(|| format!("{key} needs a value"))?);
+    }
+    let project: String = project.ok_or("--project-dir is required")?;
+    let implementations = match implementation.as_deref().unwrap_or("both") {
+        "both" => vec!["rust", "python"],
+        "rust" => vec!["rust"],
+        "python" => vec!["python"],
+        other => return Err(format!("--implementation must be both, rust or python, not {other}")),
+    };
+    let project = std::path::absolute(&project).map_err(|e| format!("{project}: {e}"))?;
+    Ok(Args { project, implementations, shard: Shard::parse(shard.as_deref().unwrap_or("1/1"))? })
+}
+
+pub fn main(args: &[String]) -> Result<(), Fail> {
+    let Args { project, implementations, shard } = parse(args).map_err(Fail::Usage)?;
+    if !project.join("Project.toml").is_file() || !project.join("Manifest.toml").is_file() {
+        return Err(Fail::Usage("the test project must be instantiated before verification".into()));
+    }
+    for binary in ["bwrap", "julia", "cargo", "node", "python3"] {
+        if !on_path(binary) {
+            return Err(Fail::Usage(format!("required verification binary missing: {binary}")));
+        }
+    }
+    let root = crate::root();
+    let gates = Gates { root: root.clone(), project: project.clone() };
+    let host_manifest = root.join("runtime/host/Cargo.toml");
+    // This is a test dependency check, not an automatic operator installation.
+    gates.run(
+        argv![
+            "julia",
+            "--startup-file=no",
+            format!("--project={}", project.display()),
+            "-e",
+            "using Palette, JSON, CSV, DataFrames, EzXML, IJulia; \
+             realpath(dirname(dirname(pathof(Palette)))) == realpath(ARGS[1]) || \
+             error(\"Test environment points to a different Palette source tree\")",
+            &root,
+        ],
+        None,
+    )?;
+    if shard.index == 1 {
+        gates.run(argv!["git", "diff", "--check"], None)?;
+        gates.run(argv!["node", root.join("runtime/scripts/check-test-policy.mjs")], None)?;
+        gates.run(argv!["julia", "--startup-file=no", format!("--project={}", root.display()), root.join("test/runtests.jl")], None)?;
+        gates.run(argv!["cargo", "test", "--manifest-path", &host_manifest], None)?;
+        gates.run(argv!["cargo", "test", "--locked", "--manifest-path", root.join("runtime/xtask/Cargo.toml")], None)?;
+        gates.run(argv!["python3", root.join("runtime/security/test_fs_digest.py"), "-v"], None)?;
+    }
+    gates.run(argv!["cargo", "build", "--release", "--manifest-path", &host_manifest], None)?;
+    let host = root.join("runtime/host/target/release/palette-host");
+    gates.run(
+        argv!["python3", root.join("runtime/security/prewarm_depot.py"), "--project-dir", &project, "--repo-dir", &root, "--host-bin", &host],
+        None,
+    )?;
+    let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: root.join(s), implementation: None, host: None }).collect();
+    for implementation in implementations {
+        let host = (implementation == "rust").then(|| host.clone());
+        let suites = HOST_SUITES.iter().chain(if implementation == "rust" { &RUST_ONLY_SUITES[..] } else { &[] });
+        runs.extend(suites.map(|s| Run { suite: root.join("runtime/security").join(s), implementation: Some(implementation), host: host.clone() }));
+    }
+    gates.run_suites(&shard, &runs)?;
+    println!("\nAll operator verification gates passed (shard {}/{}).", shard.index, shard.count);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_flags_with_and_without_equals() {
+        let a = parse(&strings(&["--project-dir", "env", "--implementation=rust", "--shard", "3/4"])).unwrap();
+        assert!(a.project.is_absolute() && a.project.ends_with("env"));
+        assert_eq!(a.implementations, ["rust"]);
+        assert_eq!((a.shard.index, a.shard.count), (3, 4));
+        let d = parse(&strings(&["--project-dir=/e"])).unwrap();
+        assert_eq!(d.implementations, ["rust", "python"]);
+        assert_eq!((d.shard.index, d.shard.count), (1, 1));
+        for bad in [&["--shard", "1/4"][..], &["--project-dir"], &["--project-dir", "e", "--implementation", "go"], &["--project-dir", "e", "--shard", "5/4"], &["--project-dir", "e", "x"]] {
+            assert!(parse(&strings(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
+}

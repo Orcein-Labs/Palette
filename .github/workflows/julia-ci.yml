@@ -132,7 +132,7 @@ jobs:
         # the conformance oracle until it is removed (runtime/docs/authority.md)
         # and runs nightly and on manual dispatch.
         implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
-        # verify_operator.py runs the shared gates on shard 1 and deals the test
+        # cargo xtask verify runs the shared gates on shard 1 and deals the test
         # cases across the shards by runtime/security/test-case-seconds.json.
         shard: [1, 2, 3, 4]
 
@@ -193,7 +193,7 @@ jobs:
 
     - name: Run the canonical operator gates
       run: >-
-        python3 runtime/security/verify_operator.py
+        cargo xtask verify
         --project-dir "$GITHUB_WORKSPACE/security-test-env"
         --implementation "${{ matrix.implementation }}"
         --shard "${{ matrix.shard }}/4"
