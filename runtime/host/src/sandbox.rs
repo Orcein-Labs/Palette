@@ -851,6 +851,13 @@ fn snapshot_names(root: &Path) -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Whether `depot` has a published snapshot.
+pub fn has_depot_snapshot(depot: &Path) -> bool {
+    depot_snapshot_root(depot).is_some_and(|root| {
+        fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) && snapshot_names(&root).is_ok_and(|n| !n.is_empty())
+    })
+}
+
 /// The newest snapshot of `depot`, held, or None when it has none.
 fn hold_depot_snapshot(depot: &Path) -> Result<Option<HeldSnapshot>, String> {
     use std::os::unix::fs::MetadataExt;
