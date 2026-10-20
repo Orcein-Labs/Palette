@@ -139,11 +139,7 @@ let state = Palette.get_kernel_state()
     with_hint(e.result.error, "")
     text_display(r.result.data); bounded_data(r.result.data); bounded_data(Dict("a" => [1]))
     scrub(out); with_hint("x", "y"); safe_json(Dict{String,Any}("a" => 1))
-    empty!(state.execution_history)
-    empty!(state.receipt_log)
-    empty!(Palette.TURN_COSTS)
-    empty!(Palette.DEFINITION_LOG); empty!(Palette.CALL_FILES); empty!(Palette.USED_FILES); empty!(Palette.BINDING_SEEN)
-    empty!(Palette.BINDING_ORIGINS); empty!(Palette.BINDING_IDENTITIES)
+    Palette.reset_kernel_state!()
     Core.eval(state.eval_module, Expr(:global, Expr(:(=), :ans, nothing)))
     Palette.REVIVAL_REPORT[] = try
         Base.invokelatest(Palette.revive_state!)
@@ -154,7 +150,6 @@ let state = Palette.get_kernel_state()
     end
     Palette.REVIVAL_REPORT[] = Palette.restore_report(Palette.REVIVAL_REPORT[])
     # Project and trusted tools: a stub per tool, so the first call loads it.
-    empty!(Palette.TOOL_USES)
     try
         Base.invokelatest(Palette.install_tool_stubs!, state.eval_module)
     catch e
