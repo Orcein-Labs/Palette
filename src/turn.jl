@@ -335,8 +335,8 @@ const SINK_PATH = Ref("")
 const SINK_READ = Ref(0)
 const MAX_BACKGROUND_BYTES = 16 * 1024
 # Output already reported is dropped once a file holding it passes this size:
-# the sandbox's /tmp is memory, and a chatty background job (50 KB/s in the
-# endurance pass) grew it by 4 GB a day. Every writer holds these files in
+# the sandbox's /tmp is memory, and a chatty background job (50 KB/s in a
+# long trial run) grew it by 4 GB a day. Every writer holds these files in
 # append mode, so truncating them is safe.
 const MAX_REPORTED_BYTES = 1024 * 1024
 function drop_reported!(path::String, read_to::Int)
@@ -399,8 +399,8 @@ end
 function bound_tasks(mod::Module)
     byname = IdDict{Task, Symbol}()
     for sym in sort!(Base.invokelatest(names, mod; all=true); by=s -> s === :ans)
-        Base.invokelatest(isdefined, mod, sym) || continue
-        t = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        t = latest_global(mod, sym)
         t isa Task && !haskey(byname, t) && (byname[t] = sym)
     end
     return sort!(collect(byname); by=p -> string(p[2]))
@@ -439,14 +439,13 @@ fmt_age(s) = s < 60 ? "$(round(Int, s))s" : s < 3600 ? "$(round(Int, s / 60))m" 
 # what runs, and what finished and waits to be collected.
 # host_command jobs this kernel started, by asking the broker only while
 # there are some: a job that finished is named once, with the poll that
-# returns its result.
-const HOST_FINISH_REPORTED = Set{String}()
+# returns its result, and is then no longer tracked.
 function report_host_jobs!(running::Vector{String}, finished::Vector{String})
     isempty(HOST_JOBS) && return
     # The line runs before the call's code and outside its deadline, so a
     # broker slow to answer skips it rather than holding up the call.
     listed = try
-        host_jobs(; timeout_s=10)
+        host_jobs(; timeout_s=1)
     catch e
         push!(running, "host jobs (listing them failed: $(sprint(showerror, e)))")
         return
@@ -457,14 +456,14 @@ function report_host_jobs!(running::Vector{String}, finished::Vector{String})
         push!(held, id)
         if j["running"] === true
             push!(running, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\"))")
-        elseif !(id in HOST_FINISH_REPORTED)
-            push!(HOST_FINISH_REPORTED, id)
+        else
+            delete!(HOST_JOBS, id)
             push!(finished, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\") returns its result)")
         end
     end
     # Jobs the broker no longer holds (its session restarted) are gone.
     for id in collect(keys(HOST_JOBS))
-        id in held || (delete!(HOST_JOBS, id); delete!(HOST_FINISH_REPORTED, id))
+        id in held || delete!(HOST_JOBS, id)
     end
 end
 
@@ -644,8 +643,8 @@ end
 
 function binding_provenance(name::Symbol; strong::Bool=false)
     mod = get_kernel_state().eval_module
-    Base.invokelatest(isdefined, mod, name) || return Dict("name" => string(name), "state" => "not_bound", "epoch" => TASK_EPOCH[])
-    value = Base.invokelatest(getglobal, mod, name)
+    latest_isdefined(mod, name) || return Dict("name" => string(name), "state" => "not_bound", "epoch" => TASK_EPOCH[])
+    value = latest_global(mod, name)
     seen = get(BINDING_SEEN, name, nothing)
     call = seen === nothing ? nothing : seen[2]
     origin = get(BINDING_ORIGINS, name, Dict{String, Any}())
@@ -694,8 +693,8 @@ function binding_list!(mod::Module, call::Int)
     definitions = IdDict{Any, Any}()
     for sym in sort!(Base.invokelatest(names, mod; all=true))
         session_binding(mod, sym) || continue
-        Base.invokelatest(isdefined, mod, sym) || continue
-        v = Base.invokelatest(getglobal, mod, sym)
+        latest_isdefined(mod, sym) || continue
+        v = latest_global(mod, sym)
         push!(live, sym)
         id = objectid(v)
         seen = get(BINDING_SEEN, sym, nothing)
@@ -767,18 +766,30 @@ function changes_since_ack(; acknowledge::Bool=false)
 end
 
 """
-    execute_turn(code, timeout_s) -> ((receipt, interrupted, stuck), output)
+    execute_turn(code, timeout_s; context=nothing) -> ((receipt, interrupted, stuck), output)
 
 One persistent turn: report what happened in the background and which used
 files changed, reload edited workspace packages, run `code` under the
-deadline, and capture everything it printed.
+deadline in `context` (nothing is normal), and capture everything it printed.
+While it runs, CURRENT_CALL and CALL_CONTEXT name this call, so its
+capability requests and context records land in its X-Ray.
 """
-function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing)
+function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing, context=nothing)
+    call = next_call()
+    CURRENT_CALL[] = call
+    CALL_CONTEXT[] = context
+    try
+        return run_execute_turn(code, timeout_s, call, context, session_request)
+    finally
+        CURRENT_CALL[] = 0
+        CALL_CONTEXT[] = nothing
+    end
+end
+
+function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call::Int, ctx, session_request)
     state = get_kernel_state()
-    call = length(state.execution_history) + 1
     # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
     # is the first one an agent pays for.
-    ctx = CALL_CONTEXT[]
     budget = ctx === nothing ? nothing : ctx["budget"]
     costs = Dict{String, Any}("call" => call, "phase" => "maintenance", "first_call_in_kernel" => isempty(TURN_COSTS),
         "context" => context_name(ctx),

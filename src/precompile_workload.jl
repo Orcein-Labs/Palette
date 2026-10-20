@@ -1,8 +1,8 @@
-# Runs only while the package is being precompiled. A new kernel used to
-# compile its whole turn path while the model waited for the first reply:
-# JSON both ways, execute's success and error paths, output capture, the
-# deadline machinery and the shaping of values for the protocol. Running
-# representative turns here caches that native code with the package.
+# Runs only while the package is being precompiled. Representative turns here
+# cache the native code of the whole turn path with the package, so a new
+# kernel does not compile it while the model waits for the first reply: JSON
+# both ways, execute's success and error paths, output capture, the deadline
+# machinery and the shaping of values for the protocol.
 #
 # Every failure is swallowed: a workload problem must never fail the build,
 # only leave some code uncompiled. Turn code runs in WorkloadScope, since
@@ -104,37 +104,7 @@ end
         # Everything after the failing line goes uncompiled, and the kernel's first calls are slow.
         @warn "precompile workload stopped early" exception=(e, catch_backtrace())
     finally
-        isempty(STATE_DIR[]) || rm(STATE_DIR[]; recursive=true, force=true)
-        STATE_DIR[] = ""
-        REVIVAL_REPORT[] = ""
-        revival_observation!()
-        LAST_SAVED_CALL[] = 0
-        LAST_SNAPSHOT_SECONDS[] = 0.0
-        GLOBAL_STATE[] = nothing
-        empty!(OUTPUTS)
-        empty!(WORKSPACE_PACKAGES)
-        empty!(WORKSPACE_DECLARATIONS)
-        empty!(RELOAD_REPORTS)
-        RELOAD_SEQUENCE[] = 0
-        empty!(USED_FILES)
-        empty!(DEFINITION_LOG)
-        empty!(CALL_FILES)
-        foreach(f -> rm(f[1]; force=true), LATE_FILES)
-        empty!(LATE_FILES)
-        empty!(BINDING_SEEN)
-        empty!(BINDING_ORIGINS)
-        empty!(BINDING_IDENTITIES)
-        OBSERVATION_ACK[] = nothing
-        empty!(TURN_COSTS)
-        empty!(LAST_RUNNING[])
-        empty!(REPORTED_TASKS)
-        empty!(FINISH_REPORTED)
-        empty!(HOST_JOBS); empty!(HOST_JOB_RESULTS); empty!(HOST_JOB_RESULT_ORDER)
-        empty!(HOST_FINISH_REPORTED)
-        empty!(TASK_OBSERVATIONS)
-        TASK_SEQUENCE[] = 0
-        TASK_EPOCH[] = ""
-        empty!(TOOL_USES); empty!(TOOL_SOURCES); empty!(TOOL_STUBS); empty!(LOADED_TOOLS); empty!(CODE_GRAPHS)
+        reset_kernel_state!(process=true)
     end
     precompile(Base.open, (Base.RawFD,))
 end

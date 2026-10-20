@@ -76,11 +76,19 @@ class KernelTestCase(unittest.TestCase):
         if shutil.which("bwrap") is None or not Path(PROJECT_DIR).exists():
             self.fail("needs bwrap and the prepared test project")
         self.ws = tempfile.mkdtemp(prefix="palette-revival-ws-")
+        self.addCleanup(shutil.rmtree, self.ws, True)
         self.state = tempfile.mkdtemp(prefix="palette-revival-state-")
+        self.addCleanup(shutil.rmtree, self.state, True)
 
-    def tearDown(self):
-        shutil.rmtree(self.ws, ignore_errors=True)
-        shutil.rmtree(self.state, ignore_errors=True)
+    def kernel(self, state: str | None = None, **kwargs) -> Kernel:
+        """A kernel on the workspace, closed when the test ends if it is still open."""
+        k = Kernel(self.ws, state or self.state, **kwargs)
+        self.addCleanup(k.close)
+        return k
+
+    def ok(self, r: dict) -> dict:
+        self.assertTrue(r["success"], r)
+        return r
 
     def session(self, *codes: str, env: dict | None = None, timeout: float = 20, may_fail: bool = False) -> list[dict]:
         k = Kernel(self.ws, self.state, timeout=timeout, env=env)

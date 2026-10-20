@@ -750,14 +750,14 @@ const _POLYGLOT_EXT_LANG = Dict{String,String}(
 
 const _SKIP_SCAN_DIRS = Set([
     ".git", "vendor", "target", "node_modules", "__pycache__", "build", "dist", "_build", "venv", ".venv",
-    "scratch", "archive", "backup", "tmp", "old", "work(from chatgpt)",
+    "scratch", "archive", "backup", "tmp", "old",
 ])
 
 function _is_scratch_dir(d::AbstractString)::Bool
     startswith(d, ".") && return true
     d in _SKIP_SCAN_DIRS && return true
     dl = lowercase(d)
-    (startswith(dl, "work(") || occursin("(from ", dl) || startswith(dl, "backup_") || startswith(dl, "scratch_")) && return true
+    (startswith(dl, "backup_") || startswith(dl, "scratch_")) && return true
     return false
 end
 
@@ -767,6 +767,11 @@ function _is_scratch_path(rel::AbstractString)::Bool
     end
     return false
 end
+
+# Git's own ignore rules decide when the root is a repository; the name
+# heuristics above decide otherwise.
+_skip_path(rel::AbstractString, git_allowed::Union{Nothing,Set{String}}) =
+    git_allowed === nothing ? _is_scratch_path(rel) : !(rel in git_allowed)
 
 
 const _NOISE_CALLEES = Set([
@@ -976,59 +981,6 @@ function _read_source_lines(root::AbstractString, relpath::AbstractString)::Vect
     end
 end
 
-"""
-    index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true) -> Int
-
-Index symbols from `Palette.codegraph()` (either a `Pharos.CodeGraph` struct or
-a JSON-like `AbstractDict`) into `store` with full duck-type traits (`fields`,
-`callees`, `params`, `arity`, `mutating`). When `include_polyglot=true` and
-`cg.root` is present, also scans additional polyglot files (`.ts`, `.js`, `.go`,
-`.c`, `.cpp`, `.h`, `.cs`) under `cg.root`.
-"""
-function index_codegraph!(store::VecStore, cg::AbstractDict; include_polyglot::Bool=true)::Int
-    symbols = get(cg, "symbols", Any[])
-    symbols isa AbstractVector || throw(ArgumentError("codegraph dict has no symbols array"))
-    primary_buf = zeros(Float32, store.dim)
-    callee_buf = zeros(Float32, store.dim)
-    indexed = 0
-    for sym in symbols
-        sym isa AbstractDict || continue
-        name = String(get(sym, "name", ""))
-        isempty(name) && continue
-        kind = String(get(sym, "kind", "symbol"))
-        lang = String(get(sym, "language", "unknown"))
-        file = String(get(sym, "file", ""))
-        line = Int(get(sym, "line", 0))
-        sig = String(get(sym, "signature", name))
-        raw_calls = String.(get(sym, "calls", get(sym, "callees", Any[])))
-        calls = [c for c in raw_calls if !_is_noise_callee(c)]
-        fields = String.(get(sym, "fields", Any[]))
-        params = String.(get(sym, "params", Any[]))
-        arity = Int(get(sym, "arity", length(params)))
-        mutating = Bool(get(sym, "mutating", endswith(name, "!")))
-        behavior_str = join(vcat(calls, fields, params), " ")
-        id = isempty(file) ? name : "$(file):$(line):$(name)"
-        primary_text = "$(name) $(name) $(name) $(kind) $(lang) $(sig) $(file)"
-        _embed_symbol_with_callees!(primary_buf, callee_buf, primary_text, behavior_str)
-        meta = Dict{String,Any}(
-            "name" => name,
-            "kind" => kind,
-            "language" => lang,
-            "file" => file,
-            "line" => line,
-            "signature" => sig,
-            "callees" => calls,
-            "fields" => fields,
-            "params" => params,
-            "arity" => arity,
-            "mutating" => mutating,
-        )
-        upsert!(store, id, primary_buf; metadata=meta)
-        indexed += 1
-    end
-    return indexed
-end
-
 function _git_nonignored_files(root_dir::AbstractString)::Union{Nothing,Set{String}}
     isempty(root_dir) && return nothing
     ispath(joinpath(root_dir, ".git")) || return nothing
@@ -1041,8 +993,17 @@ function _git_nonignored_files(root_dir::AbstractString)::Union{Nothing,Set{Stri
     end
 end
 
+"""
+    index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true) -> Int
+
+Index symbols from `Palette.codegraph()` (a `Pharos.CodeGraph`) into `store`
+with full duck-type traits (`fields`, `callees`, `params`, `arity`,
+`mutating`). When `include_polyglot=true` and
+`cg.root` is present, also scans additional polyglot files (`.ts`, `.js`, `.go`,
+`.c`, `.cpp`, `.h`, `.cs`) under `cg.root`.
+"""
 function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
-    hasproperty(cg, :files) || throw(ArgumentError("expected a Pharos.CodeGraph or AbstractDict"))
+    hasproperty(cg, :files) || throw(ArgumentError("expected a Pharos.CodeGraph"))
     root_dir = hasproperty(cg, :root) ? String(cg.root) : ""
     git_allowed = _git_nonignored_files(root_dir)
     primary_buf = zeros(Float32, store.dim)
@@ -1050,12 +1011,7 @@ function index_codegraph!(store::VecStore, cg; include_polyglot::Bool=true)::Int
     indexed = 0
 
     for path in sort!(collect(keys(cg.files)))
-        norm_p = replace(String(path), '\\' => '/')
-        if git_allowed !== nothing
-            !(norm_p in git_allowed) && continue
-        else
-            _is_scratch_path(norm_p) && continue
-        end
+        _skip_path(replace(String(path), '\\' => '/'), git_allowed) && continue
         entry = cg.files[path]
         lang = string(entry.language)
         lines = _read_source_lines(root_dir, path)
@@ -1127,11 +1083,7 @@ function _index_extra_polyglot_files!(
             islink(full) && continue
             rel = replace(relpath(full, root_dir), '\\' => '/')
             rel in already_indexed && continue
-            if git_allowed !== nothing
-                !(rel in git_allowed) && continue
-            else
-                _is_scratch_path(rel) && continue
-            end
+            _skip_path(rel, git_allowed) && continue
             lines = _read_source_lines(root_dir, rel)
             isempty(lines) && continue
             defs = _scan_polyglot_defs(lines, lang)
@@ -1638,13 +1590,7 @@ function _action_index_codegraph(args::Dict{String,Any})
 
     _ensure_store_slot!(name)
     cg = root === nothing ? Palette.codegraph() : Palette.codegraph(root)
-    est_cap = if cg isa AbstractDict
-        length(get(cg, "symbols", Any[]))
-    elseif hasproperty(cg, :files)
-        sum((length(e.definitions) for e in values(cg.files)); init=0)
-    else
-        32
-    end
+    est_cap = sum((length(e.definitions) for e in values(cg.files)); init=0)
     cap = clamp(max(est_cap, 32), 32, _MAX_ITEMS)
     store = VecStore(name; dim=dim, capacity=cap)
     _STORES[name] = store

@@ -28,7 +28,7 @@ strip_lines!(ex) = ex isa Expr ? (ex.head === :macrocall && length(ex.args) > 1 
                                    (ex.args[2] = nothing); foreach(strip_lines!, ex.args); ex) : ex
 
 is_tool_stub(mod::Module, sym::Symbol) = (f = get(TOOL_STUBS, sym, nothing)) !== nothing &&
-    Base.invokelatest(isdefined, mod, sym) && Base.invokelatest(getglobal, mod, sym) === f && length(methods(f)) == 1
+    latest_isdefined(mod, sym) && latest_global(mod, sym) === f && length(methods(f)) == 1
 
 # The session's own bindings: not the kernel's, not compiler-generated, not a tool stub.
 session_binding(mod::Module, sym::Symbol) =
@@ -39,11 +39,49 @@ unref(x) = x isa GlobalRef ? Expr(:., foldl((a, b) -> Expr(:., a, QuoteNode(b)),
            x isa Expr ? Expr(x.head, map(unref, x.args)...) : x
 clean_statement(st) = unref(strip_lines!(Base.remove_linenums!(st)))
 
+# DEFINITION_LOG by name, so a call's tool-use check does not scan the whole
+# log. `defs` holds the positions of the "def" entries naming each name, and
+# `by_call` every name a call's entries define. Entries are only appended
+# between revivals; when the log was emptied or replaced, the index is built
+# again from the start.
+mutable struct DefinitionIndex
+    indexed::Int
+    last::Union{Nothing, Dict{String, Any}}
+    defs::Dict{String, Vector{Int}}
+    by_call::Dict{Int, Set{String}}
+end
+const DEF_INDEX = DefinitionIndex(0, nothing, Dict{String, Vector{Int}}(), Dict{Int, Set{String}}())
+
+function clear_definition_index!()
+    ix = DEF_INDEX
+    ix.indexed = 0; ix.last = nothing; empty!(ix.defs); empty!(ix.by_call)
+    return ix
+end
+
+function definition_index()
+    ix, log = DEF_INDEX, DEFINITION_LOG
+    (length(log) < ix.indexed || (ix.indexed > 0 && log[ix.indexed] !== ix.last)) && clear_definition_index!()
+    for i in ix.indexed+1:length(log)
+        e = log[i]
+        names = get!(Set{String}, ix.by_call, e["call"])
+        for n in e["names"]
+            push!(names, n)
+            if e["kind"] == "def"
+                positions = get!(Vector{Int}, ix.defs, n)
+                (isempty(positions) || positions[end] != i) && push!(positions, i)
+            end
+        end
+    end
+    ix.indexed = length(log)
+    ix.last = isempty(log) ? nothing : log[end]
+    return ix
+end
+
 # Definition statements a call's top-level code made for `name`, in order, as
 # source without line comments, and its hash. `nothing` when there are none or
 # one does not print back as source. Computed again only when the entries change.
 function tool_source(name::AbstractString)
-    entries = [e for e in DEFINITION_LOG if e["kind"] == "def" && name in e["names"]]
+    entries = [DEFINITION_LOG[i] for i in get(definition_index().defs, name, Int[])]
     isempty(entries) && return nothing
     cached = get(TOOL_SOURCES, name, nothing)
     cached !== nothing && length(cached[1]) == length(entries) && all(map(===, cached[1], entries)) && return cached[2]
@@ -66,16 +104,16 @@ source. Uses live in the kernel's memory only.
 """
 function note_tool_uses!(ex, call::Int, session_request)
     ex === nothing && return
-    defined = Set(n for e in DEFINITION_LOG if e["kind"] == "def" && e["call"] != call for n in e["names"])
-    isempty(defined) && return
-    here = Set(n for e in DEFINITION_LOG if e["call"] == call for n in e["names"])
+    ix = definition_index()
+    isempty(ix.defs) && return
+    here = get(ix.by_call, call, Set{String}())
     refs = Set{Symbol}()
     for st in top_statements(ex)
         definition_kind(st) === nothing && symbol_references(st, refs)
     end
     for sym in refs
         name = string(sym)
-        name in defined && !(name in here) || continue
+        haskey(ix.defs, name) && !(name in here) || continue
         src = tool_source(name)
         src === nothing && continue
         uses = get!(Vector{Dict{String, Any}}, TOOL_USES, name)
@@ -106,7 +144,7 @@ function tool_module(name::AbstractString, code::AbstractString, file::AbstractS
     Core.eval(m, :(const Palette = $(Api)))
     Core.eval(m, :(const Api = $(Api)))
     Core.eval(m, parsed)
-    f = Base.invokelatest(isdefined, m, Symbol(name)) ? Base.invokelatest(getglobal, m, Symbol(name)) : nothing
+    f = latest_isdefined(m, Symbol(name)) ? latest_global(m, Symbol(name)) : nothing
     f isa Function || error("$file does not define a function $name")
     return f
 end
@@ -149,7 +187,7 @@ function promote_tool(name::Symbol; doc::Union{Nothing, AbstractString}=nothing)
     # Not session_binding: another tool's stub counts here, since a tool that
     # calls one would not load on its own.
     deps = sort!([string(s) for s in free_globals(ex) if s !== name && !(s in KERNEL_BINDINGS) && !startswith(string(s), '#') &&
-                  Base.invokelatest(isdefined, mod, s) && Base.binding_module(mod, s) === mod])
+                  latest_isdefined(mod, s) && Base.binding_module(mod, s) === mod])
     isempty(deps) || error("$n uses session bindings $(join(deps, ", ")); a tool must stand alone (pass them as arguments or define them inside it)")
     tool_module(n, code, n)
     dir = project_tools_dir()
@@ -158,7 +196,7 @@ function promote_tool(name::Symbol; doc::Union{Nothing, AbstractString}=nothing)
     meta = Dict{String, Any}("name" => n, "signatures" => signatures,
         "doc" => something(doc, found_doc), "stage" => "project", "source_sha256" => sha,
         "evidence" => [Dict(k => u[k] for k in ("call", "session_request", "epoch")) for u in uses],
-        "promoted" => Dict("epoch" => TASK_EPOCH[], "call" => length(get_kernel_state().execution_history) + 1))
+        "promoted" => Dict("epoch" => TASK_EPOCH[], "call" => next_call()))
     write(joinpath(dir, n * ".jl"), code)
     write(joinpath(dir, n * ".json"), JSON.json(meta, 2))
     return Dict{String, Any}("name" => n, "stage" => "project", "file" => relpath(joinpath(dir, n * ".jl"), WORKSPACE_ROOT[]),
@@ -234,7 +272,7 @@ function install_tool_stubs!(mod::Module)
     for (n, e) in tool_index()
         e["verified"] || continue
         sym = Symbol(n)
-        Base.invokelatest(isdefined, mod, sym) && continue
+        latest_isdefined(mod, sym) && continue
         TOOL_STUBS[sym] = Core.eval(mod, :(function $sym(args...; kw...)
             $(GlobalRef(Palette, :call_tool))($(QuoteNode(sym)), args, kw)
         end))
@@ -279,7 +317,7 @@ first time, note it on this call's costs and X-Ray, and call it.
 """
 function call_tool(name::Symbol, args, kw)
     e, f, loaded = loaded_tool(name)
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     costs = get(TURN_COSTS, call, nothing)
     if costs !== nothing
         used = get!(Vector{Dict{String, Any}}, costs, "tools")
@@ -334,7 +372,7 @@ function codegraph(root::AbstractString=WORKSPACE_ROOT[])
     else
         Pharos.refresh!(g)
     end
-    costs = get(TURN_COSTS, length(get_kernel_state().execution_history) + 1, nothing)
+    costs = get(TURN_COSTS, next_call(), nothing)
     if costs !== nothing
         cited = get!(Vector{Dict{String, Any}}, costs, "codegraph")
         filter!(c -> c["root"] != key, cited)
