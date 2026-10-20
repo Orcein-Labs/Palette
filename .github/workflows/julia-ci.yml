@@ -235,7 +235,7 @@ jobs:
     - name: Check the host's unit tests and its setup and service commands
       run: cargo test --manifest-path runtime/host/Cargo.toml --locked
     - name: Check optional Gesso installer and extension loading
-      run: python3 runtime/integrations/gesso/test_gesso.py
+      run: julia --project=. runtime/integrations/gesso/test_gesso.jl
     - name: Prepare the sandbox depot before bounded MCP interactions
       env:
         JULIA_NUM_THREADS: '1'
