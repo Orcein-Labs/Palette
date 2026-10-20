@@ -283,7 +283,7 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
     # so it needs no Julia quoting: `write("x.py", PAYLOAD)`.
     Core.eval(mod, Expr(:global, Expr(:(=), :PAYLOAD, payload)))
     ctx = select_context(req)
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     note_started_call!(call, code)
     CURRENT_CALL[] = call
     CALL_CONTEXT[] = ctx
