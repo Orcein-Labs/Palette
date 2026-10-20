@@ -133,7 +133,7 @@ def agent_name(client_name: Any) -> str | None:
     if not isinstance(client_name, str):
         return None
     name = client_name.strip().lower()
-    if name == "palette-router":
+    if name in ("palette-router", "all"):
         return None
     for agent, marks in _AGENT_MARKS:
         if any(mark in name for mark in marks):

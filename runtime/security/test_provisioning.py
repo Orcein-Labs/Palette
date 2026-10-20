@@ -170,7 +170,7 @@ class ProvisioningTest(unittest.TestCase):
     def test_case_provisioning_006_agent_names_from_client_info(self):
         names = {"claude-code": "claude", "codex-mcp-client": "codex", "Grok CLI": "grok",
                  "gemini-cli-mcp-client": "gemini", "antigravity": "gemini", "Kilo Code": "kilo-code",
-                 "_odd.name_": "odd.name", "x" * 40: "x" * 32, "palette-router": None, "---": None, None: None, 7: None}
+                 "_odd.name_": "odd.name", "x" * 40: "x" * 32, "palette-router": None, "all": None, "---": None, None: None, 7: None}
         for client, agent in names.items():
             self.assertEqual(agent_name(client), agent, client)
 
