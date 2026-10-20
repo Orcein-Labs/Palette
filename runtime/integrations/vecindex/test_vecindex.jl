@@ -269,7 +269,10 @@ end
         empty!(VI._STORES)
         st = VI.VecStore("duck_test"; dim=d, capacity=16)
         VI._STORES["duck_test"] = st
-        @test VI.index_codegraph!(st, cg_dict) == 3
+        items = [Dict{String,Any}("id" => "$(sym["file"]):$(sym["line"]):$(sym["name"])",
+                                  "text" => "$(sym["name"]) $(sym["kind"]) $(sym["language"]) $(sym["file"])",
+                                  "metadata" => sym) for sym in cg_dict["symbols"]]
+        @test VI.vecindex(Dict{String,Any}("action" => "upsert", "store" => "duck_test", "items" => items))["upserted_count"] == 3
 
         # 1. Pure duck-type field filter (no query_text)
         r1 = VI.vecindex(Dict{String,Any}(
