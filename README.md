@@ -89,6 +89,8 @@ Three shell doors. Get `$` wrong and you will have a bad day.
 
 Default to the payload for anything non-trivial. Verify by the content of the reply. Silence is a bug signature: a healthy kernel answers every request with an event.
 
+Each top-level statement in a call sees the methods the statements before it defined. A function body or `let` block that defines methods with `eval` or `include` cannot call them directly until it returns; use `Base.invokelatest(f, args...)`. Redefining a struct with a new layout makes a new type, and the reply names the values and methods still using the old one.
+
 Revival labels are `restored / rebuilt / stale / lost` (and uncertain, when that is the honest answer). Tasks, IO, pointers, and values built from an earlier version of a type do not come back. Files are the durable tier. Capability grants die with the generation: re-grant after a revival.
 
 ## Features
