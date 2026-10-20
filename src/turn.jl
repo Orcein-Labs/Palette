@@ -439,14 +439,13 @@ fmt_age(s) = s < 60 ? "$(round(Int, s))s" : s < 3600 ? "$(round(Int, s / 60))m" 
 # what runs, and what finished and waits to be collected.
 # host_command jobs this kernel started, by asking the broker only while
 # there are some: a job that finished is named once, with the poll that
-# returns its result.
-const HOST_FINISH_REPORTED = Set{String}()
+# returns its result, and is then no longer tracked.
 function report_host_jobs!(running::Vector{String}, finished::Vector{String})
     isempty(HOST_JOBS) && return
     # The line runs before the call's code and outside its deadline, so a
     # broker slow to answer skips it rather than holding up the call.
     listed = try
-        host_jobs(; timeout_s=10)
+        host_jobs(; timeout_s=1)
     catch e
         push!(running, "host jobs (listing them failed: $(sprint(showerror, e)))")
         return
@@ -457,14 +456,14 @@ function report_host_jobs!(running::Vector{String}, finished::Vector{String})
         push!(held, id)
         if j["running"] === true
             push!(running, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\"))")
-        elseif !(id in HOST_FINISH_REPORTED)
-            push!(HOST_FINISH_REPORTED, id)
+        else
+            delete!(HOST_JOBS, id)
             push!(finished, "host job `$(j["name"])` (Palette.host_command_poll(\"$id\") returns its result)")
         end
     end
     # Jobs the broker no longer holds (its session restarted) are gone.
     for id in collect(keys(HOST_JOBS))
-        id in held || (delete!(HOST_JOBS, id); delete!(HOST_FINISH_REPORTED, id))
+        id in held || delete!(HOST_JOBS, id)
     end
 end
 
