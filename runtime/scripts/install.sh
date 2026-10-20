@@ -3,7 +3,7 @@
 # Install Palette on Linux (or inside WSL2) and connect it to local clients:
 #   curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 # Run again to update; `install.sh --update` installs a newer release only.
-# Arguments after the options below go to setup.py (for example --replace,
+# Arguments after the options below go to `palette-host setup` (for example --replace,
 # to take over a client's existing palette server). Settings, all optional:
 #   PALETTE_VERSION           release tag to install (default: the latest release)
 #   PALETTE_HOME              where everything goes (default: ~/.local/share/palette)
@@ -101,10 +101,13 @@ else
         tar -xzf "$download/$asset" -C "$stage" --strip-components=1
         host=$stage/runtime/host/target/release/palette-host
         # The prebuilt host is x86_64 and needs glibc 2.35 or newer; elsewhere
-        # setup builds it, which needs Rust.
+        # it is built here, which needs Rust.
         if [ "$(uname -m)" != x86_64 ] || ! "$host" 2>&1 | grep -q 'usage: palette-host'; then
             rm -f "$host"
             command -v cargo >/dev/null || die "the prebuilt host does not run on this system; install Rust (https://rustup.rs) and run this again"
+            say "Building the sandbox host"
+            CARGO_TARGET_DIR=$home/build cargo build --manifest-path "$stage/runtime/host/Cargo.toml" --release --locked
+            cp "$home/build/release/palette-host" "$host"
         fi
         printf '%s\n' "$tag" > "$stage/.palette-release"
         touch "$stage/.palette-ready"
@@ -141,14 +144,14 @@ if ! julia_ok; then
 fi
 export PATH
 
-# setup.py prepares the version, checks it, and only then points the client
-# launcher at it, so a failed update leaves the working installation in use.
+# The host's setup prepares the version, checks it, and only then points the
+# client launcher at it, so a failed update leaves the working installation in use.
 set -- --repo-dir "$sdk" --output-dir "$home/client" --data-dir "$home/data" --depot-dir "$home/depot" \
     --runtime-root "$home/capabilities" --ceiling "$home/config/ceiling.json" "$@"
 [ -n "${PALETTE_WSL_DISTRIBUTION:-}" ] && set -- "$@" --wsl-distribution "$PALETTE_WSL_DISTRIBUTION"
 # An update leaves the clients' registrations as they are: the launcher path does not change.
 [ -n "$update" ] && set -- "$@" --no-register
-python3 "$sdk/runtime/plugins/setup.py" "$@" || exit 1
+"$sdk/runtime/host/target/release/palette-host" setup "$@" || exit 1
 ln -sfn "versions/$id" "$home/current.new" && mv -T "$home/current.new" "$home/current"
 
 # Remove all but the two newest earlier versions, and the layout before

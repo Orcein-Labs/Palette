@@ -32,10 +32,10 @@ ChatGPT has a single `palette/` folder; Claude's files are at the archive root.
 Claude Desktop's separate Extensions installer uses `Palette-Claude.mcpb`,
 which also includes its runtime source; it is not a second required download.
 The `.mcpb` is itself ZIP format: extract a copy and run setup from its root.
-From the directory containing `setup.py`, run:
+From the directory containing `setup.sh`, run:
 
 ```sh
-python3 setup.py
+sh setup.sh
 ```
 
 Configuration, data and the depot go to `~/.local/share/palette/` by default;
@@ -44,13 +44,13 @@ Configuration, data and the depot go to `~/.local/share/palette/` by default;
 (the name shown by `wsl.exe --list --quiet`). The helper instantiates the Julia
 project, builds the locked Rust host, prewarms the real sandbox, and generates
 `palette-launch.json`, `generic-mcp.json`, a local portable plugin, and a
-`palette-mcp` stdio command. It registers that command with Claude Code and
-Codex when they are installed and have no `palette` server (`--no-register`
-skips this), then makes one test call (`--no-check` skips it). It never
-requests model API calls or automatically configures a tunnel. Linux must
-permit bubblewrap's user namespaces; `sdk/runtime/scripts/setup-sandbox-host.sh
-install`, run as root, installs what the sandbox needs without disabling
-isolation. See `sdk/runtime/docs/install.md`.
+`palette-mcp` stdio command. It registers that command with Claude Code,
+Codex, Grok and Antigravity when they are installed and have no `palette`
+server (`--no-register` skips this), then makes one test call (`--no-check`
+skips it). It never requests model API calls or automatically configures a
+tunnel. Linux must permit bubblewrap's user namespaces;
+`sdk/runtime/scripts/setup-sandbox-host.sh install`, run as root, installs
+what the sandbox needs without disabling isolation. See `sdk/runtime/docs/install.md`.
 
 For an existing, already built and prewarmed installation, use
 `--repo-dir /absolute/path/to/Palette --connect-only` with its existing depot.
@@ -85,7 +85,7 @@ mode cannot execute a local `palette-mcp` command merely because you upload a ZI
 
 1. Connect the generated `palette-mcp` executable to **your own** Secure MCP Tunnel
    using OpenAI's tunnel client instructions. Keep the client running on the
-   prepared Linux machine. Use the exact absolute path printed by setup.py.
+   prepared Linux machine. Use the exact absolute path printed by setup.sh.
    Alternatively deploy a supported authenticated HTTPS MCP endpoint.
 2. In ChatGPT, enable developer mode when available under your account policy.
 3. Open Plugins, add a connection named Palette, choose Tunnel, and select your
