@@ -27,10 +27,49 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
 3. Installs Julia with [juliaup](https://github.com/JuliaLang/juliaup) unless
    Julia 1.10 or newer is on `PATH`.
 4. Runs `runtime/plugins/setup.py`, which instantiates the Julia project,
-   prepares the sandbox depot, writes the client configuration and the
-   `palette-mcp` stdio launcher, registers the server with Claude Code and Codex
-   when they are installed and have no server named `palette`, and makes one
-   test call, `1 + 1`, through the launcher.
+   prepares the sandbox depot, deploys [TeamLab](../integrations/teamlab/README.md)
+   into the capability registry, grants `palette.runtime` in the capability
+   ceiling (creating it, or adding to the one there), and writes the client
+   configuration and the `palette-mcp` stdio launcher. It checks the new
+   launcher (`x = 41`, then `x + 1`, then TeamLab's status) before it replaces
+   the old one, so a failed update leaves the working installation in use.
+5. Registers the server with Claude Code, Codex, Grok and Antigravity, those
+   that are installed. A client that already runs this launcher is left alone.
+   A client whose `palette` server runs something else keeps it, and setup
+   prints the two commands that move it to this installation; run the installer
+   with `--replace` (`sh -s -- --replace` after the pipe) to do that for every
+   client.
+6. Installs the Palette plugin for Claude Code (its skills, and a line at the
+   start of each session naming the installed version) from the installation's
+   own marketplace.
+7. For a release from GitHub, offers a daily update (a systemd user timer that runs
+   `install.sh --update`). Answer, or set `PALETTE_AUTO_UPDATE`; a
+   non-interactive install turns it on.
+
+The installation lives in `PALETTE_HOME` (default `~/.local/share/palette`):
+
+| Path | Holds |
+|---|---|
+| `versions/<tag>` | One directory per installed version, never changed once complete. The two newest before the current one are kept, and older ones are removed unless a running process uses them |
+| `current` | Link to the version in use. A client already running keeps its version until it restarts |
+| `client/` | `palette-mcp`, the launcher every client runs, and generated client configuration |
+| `capabilities/` | Capability registry (`PALETTE_RUNTIME_ROOT`); the installer replaces `teamlab/` and leaves other entries alone |
+| `config/ceiling.json` | Capability ceiling (`PALETTE_CAPABILITY_CEILING`), mode 0600; edit it to grant more |
+| `data/`, `depot/` | Workspace, saved worlds and package store; the prepared Julia depot |
+
+The TeamLab shelf and mailbox that the user's agents share are in
+`$XDG_DATA_HOME/palette/teamlab` (`~/.local/share/palette/teamlab`), which is
+inside the default `PALETTE_HOME`; `PALETTE_TEAMLAB_DIR` in the server's
+environment moves it, and `off` leaves TeamLab out.
+
+When `~/.config/palette/host-commands.json` exists, the launcher passes it as
+`PALETTE_HOST_COMMANDS` (see [authority](authority.md)); create it and run the
+installer again to enable host commands.
+
+`install.sh --update` installs a newer release only and leaves registrations
+as they are. It does nothing for a source checkout, and from a
+`PALETTE_RELEASE_URL` mirror it needs `PALETTE_VERSION` to name the release. The launcher's path does not change across versions, so clients need
+no new registration.
 
 `install.ps1` installs WSL2 with Ubuntu when there is no WSL distribution
 (restart Windows if asked, create the Linux user, then run it again), installs
@@ -43,19 +82,29 @@ Settings, all optional environment variables:
 
 | Variable | Effect |
 |---|---|
-| `PALETTE_HOME` | Install location (default `~/.local/share/palette`): `sdk/`, `client/`, `data/` and `depot/` |
+| `PALETTE_HOME` | Install location (default `~/.local/share/palette`) |
 | `PALETTE_VERSION` | Release tag to install. `releases/latest` skips prereleases, so a tag such as `v1.0.0-rc.1` needs this |
 | `PALETTE_RELEASE_URL` | Download from this base URL instead: a mirror, or `file:///path` for a local copy of the release assets |
+| `PALETTE_AUTO_UPDATE` | `1` or `0`: install the daily update without asking, or skip it |
 | `PALETTE_WSL_DISTRIBUTION` | On Windows, the WSL distribution to use instead of the default one |
 
-From a source checkout, `sh runtime/scripts/install.sh` uses the checkout as the SDK and
-builds the host with `cargo`. `python3 runtime/plugins/setup.py --help` lists
-the setup options, such as `--no-register` and `--no-check`, for running that
-step alone.
+From a source checkout, `sh runtime/scripts/install.sh` installs the checkout's
+last commit as `versions/git-<commit>`, building the host with `cargo` (into
+`build/`, shared between commits). Uncommitted changes are not installed.
+`python3 runtime/plugins/setup.py --help` lists the setup options, such as
+`--no-register` and `--no-check`, for running that step alone.
 
-To remove Palette: `claude mcp remove palette`, `codex mcp remove palette`,
-delete the `palette` entry from Claude Desktop's configuration on Windows, and
-delete `PALETTE_HOME`. Julia stays installed (`juliaup self uninstall` removes it).
+### Removal
+
+Remove the `palette` server from each client
+(`claude mcp remove palette`, `codex mcp remove palette`,
+`grok mcp remove -s user palette`, `agy mcp remove palette`), run
+`claude plugin uninstall palette@palette`, delete the `palette` entry from
+Claude Desktop's configuration on Windows, run
+`systemctl --user disable --now palette-update.timer`, and delete
+`PALETTE_HOME` (with the default location, this also deletes the TeamLab
+shelf). Julia stays installed
+(`juliaup self uninstall` removes it).
 
 ## Manual installation
 

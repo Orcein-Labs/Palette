@@ -6,6 +6,7 @@
 #   PALETTE_WSL_DISTRIBUTION  WSL distribution to use (default: the default one, or a new Ubuntu)
 #   PALETTE_VERSION           release tag to install (default: the latest release)
 #   PALETTE_RELEASE_URL       download the release from this base URL instead
+#   PALETTE_AUTO_UPDATE       1 or 0: install the daily update timer without asking
 & {
 $ErrorActionPreference = 'Stop'
 $env:WSL_UTF8 = '1'
@@ -70,9 +71,10 @@ In-Linux --user root --exec sh -c 'command -v curl >/dev/null || if command -v a
 if ($LASTEXITCODE -ne 0) { Stop-Install 'could not install the sandbox system packages' }
 
 # The Linux installer reads its settings from these, passed through WSLENV.
+# PALETTE_RELEASE_URL goes only when it was set: without it the installer
+# records the release tag, which is what lets the installation update itself.
 $env:PALETTE_WSL_DISTRIBUTION = $distribution
-$env:PALETTE_RELEASE_URL = $release
-$env:WSLENV = (@('PALETTE_WSL_DISTRIBUTION', 'PALETTE_RELEASE_URL', 'PALETTE_HOME') + @($env:WSLENV -split ':' | Where-Object { $_ })) -join ':'
+$env:WSLENV = (@('PALETTE_WSL_DISTRIBUTION', 'PALETTE_RELEASE_URL', 'PALETTE_VERSION', 'PALETTE_AUTO_UPDATE', 'PALETTE_HOME') + @($env:WSLENV -split ':' | Where-Object { $_ })) -join ':'
 In-Linux --exec sh -c 'curl -fsSL $0/install.sh | sh' $release
 if ($LASTEXITCODE -ne 0) { Stop-Install 'the Linux installer did not finish; its message is above' }
 
