@@ -81,7 +81,7 @@ function checkpoint(name::AbstractString; note::AbstractString="")
     startswith(name, "auto-") && error("names starting with `auto-` are kept for the checkpoints a restore saves")
     isdir(joinpath(checkpoints_dir(), name)) &&
         error("checkpoint `$name` exists; Palette.forget_checkpoint(\"$name\") removes it")
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     PENDING_CHECKPOINT[] = (String(name), String(note), call)
     return "checkpoint `$name` is saved when this call (call $call) completes"
 end

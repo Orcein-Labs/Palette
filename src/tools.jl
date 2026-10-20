@@ -158,7 +158,7 @@ function promote_tool(name::Symbol; doc::Union{Nothing, AbstractString}=nothing)
     meta = Dict{String, Any}("name" => n, "signatures" => signatures,
         "doc" => something(doc, found_doc), "stage" => "project", "source_sha256" => sha,
         "evidence" => [Dict(k => u[k] for k in ("call", "session_request", "epoch")) for u in uses],
-        "promoted" => Dict("epoch" => TASK_EPOCH[], "call" => length(get_kernel_state().execution_history) + 1))
+        "promoted" => Dict("epoch" => TASK_EPOCH[], "call" => next_call()))
     write(joinpath(dir, n * ".jl"), code)
     write(joinpath(dir, n * ".json"), JSON.json(meta, 2))
     return Dict{String, Any}("name" => n, "stage" => "project", "file" => relpath(joinpath(dir, n * ".jl"), WORKSPACE_ROOT[]),
@@ -279,7 +279,7 @@ first time, note it on this call's costs and X-Ray, and call it.
 """
 function call_tool(name::Symbol, args, kw)
     e, f, loaded = loaded_tool(name)
-    call = length(get_kernel_state().execution_history) + 1
+    call = next_call()
     costs = get(TURN_COSTS, call, nothing)
     if costs !== nothing
         used = get!(Vector{Dict{String, Any}}, costs, "tools")
@@ -334,7 +334,7 @@ function codegraph(root::AbstractString=WORKSPACE_ROOT[])
     else
         Pharos.refresh!(g)
     end
-    costs = get(TURN_COSTS, length(get_kernel_state().execution_history) + 1, nothing)
+    costs = get(TURN_COSTS, next_call(), nothing)
     if costs !== nothing
         cited = get!(Vector{Dict{String, Any}}, costs, "codegraph")
         filter!(c -> c["root"] != key, cited)

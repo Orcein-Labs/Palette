@@ -775,7 +775,7 @@ deadline, and capture everything it printed.
 """
 function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_request=nothing)
     state = get_kernel_state()
-    call = length(state.execution_history) + 1
+    call = next_call()
     # The kernel's warm-up turns empty TURN_COSTS, so the first call they leave
     # is the first one an agent pays for.
     ctx = CALL_CONTEXT[]

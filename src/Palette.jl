@@ -268,6 +268,9 @@ function get_kernel_state()::KernelState
     return state
 end
 
+# The number of the call in flight, or of the next one between calls.
+next_call() = length(get_kernel_state().execution_history) + 1
+
 """
     reset_kernel_state()
 
@@ -1016,7 +1019,7 @@ function execute(op::ExecuteCode)::OperationReceipt
 
     result = OperationResult(nothing, true, nothing)
     error_msg = nothing
-    call_file = "call $(length(state.execution_history) + 1)"
+    call_file = "call $(next_call())"
 
     try
         # Meta.parse only parses a single top-level statement and throws on
