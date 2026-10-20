@@ -159,11 +159,13 @@ For the complete Linux process conformance gates, prepare a Julia environment
 with this checkout plus JSON, CSV, DataFrames, EzXML, and IJulia, then run:
 
 ```sh
-python3 runtime/security/verify_operator.py --project-dir /absolute/path/to/test-env --implementation both
+cargo xtask verify --project-dir /absolute/path/to/test-env --implementation both
 ```
 
-`--shard I/N` runs the shared gates on shard 1 and every Nth test case on each
-shard; CI runs the process gates as four shards.
+Run it from the checkout root. `--shard I/N` runs the shared gates on shard 1
+and deals the test cases across the shards by their recorded seconds
+(`runtime/security/test-case-seconds.json`, refreshed from CI job logs with
+`cargo xtask record-test-case-seconds`); CI runs the process gates as four shards.
 
 CI runs package, host, Jupyter integration, workspace/patch, and process gates.
 Pull requests run the process gates against the Rust host; both hosts run nightly.

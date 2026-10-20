@@ -12,7 +12,7 @@ Preserve supported behavior and keep changes focused.
 Run Julia package tests for Julia changes, Rust tests for host changes, and each
 modified test file directly. Adapter and process changes need real integration
 checks against the affected host implementations. The full Linux verification
-entrypoint is `runtime/security/verify_operator.py`; its test environment must
+entrypoint is `cargo xtask verify`; its test environment must
 use this checkout. Required checks must pass before merging. Whole-package JET
 analysis currently follows the [advisory policy](runtime/docs/static-analysis.md).
 

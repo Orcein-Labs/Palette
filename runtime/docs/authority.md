@@ -139,7 +139,7 @@ files.
 
 Production entry points start sessions and brokers through the Rust host,
 `palette-host`. The Python session, broker and `session_cli.py` are a reference
-implementation for the conformance suites (`verify_operator.py --implementation
+implementation for the conformance suites (`cargo xtask verify --implementation
 python`); no production entry point imports them.
 
 ## Python host: scheduled for removal
@@ -155,7 +155,7 @@ the two shows up as a failure on one side. That is how A3 and the D11 control
 were caught.
 
 The oracle covers these categories, one suite each, as run by
-`verify_operator.py --implementation python`:
+`cargo xtask verify --implementation python`:
 
 | Category | Suite |
 |---|---|

@@ -5,6 +5,7 @@
 *.jl.mem
 /Manifest.toml
 /runtime/host/target/
+/runtime/xtask/target/
 /deps/
 node_modules/
 
