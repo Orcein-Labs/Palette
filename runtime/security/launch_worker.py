@@ -1166,8 +1166,10 @@ def package_store_paths(
     for tree in (depot / "registries", depot / "packages"):
         _reject_symlink_tree(tree, "package store directory", allow_contained=True)
 
-    from provisioning import operator_ceiling, protected_host_paths
+    from provisioning import command_parents, operator_ceiling, protected_host_paths
     frozen_ceiling = operator_ceiling() if ceiling is None else ceiling
+    if path in command_parents(frozen_ceiling):
+        raise RuntimeError(f"PALETTE_PACKAGE_DEPOT is the parent of a host-command path: {path}")
     protected = set(protected_host_paths(frozen_ceiling, include_package_depot=False))
     # An empty or absent entry names nothing. Path("").resolve() is the cwd,
     # which would make the overlap check depend on where the host started.

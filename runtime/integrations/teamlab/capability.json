@@ -1,0 +1,9 @@
+{
+  "id": "teamlab",
+  "version": "0.2.0",
+  "source": "teamlab.jl",
+  "entrypoint": "teamlab",
+  "dependencies": [],
+  "requires": ["teamlab"],
+  "description": "A shelf of Julia tools and a mailbox shared by one user's agents, kept by the session host"
+}

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,8 @@ class WorkspaceRouterIntegration(unittest.TestCase):
             "PALETTE_PROJECT_ROOTS": "{}",
             "PALETTE_PATCH_ROOTS": "{}",
             "PALETTE_READ_ROOTS": "",
+            # Never the user's own shelf.
+            "PALETTE_TEAMLAB_DIR": str(root / "teamlab"),
         }
         for key in ("PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG",
                     "PALETTE_TASK_TOOLS", "PALETTE_TASK_ENV"):
@@ -575,6 +578,41 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         self.assertIn("outside the operator ceiling", still_denied["error"])
         after = schemas()
         self.assertEqual(after, before)
+
+    def test_C05_teamlab_runs_in_the_sandbox_as_the_named_client(self):
+        runtime_root = Path(self.tmp.name) / "runtime-capabilities"
+        shutil.copytree(REPO / "runtime/integrations/teamlab", runtime_root / "teamlab")
+        ceiling_path = Path(self.tmp.name) / "ceiling.json"
+        ceiling_path.write_text(json.dumps({"host_request": {"allowed_types": ["palette.runtime"]}}))
+        self.proc.stdin.close(); self.proc.wait(timeout=60); self.proc.stdout.close()
+        self.env["PALETTE_CAPABILITY_CEILING"] = str(ceiling_path)
+        self.start_router()
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                          "params": {"clientInfo": {"name": "claude-code"}}}) + "\n")
+        self.proc.stdin.flush()
+        self.assertIn("result", json.loads(self.proc.stdout.readline()))
+
+        tl = 'tl(args...) = Palette.runtime("invoke", Dict("id"=>"teamlab", "arguments"=>Dict{String,Any}(args...)))["result"]\n'
+        found = self.call("palette", {"code": tl + 'Palette.runtime("discover")'})["data"]
+        self.assertIn("teamlab", found["authorized_capabilities"])
+        self.assertEqual(found["authorized_ceiling"]["teamlab"], {"enabled": True})
+        # The test runs in a second Julia inside the sandbox.
+        published = self.call("palette", {"code": 'tl("action"=>"publish", "name"=>"probe", "source"=>"probe(x) = 2x + 1\\n", '
+                                                  '"test_source"=>"using Test; include(\\"probe.jl\\"); @test probe(20) == 41")'})["data"]
+        self.assertEqual(published["published"], True, published)
+        synced = self.call("palette", {"code": 'tl("action"=>"sync")'})["data"]
+        self.assertEqual([t["name"] for t in synced["loaded"]], ["probe"], synced)
+        self.assertEqual(synced["agent"], "claude")
+        self.assertEqual(self.call("palette", {"code": "TeamLab.probe(10)"})["data"], 21)
+        # The kernel cannot reach the shelf itself.
+        lab = Path(self.env["PALETTE_TEAMLAB_DIR"])
+        self.assertTrue(lab.is_dir())
+        unseen = self.call("palette", {"code": f"isdir({json.dumps(str(lab))})"})["data"]
+        self.assertFalse(unseen)
+        receipts = [json.loads(line) for path in Path(self.tmp.name).rglob("receipts.jsonl")
+                    for line in path.read_text().splitlines()]
+        teamlab = [r for r in receipts if r.get("category") == "teamlab"]
+        self.assertTrue(teamlab and all(r["params"]["agent"] == "claude" for r in teamlab), teamlab)
 
     def test_C03_runtime_registry_rejects_manifest_authority_and_source_escape(self):
         root = Path(self.tmp.name) / "registry-negative"

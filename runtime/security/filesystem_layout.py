@@ -2,9 +2,14 @@
 from pathlib import Path
 
 
-def require_disjoint(writable, protected):
+def require_disjoint(writable, protected, parents=()):
+    """Refuse a writable path that equals, contains or lies inside a protected
+    one, or that equals one of ``parents`` (``provisioning.command_parents``)."""
+    parents = {Path(parent).resolve() for parent in parents}
     for writable_path in writable:
         left = Path(writable_path).resolve()
+        if left in parents:
+            raise PermissionError(f"Writable path {left} must not be the parent of a host-command path")
         for protected_path in protected:
             right = Path(protected_path).resolve()
             if left == right or left.is_relative_to(right) or right.is_relative_to(left):
