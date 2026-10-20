@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const FORMAT: u64 = 2;
@@ -97,33 +97,14 @@ fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if matches!(configured.trim(), "" | "off") {
         return None;
     }
+    // `~` and `~/x` expand to HOME. `~user` gives None: only the news line
+    // reads this, and it then stays quiet.
     let path = match configured.strip_prefix('~') {
-        Some(rest) => expand_user(rest, &var)?,
+        Some("") => PathBuf::from(var("HOME")?),
+        Some(rest) => Path::new(&var("HOME")?).join(rest.strip_prefix('/')?),
         None => PathBuf::from(&configured),
     };
     path.is_absolute().then_some(path)
-}
-
-/// `~` and `~user` as Python's `expanduser` reads them: `rest` follows the
-/// `~`. None for a user with no home.
-fn expand_user(rest: &str, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let (user, tail) = rest.split_once('/').unwrap_or((rest, ""));
-    let home = if user.is_empty() { var("HOME")? } else { home_of(user)? };
-    let home = PathBuf::from(home);
-    Some(if tail.is_empty() { home } else { home.join(tail) })
-}
-
-/// A user's home directory from the password database.
-fn home_of(user: &str) -> Option<String> {
-    let name = std::ffi::CString::new(user).ok()?;
-    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found: *mut libc::passwd = std::ptr::null_mut();
-    let mut buf = vec![0 as libc::c_char; 16384];
-    let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
-    if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
-        return None;
-    }
-    unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) }.to_str().ok().map(String::from)
 }
 
 /// 1-32 of `[a-z0-9._-]`, starting with a letter or digit, and not "all",
@@ -206,13 +187,7 @@ impl Lab {
         let blobs = dir.join("blobs");
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&blobs).map_err(io(&blobs))?;
         for d in [dir, blobs.as_path()] {
-            let meta = fs::symlink_metadata(d).map_err(io(d))?;
-            let uid = unsafe { libc::geteuid() };
-            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
-                return Err(Internal(format!(
-                    "teamlab {} must be a directory (not a symlink) owned by uid {uid} that only its owner can write",
-                    d.display())));
-            }
+            util::check_private_dir(d).map_err(|e| Internal(format!("teamlab {e}")))?;
         }
         Ok(Lab { dir: dir.to_path_buf() })
     }
@@ -1220,9 +1195,7 @@ mod tests {
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab")])), Some(PathBuf::from("/lab")));
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~/lab")])), Some(PathBuf::from("/h/lab")));
         assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~")])), Some(PathBuf::from("/h")));
-        let root = home_of("root").expect("root has a home");
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~root/lab")])), Some(Path::new(&root).join("lab")));
-        for off in ["", "off", "relative", "~no-such-user-palette/lab"] {
+        for off in ["", "off", "relative", "~root/lab"] {
             let pairs: &'static [(&str, &str)] = Box::leak(Box::new([("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", off)]));
             assert_eq!(dir_from_env(env(pairs)), None, "{off:?}");
         }
