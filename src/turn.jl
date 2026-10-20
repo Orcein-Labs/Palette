@@ -335,8 +335,8 @@ const SINK_PATH = Ref("")
 const SINK_READ = Ref(0)
 const MAX_BACKGROUND_BYTES = 16 * 1024
 # Output already reported is dropped once a file holding it passes this size:
-# the sandbox's /tmp is memory, and a chatty background job (50 KB/s in the
-# endurance pass) grew it by 4 GB a day. Every writer holds these files in
+# the sandbox's /tmp is memory, and a chatty background job (50 KB/s in a
+# long trial run) grew it by 4 GB a day. Every writer holds these files in
 # append mode, so truncating them is safe.
 const MAX_REPORTED_BYTES = 1024 * 1024
 function drop_reported!(path::String, read_to::Int)
