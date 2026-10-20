@@ -101,18 +101,13 @@ jobs:
       with:
         version: '1.12'
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-
     - name: Build a Julia environment with Palette + IJulia
       run: |
         julia -e '
           using Pkg
           Pkg.activate("ijulia-env")
           Pkg.develop(path=".")
-          Pkg.add("IJulia")
+          Pkg.add(["IJulia", "ZMQ", "JSON"])
         '
 
     - name: Install the kernelspec (isolated Jupyter data dir)
@@ -123,13 +118,10 @@ jobs:
           IJulia.installkernel("PaletteTest", "--project=$(abspath("ijulia-env"))")
         '
 
-    - name: Install jupyter_client
-      run: pip install jupyter_client
-
     - name: Run the real Jupyter-wire-protocol proof (a live IJulia kernel, real ZMQ)
       run: |
-        JUPYTER_DATA_DIR="$GITHUB_WORKSPACE/jupyter-data" JUPYTER_PATH="$GITHUB_WORKSPACE/jupyter-data" \
-          python3 runtime/scripts/real_ijulia_proof.py
+        JUPYTER_DATA_DIR="$GITHUB_WORKSPACE/jupyter-data" \
+          julia --project=ijulia-env runtime/scripts/real_ijulia_proof.jl
 
   security-suite:
     runs-on: ubuntu-latest
