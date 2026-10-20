@@ -19,7 +19,7 @@ sys.path.insert(0, str(HERE))
 
 # What operators and clients start.
 ENTRY_POINTS = (
-    "serve_palette", "operator_mcp", "server_runtime", "generation_runtime",
+    "serve_palette", "operator_mcp", "generation_runtime",
     "operator_workspace_router", "install_operator_plugin", "palette_mcp_client", "prewarm_depot",
 )
 REFERENCE_ONLY = {"session", "broker", "session_cli", "host_adapter"}
@@ -56,7 +56,7 @@ class ProductionEntryPointsTest(unittest.TestCase):
                                  f"{entry} imports the reference-only Python host")
 
     def test_entry_points_name_the_rust_host(self):
-        for entry in ("serve_palette", "operator_mcp", "server_runtime", "generation_runtime"):
+        for entry in ("serve_palette", "operator_mcp", "generation_runtime"):
             with self.subTest(entry=entry):
                 text = (HERE / f"{entry}.py").read_text(encoding="utf-8")
                 self.assertIn("runtime/host/target/release/palette-host", text)

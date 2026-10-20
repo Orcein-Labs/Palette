@@ -29,14 +29,19 @@ host commands or file writes. Package requests remain subject to the named
 allowlist. Leave `package_management` out when installations are not authorized.
 Worker networking stays disabled; the broker performs an approved installation.
 
-Generate a profile on the server, then prepare it as an administrator action:
+Build the host once, generate a profile on the server, then prepare it as an
+administrator action:
 
 ```sh
-python3 /opt/palette/runtime/security/server_runtime.py init \
+cargo build --release --locked --manifest-path /opt/palette/runtime/host/Cargo.toml
+/opt/palette/runtime/host/target/release/palette-host serve init \
   --profile /etc/palette/runtime.json
-python3 /opt/palette/runtime/security/server_runtime.py prepare \
+/opt/palette/runtime/host/target/release/palette-host serve prepare \
   --profile /etc/palette/runtime.json
 ```
+
+`prepare` needs `julia`, `cargo` and `bwrap` on `PATH`, plus `python3` until the
+depot prewarm and the stdio adapter move into the host.
 
 Defaults are `/opt/palette` for source, `/var/lib/palette` for data,
 `/var/cache/palette/depot` for prepared dependencies, and
@@ -47,7 +52,7 @@ the selected ownership/layout without starting a worker.
 Launch the production MCP stdio adapter with:
 
 ```sh
-python3 /opt/palette/runtime/security/server_runtime.py launch \
+/opt/palette/runtime/host/target/release/palette-host serve launch \
   --profile /etc/palette/runtime.json
 ```
 
