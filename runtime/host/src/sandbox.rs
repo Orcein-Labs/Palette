@@ -1005,8 +1005,7 @@ fn identity_base(runtime_dir: Option<&Path>) -> Option<PathBuf> {
 /// could pre-create it and choose the sandbox's passwd, or plant a symlink
 /// where the temp file is written.
 fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
     let uid = unsafe { libc::getuid() };
     let etc = base.join(format!("palette-etc-{uid}"));
     match fs::DirBuilder::new().mode(0o755).create(&etc) {
@@ -1014,13 +1013,7 @@ fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(format!("creating {}: {e}", etc.display())),
     }
-    let meta = fs::symlink_metadata(&etc).map_err(|e| format!("checking {}: {e}", etc.display()))?;
-    if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
-        return Err(format!(
-            "refusing sandbox identity dir {}: it must be a directory owned by uid {uid} and writable only by its owner",
-            etc.display()
-        ));
-    }
+    util::check_private_dir(&etc).map_err(|e| format!("refusing sandbox identity dir: {e}"))?;
     let passwd = format!("{SANDBOX_USER}:x:1000:1000:Palette sandbox:/run/palette/home:/bin/bash\n");
     let group = format!("{SANDBOX_USER}:x:1000:\n");
     let current = |name: &str| fs::read_to_string(etc.join(name)).ok();
@@ -1028,11 +1021,7 @@ fn identity_files_in(base: &Path) -> Result<PathBuf, String> {
         for (name, text) in [("passwd", &passwd), ("group", &group)] {
             let tmp = etc.join(format!(".{name}.{}", std::process::id()));
             let _ = fs::remove_file(&tmp);
-            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW).open(&tmp).map_err(|e| e.to_string())?;
-            f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
-            fs::rename(&tmp, etc.join(name)).map_err(|e| e.to_string())?;
+            util::write_then(&tmp, text.as_bytes(), 0o644, || fs::rename(&tmp, etc.join(name))).map_err(|e| e.to_string())?;
         }
     }
     Ok(etc)
@@ -1734,6 +1723,15 @@ mod tests {
 
         let clone = copied_depot(&depot);
         assert_eq!(fs::read_to_string(clone.join("cache")).unwrap(), "second");
+        // A child another test forks shares this process's open files until it
+        // execs, and with them the snapshot's lock, so a sweep can miss once.
+        for _ in 0..50 {
+            if !first.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            try_sweep_depot_snapshots(&depot);
+        }
         assert!(!first.exists(), "the released snapshot was not swept");
         assert!(second.is_dir());
         fs::remove_dir_all(&root).unwrap();
