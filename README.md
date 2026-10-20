@@ -152,7 +152,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, verification, and research arc
 ```sh
 julia --project=. -e 'using Pkg; Pkg.test()'
 cargo test --manifest-path runtime/host/Cargo.toml --locked
-python3 runtime/scripts/test_julia_analyzer.py
 node runtime/scripts/check-test-policy.mjs
 ```
 
