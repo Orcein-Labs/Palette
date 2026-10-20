@@ -313,6 +313,7 @@ Normalize textual LLVM IR (`.ll`) produced by `rustc` (LLVM 19–22+) or `clang`
   `getelementptr inbounds`, `trunc nuw nsw` → `trunc`, `zext nneg` → `zext`,
   `uitofp nneg` → `uitofp`, `or disjoint` → `or`, `icmp samesign` → `icmp`)
 - Strips metadata tags (`, !noundef !3`, `, !llvm.loop !4`, `, !dbg !5`, `, !tbaa !6`)
+- Keeps named struct type definitions, which clang ≤ 18 field accesses refer to
 - Marks defined functions `alwaysinline` so Julia's LLVM optimizer fuses the
   foreign IR directly into the calling Julia loop.
 """
@@ -331,6 +332,13 @@ function normalize_llvm_ir(raw_ll::AbstractString; entry_fn::AbstractString=""):
         startswith(line, "target ") && continue
         startswith(line, "attributes #") && continue
         startswith(line, "!") && continue
+
+        # Keep named struct types (`%struct.Particle = type { ... }`): clang ≤ 18
+        # indexes fields through them instead of using byte offsets.
+        if !in_fn && occursin(r"^%[-$.\w\"]+ = type ", line)
+            push!(out_lines, String(line))
+            continue
+        end
 
         if startswith(line, "declare ")
             # Skip external Rust EH personality declaration when normalizing panic=abort kernels
