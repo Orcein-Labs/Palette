@@ -238,6 +238,8 @@ jobs:
     - name: Check generic toolchain boundaries and client packaging
       run: |
         python3 runtime/security/test_provisioning.py
+        python3 runtime/plugins/test_setup.py
+        sh -n runtime/scripts/install.sh
         python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/palette-bundles"
     - name: Configure runner Bubblewrap namespaces
       run: bash runtime/scripts/setup-ci-bubblewrap.sh
