@@ -31,7 +31,25 @@ pub fn hex(n: usize) -> String {
 
 /// Bytes as lowercase hex, two digits each.
 pub fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(DIGITS[(b >> 4) as usize] as char);
+        s.push(DIGITS[(b & 15) as usize] as char);
+    }
+    s
+}
+
+/// Refuses `dir` unless it is a real directory (not a symlink) this user
+/// owns that no one else can write.
+pub fn check_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("checking {}: {e}", dir.display()))?;
+    let uid = unsafe { libc::getuid() };
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(format!("{} must be a directory (not a symlink) owned by uid {uid} that only its owner can write", dir.display()));
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to the new file `tmp` (never through a symlink), syncs it,
@@ -43,9 +61,7 @@ pub fn write_then(tmp: &Path, bytes: &[u8], mode: u32, place: impl FnOnce() -> s
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        if mode != 0o600 {
-            fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
-        }
+        fs::set_permissions(tmp, fs::Permissions::from_mode(mode))?;
         place()
     })();
     if written.is_err() {

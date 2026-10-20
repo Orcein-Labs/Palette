@@ -44,7 +44,7 @@ from launch_worker import (resolve_real_julia_binary, build_bwrap_argv, create_r
                            default_depot, default_receipts_root, package_store_paths, private_dir, record_owner, remove_owned_dir,
                            remove_session_depot, sweep_orphaned_dirs)
 from filesystem_layout import require_disjoint
-from provisioning import command_parents, command_paths
+from provisioning import command_paths
 
 import broker as _broker
 
@@ -218,7 +218,8 @@ class PaletteSession:
             receipts_path = str(receipts_root / "receipts.jsonl")
             writable = [self.workspace_dir] + ([state_dir] if state_dir else [])
             require_disjoint(writable, [broker_root, Path(receipts_path).parent, self.depot_clone_dir, self.package_store_root])
-            require_disjoint(writable, command_paths(ceiling), command_parents(ceiling))
+            commands = command_paths(ceiling)
+            require_disjoint(writable, commands, {path.parent for path in commands})
             self._broker_server, self._broker = _broker.serve(
                 str(Path(self._broker_sock_dir) / "broker.sock"),
                 ceiling, receipts_path, self.session_id,

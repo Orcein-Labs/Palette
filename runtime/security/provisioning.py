@@ -133,12 +133,13 @@ def agent_name(client_name: Any) -> str | None:
     if not isinstance(client_name, str):
         return None
     name = client_name.strip().lower()
-    if name in ("palette-router", "all"):
+    if name == "palette-router":
         return None
     for agent, marks in _AGENT_MARKS:
         if any(mark in name for mark in marks):
             return agent
-    return re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")[:32].rstrip("-._") or None
+    name = re.sub(r"[^a-z0-9._-]+", "-", name).strip("-._")[:32].rstrip("-._")
+    return name if name not in ("", "all") else None
 
 
 def with_teamlab(ceiling: dict[str, Any]) -> dict[str, Any]:

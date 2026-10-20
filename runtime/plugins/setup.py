@@ -64,13 +64,16 @@ def write_atomic(path, text, mode=0o644):
 def restored_on_failure(paths):
     """Put each path back as it was, or remove it if it did not exist, when
     the block fails."""
+    def clone(src, dst):
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        elif src.exists():
+            shutil.copy2(src, dst)
+
     with tempfile.TemporaryDirectory(prefix='palette-setup-') as keep:
         kept = [(path, Path(keep)/str(i)) for i, path in enumerate(paths)]
         for path, copy in kept:
-            if path.is_dir():
-                shutil.copytree(path, copy, symlinks=True)
-            elif path.exists():
-                shutil.copy2(path, copy)
+            clone(path, copy)
         try:
             yield
         except BaseException:
@@ -79,10 +82,7 @@ def restored_on_failure(paths):
                     shutil.rmtree(path)
                 else:
                     path.unlink(missing_ok=True)
-                if copy.is_dir():
-                    shutil.copytree(copy, path, symlinks=True)
-                elif copy.exists():
-                    shutil.copy2(copy, path)
+                clone(copy, path)
             raise
 
 

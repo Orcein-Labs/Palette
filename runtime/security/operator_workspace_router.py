@@ -519,9 +519,6 @@ def validate(args, schema):
             raise ValueError("Invalid " + key)
         if kind == "boolean" and not isinstance(value, bool):
             raise ValueError("Invalid " + key)
-        if kind == "integer" and (isinstance(value, bool) or not isinstance(value, int)
-                                  or not spec.get("minimum", -float("inf")) <= value <= spec.get("maximum", float("inf"))):
-            raise ValueError("Invalid " + key)
         if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))
                                  or not spec.get("exclusiveMinimum", float("-inf")) < value <= spec.get("maximum", float("inf"))):
             raise ValueError(f"Invalid {key}: must be a number in ({spec.get('exclusiveMinimum', float('-inf')):g}, "
