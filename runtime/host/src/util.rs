@@ -248,13 +248,29 @@ pub fn shjoin<S: AsRef<str>>(words: &[S]) -> String {
     words.iter().map(|w| shquote(w.as_ref())).collect::<Vec<_>>().join(" ")
 }
 
-/// `s` with a leading `~` or `~/` taken as the home directory.
+/// `s` with a leading `~` taken as the home directory and `~name` as that
+/// user's, as `os.path.expanduser` does: an unknown user leaves `s` as it is.
 pub fn expand_user(s: &str) -> PathBuf {
-    match s.strip_prefix('~') {
-        Some("") => home(),
-        Some(rest) if rest.starts_with('/') => home().join(&rest[1..]),
-        _ => PathBuf::from(s),
+    let Some(rest) = s.strip_prefix('~') else { return PathBuf::from(s) };
+    let (name, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let Some(dir) = (if name.is_empty() { Some(home()) } else { user_home(name) }) else { return PathBuf::from(s) };
+    let dir = dir.to_string_lossy().trim_end_matches('/').to_string();
+    PathBuf::from(if dir.is_empty() && tail.is_empty() { "/".to_string() } else { dir + tail })
+}
+
+/// The home directory of the user `name` in the password database.
+fn user_home(name: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwnam_r(cname.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
+    if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
+        return None;
     }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
 /// True for a file this user may execute.
