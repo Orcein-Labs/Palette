@@ -851,6 +851,13 @@ fn snapshot_names(root: &Path) -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Whether `depot` has a published snapshot.
+pub fn has_depot_snapshot(depot: &Path) -> bool {
+    depot_snapshot_root(depot).is_some_and(|root| {
+        fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) && snapshot_names(&root).is_ok_and(|n| !n.is_empty())
+    })
+}
+
 /// The newest snapshot of `depot`, held, or None when it has none.
 fn hold_depot_snapshot(depot: &Path) -> Result<Option<HeldSnapshot>, String> {
     use std::os::unix::fs::MetadataExt;
@@ -1758,6 +1765,15 @@ mod tests {
         remove_session_depot(&overlay);
         assert!(fs::symlink_metadata(&overlay).is_err() && fs::symlink_metadata(clone_owner_path(&overlay)).is_err());
         let copy = copied_depot(&depot);
+        // A child another test thread forked holds the hold's copy until it
+        // execs, so the snapshot may survive one sweep.
+        for _ in 0..200 {
+            if !first.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            try_sweep_depot_snapshots(&depot);
+        }
         assert!(!first.exists(), "a removed overlay kept its snapshot held");
         assert_eq!(fs::read_to_string(copy.join("cache")).unwrap(), "second");
         assert!(second.is_dir());

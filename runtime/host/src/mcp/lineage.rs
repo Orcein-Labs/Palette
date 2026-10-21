@@ -15,6 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -81,13 +82,19 @@ fn acquire_migration_lock(state_dir: &Path) -> Result<File, Fault> {
         mkdir_private(parent)?;
     }
     let lock = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(&path).map_err(Fault::io)?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // A child another thread forked holds a copy of a just-released lock
+    // until it execs, so a busy lock is retried briefly before it counts.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(Fault::io(e));
+        }
+        if Instant::now() >= deadline {
             return Err(Fault::new("LineageBusy", format!(
                 "Project lineage migration is blocked by an active legacy owner: {}", state_dir.display())));
         }
-        return Err(Fault::io(e));
+        std::thread::sleep(Duration::from_millis(5));
     }
     Ok(lock)
 }
