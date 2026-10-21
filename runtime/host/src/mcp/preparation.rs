@@ -257,20 +257,27 @@ fn run_captured(argv: &[String], timeout: Option<Duration>) -> std::io::Result<(
     let (out, out_reader) = collect(Box::new(child.stdout.take().expect("piped stdout")));
     let (err, err_reader) = collect(Box::new(child.stderr.take().expect("piped stderr")));
     let deadline = timeout.map(|t| Instant::now() + t);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            // Its output ends when it does.
-            let _ = (out_reader.join(), err_reader.join());
-            break (status, false);
+    let mut status = None;
+    let timed_out = loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        // Its output ends once it and every process it left holding the
+        // pipes have exited.
+        if status.is_some() && out_reader.is_finished() && err_reader.is_finished() {
+            break false;
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            // A process it left behind may hold the pipes open, so the output
-            // is what arrived by now.
-            break (child.wait()?, true);
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
+            // The output is what arrived by now.
+            break true;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    let status = status.expect("the loop ends with a status");
     let code = status.code().unwrap_or_else(|| -status.signal().unwrap_or(0));
     let text = |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().unwrap()).into_owned();
     Ok((code, text(&out), text(&err), timed_out))
@@ -398,6 +405,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_descendant_holding_the_pipes_cannot_outlast_the_timeout() {
+        let argv: Vec<String> = ["/bin/sh", "-c", "echo started; sleep 30 & exit 0"].map(String::from).into();
+        let begun = Instant::now();
+        let (code, stdout, _, timed_out) = run_captured(&argv, Some(Duration::from_millis(500))).unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(10), "{:?}", begun.elapsed());
+        assert_eq!((code, stdout.as_str(), timed_out), (0, "started\n", true));
+        let (code, _, _, timed_out) = run_captured(&["/bin/true".to_string()], Some(Duration::from_secs(30))).unwrap();
+        assert_eq!((code, timed_out), (0, false));
     }
 
     #[test]
