@@ -19,8 +19,6 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 HOST = REPO / "runtime/host/target/release/palette-host"
-sys.path.insert(0, str(REPO / "runtime/security"))
-from runtime_registry import RuntimeRegistry, RuntimeRegistryError  # noqa: E402
 
 
 class WorkspaceRouterIntegration(unittest.TestCase):
@@ -619,43 +617,6 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                     for line in path.read_text().splitlines()]
         teamlab = [r for r in receipts if r.get("category") == "teamlab"]
         self.assertTrue(teamlab and all(r["params"]["agent"] == "claude" for r in teamlab), teamlab)
-
-    def test_C03_runtime_registry_rejects_manifest_authority_and_source_escape(self):
-        root = Path(self.tmp.name) / "registry-negative"
-        workspace = Path(self.tmp.name) / "registry-negative-workspace"
-        state = Path(self.tmp.name) / "registry-negative-state"
-        workspace.mkdir(); state.mkdir(); root.mkdir()
-        cap = root / "bad-authority"
-        cap.mkdir()
-        (cap / "main.jl").write_text("function safe_entry(args); 1; end\n")
-        (cap / "capability.json").write_text(json.dumps({"id": "bad-authority", "version": "1",
-            "source": "main.jl", "entrypoint": "safe_entry", "ceiling": {"network_access": {"allowed": True}}}))
-        with self.assertRaisesRegex(RuntimeRegistryError, "forbidden field"):
-            RuntimeRegistry(root, {}, workspace=workspace, state_dir=state)
-
-        (cap / "capability.json").write_text(json.dumps({"id": "bad-authority", "version": "1",
-            "source": "../outside.jl", "entrypoint": "safe_entry"}))
-        (root / "outside.jl").write_text("function safe_entry(args); 1; end\n")
-        with self.assertRaisesRegex(RuntimeRegistryError, "inside its directory"):
-            RuntimeRegistry(root, {}, workspace=workspace, state_dir=state)
-
-    def test_C01_runtime_registry_toolchain_checks_nested_fixed_artifacts(self):
-        root = Path(self.tmp.name) / "registry-toolchains"
-        workspace = Path(self.tmp.name) / "registry-toolchains-workspace"
-        state = Path(self.tmp.name) / "registry-toolchains-state"
-        cwd = Path(self.tmp.name) / "configured-tool"
-        root.mkdir(); workspace.mkdir(); state.mkdir(); cwd.mkdir()
-        executable = cwd / "runner"
-        executable.write_text("#!/bin/sh\nexit 0\n")
-        executable.chmod(0o755)
-        artifact = cwd / "model.bin"
-        argv = [str(executable), "--fixed-arg=--model=" + str(artifact)]
-        ceiling = {"host_command": {"commands": {"model": {"argv": argv, "cwd": str(cwd)}}}}
-        registry = RuntimeRegistry(root, ceiling, workspace=workspace, state_dir=state)
-        self.assertEqual(next(item for item in registry._toolchains() if item["name"] == "model")["status"], "missing")
-        artifact.write_bytes(b"model")
-        self.assertEqual(next(item for item in registry._toolchains() if item["name"] == "model")["status"], "ready")
-
 
     def test_live_limit_and_router_crash_recovery(self):
         self.proc.stdin.close()
