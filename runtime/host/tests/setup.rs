@@ -149,7 +149,9 @@ impl Fixture {
         for dir in ["runtime/integrations/teamlab", "runtime/plugins/palette", "runtime/licenses"] {
             copy_tree(&source().join(dir), &repo.join(dir));
         }
-        fs::copy(source().join("Project.toml"), repo.join("Project.toml")).unwrap();
+        for file in ["Project.toml", "LICENSE"] {
+            fs::copy(source().join(file), repo.join(file)).unwrap();
+        }
         write(&repo.join("Manifest.toml"), "", 0o644);
         write(&repo.join("runtime/host/target/release/palette-host"), FAKE_SERVER, 0o755);
         write(&repo.join("runtime/security/prewarm_depot.py"), FAKE_PREWARM, 0o755);
@@ -278,7 +280,7 @@ fn installs_checks_and_keeps_the_working_installation_when_a_check_fails() {
     }
     assert_eq!(names(&f.client_dir()), ["generic-mcp.json", "palette-launch.json", "palette-local-plugin", "palette-mcp"]);
     let plugin = f.client_dir().join("palette-local-plugin");
-    assert_eq!(json(&plugin.join("plugin.json"))["license"], "Apache-2.0");
+    assert_eq!(json(&plugin.join("plugin.json"))["license"], "AGPL-3.0-only");
     let entry = &json(&plugin.join("mcp.json"))["mcpServers"]["palette"];
     assert_eq!(entry["type"], "stdio");
     assert_eq!(entry["env"]["PALETTE_REPO"], sdk1.to_str().unwrap());

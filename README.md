@@ -59,7 +59,7 @@ settings, a source checkout, servers and removal.
 
 **Palette-ChatGPT.zip**, **Palette-Claude.zip** and the Claude Desktop extension
 **Palette-Claude.mcpb** are release assets: uploadable plugins with SDK source
-and setup instructions ([client guide](runtime/plugins/DISTRIBUTION.md)). An
+and setup instructions ([install guide](runtime/docs/install.md)). An
 upload alone does not start a runtime. ChatGPT Chat needs a remote connection
 to one; [server deployment](runtime/docs/server.md) keeps compute, packages and
 state on that server.
@@ -111,7 +111,7 @@ Revival labels are `restored / rebuilt / stale / lost` (and uncertain, when that
 
 ## Optional operator briefing
 
-[BRAIN_BLAST.md](BRAIN_BLAST.md) explains how to exploit persistent Julia state,
+The [operator briefing](docs/brain-blast.md) explains how to exploit persistent Julia state,
 representations, compiled helpers, provenance, and controlled experiments.
 Provide it as context when you want a model to start with those practices, or
 withhold it when evaluating unprimed exploration. It is guidance, not a required
@@ -179,8 +179,7 @@ The reason I developed this and didn't simply wrap one of these three, is that J
 
 ## License
 
-Core: **AGPL-3.0-only**. Identified client/plugin packages and public docs:
-**Apache-2.0**. Inherited MIT notices remain preserved. See
+**AGPL-3.0-only**. Inherited MIT notices remain preserved. See
 [license boundaries](runtime/licenses/README.md) and [LICENSE](LICENSE).
 
 ## Provider terms

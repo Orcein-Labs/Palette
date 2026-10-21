@@ -45,3 +45,6 @@ Thumbs.db
 # Generated launch archives and campaign backup copies
 /Palette-Launch-Bundles.zip
 *.pre-*
+
+# Local client-distribution notes (kept out of the repo)
+/runtime/plugins/DISTRIBUTION.md
