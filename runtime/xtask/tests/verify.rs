@@ -115,7 +115,7 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
     for call in &calls {
         assert_eq!(call.cwd, r.to_string(), "{} ran outside the checkout", call.args);
     }
-    let gates: Vec<String> = calls.iter().take(9).map(|c| format!("{} {}", c.tool, c.args)).collect();
+    let gates: Vec<String> = calls.iter().take(10).map(|c| format!("{} {}", c.tool, c.args)).collect();
     assert!(gates[0].starts_with(&format!("julia --startup-file=no --project={} -e using Palette", f.dir.join("project").display())));
     assert!(gates[0].ends_with(&format!(" {r}")));
     assert_eq!(
@@ -124,6 +124,7 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
             "git diff --check".to_string(),
             format!("node {r}/runtime/scripts/check-test-policy.mjs"),
             format!("julia --startup-file=no --project={r} {r}/test/runtests.jl"),
+            format!("julia --startup-file=no --project={r} {r}/runtime/integrations/gesso/test_gesso.jl"),
             format!("cargo test --manifest-path {r}/runtime/host/Cargo.toml"),
             format!("cargo test --locked --manifest-path {r}/runtime/xtask/Cargo.toml"),
             format!("python3 {r}/runtime/security/test_fs_digest.py -v"),
@@ -131,9 +132,9 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
             format!("python3 {r}/runtime/security/prewarm_depot.py --project-dir {} --repo-dir {r} --host-bin {host}", f.dir.join("project").display()),
         ]
     );
-    assert!(calls.iter().take(9).all(|c| c.host == "unset"));
-    let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
-    let shared = ["test_provisioning", "test_patch_broker", "test_workspace_router", "test_receipt_query", "test_read_roots", "test_palette_daemon", "test_gesso"];
+    assert!(calls.iter().take(10).all(|c| c.host == "unset"));
+    let suites: Vec<(&str, &str)> = calls[10..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
+    let shared = ["test_provisioning", "test_patch_broker", "test_workspace_router", "test_receipt_query", "test_read_roots", "test_palette_daemon"];
     let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_time_machine", "test_tools"];
     let expected: Vec<(&str, &str)> = shared
         .iter()
@@ -142,9 +143,8 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
         .chain(hosted.iter().map(|s| (*s, "unset")))
         .collect();
     assert_eq!(suites, expected);
-    assert!(calls[9..].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
-    assert!(calls[9].args.starts_with(&format!("{r}/runtime/security/test_provisioning.py")));
-    assert!(calls[15].args.starts_with(&format!("{r}/runtime/integrations/gesso/test_gesso.py")));
+    assert!(calls[10..].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
+    assert!(calls[10].args.starts_with(&format!("{r}/runtime/security/test_provisioning.py")));
     let text = stdout(&out);
     let rust = text.find("\noperator implementation: rust\n").expect("the rust heading");
     let python = text.find("\noperator implementation: python\n").expect("the python heading");
@@ -179,9 +179,9 @@ fn shards_deal_each_listed_case_to_exactly_one_shard() {
         }
         let skipped = text.matches(&format!("has no cases in shard {shard}")).count();
         let suites_run = calls.iter().filter(|c| suite(c).is_some()).count();
-        assert_eq!(skipped + suites_run, 17, "every suite runs or says it has no cases");
+        assert_eq!(skipped + suites_run, 16, "every suite runs or says it has no cases");
     }
-    assert_eq!(listed.len(), 17);
+    assert_eq!(listed.len(), 16);
     let mut expected: Vec<(String, String)> =
         listed.iter().flat_map(|s| ["Case.test_one", "Case.test_two", "Case.test_three"].map(|c| (s.clone(), c.to_string()))).collect();
     expected.sort();

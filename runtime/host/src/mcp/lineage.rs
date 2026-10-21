@@ -134,9 +134,21 @@ pub(crate) fn ensure_project_lineage(registry: &mut Value, root: &Path, project_
             "Multiple non-empty legacy project states exist for {project_root_id}; refusing to choose")));
     }
 
-    let _lock = match legacy_nonempty.first() {
+    // Every state directory this call removes or replaces is locked first,
+    // empty ones included: a live owner may not have written anything yet.
+    let source = legacy_nonempty.first();
+    let mut locks = Vec::new();
+    for (_, legacy) in &aliases {
+        if *legacy != target && fs::metadata(legacy).is_ok() {
+            locks.push(acquire_migration_lock(legacy)?);
+        }
+    }
+    if source.is_some() && fs::metadata(&target).is_ok() {
+        locks.push(acquire_migration_lock(&target)?);
+    }
+
+    match source {
         Some(source) => {
-            let lock = acquire_migration_lock(source)?;
             if let Some(parent) = target.parent() {
                 mkdir_private(parent)?;
             }
@@ -152,13 +164,9 @@ pub(crate) fn ensure_project_lineage(registry: &mut Value, root: &Path, project_
                 fs::remove_dir(&target).map_err(Fault::io)?;
             }
             fs::rename(source, &target).map_err(Fault::io)?;
-            Some(lock)
         }
-        None => {
-            mkdir_private(&target)?;
-            None
-        }
-    };
+        None => mkdir_private(&target)?,
+    }
 
     for (id, legacy) in &aliases {
         if let Some(entry) = workspaces.get_mut(id).and_then(Value::as_object_mut) {
@@ -169,6 +177,7 @@ pub(crate) fn ensure_project_lineage(registry: &mut Value, root: &Path, project_
             fs::remove_dir(legacy).map_err(Fault::io)?;
         }
     }
+    drop(locks);
     Ok((target, lid))
 }
 
@@ -284,6 +293,25 @@ mod tests {
         reg["workspaces"]["a"]["state_dir"] = json!("/somewhere/else");
         let e = ensure_project_lineage(&mut reg, &t.0, "p1").unwrap_err();
         assert_eq!(e.to_string(), "PermissionError: Workspace registry state path differs from the canonical project lineage: /somewhere/else");
+    }
+
+    #[test]
+    fn owned_empty_states_are_never_removed() {
+        let t = tmp();
+        let (a, b, target) = (t.0.join("states/a"), t.0.join("states/b"), t.0.join("lineages/p1"));
+        fs::create_dir_all(a.join("x")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let mut reg = json!({"workspaces": {"a": project(&t.0, "a", &a), "b": project(&t.0, "b", &b)}});
+        for owned in [&b, &target] {
+            let held = OpenOptions::new().append(true).create(true).open(owner_lock_path(owned)).unwrap();
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            let e = ensure_project_lineage(&mut reg, &t.0, "p1").unwrap_err();
+            assert_eq!(e.kind, "LineageBusy", "{}", owned.display());
+            assert!(a.join("x").is_dir() && b.is_dir() && target.is_dir());
+        }
+        ensure_project_lineage(&mut reg, &t.0, "p1").unwrap();
+        assert!(target.join("x").is_dir() && !a.exists() && !b.exists());
     }
 
     #[test]
