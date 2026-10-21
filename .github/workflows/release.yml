@@ -43,7 +43,7 @@ jobs:
         gzip -9n "$out/palette.tar"
         mv "$out/palette.tar.gz" "$out/palette-linux-x86_64.tar.gz"
         cp runtime/scripts/install.sh runtime/scripts/install.ps1 runtime/scripts/setup-sandbox-host.sh "$out/"
-        python3 runtime/plugins/build_bundles.py --output-dir "$RUNNER_TEMP/bundles"
+        cargo xtask bundles --output-dir "$RUNNER_TEMP/bundles"
         cp "$RUNNER_TEMP"/bundles/*.zip "$RUNNER_TEMP"/bundles/*.mcpb "$out/"
         (cd "$out" && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
         echo "RELEASE_DIR=$out" >> "$GITHUB_ENV"
