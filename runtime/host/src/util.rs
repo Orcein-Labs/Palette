@@ -302,10 +302,246 @@ pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), String
 
 /// Python's repr of a string.
 pub fn py_str(s: &str) -> String {
-    if s.contains('\'') && !s.contains('"') {
-        format!("\"{s}\"")
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => out.extend(['\\', c]),
+            c if !py_printable(c) => out.push_str(&match c as u32 {
+                n @ ..=0xff => format!("\\x{n:02x}"),
+                n @ ..=0xffff => format!("\\u{n:04x}"),
+                n => format!("\\U{n:08x}"),
+            }),
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// False for what Python's repr escapes: controls, separators other than
+/// the space, format and private-use characters (Python 3.14, Unicode 16).
+/// Python also escapes unassigned code points, which pass through here.
+fn py_printable(c: char) -> bool {
+    !matches!(
+        c,
+        '\u{0}'..='\u{1f}'
+        | '\u{7f}'..='\u{a0}'
+        | '\u{ad}'
+        | '\u{600}'..='\u{605}'
+        | '\u{61c}'
+        | '\u{6dd}'
+        | '\u{70f}'
+        | '\u{890}'..='\u{891}'
+        | '\u{8e2}'
+        | '\u{1680}'
+        | '\u{180e}'
+        | '\u{2000}'..='\u{200f}'
+        | '\u{2028}'..='\u{202f}'
+        | '\u{205f}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        | '\u{3000}'
+        | '\u{e000}'..='\u{f8ff}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{110bd}'
+        | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}'
+        | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}'
+        | '\u{e0001}'
+        | '\u{e0020}'..='\u{e007f}'
+        | '\u{f0000}'..='\u{ffffd}'
+        | '\u{100000}'..='\u{10fffd}'
+    )
+}
+
+/// Python's repr of a JSON value. Dicts list their keys sorted.
+pub fn py_repr(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Null => "None".into(),
+        Value::Bool(b) => if *b { "True" } else { "False" }.into(),
+        Value::Number(n) => n.as_f64().filter(|_| n.is_f64()).map_or_else(|| n.to_string(), py_repr_f64),
+        Value::String(s) => py_str(s),
+        Value::Array(a) => format!("[{}]", a.iter().map(py_repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", py_str(k), py_repr(v))).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// The name of the Python type a JSON value loads as.
+pub fn py_type_name(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value;
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// `json.dumps(v)` (or with `indent`) as Python writes it, keys sorted.
+pub fn py_dumps(v: &serde_json::Value, indent: Option<usize>) -> String {
+    let mut out = String::new();
+    dump_into(v, indent, 0, &mut out);
+    out
+}
+
+fn dump_into(v: &serde_json::Value, indent: Option<usize>, depth: usize, out: &mut String) {
+    use serde_json::Value;
+    let items: Vec<(Option<&String>, &Value)> = match v {
+        Value::Array(a) if !a.is_empty() => a.iter().map(|x| (None, x)).collect(),
+        Value::Object(o) if !o.is_empty() => o.iter().map(|(k, x)| (Some(k), x)).collect(),
+        Value::Number(n) if n.is_f64() => return out.push_str(&py_repr_f64(n.as_f64().unwrap_or_default())),
+        Value::String(s) => return out.push_str(&py_json_str(s)),
+        _ => return out.push_str(&v.to_string()),
+    };
+    let newline = |out: &mut String, depth: usize| {
+        if let Some(n) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(n * depth));
+        }
+    };
+    out.push(if v.is_array() { '[' } else { '{' });
+    for (i, (key, x)) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(if indent.is_some() { "," } else { ", " });
+        }
+        newline(out, depth + 1);
+        if let Some(k) = key {
+            out.push_str(&py_json_str(k));
+            out.push_str(": ");
+        }
+        dump_into(x, indent, depth + 1, out);
+    }
+    newline(out, depth);
+    out.push(if v.is_array() { ']' } else { '}' });
+}
+
+/// A failed UTF-8 decode as Python's `bytes.decode()` words it.
+pub fn py_utf8_error(bytes: &[u8], e: &std::str::Utf8Error) -> String {
+    let at = e.valid_up_to();
+    let (end, reason) = match e.error_len() {
+        None => (bytes.len(), "unexpected end of data"),
+        Some(1) if matches!(bytes[at], 0x80..=0xc1 | 0xf5..) => (at + 1, "invalid start byte"),
+        Some(n) => (at + n, "invalid continuation byte"),
+    };
+    let what = if end - at == 1 { format!("byte 0x{:02x} in position {at}", bytes[at]) } else { format!("bytes in position {at}-{}", end - 1) };
+    format!("'utf-8' codec can't decode {what}: {reason}")
+}
+
+/// `[Errno N] text`, as Python prints an OSError raised without a path.
+pub fn py_errno(n: i32) -> String {
+    let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(n)) }.to_string_lossy().into_owned();
+    format!("[Errno {n}] {text}")
+}
+
+/// An OS error as Python prints it: `[Errno 2] No such file or directory: '/x'`.
+pub fn py_os_error(e: &std::io::Error, path: &Path) -> String {
+    match e.raw_os_error() {
+        Some(n) => format!("{}: {}", py_errno(n), py_str(&path.to_string_lossy())),
+        None => e.to_string(),
+    }
+}
+
+/// `path` made absolute against the working directory without resolving
+/// symlinks or `..`, as Python's `Path.absolute()`.
+pub fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).components().collect()
+}
+
+/// Python's `Path.resolve(strict=True)` (CPython 3.13+ `realpath`): every
+/// part must exist and every part before the last be a directory. The error
+/// names the path that failed.
+pub fn resolve_strict(p: &Path) -> Result<PathBuf, (std::io::Error, PathBuf)> {
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    enum Part {
+        Name(Vec<u8>),
+        /// The symlink at this path is resolved to whatever is resolved now.
+        Resolved(Vec<u8>),
+    }
+    let split = |b: &[u8]| b.split(|&c| c == b'/').rev().map(|s| Part::Name(s.to_vec())).collect::<Vec<_>>();
+    let as_path = |b: &[u8]| PathBuf::from(OsStr::from_bytes(b));
+    let bytes = p.as_os_str().as_bytes();
+    let trimmed = &bytes[..bytes.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1)];
+    let mut rest = split(trimmed);
+    let mut count = rest.len();
+    let mut path = if bytes.starts_with(b"/") {
+        b"/".to_vec()
     } else {
-        format!("'{}'", s.replace('\'', "\\'"))
+        std::env::current_dir().map_err(|e| (e, PathBuf::from(".")))?.into_os_string().into_vec()
+    };
+    let mut seen: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+    while count > 0 {
+        let name = match rest.pop().expect("count never exceeds the stack") {
+            Part::Resolved(link) => {
+                seen.insert(link, Some(path.clone()));
+                continue;
+            }
+            Part::Name(name) => name,
+        };
+        count -= 1;
+        if name.is_empty() || name == b"." {
+            continue;
+        }
+        if name == b".." {
+            path.truncate(path.iter().rposition(|&c| c == b'/').unwrap_or(0).max(1));
+            continue;
+        }
+        let mut newpath = path.clone();
+        if newpath != b"/" {
+            newpath.push(b'/');
+        }
+        newpath.extend(&name);
+        let shown = as_path(&newpath);
+        let meta = fs::symlink_metadata(&shown).map_err(|e| (e, shown.clone()))?;
+        if !meta.file_type().is_symlink() {
+            if count > 0 && !meta.is_dir() {
+                return Err((std::io::Error::from_raw_os_error(libc::ENOTDIR), shown));
+            }
+            path = newpath;
+            continue;
+        }
+        match seen.get(&newpath) {
+            Some(Some(done)) => {
+                path = done.clone();
+                continue;
+            }
+            // Met again before it resolved: a loop.
+            Some(None) => return Err((fs::metadata(&shown).err().unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::ELOOP)), shown)),
+            None => {}
+        }
+        let target = fs::read_link(&shown).map_err(|e| (e, shown.clone()))?.into_os_string().into_vec();
+        if target.starts_with(b"/") {
+            path = b"/".to_vec();
+        }
+        seen.insert(newpath.clone(), None);
+        rest.push(Part::Resolved(newpath));
+        let parts = split(&target);
+        count += parts.len();
+        rest.extend(parts);
+    }
+    Ok(as_path(&path))
+}
+
+/// `openat(dir, name)`, never following a symlink at `name`.
+pub fn open_at(dir: libc::c_int, name: &std::ffi::CString, flags: libc::c_int, mode: libc::c_uint) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 }
 

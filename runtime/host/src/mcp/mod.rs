@@ -1,9 +1,11 @@
 //! `palette-host mcp`: the MCP front door, ported from the Python router and
 //! adapter. Wired into the binary in slice C.
 
+pub(crate) mod casefold;
 pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;
+pub(crate) mod patch;
 pub(crate) mod preparation;
 pub(crate) mod receipts;
 pub(crate) mod time_machine;
@@ -47,6 +49,48 @@ impl Fault {
     pub fn io(e: std::io::Error) -> Fault {
         Fault::new("OSError", e.to_string())
     }
+
+    /// The OSError subclass Python raises for `e`, naming `path` as it does.
+    pub fn os(e: &std::io::Error, path: &Path) -> Fault {
+        let kind = match e.raw_os_error() {
+            Some(libc::ENOENT) => "FileNotFoundError",
+            Some(libc::EACCES | libc::EPERM) => "PermissionError",
+            Some(libc::ENOTDIR) => "NotADirectoryError",
+            Some(libc::EEXIST) => "FileExistsError",
+            Some(libc::EISDIR) => "IsADirectoryError",
+            Some(libc::EAGAIN) => "BlockingIOError",
+            Some(libc::ETIMEDOUT) => "TimeoutError",
+            Some(libc::ESRCH) => "ProcessLookupError",
+            Some(libc::ECHILD) => "ChildProcessError",
+            _ => "OSError",
+        };
+        Fault::new(kind, util::py_os_error(e, path))
+    }
+}
+
+/// `json.loads(text)`, with the JSONDecodeError wording for the failures a
+/// peer usually sends: nothing parseable, or a value followed by more.
+pub(crate) fn py_json_loads(text: &str) -> Result<Value, Fault> {
+    serde_json::from_str(text).map_err(|e| {
+        let what = e.to_string();
+        let what = if what.starts_with("trailing characters") {
+            "Extra data"
+        } else if what.starts_with("expected value") || what.starts_with("EOF while parsing a value") {
+            "Expecting value"
+        } else {
+            return Fault::new("JSONDecodeError", what);
+        };
+        // serde counts a 1-based byte column at the failing byte (0 at an
+        // empty end); Python counts characters from the failing one.
+        let line_start: usize = text.split_inclusive('\n').take(e.line() - 1).map(str::len).sum();
+        let mut at = (line_start + e.column().saturating_sub(1)).min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let char_at = text[..at].chars().count();
+        let column = text[line_start..at].chars().count() + 1;
+        Fault::new("JSONDecodeError", format!("{what}: line {} column {column} (char {char_at})", e.line()))
+    })
 }
 
 impl fmt::Display for Fault {

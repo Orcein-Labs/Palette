@@ -57,12 +57,6 @@ pub(crate) fn error_summary(text: &str) -> String {
     format!("{head}\n[... {} characters left out ...]\n{tail}", chars.len() - HEAD - TAIL)
 }
 
-/// `path` made absolute against the working directory without resolving
-/// symlinks or `..`, as Python's `Path.absolute()`.
-fn absolute(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).components().collect()
-}
-
 /// Files under `dir` whose names end with `suffix`, recursing into real
 /// directories only when `recursive`.
 fn files_ending(dir: &Path, suffix: &str, recursive: bool, out: &mut BTreeSet<PathBuf>) {
@@ -89,7 +83,7 @@ fn digests(paths: BTreeSet<PathBuf>) -> Result<Value, Fault> {
 /// What a preparation was made for: the sources it compiled, the workload,
 /// the Julia that ran it, the task and package environments and the depot.
 pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> Result<Value, Fault> {
-    let (project, repo) = (absolute(project_dir), absolute(repo_dir));
+    let (project, repo) = (util::absolute(project_dir), util::absolute(repo_dir));
     let mut sources = BTreeSet::new();
     files_ending(&repo.join("src"), ".jl", true, &mut sources);
     files_ending(&project.join("src"), ".jl", true, &mut sources);
