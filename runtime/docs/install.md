@@ -19,7 +19,7 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
 1. Downloads the release archive, which holds the source and a prebuilt
    x86_64 host (glibc 2.35 or newer), and checks it against `SHA256SUMS.txt`.
    Where the prebuilt host does not run, the installer builds it with Rust.
-2. Installs Python 3 and bubblewrap if they are missing and, where AppArmor
+2. Installs bubblewrap if it is missing and, where AppArmor
    restricts user namespaces (Ubuntu 23.10 and newer), Ubuntu's recommended
    upstream bubblewrap profile, pinned by revision and checksum. This is the
    only step that needs root (`runtime/scripts/setup-sandbox-host.sh`); global
@@ -112,7 +112,7 @@ shop). Julia stays installed
 
 ## Manual installation
 
-The Linux supervised runtime requires Julia, Python 3, bubblewrap, and a built
+The Linux supervised runtime requires Julia, bubblewrap, and a built
 Rust host. Julia dependencies are defined by `Project.toml`; Rust dependencies
 are locked in `runtime/host/Cargo.lock`. Instantiate the Julia project and build the host
 before installing the adapter. Additional packages must be provisioned by the
