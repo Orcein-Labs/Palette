@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 # Make this Linux host able to run Palette's sandbox.
 #   setup-sandbox-host.sh check    as the user: exit 0 when the sandbox starts
 #   setup-sandbox-host.sh install  as root: install Python 3 and bubblewrap and,

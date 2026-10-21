@@ -1,0 +1,10 @@
+# Palette layout predates the hygiene standard; these are the intentional exceptions.
+
+[root]
+# runtime/ is the host, worker, broker and client tree; .claude-plugin/ is where
+# Claude Code looks for the plugin marketplace manifest.
+allow = ["runtime", ".claude-plugin"]
+
+[names]
+# Agent skills must be named SKILL.md; inherited license texts keep their SPDX-style names.
+allow = ["*/SKILL.md", "runtime/licenses/*.txt"]

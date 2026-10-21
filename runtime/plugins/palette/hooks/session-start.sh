@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 # Tell a new Claude Code session which Palette is installed, or how to install it.
 home=${PALETTE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/palette}
 if [ -x "$home/client/palette-mcp" ] && version=$(readlink "$home/current" 2>/dev/null); then

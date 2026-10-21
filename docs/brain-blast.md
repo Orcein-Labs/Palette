@@ -1,7 +1,7 @@
 # Think in Julia. Work in Palette.
 
 An optional operator briefing for the standalone Palette surface. Read this
-alongside the actual tool schema and [operator contract](runtime/docs/operator.md).
+alongside the actual tool schema and [operator contract](../runtime/docs/operator.md).
 Deployment-specific inference engines, other language kernels, agent bridges,
 and compiler toolchains are not assumed to exist.
 
@@ -211,7 +211,7 @@ a patch. Use `palette_patch` to read, prepare, and review an exact change set;
 a trusted client's confirmation or an explicitly authorized local operator must
 approve its digest. Approval permits one bounded attempt, not general filesystem
 access. Receipts describe committed files and failures; a multi-file patch is
-not an all-or-nothing transaction. See [workspaces and patches](runtime/docs/workspaces.md).
+not an all-or-nothing transaction. See [workspaces and patches](../runtime/docs/workspaces.md).
 
 Do not target the deployed adapter's own source directory. Apply experimental
 changes to a separate checkout, test them, then switch installations deliberately.

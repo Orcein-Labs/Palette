@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """Load trusted operator capability configuration for Palette sessions.
 
 The capability file is a host-owned JSON object selected by
