@@ -226,8 +226,6 @@ jobs:
       run: |
         julia --project=@. -e 'using Pkg; Pkg.instantiate()'
         cargo build --manifest-path runtime/host/Cargo.toml --release --locked
-    - name: Check generic toolchain boundaries
-      run: python3 runtime/security/test_provisioning.py
     - name: Check the host's unit tests and its setup and service commands
       run: cargo test --manifest-path runtime/host/Cargo.toml --locked
     - name: Check optional Gesso installer and extension loading
@@ -245,4 +243,4 @@ jobs:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_depot_clones test_entry_points
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_entry_points

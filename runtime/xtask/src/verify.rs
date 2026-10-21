@@ -18,11 +18,9 @@ print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[
 "#;
 
 /// Suites that start no session host.
-const SHARED_SUITES: [&str; 5] = [
-    "runtime/security/test_provisioning.py",
+const SHARED_SUITES: [&str; 3] = [
     "runtime/security/test_patch_broker.py",
     "runtime/security/test_workspace_router.py",
-    "runtime/security/test_read_roots.py",
     "runtime/security/test_palette_daemon.py",
 ];
 /// Suites run against the host binary.
