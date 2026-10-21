@@ -2,7 +2,7 @@
 """Integration proof for plugin-lab multi-workspace routing.
 
 This is intentionally an adapter-level test: it exercises the real existing
-operator_mcp child and therefore the real Rust Palette host.
+`palette-host mcp child` and therefore the real Rust Palette host.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
-ROUTER = REPO / "runtime/security/operator_workspace_router.py"
 HOST = REPO / "runtime/host/target/release/palette-host"
 sys.path.insert(0, str(REPO / "runtime/security"))
 from runtime_registry import RuntimeRegistry, RuntimeRegistryError  # noqa: E402
@@ -65,7 +64,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
 
     def start_router(self):
         self.proc = subprocess.Popen(
-            [sys.executable, str(ROUTER)],
+            [str(HOST), "mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self.router_stderr,
@@ -148,7 +147,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         alias.symlink_to(REPO, target_is_directory=True)
         for workspace in (REPO, REPO.parent, alias, root, root / "registry", root / "registry/child", root / "legacy-state", root / "legacy-state.receipts"):
             with self.subTest(workspace=workspace):
-                result = subprocess.run([sys.executable, str(ROUTER)],
+                result = subprocess.run([str(HOST), "mcp"],
                     input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
                     capture_output=True, text=True, timeout=60,
                     env={**self.env, "OPERATOR_WORKSPACE":str(workspace)})
@@ -157,7 +156,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
 
     def test_D02_missing_default_workspace_is_created_at_start(self):
         workspace = Path(self.tmp.name) / "not-yet" / "workspace"
-        result = subprocess.run([sys.executable, str(ROUTER)],
+        result = subprocess.run([str(HOST), "mcp"],
             input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
             capture_output=True, text=True, timeout=60,
             env={**self.env, "OPERATOR_WORKSPACE":str(workspace)})
@@ -183,7 +182,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         for path in (REPO, alias, self.workspace, Path.home() / ".julia"):
             with self.subTest(path=path):
                 result = subprocess.run(
-                    [sys.executable, str(ROUTER)],
+                    [str(HOST), "mcp"],
                     input=json.dumps({"jsonrpc":"2.0", "id":1, "method":"tools/list"})+"\n",
                     capture_output=True, text=True, timeout=60,
                     env={**self.env, "PALETTE_PROJECT_ROOTS":json.dumps({"unsafe":str(path)})},

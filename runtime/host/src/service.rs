@@ -139,13 +139,9 @@ fn env_file_line(path: Option<&str>) -> Result<String, String> {
     path.map_or(Ok(String::new()), |p| Ok(format!("EnvironmentFile={}\n", unit_path(&operator_env_file(p)?)?)))
 }
 
-fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, python: &Path, env_file: Option<&str>) -> Result<String, String> {
+fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, env_file: Option<&str>) -> Result<String, String> {
     let (repo, sock) = (util::resolve(repo), util::resolve(sock));
     let workspace = workspace.ok_or("--workspace-dir is required because the daemon needs its default workspace")?;
-    let router = repo.join("runtime/security/operator_workspace_router.py");
-    if !router.is_file() {
-        return Err(format!("missing Palette daemon entrypoint: {}", router.display()));
-    }
     let host = repo.join("runtime/host/target/release/palette-host");
     if !util::executable(&host) {
         return Err(format!("missing or non-executable Palette host: {}", host.display()));
@@ -156,7 +152,7 @@ fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, python
     for (i, (key, value)) in values.iter().enumerate() {
         env.push_str(&format!("{}Environment={key}={}", if i > 0 { "\n" } else { "" }, unit_quote(text(value)?)?));
     }
-    let command = quote_all(&[text(python)?, text(&router)?, "--socket", text(&sock)?])?;
+    let command = quote_all(&[text(&host)?, "mcp", "--socket", text(&sock)?])?;
     Ok(format!(
         "[Unit]
 Description=Palette Julia operator daemon
@@ -249,9 +245,7 @@ fn install(f: &HashMap<String, String>) -> Result<i32, String> {
     let get = |k: &str| f.get(k).map(String::as_str);
     let sock = socket_path(get("socket"))?;
     let repo = PathBuf::from(get("repo-dir").map(str::to_string).map_or_else(crate::cli::default_repo_dir, Ok)?);
-    // The daemon's router is still Python until `palette-host mcp` replaces it.
-    let python = util::which("python3").ok_or("python3 is not available: the Palette daemon router runs on it")?;
-    let daemon = render_palette_unit(&repo, get("workspace-dir"), &sock, &python, get("env-file"))?;
+    let daemon = render_palette_unit(&repo, get("workspace-dir"), &sock, get("env-file"))?;
     // Both units are checked before either is written.
     let tunnel = match (get("tunnel-client"), get("tunnel-profile")) {
         (Some(client), Some(profile)) => Some(render_tunnel_unit(client, profile, get("tunnel-env-file"), get("tunnel-profile-dir"), Some(&sock))?),
@@ -346,7 +340,6 @@ mod tests {
     impl Fixture {
         fn new() -> Fixture {
             let f = Fixture { root: util::resolve(&util::mkdtemp("palette-service-test-").unwrap()) };
-            write(&f.repo().join("runtime/security/operator_workspace_router.py"), "# fixture\n", 0o644);
             write(&f.repo().join("runtime/host/target/release/palette-host"), "#!/bin/sh\n", 0o700);
             f
         }
@@ -364,7 +357,7 @@ mod tests {
         }
 
         fn daemon(&self, env_file: Option<&str>) -> Result<String, String> {
-            render_palette_unit(&self.repo(), self.workspace().to_str(), &self.sock(), Path::new("/usr/bin/python with space"), env_file)
+            render_palette_unit(&self.repo(), self.workspace().to_str(), &self.sock(), env_file)
         }
     }
 
@@ -391,7 +384,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=\"/usr/bin/python with space\" {router} \"--socket\" {sock}
+ExecStart={host} \"mcp\" \"--socket\" {sock}
 Restart=on-failure
 RestartSec=2s
 RuntimeDirectory=palette
@@ -410,7 +403,6 @@ StandardError=journal
 [Install]
 WantedBy=default.target
 ",
-            router = q(&f.repo().join("runtime/security/operator_workspace_router.py")),
             sock = q(&f.sock()),
             repo = unit_quote(&repo).unwrap(),
             host = q(&f.repo().join("runtime/host/target/release/palette-host")),
@@ -425,15 +417,13 @@ WantedBy=default.target
     }
 
     #[test]
-    fn daemon_unit_requires_workspace_router_and_host() {
+    fn daemon_unit_requires_workspace_and_host() {
         let f = Fixture::new();
-        let render = |workspace: Option<&str>| render_palette_unit(&f.repo(), workspace, &f.sock(), Path::new("/usr/bin/python3"), None);
+        let render = |workspace: Option<&str>| render_palette_unit(&f.repo(), workspace, &f.sock(), None);
         assert!(render(None).unwrap_err().contains("--workspace-dir is required"));
         let host = f.repo().join("runtime/host/target/release/palette-host");
         fs::set_permissions(&host, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(render(Some("w")).unwrap_err().contains("missing or non-executable Palette host"));
-        fs::remove_file(f.repo().join("runtime/security/operator_workspace_router.py")).unwrap();
-        assert!(render(Some("w")).unwrap_err().contains("missing Palette daemon entrypoint"));
     }
 
     #[test]

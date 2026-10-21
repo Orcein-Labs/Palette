@@ -1,7 +1,6 @@
 """A failed or outdated preparation reads as what it is, not as a lost connection."""
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -70,25 +69,6 @@ class StaleStatusTest(unittest.TestCase):
             status = preparation_status(identity, root)
             self.assertEqual((status["state"], status["error"]), ("stale", None))
             self.assertEqual(status["reason"], "prepared cache missing or changed")
-
-
-class ToolFailureTest(unittest.TestCase):
-    def failure_text(self, expression):
-        # Importing the server sets up its patch broker under HOME, so it runs in a throwaway home.
-        with tempfile.TemporaryDirectory() as root:
-            env = {**os.environ, "HOME": root, "OPERATOR_WORKSPACE": str(Path(root, "workspace")),
-                   "PALETTE_STATE_DIR": str(Path(root, "state"))}
-            code = f"import json, operator_mcp as m; print(m.tool_failure({expression})['content'][0]['text'])"
-            out = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env, stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, check=True).stdout
-            return json.loads(out)["error"]
-
-    def test_a_preparation_failure_is_not_reported_as_a_connection_problem(self):
-        error = self.failure_text("m.PreparationFailed('Palette could not prepare its Julia environment')")
-        self.assertEqual(error, "Palette could not prepare its Julia environment")
-
-    def test_other_failures_still_point_at_the_connection(self):
-        self.assertIn("Check connection status", self.failure_text("RuntimeError('operator died')"))
 
 
 if __name__ == "__main__":

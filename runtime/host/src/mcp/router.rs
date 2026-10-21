@@ -670,22 +670,7 @@ impl Worker {
         if lock(&self.proc).child.is_some() && !self.alive() {
             self.stop_proc(r);
         }
-        let reserved = {
-            let mut children = lock(&r.children);
-            if lock(&self.proc).child.is_none() {
-                let mut occupied: HashSet<&String> = children.map.iter().filter(|(_, w)| w.alive()).map(|(k, _)| k).collect();
-                occupied.extend(children.starting.iter());
-                occupied.extend(children.stopping.iter());
-                if occupied.len() >= r.max_live {
-                    return Err(Fault::new("RuntimeError", format!("Live workspace limit ({}); close an unused workspace first", r.max_live)));
-                }
-                children.starting.insert(self.key.clone());
-                true
-            } else {
-                false
-            }
-        };
-        if reserved {
+        if self.reserve(r)? {
             let started = self.start(r, &mut frames);
             lock(&r.children).starting.remove(&self.key);
             started?;
@@ -696,6 +681,23 @@ impl Worker {
         }
         *lock(&self.last_used) = Instant::now();
         result
+    }
+
+    /// Reserves a live slot when this worker has no adapter. A workspace
+    /// that is live and also starting or stopping counts once.
+    fn reserve(&self, r: &Router) -> Result<bool, Fault> {
+        let mut children = lock(&r.children);
+        if lock(&self.proc).child.is_some() {
+            return Ok(false);
+        }
+        let mut occupied: HashSet<&String> = children.map.iter().filter(|(_, w)| w.alive()).map(|(k, _)| k).collect();
+        occupied.extend(children.starting.iter());
+        occupied.extend(children.stopping.iter());
+        if occupied.len() >= r.max_live {
+            return Err(Fault::new("RuntimeError", format!("Live workspace limit ({}); close an unused workspace first", r.max_live)));
+        }
+        children.starting.insert(self.key.clone());
+        Ok(true)
     }
 
     /// Starts this workspace's adapter under the active generation, holding
@@ -1216,7 +1218,7 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
         [] => None,
         [flag, path] if flag == "--socket" => Some(path.as_str()),
         [flag] if flag.starts_with("--socket=") => Some(&flag["--socket=".len()..]),
-        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp child".into()),
+        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp start | palette-host mcp child".into()),
     }.filter(|p| !p.is_empty());
     let r = match Router::new() {
         Ok(r) => Arc::new(r),
@@ -1243,6 +1245,49 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
             Ok(1)
         }
     }
+}
+
+/// `palette-host mcp start`, the clients' entry (ported from serve_palette.py):
+/// checks the instance is set up, fills the local instance's defaults for
+/// whatever its launcher left unset, then serves stdio.
+pub(crate) fn start() -> Result<i32, String> {
+    for (key, value) in start_defaults(&|k| std::env::var_os(k))? {
+        std::env::set_var(key, value);
+    }
+    main(&[])
+}
+
+/// The variables `start` sets, read through `var`: like setdefault, a
+/// variable set, even empty, is the launcher's.
+fn start_defaults(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    let given = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let repo = match given("PALETTE_REPO") {
+        Some(r) => r,
+        None => crate::util::installed_checkout().ok_or("Palette setup incomplete: this binary is not inside a Palette checkout; set PALETTE_REPO")?,
+    };
+    let repo = crate::util::resolve(&repo);
+    let host = given("PALETTE_HOST").unwrap_or_else(|| repo.join("runtime/host/target/release/palette-host"));
+    for required in [repo.join("Project.toml"), repo.join("Manifest.toml"), host.clone()] {
+        if !required.is_file() {
+            return Err(format!("Palette setup incomplete: missing {}; instantiate Julia and build the host before starting", required.display()));
+        }
+    }
+    if !crate::util::executable(&host) {
+        return Err(format!("Palette host is not executable: {}", host.display()));
+    }
+    let home = given("HOME").unwrap_or_default();
+    let data = crate::util::resolve(&given("PALETTE_DATA_HOME").unwrap_or_else(|| home.join(".local/share/palette")));
+    let defaults = [
+        ("PALETTE_REPO", repo),
+        ("PALETTE_HOST", host),
+        ("OPERATOR_WORKSPACE", data.join("workspace")),
+        ("PALETTE_STATE_DIR", data.join("state")),
+        ("PALETTE_WORKSPACE_STATE_ROOT", data.join("worlds")),
+        // A private instance keeps its packages beside its other data instead
+        // of sharing the host-wide store, as the installers already arrange.
+        ("PALETTE_PACKAGE_DEPOT", data.join("packages")),
+    ];
+    Ok(defaults.into_iter().filter(|(key, _)| var(key).is_none()).collect())
 }
 
 #[cfg(test)]
@@ -1356,5 +1401,133 @@ mod tests {
         assert_eq!(frames.recv().unwrap().unwrap_err().kind, "JSONDecodeError");
         let frames = pump(std::io::Cursor::new(vec![b' '; FRAME_LIMIT + 2]));
         assert_eq!(frames.recv().unwrap().unwrap_err().message, "Workspace child frame exceeded 1 MiB");
+    }
+
+    #[test]
+    fn a_private_data_home_gets_its_own_package_store() {
+        let tmp = Tmp(util::resolve(&util::mkdtemp("palette-start-").unwrap()));
+        let (repo, data) = (tmp.0.join("repo"), tmp.0.join("data"));
+        let host = repo.join("runtime/host/target/release/palette-host");
+        fs::create_dir_all(host.parent().unwrap()).unwrap();
+        fs::write(repo.join("Project.toml"), "").unwrap();
+        let given = |extra: &[(&str, &str)]| {
+            let mut vars: HashMap<String, String> = HashMap::from([
+                ("PALETTE_REPO".into(), repo.to_string_lossy().into()), ("PALETTE_DATA_HOME".into(), data.to_string_lossy().into())]);
+            vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            start_defaults(&move |k| vars.get(k).map(Into::into)).map(|d| d.into_iter().collect::<HashMap<_, _>>())
+        };
+        assert!(given(&[]).unwrap_err().starts_with("Palette setup incomplete: missing "));
+        fs::write(repo.join("Manifest.toml"), "").unwrap();
+        fs::write(&host, "").unwrap();
+        assert!(given(&[]).unwrap_err().starts_with("Palette host is not executable: "));
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+        let defaults = given(&[]).unwrap();
+        assert_eq!(defaults["PALETTE_PACKAGE_DEPOT"], data.join("packages"));
+        assert_eq!(defaults["PALETTE_HOST"], host);
+        assert!(!defaults.contains_key("PALETTE_REPO"), "the launcher's value stays");
+        let shared = given(&[("PALETTE_PACKAGE_DEPOT", "/srv/shared-packages"), ("OPERATOR_WORKSPACE", "")]).unwrap();
+        assert!(!shared.contains_key("PALETTE_PACKAGE_DEPOT") && !shared.contains_key("OPERATOR_WORKSPACE"));
+    }
+
+    // -- Worker synchronization ------------------------------------------------
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A router over a scratch layout, built without the environment.
+    fn router(max_live: usize) -> (Tmp, Router) {
+        let tmp = Tmp(util::resolve(&util::mkdtemp("palette-router-").unwrap()));
+        let (repo, base, legacy, root) = (tmp.0.join("repo"), tmp.0.join("project"), tmp.0.join("legacy"), tmp.0.join("worlds"));
+        fs::create_dir(&base).unwrap();
+        let r = Router {
+            generations: GenerationStore::new(&root.join("runtime-generations"), &repo, &repo.join("host")),
+            legacy_receipts: child::receipts_dir(&legacy),
+            project_roots: BTreeMap::from([("default".to_string(), base.clone())]),
+            repo, base, legacy, root,
+            generation_lock: Mutex::new(()),
+            max_live,
+            idle: Duration::from_secs(900),
+            limits: (60.0, 1800.0),
+            command_parents: Vec::new(),
+            tools: Value::Null,
+            children: Mutex::new(Children::default()),
+        };
+        (tmp, r)
+    }
+
+    fn open_worker(r: &Router, id: &str) -> Arc<Worker> {
+        let entry = r.workspace_control(json!({"action": "create", "workspace_id": id, "scope": "open"}).as_object().unwrap()).unwrap();
+        r.child_for(entry.as_object().unwrap())
+    }
+
+    /// Gives `w` a live adapter: `cat` exits when its stdin closes.
+    fn make_live(w: &Worker) {
+        let mut cat = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut proc = lock(&w.proc);
+        proc.stdin = cat.stdin.take();
+        proc.child = Some(cat);
+    }
+
+    fn control(r: &Router, action: &str, id: &str) -> Value {
+        r.workspace_control(json!({"action": action, "workspace_id": id}).as_object().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn close_waits_for_an_in_flight_call_and_status_sees_the_stop() {
+        let (_tmp, r) = router(4);
+        let w = open_worker(&r, "sync-world");
+        make_live(&w);
+        assert_eq!(control(&r, "status", "sync-world")["running"], json!(true));
+        let in_flight = lock(&w.call);
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| tx.send(control(&r, "close", "sync-world")).unwrap());
+            assert_eq!(rx.recv_timeout(Duration::from_millis(300)), Err(RecvTimeoutError::Timeout),
+                       "close returned while a call held the worker");
+            assert!(w.alive());
+            drop(in_flight);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap()["state_retained"], json!(true));
+        });
+        assert!(!w.alive());
+        assert_eq!(control(&r, "status", "sync-world")["running"], json!(false));
+    }
+
+    #[test]
+    fn waiting_on_one_workspace_does_not_hold_the_registry_lock() {
+        let (_tmp, r) = router(4);
+        let w = open_worker(&r, "busy-world");
+        make_live(&w);
+        let in_flight = lock(&w.call);
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| tx.send(w.call(&r, "palette", Map::new()).is_err()).unwrap());
+            assert_eq!(rx.recv_timeout(Duration::from_millis(300)), Err(RecvTimeoutError::Timeout),
+                       "the second call did not wait for the first");
+            assert!(r.children.try_lock().is_ok(), "a busy workspace held the router's registry lock");
+            drop(in_flight);
+            // No frames pump, so the forwarded call fails and stops the adapter.
+            assert!(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        });
+        assert!(!w.alive());
+    }
+
+    #[test]
+    fn start_reservations_do_not_double_count_live_workers() {
+        let (_tmp, r) = router(2);
+        let (a, b, c) = (open_worker(&r, "starting-a"), open_worker(&r, "starting-b"), open_worker(&r, "starting-c"));
+        make_live(&a);
+        lock(&r.children).starting.insert(a.key.clone());
+        lock(&r.children).stopping.insert(a.key.clone());
+        assert!(!a.reserve(&r).unwrap(), "a live worker needs no slot");
+        assert!(b.reserve(&r).unwrap(), "a live worker that is also starting counted twice");
+        assert_eq!(c.reserve(&r).unwrap_err().message, "Live workspace limit (2); close an unused workspace first");
+        lock(&r.children).starting.remove(&a.key);
+        a.stop_proc(&r);
+        assert!(c.reserve(&r).unwrap());
+        assert_eq!(lock(&r.children).starting, HashSet::from([b.key.clone(), c.key.clone()]));
     }
 }
