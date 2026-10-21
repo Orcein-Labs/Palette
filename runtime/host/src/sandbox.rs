@@ -355,10 +355,11 @@ pub fn package_store_paths(protected_paths: &[PathBuf], ceiling: Option<&serde_j
         _ => util::home().join(".palette").join("packages"),
     };
     let configured_ceiling = if ceiling.is_none() { configured_ceiling_paths()? } else { None };
-    package_store_paths_at(root, protected_paths, ceiling.or(configured_ceiling.as_ref()))
+    package_store_paths_at(root, protected_paths, ceiling.or(configured_ceiling.as_ref()), &|key| std::env::var(key).ok())
 }
 
-fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: Option<&serde_json::Value>) -> Result<PackageStore, String> {
+fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: Option<&serde_json::Value>,
+    var: &dyn Fn(&str) -> Option<String>) -> Result<PackageStore, String> {
     if !root.is_absolute() {
         return Err("PALETTE_PACKAGE_DEPOT must be an absolute path".into());
     }
@@ -382,10 +383,10 @@ fn package_store_paths_at(root: PathBuf, protected_paths: &[PathBuf], ceiling: O
     // The checkout in use, found at run time. A compile-time path would name
     // the build machine's checkout and leave a relocated install unprotected.
     protected.extend(util::installed_checkout());
-    protected.extend(parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?);
-    protected.extend(trusted_tools_dir(std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())?);
+    protected.extend(parse_read_roots(var("PALETTE_READ_ROOTS").as_deref())?);
+    protected.extend(trusted_tools_dir(var("PALETTE_TRUSTED_TOOLS").as_deref())?);
     for key in ["PALETTE_CAPABILITY_CEILING", "PALETTE_HOST_COMMANDS", "PALETTE_REPAIR_CONFIG", "PALETTE_RUNTIME_ROOT", "PALETTE_REPO_DIR"] {
-        if let Ok(path) = std::env::var(key) { if !path.is_empty() { protected.push(PathBuf::from(path)); } }
+        if let Some(path) = var(key) { if !path.is_empty() { protected.push(PathBuf::from(path)); } }
     }
     let commands = ceiling.map(protected_command_paths).unwrap_or_default();
     let root = util::resolve(&lexical_root);
@@ -1601,7 +1602,7 @@ mod tests {
             fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
             fs::set_permissions(&depot, fs::Permissions::from_mode(0o755)).unwrap();
             symlink(&outside, depot.join("registries")).unwrap();
-            let error = package_store_paths_at(store.clone(), &[], None).unwrap_err();
+            let error = package_store_paths_at(store.clone(), &[], None, &|_| None).unwrap_err();
             assert!(error.contains("must not be a symlink"), "{error}");
             assert_eq!(fs::read_to_string(outside.join("sentinel")).unwrap(), "untouched");
             assert_eq!(fs::metadata(&store).unwrap().permissions().mode() & 0o777, 0o755);
@@ -1609,7 +1610,7 @@ mod tests {
             fs::remove_file(depot.join("registries")).unwrap();
             let nested = dir(&depot.join("packages"), "Fixture/slug/src");
             symlink(outside.join("sentinel"), nested.join("module.jl")).unwrap();
-            let error = package_store_paths_at(store.clone(), &[], None).unwrap_err();
+            let error = package_store_paths_at(store.clone(), &[], None, &|_| None).unwrap_err();
             assert!(error.contains("symlinks"), "{error}");
             assert_eq!(fs::read_to_string(outside.join("sentinel")).unwrap(), "untouched");
             assert_eq!(fs::metadata(&store).unwrap().permissions().mode() & 0o777, 0o755);
@@ -1623,9 +1624,132 @@ mod tests {
         let parent = util::mkdtemp("palette-pkg-store-collision-").unwrap();
         let _guard = Temp(parent.clone());
         let root = parent.join("runtime-root");
-        let error = package_store_paths_at(root.clone(), &[root.clone()], None).unwrap_err();
+        let error = package_store_paths_at(root.clone(), &[root.clone()], None, &|_| None).unwrap_err();
         assert!(error.contains("overlaps protected host path"), "{error}");
         assert!(!root.exists(), "rejected protected path was created");
+
+        // The same holds for the runtime root and read roots named in the environment.
+        let runtime = root.to_string_lossy().into_owned();
+        let error = package_store_paths_at(root.clone(), &[], None,
+            &|key| (key == "PALETTE_RUNTIME_ROOT").then(|| runtime.clone())).unwrap_err();
+        assert!(error.contains("overlaps protected host path"), "{error}");
+        assert!(!root.exists(), "rejected runtime-root collision was created");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            let read_root = dir(&parent, "read-root");
+            fs::set_permissions(&read_root, fs::Permissions::from_mode(0o755)).unwrap();
+            let spec = read_root.to_string_lossy().into_owned();
+            let error = package_store_paths_at(read_root.clone(), &[], None,
+                &|key| (key == "PALETTE_READ_ROOTS").then(|| spec.clone())).unwrap_err();
+            assert!(error.contains("overlaps protected host path"), "{error}");
+            assert_eq!(fs::metadata(&read_root).unwrap().permissions().mode() & 0o777, 0o755,
+                "rejected read-root overlap changed the directory mode");
+            assert!(!read_root.join("depot").exists(), "rejected read-root overlap created a depot");
+        }
+    }
+
+    /// Pkg's real build phase (`deps/build.jl`) runs with only the package
+    /// store writable: a developed operator source and a host sibling stay
+    /// untouched, and the same script run without the namespace writes both.
+    #[test]
+    fn case_p04_pkg_build_scripts_write_only_inside_the_package_store() {
+        struct Temp(PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let root = util::mkdtemp("palette-pkg-build-").unwrap();
+        let _guard = Temp(root.clone());
+        let store = dir(&root, "store");
+        let depot = dir(&store, "depot");
+        let environment = dir(&store, "environment");
+        let quote = |path: &Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+        let (name, uuid, registry_uuid) = ("BuildProbe", "7b4f9f1c-2bc0-4ae6-85f8-0a1327452f61", "36eb0b89-20d6-4ff4-9494-24ad49e82f57");
+
+        let gesso = dir(&store, "sources/gesso");
+        dir(&gesso, "src");
+        fs::write(gesso.join("Project.toml"),
+            "name = \"GessoFixture\"\nuuid = \"b63ad0dc-6b3b-4c45-a9c4-123dbbcc1940\"\nversion = \"0.1.0\"\n").unwrap();
+        fs::write(gesso.join("src/GessoFixture.jl"), "module GessoFixture\nfixture_value() = 42\nend\n").unwrap();
+        let source_marker = gesso.join("build-script-write");
+        let outside_marker = root.join("outside-write");
+        let store_marker = depot.join("build-script-ran");
+
+        let repository = dir(&depot, "fixture-repository");
+        dir(&repository, "src");
+        dir(&repository, "deps");
+        fs::write(repository.join("Project.toml"),
+            format!("name = \"{name}\"\nuuid = \"{uuid}\"\nversion = \"0.1.0\"\n")).unwrap();
+        fs::write(repository.join(format!("src/{name}.jl")), format!("module {name}\nend\n")).unwrap();
+        // The first write stays in the store; the others target the operator's
+        // developed source and a host sibling the namespace does not mount.
+        fs::write(repository.join("deps/build.jl"), format!(
+            concat!("open({}, \"w\") do io; write(io, \"ran\"); end\n",
+                    "try; open({}, \"w\") do io; write(io, \"escaped\"); end; catch; println(\"SOURCE_WRITE_BLOCKED\"); end\n",
+                    "try; open({}, \"w\") do io; write(io, \"escaped\"); end; catch; println(\"OUTSIDE_WRITE_BLOCKED\"); end\n"),
+            quote(&store_marker), quote(&source_marker), quote(&outside_marker))).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(&repository).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["-c", "user.name=Palette test", "-c", "user.email=test@example.invalid",
+              "commit", "-qm", "installer confinement fixture"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]).trim().to_string();
+
+        let registry = dir(&depot, "registries/LocalFixture");
+        let package_registry = dir(&registry, &format!("B/{name}"));
+        fs::write(registry.join("Registry.toml"), format!(
+            "name = \"LocalFixture\"\nuuid = \"{registry_uuid}\"\nrepo = \"file://{}\"\n\n[packages]\n\"{uuid}\" = {{ name = \"{name}\", path = \"B/{name}\" }}\n",
+            registry.display())).unwrap();
+        fs::write(package_registry.join("Package.toml"), format!(
+            "name = \"{name}\"\nuuid = \"{uuid}\"\nrepo = \"file://{}\"\n", repository.display())).unwrap();
+        fs::write(package_registry.join("Versions.toml"), format!("[\"0.1.0\"]\ngit-tree-sha1 = \"{tree}\"\n")).unwrap();
+
+        let julia = resolve_julia().unwrap();
+        let base = PathBuf::from(default_depot());
+        // With the Pkg server off, Pkg clones the fixture's file URL and never
+        // reaches an external registry or package service.
+        let script = format!(
+            concat!("ENV[\"JULIA_PKG_SERVER\"] = \"\"; using Pkg; Pkg.develop(path={}); ",
+                    "Pkg.add(Pkg.PackageSpec(name=\"{}\", version=\"0.1.0\")); ",
+                    "using GessoFixture; println(\"GESSO_VALUE=\", GessoFixture.fixture_value())"),
+            quote(&gesso), name);
+        let argv = package_installer_argv(&julia, &store, &depot, &environment, &base, false, &script, &[]).unwrap();
+        let path = BTreeMap::from([("PATH".to_string(), Some("/usr/bin:/bin".to_string()))]);
+        let confined = run_captured_clean(&argv, &path, Duration::from_secs(180)).unwrap();
+        assert_eq!(confined.returncode, 0, "{}{}", confined.stdout, confined.stderr);
+        assert!(confined.stdout.contains("GESSO_VALUE=42"), "{}{}", confined.stdout, confined.stderr);
+        let mut logs = Vec::new();
+        let mut pending = vec![depot.join("scratchspaces")];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).into_iter().flatten().flatten() {
+                let entry = entry.path();
+                if entry.is_dir() { pending.push(entry); } else if entry.ends_with("build.log") { logs.push(entry); }
+            }
+        }
+        assert!(logs.iter().any(|log| fs::read_to_string(log).unwrap_or_default().contains("SOURCE_WRITE_BLOCKED")),
+            "no build log recorded the developed-source write denial: {logs:?}");
+        assert!(store_marker.is_file(), "the build script did not run in the store");
+        assert!(!source_marker.exists(), "the build script modified the developed operator source");
+        assert!(!outside_marker.exists(), "the build script wrote outside the package store");
+
+        // Negative control: the same build script without the namespace.
+        let home = dir(&root, "direct-home");
+        let env = BTreeMap::from([
+            ("HOME".to_string(), Some(home.to_string_lossy().into_owned())),
+            ("JULIA_PROJECT".to_string(), Some(environment.to_string_lossy().into_owned())),
+            ("JULIA_DEPOT_PATH".to_string(), Some(format!("{}:{}", depot.display(), base.display()))),
+            ("JULIA_PKG_PRECOMPILE_AUTO".to_string(), Some("0".to_string())),
+            ("JULIA_PKG_OFFLINE".to_string(), Some("true".to_string())),
+            ("JULIA_PKG_SERVER".to_string(), Some(String::new())),
+            ("PATH".to_string(), Some("/usr/bin:/bin".to_string())),
+        ]);
+        let direct = vec![julia.clone(), "--startup-file=no".into(), "-e".into(),
+                          format!("include({})", quote(&repository.join("deps/build.jl")))];
+        let unconfined = run_captured_clean(&direct, &env, Duration::from_secs(60)).unwrap();
+        assert_eq!(unconfined.returncode, 0, "{}{}", unconfined.stdout, unconfined.stderr);
+        assert!(source_marker.is_file(), "the unconfined script did not demonstrate the source write");
+        assert!(outside_marker.is_file(), "the unconfined script did not demonstrate the outside write");
     }
 
     #[test]

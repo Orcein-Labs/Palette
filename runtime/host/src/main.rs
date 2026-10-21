@@ -5,6 +5,7 @@
 //!   palette-host run-worker --workspace W --project P --repo R --script CODE [--broker-socket-dir D] [--timeout S]
 //!   palette-host broker     --socket PATH --ceiling C --receipts FILE [--session-id ID] [--project P --repo R --depot D]
 //!   palette-host subset     REQUESTED_JSON PARENT_JSON
+//!   palette-host session-depot   (prints a session depot's path, holds it until stdin closes, then removes it)
 //!   palette-host prewarm    --project-dir P [--repo-dir R]
 //!   palette-host prepare    --project-dir P [--repo-dir R] [--state-dir S] [--host-bin H] [--status] [--force] [--timeout-s T]
 //!   palette-host teamlab-news [--agent A]
@@ -107,6 +108,21 @@ fn run_broker(argv: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+/// A session depot for callers outside this process (the Python suites): it
+/// lives while this process does, since its owner record names this process
+/// and an overlay holds its snapshot here.
+fn session_depot(argv: &[String]) -> Result<i32, String> {
+    if !argv.is_empty() { return Err("session-depot takes no arguments".into()) }
+    let depot = sandbox::create_session_depot(None)?;
+    println!("{}", json!({"kind": "READY", "depot": depot}));
+    let mut sink = String::new();
+    while std::io::stdin().read_line(&mut sink).map(|n| n > 0).unwrap_or(false) {
+        sink.clear();
+    }
+    sandbox::remove_session_depot(&depot);
+    Ok(0)
+}
+
 fn subset(argv: &[String]) -> Result<i32, String> {
     let [req, parent] = argv else { return Err("subset takes REQUESTED_JSON PARENT_JSON".into()) };
     let parse = |s: &str| serde_json::from_str::<Value>(s).map_err(|e| e.to_string());
@@ -177,6 +193,7 @@ fn main() {
         Some("run-worker") => run_worker(rest),
         Some("broker") => run_broker(rest),
         Some("subset") => subset(rest),
+        Some("session-depot") => session_depot(rest),
         Some("prewarm") => prewarm(rest),
         Some("prepare") => flags(rest, &["status", "force"]).and_then(|f| mcp::preparation::main(&f)),
         Some("teamlab-news") => teamlab_news(rest),
