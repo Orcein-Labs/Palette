@@ -9,17 +9,13 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
 use super::{atomic_json, Fault};
 use crate::{sandbox, util, PREWARM};
@@ -27,12 +23,8 @@ use crate::{sandbox, util, PREWARM};
 const SCHEMA: &str = "palette.preparation.v1";
 const CACHES_LINE: &str = "palette_preparation_caches=";
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    util::to_hex(&Sha256::digest(bytes))
-}
-
 fn file_digest(path: &Path) -> std::io::Result<String> {
-    fs::read(path).map(|b| sha256_hex(&b))
+    fs::read(path).map(|b| util::sha256_hex(&b))
 }
 
 /// Julia's error output without colour codes, cut in the middle: the cause
@@ -65,12 +57,6 @@ pub(crate) fn error_summary(text: &str) -> String {
     format!("{head}\n[... {} characters left out ...]\n{tail}", chars.len() - HEAD - TAIL)
 }
 
-/// `path` made absolute against the working directory without resolving
-/// symlinks or `..`, as Python's `Path.absolute()`.
-fn absolute(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).components().collect()
-}
-
 /// Files under `dir` whose names end with `suffix`, recursing into real
 /// directories only when `recursive`.
 fn files_ending(dir: &Path, suffix: &str, recursive: bool, out: &mut BTreeSet<PathBuf>) {
@@ -97,7 +83,7 @@ fn digests(paths: BTreeSet<PathBuf>) -> Result<Value, Fault> {
 /// What a preparation was made for: the sources it compiled, the workload,
 /// the Julia that ran it, the task and package environments and the depot.
 pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> Result<Value, Fault> {
-    let (project, repo) = (absolute(project_dir), absolute(repo_dir));
+    let (project, repo) = (util::absolute(project_dir), util::absolute(repo_dir));
     let mut sources = BTreeSet::new();
     files_ending(&repo.join("src"), ".jl", true, &mut sources);
     files_ending(&project.join("src"), ".jl", true, &mut sources);
@@ -127,7 +113,7 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
         "project": project.to_string_lossy(),
         "repo": repo.to_string_lossy(),
         "source": digests(sources)?,
-        "workload": sha256_hex(PREWARM.as_bytes()),
+        "workload": util::sha256_hex(PREWARM.as_bytes()),
         "runtime": {"binary": julia_bin, "version": String::from_utf8_lossy(&out.stdout).trim(),
                     "machine": std::env::consts::ARCH},
         "task_environment": task_environment,
@@ -136,27 +122,11 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
     }))
 }
 
-/// A string as Python's `json.dumps` writes it (`ensure_ascii`).
-fn py_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in Value::String(s.into()).to_string().chars() {
-        // Python also escapes DEL, which serde leaves alone.
-        if c.is_ascii() && c != '\x7f' {
-            out.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                out.push_str(&format!("\\u{unit:04x}"));
-            }
-        }
-    }
-    out
-}
-
 /// Where the record for `identity` lives. The key is the one Python wrote, so
 /// records already on disk are found.
 pub(crate) fn record_path(identity: &Value, state_dir: Option<&Path>) -> PathBuf {
-    let field = |k: &str| py_json_str(identity[k].as_str().unwrap_or(""));
-    let key = sha256_hex(format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")).as_bytes());
+    let field = |k: &str| util::py_json_str(identity[k].as_str().unwrap_or(""));
+    let key = util::sha256_hex(format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")).as_bytes());
     let dir = match state_dir {
         Some(dir) => dir.to_path_buf(),
         None => Path::new(identity["depot"].as_str().unwrap_or("")).join(".palette-preparation"),
@@ -238,51 +208,6 @@ pub(crate) fn status(identity: &Value, state_dir: Option<&Path>) -> Value {
     Value::Object(record)
 }
 
-/// The output of `argv` and its exit code (minus the signal that ended it),
-/// or, once `timeout` passes, the output so far with the process killed.
-fn run_captured(argv: &[String], timeout: Option<Duration>) -> std::io::Result<(i32, String, String, bool)> {
-    let mut child = Command::new(&argv[0]).args(&argv[1..])
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let collect = |mut pipe: Box<dyn Read + Send>| {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&buf);
-        let reader = std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
-                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
-            }
-        });
-        (buf, reader)
-    };
-    let (out, out_reader) = collect(Box::new(child.stdout.take().expect("piped stdout")));
-    let (err, err_reader) = collect(Box::new(child.stderr.take().expect("piped stderr")));
-    let deadline = timeout.map(|t| Instant::now() + t);
-    let mut status = None;
-    let timed_out = loop {
-        if status.is_none() {
-            status = child.try_wait()?;
-        }
-        // Its output ends once it and every process it left holding the
-        // pipes have exited.
-        if status.is_some() && out_reader.is_finished() && err_reader.is_finished() {
-            break false;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            if status.is_none() {
-                let _ = child.kill();
-                status = Some(child.wait()?);
-            }
-            // The output is what arrived by now.
-            break true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let status = status.expect("the loop ends with a status");
-    let code = status.code().unwrap_or_else(|| -status.signal().unwrap_or(0));
-    let text = |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().unwrap()).into_owned();
-    Ok((code, text(&out), text(&err), timed_out))
-}
-
 /// Prewarms the depot with `host_bin prewarm` and records the result, unless
 /// a prepared record for the same identity exists and `force` is false. One
 /// preparation runs at a time per record.
@@ -330,7 +255,7 @@ pub(crate) fn prepare(project_dir: &Path, repo_dir: &Path, state_dir: Option<&Pa
     let argv: Vec<String> = vec![host_bin.to_string_lossy().into_owned(), "prewarm".into(), "--project-dir".into(),
                                  project_dir.to_string_lossy().into_owned(), "--repo-dir".into(), repo_dir.to_string_lossy().into_owned()];
     let fields = record.as_object_mut().expect("a record is an object");
-    let outcome = run_captured(&argv, timeout.map(Duration::from_secs_f64))
+    let outcome = super::run_captured(&argv, None, timeout.map(Duration::from_secs_f64))
         .map_err(|e| format!("OSError: {e}: {}", argv[0]))
         .and_then(|(code, stdout, mut stderr, timed_out)| {
             if timed_out {
@@ -408,17 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn a_descendant_holding_the_pipes_cannot_outlast_the_timeout() {
-        let argv: Vec<String> = ["/bin/sh", "-c", "echo started; sleep 30 & exit 0"].map(String::from).into();
-        let begun = Instant::now();
-        let (code, stdout, _, timed_out) = run_captured(&argv, Some(Duration::from_millis(500))).unwrap();
-        assert!(begun.elapsed() < Duration::from_secs(10), "{:?}", begun.elapsed());
-        assert_eq!((code, stdout.as_str(), timed_out), (0, "started\n", true));
-        let (code, _, _, timed_out) = run_captured(&["/bin/true".to_string()], Some(Duration::from_secs(30))).unwrap();
-        assert_eq!((code, timed_out), (0, false));
-    }
-
-    #[test]
     fn error_summaries_drop_colour_and_keep_both_ends() {
         assert_eq!(error_summary("\x1b[91m\x1b[1mERROR:\x1b[22m\x1b[39m ZMQ failed\n"), "ERROR: ZMQ failed");
         assert_eq!(error_summary("a\x1b]b\x1b"), "a\x1b]b\x1b");
@@ -433,7 +347,7 @@ mod tests {
     fn record_keys_match_the_python_ones() {
         // hashlib.sha256(json.dumps(["/p", "/r é", "/d\"\n"]).encode()).hexdigest()
         let identity = json!({"project": "/p", "repo": "/r é", "depot": "/d\"\n"});
-        assert_eq!(py_json_str("/r é😀\u{7f}"), "\"/r \\u00e9\\ud83d\\ude00\\u007f\"");
+        assert_eq!(util::py_json_str("/r é😀\u{7f}"), "\"/r \\u00e9\\ud83d\\ude00\\u007f\"");
         assert_eq!(record_path(&identity, Some(Path::new("/s"))),
                    Path::new("/s/e867693d64c661e80e711d5167eab68536a50b4360d1761d8e282da977f17ecf.json"));
         assert_eq!(record_path(&json!({"project": "/p", "repo": "/r", "depot": "/d"}), None).parent().unwrap(), Path::new("/d/.palette-preparation"));
@@ -462,7 +376,7 @@ mod tests {
         let cache = root.join("x.ji");
         fs::write(&cache, "cache").unwrap();
         write_record(root, &identity, json!({"state": "prepared", "returncode": 0, "error": "warnings",
-                                             "cache_files": {cache.to_str().unwrap(): sha256_hex(b"cache")}}));
+                                             "cache_files": {cache.to_str().unwrap(): util::sha256_hex(b"cache")}}));
         let prepared = status(&identity, Some(root));
         assert_eq!((prepared["state"].as_str(), &prepared["error"], &prepared["stderr"]), (Some("prepared"), &Value::Null, &json!("warnings")));
         fs::write(&cache, "changed").unwrap();

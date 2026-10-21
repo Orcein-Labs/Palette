@@ -6,7 +6,7 @@ edition = "2021"
 description = "Palette host: the sandbox launcher, persistent session, and capability broker for the Palette kernel"
 
 [dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 libc = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # The same URL parser ureq uses, so the broker checks the host it connects to.

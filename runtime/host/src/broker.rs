@@ -207,7 +207,7 @@ fn allowlist_host(u: &url::Url) -> String {
 /// refused instead of landing wherever it points.
 fn write_beneath(root: &Path, target: &Path, content: &[u8]) -> Result<(), Fail> {
     use std::ffi::CString;
-    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let rel = target.strip_prefix(root).map_err(|_| Internal(format!("{} is not under {}", target.display(), root.display())))?;
     let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
@@ -215,10 +215,7 @@ fn write_beneath(root: &Path, target: &Path, content: &[u8]) -> Result<(), Fail>
         return Err(Internal(format!("{} is a directory", target.display())));
     };
     let cstr = |p: &std::ffi::OsStr| CString::new(p.as_bytes()).map_err(|e| Internal(e.to_string()));
-    let open_at = |dir: libc::c_int, p: &CString, flags: libc::c_int, mode: libc::c_uint| -> std::io::Result<OwnedFd> {
-        let fd = unsafe { libc::openat(dir, p.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
-        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
-    };
+    use util::open_at;
     let refused = |e: std::io::Error, what: &Path| match e.raw_os_error() {
         Some(libc::ELOOP) | Some(libc::ENOTDIR) => Denied(format!("refusing to write through a symlink at {}", what.display())),
         _ => Internal(format!("{}: {e}", what.display())),

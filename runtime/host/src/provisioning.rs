@@ -113,19 +113,8 @@ pub(crate) fn validate_ceiling(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// An OS error as Python prints it: `[Errno 2] No such file or directory: '/x'`.
-fn os_error(e: &std::io::Error, path: &Path) -> String {
-    match e.raw_os_error() {
-        Some(n) => {
-            let text = unsafe { std::ffi::CStr::from_ptr(libc::strerror(n)) }.to_string_lossy().into_owned();
-            format!("[Errno {n}] {text}: '{}'", path.display())
-        }
-        None => e.to_string(),
-    }
-}
-
 fn read_json(path: &Path, var: &str, shown: &str) -> Result<Value, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("cannot read {var} {shown}: {}", os_error(&e, path)))?;
+    let text = fs::read_to_string(path).map_err(|e| format!("cannot read {var} {shown}: {}", util::py_os_error(&e, path)))?;
     serde_json::from_str(&text).map_err(|e| format!("invalid JSON in {var} {shown}: {e}"))
 }
 

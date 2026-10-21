@@ -33,7 +33,6 @@
 use crate::broker::Fail::{self, Denied, Internal};
 use crate::util;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
@@ -154,15 +153,11 @@ fn valid_id(s: &str) -> bool {
     (8..=64).contains(&s.len()) && is_hex(s)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    util::to_hex(&Sha256::digest(bytes))
-}
-
 /// A new listing's id: the shortest prefix (8 hex digits, then 12, ...) of a
 /// hash of who listed it, its binding and its first source that no other
 /// listing has.
 fn new_listing_id(taken: &Map<String, Value>, author: &str, binding: &str, first_sha: &str) -> String {
-    let full = sha256_hex(format!("{author}\n{binding}\n{first_sha}").as_bytes());
+    let full = util::sha256_hex(format!("{author}\n{binding}\n{first_sha}").as_bytes());
     let mut n = 8;
     while n < 64 && taken.contains_key(&full[..n]) {
         n += 4;
@@ -307,7 +302,7 @@ impl Lab {
             .open(&path).map_err(io(&path))?;
         let mut bytes = Vec::new();
         Read::take(&mut f, MAX_SOURCE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(io(&path))?;
-        if bytes.len() > MAX_SOURCE_BYTES || sha256_hex(&bytes) != sha {
+        if bytes.len() > MAX_SOURCE_BYTES || util::sha256_hex(&bytes) != sha {
             return Err(Internal(format!("teamlab blob {} was tampered with: its contents no longer match its hash", path.display())));
         }
         String::from_utf8(bytes).map_err(|_| Internal(format!("teamlab blob {} is not UTF-8", path.display())))
@@ -635,7 +630,7 @@ fn publish(lab: &Lab, state: &mut Map<String, Value>, agent: &str, p: &Map<Strin
     };
     let tag = str_param(p, "tag")?.map(tag_of).transpose().map_err(Denied)?;
     let (note, test) = (note_param(p)?, test_param(p)?);
-    let sha = sha256_hex(source.as_bytes());
+    let sha = util::sha256_hex(source.as_bytes());
 
     let id = match id_param(p, "id")? {
         Some(id) => Some(id.to_string()),
@@ -1145,7 +1140,7 @@ fn lowercase_first(s: &str) -> String {
 pub fn receipt_view(agent: &str, params: &Value, result: &Value) -> (Value, Value) {
     fn digest(text: &Value) -> Value {
         match text.as_str() {
-            Some(s) => json!({"sha256": sha256_hex(s.as_bytes()), "bytes": s.len()}),
+            Some(s) => json!({"sha256": util::sha256_hex(s.as_bytes()), "bytes": s.len()}),
             None => text.clone(),
         }
     }
@@ -1516,7 +1511,7 @@ mod tests {
     fn a_format_1_index_reads_as_listings_and_is_written_back_as_format_2() {
         let d = lab();
         let l = Lab::open(&d.0).unwrap();
-        let sha = sha256_hex(SRC.as_bytes());
+        let sha = util::sha256_hex(SRC.as_bytes());
         l.put_blob(&sha, SRC.as_bytes()).unwrap();
         let v = |note: Value| json!({"sha256": sha, "version": 1, "author": "codex", "published_at": 100.0, "bytes": SRC.len(),
                                      "note": note, "test": null, "approvals": []});
@@ -1549,7 +1544,7 @@ mod tests {
 
     #[test]
     fn listing_ids_grow_until_unique() {
-        let full = sha256_hex(b"codex\nhello\nabc");
+        let full = util::sha256_hex(b"codex\nhello\nabc");
         let mut taken = Map::new();
         assert_eq!(new_listing_id(&taken, "codex", "hello", "abc"), full[..8]);
         taken.insert(full[..8].to_string(), json!({}));
