@@ -1,5 +1,5 @@
 //! The operator verification gates: Julia, Rust and the real conformance
-//! suites, against both hosts or one, whole or as shard I of N.
+//! suites against the Rust host, whole or as shard I of N.
 
 use crate::timings::{self, Shard};
 use crate::Fail;
@@ -26,8 +26,8 @@ const SHARED_SUITES: [&str; 6] = [
     "runtime/security/test_read_roots.py",
     "runtime/security/test_palette_daemon.py",
 ];
-/// Suites run once per host implementation.
-const HOST_SUITES: [&str; 8] = [
+/// Suites run against the host binary.
+const HOST_SUITES: [&str; 10] = [
     "test_authority.py",
     "test_session.py",
     "test_session_cli.py",
@@ -36,9 +36,9 @@ const HOST_SUITES: [&str; 8] = [
     "test_contexts.py",
     "test_time_machine.py",
     "test_tools.py",
+    "test_xray.py",
+    "test_host_command.py",
 ];
-/// Receipts are the Rust host's, and test_host_command runs the Python broker itself.
-const RUST_ONLY_SUITES: [&str; 2] = ["test_xray.py", "test_host_command.py"];
 
 macro_rules! argv {
     ($($word:expr),* $(,)?) => { vec![$(OsString::from($word)),*] };
@@ -46,8 +46,7 @@ macro_rules! argv {
 
 struct Run {
     suite: PathBuf,
-    implementation: Option<&'static str>,
-    /// PALETTE_HOST_BIN for the suite: the Rust host, or unset for Python.
+    /// PALETTE_HOST_BIN for the suite, or unset for one that starts no host.
     host: Option<PathBuf>,
 }
 
@@ -110,12 +109,7 @@ impl Gates {
             let dealt = shard.deal(&keys, &timings::load(&self.root.join(timings::WEIGHTS))?);
             Some(cases.into_iter().zip(dealt).filter_map(|(case, m)| m.then_some(case)).collect())
         };
-        let mut current = None;
         for (i, run) in runs.iter().enumerate() {
-            if run.implementation.is_some() && run.implementation != current {
-                println!("\noperator implementation: {}", run.implementation.unwrap_or_default());
-                current = run.implementation;
-            }
             let mut words = argv!["python3", &run.suite, "-v"];
             if let Some(mine) = &mine {
                 let tests: Vec<&String> = mine.iter().filter(|(r, _)| *r == i).map(|(_, id)| id).collect();
@@ -150,25 +144,18 @@ fn on_path(name: &str) -> bool {
 
 struct Args {
     project: PathBuf,
-    implementations: Vec<&'static str>,
     shard: Shard,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
-    let mut flags = crate::flags(args, &["--project-dir", "--implementation", "--shard"])?;
+    let mut flags = crate::flags(args, &["--project-dir", "--shard"])?;
     let project = flags.remove("--project-dir").ok_or("--project-dir is required")?;
-    let implementations = match flags.get("--implementation").map_or("both", String::as_str) {
-        "both" => vec!["rust", "python"],
-        "rust" => vec!["rust"],
-        "python" => vec!["python"],
-        other => return Err(format!("--implementation must be both, rust or python, not {other}")),
-    };
     let project = std::path::absolute(&project).map_err(|e| format!("{project}: {e}"))?;
-    Ok(Args { project, implementations, shard: Shard::parse(flags.get("--shard").map_or("1/1", String::as_str))? })
+    Ok(Args { project, shard: Shard::parse(flags.get("--shard").map_or("1/1", String::as_str))? })
 }
 
 pub fn main(args: &[String]) -> Result<(), Fail> {
-    let Args { project, implementations, shard } = parse(args).map_err(Fail::Usage)?;
+    let Args { project, shard } = parse(args).map_err(Fail::Usage)?;
     if !project.join("Project.toml").is_file() || !project.join("Manifest.toml").is_file() {
         return Err(Fail::Usage("the test project must be instantiated before verification".into()));
     }
@@ -201,7 +188,6 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
         gates.run(argv!["julia", "--startup-file=no", format!("--project={}", root.display()), root.join("runtime/integrations/gesso/test_gesso.jl")], None)?;
         gates.run(argv!["cargo", "test", "--manifest-path", &host_manifest], None)?;
         gates.run(argv!["cargo", "test", "--locked", "--manifest-path", root.join("runtime/xtask/Cargo.toml")], None)?;
-        gates.run(argv!["python3", root.join("runtime/security/test_fs_digest.py"), "-v"], None)?;
     }
     gates.run(argv!["cargo", "build", "--release", "--manifest-path", &host_manifest], None)?;
     // Through cargo, which has just built it, so the stubbed tests run no real host.
@@ -211,12 +197,8 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
         None,
     )?;
     let host = root.join("runtime/host/target/release/palette-host");
-    let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: root.join(s), implementation: None, host: None }).collect();
-    for implementation in implementations {
-        let host = (implementation == "rust").then(|| host.clone());
-        let suites = HOST_SUITES.iter().chain(if implementation == "rust" { &RUST_ONLY_SUITES[..] } else { &[] });
-        runs.extend(suites.map(|s| Run { suite: root.join("runtime/security").join(s), implementation: Some(implementation), host: host.clone() }));
-    }
+    let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: root.join(s), host: None }).collect();
+    runs.extend(HOST_SUITES.iter().map(|s| Run { suite: root.join("runtime/security").join(s), host: Some(host.clone()) }));
     gates.run_suites(&shard, &runs)?;
     println!("\nAll operator verification gates passed (shard {}/{}).", shard.index, shard.count);
     Ok(())
@@ -232,14 +214,12 @@ mod tests {
 
     #[test]
     fn parses_flags_with_and_without_equals() {
-        let a = parse(&strings(&["--project-dir", "env", "--implementation=rust", "--shard", "3/4"])).unwrap();
+        let a = parse(&strings(&["--project-dir", "env", "--shard=3/4"])).unwrap();
         assert!(a.project.is_absolute() && a.project.ends_with("env"));
-        assert_eq!(a.implementations, ["rust"]);
         assert_eq!((a.shard.index, a.shard.count), (3, 4));
         let d = parse(&strings(&["--project-dir=/e"])).unwrap();
-        assert_eq!(d.implementations, ["rust", "python"]);
         assert_eq!((d.shard.index, d.shard.count), (1, 1));
-        for bad in [&["--shard", "1/4"][..], &["--project-dir"], &["--project-dir", "e", "--implementation", "go"], &["--project-dir", "e", "--shard", "5/4"], &["--project-dir", "e", "x"]] {
+        for bad in [&["--shard", "1/4"][..], &["--project-dir"], &["--project-dir", "e", "--implementation", "rust"], &["--project-dir", "e", "--shard", "5/4"], &["--project-dir", "e", "x"]] {
             assert!(parse(&strings(bad)).is_err(), "{bad:?} was accepted");
         }
     }

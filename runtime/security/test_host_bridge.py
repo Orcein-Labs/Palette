@@ -2,7 +2,7 @@
 """
 Mid-call host requests: the kernel asks the agent host to act (an RLM child,
 for instance) while a call runs, through its broker, and only for the request
-types its ceiling names. These tests play the host on session_cli's stdio.
+types its ceiling names. These tests play the host on the session bridge's stdio.
 
 Run:
     python3 runtime/security/test_host_bridge.py
@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from host_adapter import B, session_cmd  # noqa: E402
 
-from test_session_cli import CLI, PROJECT_DIR, _skip_if_no_bwrap, _skip_if_no_project  # noqa: E402
+from test_session_cli import PROJECT_DIR, _skip_if_no_bwrap, _skip_if_no_project  # noqa: E402
 
 RLM_TYPES = ["rlm.run", "rlm.collect", "rlm.list_subagents"]
 CHILD = {"rlm_child_id": "c1", "name": "w", "session_dir": "/s/c1", "model": "openai/luna"}
@@ -35,7 +35,7 @@ def _ok(result):
 
 
 class Host:
-    """session_cli with a given ceiling, driven the way the agent host drives it."""
+    """The session bridge with a given ceiling, driven the way the agent host drives it."""
 
     def __init__(self, ceiling: dict, turn_timeout: float = 20):
         self.workspace = tempfile.mkdtemp(prefix="palette-bridge-")
