@@ -1,4 +1,4 @@
-//! Host-side, one-attempt file patch grants, ported from `patch_broker.py`.
+//! Host-side, one-attempt file patch grants.
 //! Approval is never a tool argument: a patch is prepared, then approved by
 //! the local administrator command (or a client's form confirmation), then
 //! applied once by a Landlock-confined helper process.
@@ -104,11 +104,8 @@ pub(crate) fn classify_patch_path(relative: &str, prefixes: &[(String, String)])
     const PROTECTED_DIRS: [&str; 17] = ["runtime/security", "runtime/host", "runtime/capabilities", "runtime/plugins",
                                         "src/security", "src/host", "host/security", ".github", ".buildkite",
                                         "config", "configs", "deployment", "deploy", "infra", ".ssh", ".aws", ".gnupg"];
-    const PROTECTED_NAMES: [&str; 20] = [
-        "operator_mcp.py", "operator_workspace_router.py", "runtime_registry.py",
-        "patch_broker.py", "repair_broker.py", "broker.py", "sandbox.py",
-        "launch_worker.py", "install_operator_plugin.py", "serve_palette.py",
-        "capability.json",
+    const PROTECTED_NAMES: [&str; 12] = [
+        "broker.py", "sandbox.py", "capability.json",
         "project.toml", "manifest.toml", "startup.jl", "localpreferences.toml",
         "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini",
     ];
@@ -1546,7 +1543,7 @@ mod tests {
         let classes = ["runtime", "tools", "recipes", "adapters"].map(|c| (c.to_string(), c.to_string())).to_vec();
         f.broker.auto_apply_prefixes.insert("project".into(), classes);
         let classify = |path: &str| f.broker.classify(&"project".into(), &path.into()).unwrap();
-        assert!(!classify("runtime/security/patch_broker.py").self_apply);
+        assert!(!classify("runtime/security/host_adapter.py").self_apply);
         assert!(!classify("runtime/capabilities/manifest.json").self_apply);
         assert_eq!(classify("settings/credentials.json").class, "forbidden");
         assert!(!classify("unclassified/app.py").self_apply);

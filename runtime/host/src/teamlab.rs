@@ -85,8 +85,7 @@ pub fn ceiling_dir(ceiling: &Value) -> Option<PathBuf> {
     Path::new(dir).is_absolute().then(|| util::resolve(Path::new(dir)))
 }
 
-/// The shop the operator grants this user's sessions, as provisioning.py's
-/// `with_teamlab` finds it: `PALETTE_TEAMLAB_DIR` (empty or `off` for none),
+/// The shop the operator grants this user's sessions: `PALETTE_TEAMLAB_DIR` (empty or `off` for none),
 /// else `$XDG_DATA_HOME/palette/teamlab`, else `~/.local/share/palette/teamlab`.
 pub fn user_dir() -> Option<PathBuf> {
     dir_from_env(|k| std::env::var(k).ok()).ok().flatten()
