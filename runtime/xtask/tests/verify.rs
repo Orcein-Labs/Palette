@@ -133,7 +133,7 @@ fn runs_every_gate_then_each_suite_whole_against_the_host() {
     );
     assert!(calls.iter().take(9).all(|c| c.host == "unset"));
     let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
-    let shared = ["test_provisioning", "test_patch_broker", "test_workspace_router", "test_receipt_query", "test_read_roots", "test_palette_daemon"];
+    let shared = ["test_provisioning", "test_patch_broker", "test_workspace_router", "test_read_roots", "test_palette_daemon"];
     let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_time_machine", "test_tools", "test_xray", "test_host_command"];
     let expected: Vec<(&str, &str)> =
         shared.iter().map(|s| (*s, "unset")).chain(hosted.iter().map(|s| (*s, host.as_str()))).collect();
@@ -172,9 +172,9 @@ fn shards_deal_each_listed_case_to_exactly_one_shard() {
         }
         let skipped = text.matches(&format!("has no cases in shard {shard}")).count();
         let suites_run = calls.iter().filter(|c| suite(c).is_some()).count();
-        assert_eq!(skipped + suites_run, 16, "every suite runs or says it has no cases");
+        assert_eq!(skipped + suites_run, 15, "every suite runs or says it has no cases");
     }
-    assert_eq!(listed.len(), 16);
+    assert_eq!(listed.len(), 15);
     let mut expected: Vec<(String, String)> =
         listed.iter().flat_map(|s| ["Case.test_one", "Case.test_two", "Case.test_three"].map(|c| (s.clone(), c.to_string()))).collect();
     expected.sort();

@@ -1,5 +1,4 @@
-//! `palette-host mcp`: the workspace router, ported from
-//! `operator_workspace_router.py`.
+//! `palette-host mcp`: the workspace router.
 //!
 //! The router is the MCP server agents talk to. It keeps a registry of
 //! logical workspaces (thread, project or open worlds), starts one
@@ -1247,7 +1246,7 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
     }
 }
 
-/// `palette-host mcp start`, the clients' entry (ported from serve_palette.py):
+/// `palette-host mcp start`, the clients' entry:
 /// checks the instance is set up, fills the local instance's defaults for
 /// whatever its launcher left unset, then serves stdio.
 pub(crate) fn start() -> Result<i32, String> {

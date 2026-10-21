@@ -185,6 +185,7 @@ fn main() {
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
         Some("patch") => mcp::patch::main(rest),
+        Some("control") => mcp::control::main(rest),
         Some("toolchain") => toolchain::main(rest),
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
@@ -192,7 +193,7 @@ fn main() {
             Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|toolchain|mcp ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|control|toolchain|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
