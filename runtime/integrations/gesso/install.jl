@@ -292,11 +292,12 @@ function deploy_capability(runtime_root, model_path, artifact_info, source_revis
     return target, manifest["version"]
 end
 
-"Runs `cmd`, killing it after `seconds`; returns (succeeded, stdout, stderr)."
+"Runs `cmd`, SIGKILLing it after `seconds`; returns (succeeded, stdout, stderr)."
 function capture(cmd, seconds)
     out, err = IOBuffer(), IOBuffer()
     process = run(pipeline(cmd; stdin=devnull, stdout=out, stderr=err); wait=false)
-    timer = Timer(_ -> kill(process), seconds)
+    # SIGKILL, not kill()'s default SIGTERM, which a child can ignore.
+    timer = Timer(_ -> kill(process, Base.SIGKILL), seconds)
     wait(process)
     timed_out = !isopen(timer)
     close(timer)
@@ -362,6 +363,8 @@ usage: julia --project=<Palette checkout> runtime/integrations/gesso/install.jl
 const FLAGS = ("--gesso-source", "--model-source", "--package-store", "--artifact-store", "--runtime-root", "--julia")
 
 function parse_args(args)
+    # Accept `--name=value` as well as `--name value`, as argparse did.
+    args = collect(Iterators.flatten(startswith(a, "--") && occursin('=', a) ? split(a, '='; limit=2) : (a,) for a in args))
     iseven(length(args)) || throw(ArgumentError("arguments must be --name value pairs"))
     parsed = Dict{Symbol,String}()
     for i in 1:2:length(args)

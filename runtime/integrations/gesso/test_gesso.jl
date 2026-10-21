@@ -4,7 +4,7 @@ using JSON
 
 include(joinpath(@__DIR__, "install.jl"))
 using .GessoInstall: MODEL_FILES, deploy_capability, install_gesso_source, install_model, inventory_digest,
-                     sha256_file, validate_model_source, copy_file
+                     sha256_file, validate_model_source, copy_file, parse_args, capture
 
 const JULIA = joinpath(Sys.BINDIR, Base.julia_exename())
 const PALETTE_ROOT = dirname(dirname(dirname(realpath(@__DIR__))))
@@ -184,5 +184,18 @@ deploy(root, artifact_root, info) =
             @test ok || out * err
             @test occursin("GESSO_ARTIFACT_LINK=denied", out)
         end
+    end
+
+    @testset "G07_cli_equals_form_and_hard_registration_timeout" begin
+        dirs = ["--gesso-source=/g", "--model-source", "/m", "--package-store=/p=q", "--artifact-store", "/a", "--runtime-root=/r"]
+        parsed = parse_args(dirs)
+        @test parsed[:gesso_source] == "/g" && parsed[:package_store] == "/p=q" && parsed[:runtime_root] == "/r"
+        @test_throws ArgumentError parse_args([dirs; "--julia="; "/j"])
+        @test_throws ArgumentError parse_args([dirs; "--gesso-source=/again"])
+        @test_throws ArgumentError parse_args([dirs; "--bogus=1"])
+        started = time()
+        err = try capture(`sh -c 'trap "" TERM; exec sleep 30'`, 1); nothing catch e; e end
+        @test err isa ErrorException && occursin("timed out after 1 seconds", err.msg)
+        @test time() - started < 10
     end
 end
