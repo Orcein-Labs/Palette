@@ -16,6 +16,7 @@
 
 mod broker;
 mod cli;
+mod install_plugin;
 mod mcp;
 mod provisioning;
 mod receipt_archive;
@@ -178,15 +179,17 @@ fn main() {
         Some("prepare") => flags(rest, &["status", "force"]).and_then(|f| mcp::preparation::main(&f)),
         Some("teamlab-news") => teamlab_news(rest),
         Some("setup") => setup::main(rest),
+        Some("install-plugin") => install_plugin::main(rest),
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
         Some("patch") => mcp::patch::main(rest),
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
+            Some("connect") if rest.len() == 1 => Ok(mcp::client::main()),
             Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve|patch|mcp ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,

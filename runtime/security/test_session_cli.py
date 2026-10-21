@@ -932,7 +932,7 @@ class TestSessionCli(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="palette-mcp-state-") as state_root:
             state = str(Path(state_root, "state"))
             plugin = Path(state_root, "plugin")
-            subprocess.run([sys.executable, str(Path(REPO_DIR, "runtime/security/install_operator_plugin.py")),
+            subprocess.run([str(Path(REPO_DIR, "runtime/host/target/release/palette-host")), "install-plugin",
                 "--plugin-dir", str(plugin), "--workspace-dir", self.task_workspace], stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, check=True)
             connection = json.loads((plugin / ".mcp.json").read_text())["mcpServers"]["palette"]

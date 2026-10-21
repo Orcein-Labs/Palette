@@ -161,15 +161,16 @@ without reflinks the snapshot is a full copy of the depot.
 ## Local stdio plugin
 
 ```sh
-python3 runtime/security/install_operator_plugin.py \
+runtime/host/target/release/palette-host install-plugin \
   --plugin-dir /absolute/path/to/plugin \
   --workspace-dir /absolute/path/to/workspace \
   --repo-dir /absolute/path/to/Palette
 ```
 
-The installer creates a Codex-compatible manifest and MCP configuration. It
-checks the local build and preserves configuration when updating an existing
-Palette entry. The client must separately support and enable that plugin format.
+The installer creates a Codex-compatible manifest and MCP configuration whose
+server runs `palette-host mcp connect`, a stdio client for the user service
+below. It checks the local build and preserves configuration when updating an
+existing Palette entry. The client must separately support and enable that plugin format.
 Installing these files does not register a remote ChatGPT connection.
 
 ### User service lifecycle
