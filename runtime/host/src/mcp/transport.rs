@@ -1,5 +1,4 @@
-//! Palette execution arguments at the host transport boundary, as
-//! source_transport.py checks them.
+//! Palette execution arguments at the host transport boundary.
 //!
 //! `source` is opaque program text carried by the MCP/JSON transport. It is
 //! never embedded in another Julia string literal: it becomes the worker's

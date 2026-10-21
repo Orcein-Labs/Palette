@@ -1,9 +1,10 @@
-//! `palette-host mcp`: the MCP front door, ported from the Python router and
-//! adapter. `router` serves agents; `child` is one workspace's adapter.
+//! `palette-host mcp`: the MCP front door. `router` serves agents; `child` is
+//! one workspace's adapter.
 
 pub(crate) mod casefold;
 pub(crate) mod child;
 pub(crate) mod client;
+pub(crate) mod control;
 pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;
