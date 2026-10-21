@@ -116,6 +116,6 @@ fn prepares_reuses_fails_and_times_out() {
     assert!(record["stderr"].as_str().unwrap().starts_with("prewarm did not finish in 1 s; its output so far:\nPrecompiling Stuck"));
 
     let (summary, _, code) = f.prepare(&f.root.join("nope"), &["--force"]);
-    assert!(summary["error"].as_str().unwrap().starts_with("OSError: "), "{summary}");
+    assert!(summary["error"].as_str().unwrap().starts_with("FileNotFoundError: [Errno 2] No such file or directory: "), "{summary}");
     assert_eq!(code, 1);
 }
