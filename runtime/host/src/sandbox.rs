@@ -1163,6 +1163,13 @@ fn check_unreadable(name: &str, hidden: &Path, roots: &[PathBuf]) -> Result<(), 
 }
 
 pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
+    bwrap_argv(s, std::env::var("PALETTE_READ_ROOTS").ok().as_deref(),
+               std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())
+}
+
+/// `build_bwrap_argv` with PALETTE_READ_ROOTS and PALETTE_TRUSTED_TOOLS passed in.
+fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec: Option<&str>)
+    -> Result<Vec<String>, String> {
     let toolchain = Path::new(s.julia_bin).parent().and_then(Path::parent).unwrap_or(Path::new("/"));
     let workspace = canonical_dir("workspace", Path::new(s.workspace_dir))?;
     let repo = canonical_dir("repository", Path::new(s.repo_dir))?;
@@ -1220,8 +1227,8 @@ pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
     // /tmp/workspace-style child mounts are intentional; only an equal or
     // ancestor workspace/state mount could hide the synthetic /tmp or /run root.
     check_writable_roots_not_masked(&writable, &required_roots)?;
-    let trusted_tools = trusted_tools_dir(std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())?;
-    let mut read_roots = parse_read_roots(std::env::var("PALETTE_READ_ROOTS").ok().as_deref())?;
+    let trusted_tools = trusted_tools_dir(trusted_tools_spec)?;
+    let mut read_roots = parse_read_roots(read_roots_spec)?;
     read_roots.extend(trusted_tools.clone());
     let others: Vec<(&str, &Path)> = protected.iter().chain(required_roots.iter()).copied().collect();
     check_read_roots(&read_roots, &writable, &others)?;
@@ -2039,6 +2046,28 @@ mod tests {
         }).unwrap_err();
         assert!(error.contains("depot snapshot"), "{error}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn argv_binds_each_read_root_read_only_at_its_own_path() {
+        let root = fs::canonicalize(util::mkdtemp("palette-read-root-argv-").unwrap()).unwrap();
+        let s = |p: &Path| p.to_str().unwrap().to_owned();
+        let (repo, project, depot, ws, data) = (s(&dir(&root, "repo")), s(&dir(&root, "project")),
+            s(&dir(&root, "home/depot")), s(&dir(&root, "ws")), s(&dir(&root, "data")));
+        dir(&root, "toolchain/bin");
+        let julia = s(&root.join("toolchain/bin/julia"));
+        let spec = SandboxSpec {
+            workspace_dir: &ws, broker_socket_dir: None, project_dir: &project, repo_dir: &repo,
+            julia_bin: &julia, julia_depot: &depot, network_enabled: false, depot_clone_dir: None,
+            package_store_root: None, package_depot_dir: None, package_environment_dir: None, state_dir: None,
+        };
+        let argv = bwrap_argv(&spec, Some(&data), None).unwrap();
+        let i = argv.iter().position(|a| *a == data).unwrap();
+        assert_eq!(argv[i - 1..i + 2], ["--ro-bind", data.as_str(), data.as_str()]);
+        assert!(!bwrap_argv(&spec, None, None).unwrap().contains(&data));
+        // A root holding the workspace and depot would expose them read-only.
+        assert!(bwrap_argv(&spec, Some(&s(&root)), None).unwrap_err().contains("read root"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
