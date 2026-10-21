@@ -40,8 +40,7 @@ cargo build --release --locked --manifest-path /opt/palette/runtime/host/Cargo.t
   --profile /etc/palette/runtime.json
 ```
 
-`prepare` needs `julia`, `cargo` and `bwrap` on `PATH`, plus `python3` until the
-depot prewarm and the stdio adapter move into the host.
+`prepare` needs `julia`, `cargo` and `bwrap` on `PATH`.
 
 Defaults are `/opt/palette` for source, `/var/lib/palette` for data,
 `/var/cache/palette/depot` for prepared dependencies, and

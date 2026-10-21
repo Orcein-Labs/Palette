@@ -195,10 +195,6 @@ fn environment(p: &Profile) -> Result<Vec<(String, String)>, String> {
     Ok(env)
 }
 
-fn python3(why: &str) -> Result<PathBuf, String> {
-    util::which("python3").ok_or_else(|| format!("python3 is not available: {why}"))
-}
-
 /// First-time provisioning is an administrator action, before the sandbox
 /// opens. Interactive workers keep offline package networking afterwards.
 fn prepare(p: &Profile) -> Result<(), String> {
@@ -206,7 +202,6 @@ fn prepare(p: &Profile) -> Result<(), String> {
     for name in ["julia", "cargo", "bwrap"] {
         tools.insert(name, util::which(name).ok_or_else(|| format!("Missing server prerequisite: {name}"))?);
     }
-    let python = python3("prepare prewarms the depot with it")?;
     for dir in [&p.data, &p.depot, &p.runtime_root] {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -214,11 +209,11 @@ fn prepare(p: &Profile) -> Result<(), String> {
     env.retain(|(k, _)| k != "JULIA_PKG_OFFLINE");
     env.push(("JULIA_PKG_OFFLINE".into(), "false".into()));
     let repo = text(&p.repo)?;
-    let host = text(&p.repo.join(HOST))?.to_string();
+    let host = p.repo.join(HOST);
     let steps: [(&Path, Vec<String>); 3] = [
         (&tools["julia"], vec!["--startup-file=no".into(), format!("--project={repo}"), "-e".into(), "using Pkg; Pkg.instantiate()".into()]),
         (&tools["cargo"], vec!["build".into(), "--release".into(), "--locked".into(), "--manifest-path".into(), format!("{repo}/runtime/host/Cargo.toml")]),
-        (&python, vec![format!("{repo}/runtime/security/prewarm_depot.py"), "--project-dir".into(), repo.into(), "--host-bin".into(), host]),
+        (&host, vec!["prepare".into(), "--project-dir".into(), repo.into()]),
     ];
     for (bin, args) in steps {
         let status = Command::new(bin).args(&args).env_clear().envs(env.iter().cloned()).current_dir(&p.repo).stdin(Stdio::null()).status()

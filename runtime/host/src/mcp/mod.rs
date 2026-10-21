@@ -3,6 +3,7 @@
 
 pub(crate) mod casefold;
 pub(crate) mod child;
+pub(crate) mod client;
 pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;

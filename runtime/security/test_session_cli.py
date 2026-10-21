@@ -301,11 +301,11 @@ class TestSessionCli(unittest.TestCase):
         self.assertEqual(r3["data"], 5)
 
     def test_stdlib_loads_without_precompiling(self):
-        """Fails until runtime/security/prewarm_depot.py has run for this depot: a
+        """Fails until `palette-host prepare` has run for this depot: a
         cold `using Pkg` took ~80s per session, longer than a turn."""
         r = self._turn("using Test, Pkg, SparseArrays; 1")
         self.assertTrue(r["success"], r)
-        self.assertNotIn("Precompiling", r["output"], "run runtime/security/prewarm_depot.py for this depot")
+        self.assertNotIn("Precompiling", r["output"], "run palette-host prepare for this depot")
 
     def test_bash_runs_shell_syntax_and_returns_its_output_and_status(self):
         """bash() used to return only the exit code, so a command's output
@@ -890,7 +890,7 @@ class TestSessionCli(unittest.TestCase):
                 shutil.copytree(Path(REPO_DIR, name), repo / name)
             shutil.copyfile(Path(REPO_DIR, "Project.toml"), repo / "Project.toml")
             shutil.copyfile(Path(PROJECT_DIR, "Manifest.toml"), repo / "Manifest.toml")
-            command = [sys.executable, str(Path(REPO_DIR, "runtime/security/prewarm_depot.py")),
+            command = [str(Path(REPO_DIR, "runtime/host/target/release/palette-host")), "prepare",
                        "--project-dir", str(repo), "--repo-dir", str(repo), "--state-dir", str(Path(root, "state"))]
             def invoke(*flags):
                 result = subprocess.run([*command, *flags], stdin=subprocess.DEVNULL, capture_output=True, text=True)
@@ -932,7 +932,7 @@ class TestSessionCli(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="palette-mcp-state-") as state_root:
             state = str(Path(state_root, "state"))
             plugin = Path(state_root, "plugin")
-            subprocess.run([sys.executable, str(Path(REPO_DIR, "runtime/security/install_operator_plugin.py")),
+            subprocess.run([str(Path(REPO_DIR, "runtime/host/target/release/palette-host")), "install-plugin",
                 "--plugin-dir", str(plugin), "--workspace-dir", self.task_workspace], stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, check=True)
             connection = json.loads((plugin / ".mcp.json").read_text())["mcpServers"]["palette"]

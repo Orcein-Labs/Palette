@@ -129,7 +129,7 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
             format!("cargo test --locked --manifest-path {r}/runtime/xtask/Cargo.toml"),
             format!("python3 {r}/runtime/security/test_fs_digest.py -v"),
             format!("cargo build --release --manifest-path {r}/runtime/host/Cargo.toml"),
-            format!("python3 {r}/runtime/security/prewarm_depot.py --project-dir {} --repo-dir {r} --host-bin {host}", f.dir.join("project").display()),
+            format!("cargo run --release --quiet --manifest-path {r}/runtime/host/Cargo.toml --bin palette-host -- prepare --project-dir {} --repo-dir {r}", f.dir.join("project").display()),
         ]
     );
     assert!(calls.iter().take(10).all(|c| c.host == "unset"));

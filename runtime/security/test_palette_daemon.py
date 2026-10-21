@@ -7,18 +7,13 @@ from pathlib import Path
 import selectors
 import socket
 import stat
-import struct
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
-from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 HOST = REPO / "runtime/host/target/release/palette-host"
-sys.path.insert(0, str(REPO / "runtime/security"))
-import palette_mcp_client  # noqa: E402
 
 
 def descendants(pid):
@@ -102,7 +97,7 @@ class PaletteDaemonProcess(unittest.TestCase):
     def test_disconnect_restart_and_revive(self):
         daemon_pid = self.proc.pid
         self.assertEqual(stat.S_IMODE(self.sockpath.stat().st_mode), 0o600)
-        proxy = subprocess.run([sys.executable, str(REPO / "runtime/security/palette_mcp_client.py")],
+        proxy = subprocess.run([str(HOST), "mcp", "connect"],
                                input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
                                text=True, capture_output=True, timeout=20, env={**self.env, "PALETTE_SOCKET": str(self.sockpath)})
         self.assertEqual(proxy.returncode, 0, proxy.stderr)
@@ -188,18 +183,6 @@ class PaletteDaemonProcess(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((private_child / "daemon.sock").exists())
-
-    def test_client_rejects_wrong_uid_peer(self):
-        if hasattr(socket, "SO_PEERCRED"):
-            peer = mock.Mock()
-            peer.getsockopt.return_value = struct.pack("3i", 42, os.getuid() + 1, 7)
-        else:
-            class Peer:
-                def getpeereid(self):
-                    return os.getuid() + 1, os.getgid()
-            peer = Peer()
-        with self.assertRaises(PermissionError):
-            palette_mcp_client.verify_peer_uid(peer)
 
 
 if __name__ == "__main__":
