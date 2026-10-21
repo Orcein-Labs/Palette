@@ -15,7 +15,7 @@ from unittest.mock import patch
 import patch_broker as patch_broker_module
 from patch_broker import PatchBroker, TRUSTED_TOOLS_TARGET, approval_mode, patch_roots_from_env, request_digest
 from repair_broker import RepairBroker, normalize_recipe, run_isolated_test
-from launch_worker import resolve_real_julia_binary
+from host_adapter import julia_binary
 
 
 def python_test_recipe(recipe_id, *arguments, executable=None, toolchain_root=None,
@@ -373,7 +373,7 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(source.read_text(), "VALUE = 'before'\n")
 
     def test_R07_julia_candidate_runs_in_disposable_worker(self):
-        executable = Path(resolve_real_julia_binary()).resolve()
+        executable = Path(julia_binary()).resolve()
         toolchain = executable.parent.parent
         (self.root / "tools").mkdir()
         source = self.root / "tools/value.jl"
@@ -431,7 +431,7 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(source.read_text(), "VALUE = 'before'\n")
 
     def test_R11_whitelisted_readonly_capability_source_is_tested_before_apply(self):
-        executable = Path(resolve_real_julia_binary()).resolve()
+        executable = Path(julia_binary()).resolve()
         toolchain = executable.parent.parent
         registry = Path(self.tmp.name) / "runtime-capabilities"
         capability = registry / "gesso-fixture"
@@ -500,7 +500,7 @@ class PatchTests(unittest.TestCase):
         classified = protected_host.classify("adapter", "adapter.jl")
         self.assertEqual(classified["class"], "protected")
         self.assertFalse(classified["self_apply"])
-        executable = Path(resolve_real_julia_binary()).resolve()
+        executable = Path(julia_binary()).resolve()
         (capability / "verify_adapter.jl").write_text(
             'using Test; include("adapter.jl"); @test answer() == 2\n')
         protected_repair = RepairBroker(protected_host,

@@ -147,9 +147,10 @@ same conformance suites as the Rust host, so a divergence showed up as a
 failure on one side. That is how A3 and the D11 control were caught. Each
 category below now asserts absolute expected values against `palette-host`, so
 the second host no longer decides right from wrong, and it has been deleted
-along with the `--implementation` option of `cargo xtask verify`.
-`launch_worker.py` remains only as test support and goes with the rest of the
-Python port.
+along with the `--implementation` option of `cargo xtask verify`. Its test
+support module `launch_worker.py` has gone too: the suites get session depots
+from `palette-host session-depot`, and the package-store checks it served are
+Rust tests (`case_p01`–`case_p04` in `sandbox.rs`).
 
 | Category | Suite |
 |---|---|
