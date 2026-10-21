@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Make this Linux host able to run Palette's sandbox.
 #   setup-sandbox-host.sh check    as the user: exit 0 when the sandbox starts
-#   setup-sandbox-host.sh install  as root: install Python 3 and bubblewrap and,
+#   setup-sandbox-host.sh install  as root: install bubblewrap and,
 #                                  where AppArmor restricts user namespaces,
 #                                  the upstream bwrap profile that permits them
 # Global AppArmor and user-namespace policy is left as it is.
 set -eu
 
 check() {
-    command -v python3 >/dev/null || { echo "python3 is not installed" >&2; return 1; }
     command -v bwrap >/dev/null || { echo "bubblewrap is not installed" >&2; return 1; }
     # The namespace setup the host uses, with every capability dropped inside.
     bwrap --unshare-user --unshare-net --unshare-pid --unshare-ipc \
@@ -21,15 +20,15 @@ check() {
 
 install_packages() {
     if command -v apt-get >/dev/null; then
-        apt-get update && apt-get install -y python3 bubblewrap
+        apt-get update && apt-get install -y bubblewrap
     elif command -v dnf >/dev/null; then
-        dnf install -y python3 bubblewrap
+        dnf install -y bubblewrap
     elif command -v pacman >/dev/null; then
-        pacman -S --needed --noconfirm python bubblewrap
+        pacman -S --needed --noconfirm bubblewrap
     elif command -v zypper >/dev/null; then
-        zypper --non-interactive install python3 bubblewrap
+        zypper --non-interactive install bubblewrap
     else
-        echo "Unknown package manager: install python3 and bubblewrap, then run this again" >&2
+        echo "Unknown package manager: install bubblewrap, then run this again" >&2
         return 1
     fi
 }
@@ -55,7 +54,7 @@ case "${1:-}" in
     check) check ;;
     install)
         [ "$(id -u)" = 0 ] || { echo "install needs root: sudo sh $0 install" >&2; exit 1; }
-        { command -v python3 && command -v bwrap; } >/dev/null || install_packages
+        command -v bwrap >/dev/null || install_packages
         install_profile ;;
     *) echo "usage: $0 check|install" >&2; exit 2 ;;
 esac

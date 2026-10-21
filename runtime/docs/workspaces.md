@@ -33,8 +33,8 @@ To take the client out of approval entirely, set `PALETTE_PATCH_APPROVAL=adminis
 If the client does not support confirmation, the request remains pending. The `approval_required` reply carries `review_command` and `approve_command`, the exact commands below with this request's storage path, identifier and digest filled in. An explicitly authorized local administrator can inspect and approve it:
 
 ```
-python3 runtime/security/patch_broker.py --storage /actual/registry/patches review REQUEST_ID
-python3 runtime/security/patch_broker.py --storage /actual/registry/patches approve REQUEST_ID --digest REVIEWED_SHA256
+runtime/host/target/release/palette-host patch --storage /actual/registry/patches review REQUEST_ID
+runtime/host/target/release/palette-host patch --storage /actual/registry/patches approve REQUEST_ID --digest REVIEWED_SHA256
 ```
 
 Then repeat action=apply. A future grant must be authorized explicitly; merely requesting a patch is not permission for Codex or another agent to approve it on the user's behalf.

@@ -12,7 +12,7 @@ from unittest import mock
 from filesystem_layout import require_disjoint
 from provisioning import OperatorConfigError, agent_name, command_parents, operator_ceiling, protected_host_paths, validate_ceiling, with_teamlab
 
-RUNNER = Path(__file__).with_name("provisioning.py")
+HOST = Path(__file__).resolve().parents[2] / "runtime/host/target/release/palette-host"
 
 
 class ProvisioningTest(unittest.TestCase):
@@ -80,7 +80,7 @@ class ProvisioningTest(unittest.TestCase):
             paths = [model, weights, artifact, tokenizer_config, generic_config, library, executable, lock]
             for path in paths:
                 path.mkdir(parents=True, exist_ok=True) if path == library else path.parent.mkdir(parents=True, exist_ok=True)
-            argv = ["/usr/bin/python3", str(RUNNER), "run",
+            argv = [str(HOST), "toolchain", "run",
                     "--executable", str(executable),
                     f"--executable={executable}", f"--model={model}",
                     "--weights", str(weights), f"--weights={weights}",
@@ -124,7 +124,7 @@ class ProvisioningTest(unittest.TestCase):
             executable.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
                                   "print(json.dumps({'argv': sys.argv[1:], 'env': dict(os.environ)}))\n")
             executable.chmod(0o755)
-            config = subprocess.run([sys.executable, str(RUNNER), "config", "--name", "fixture",
+            config = subprocess.run([str(HOST), "toolchain", "config", "--name", "fixture",
                 "--executable", str(executable), "--cwd", tmp, "--artifact", str(artifact),
                 "--fixed-arg=--backend", "--input-mode", "text", "--input-prefix=--prompt"],
                 capture_output=True, text=True, check=True, timeout=10)

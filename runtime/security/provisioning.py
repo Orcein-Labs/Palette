@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 """Load trusted operator capability configuration for Palette sessions.
 
@@ -11,12 +10,8 @@ from __future__ import annotations
 
 import json
 import os
-import argparse
 from pathlib import Path
 import re
-import subprocess
-import sys
-import tempfile
 import tomllib
 from typing import Any
 
@@ -319,123 +314,3 @@ def _configured_path_arguments(argv: list[str]) -> list[str]:
                 i += 1
             i += 1
     return result
-
-
-def _existing_file(value: str) -> str:
-    path = Path(value).expanduser().resolve()
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f"File does not exist: {path}")
-    return str(path)
-
-
-def _existing_executable(value: str) -> str:
-    path = Path(_existing_file(value))
-    if not os.access(path, os.X_OK):
-        raise argparse.ArgumentTypeError(f"File is not executable: {path}")
-    return str(path)
-
-
-def _existing_directory(value: str) -> str:
-    path = Path(value).expanduser().resolve()
-    if not path.is_dir():
-        raise argparse.ArgumentTypeError(f"Directory does not exist: {path}")
-    return str(path)
-
-
-def _toolchain_config(args: argparse.Namespace) -> dict[str, Any]:
-    argv = [sys.executable, str(Path(__file__).resolve()), "run",
-            "--executable", args.executable, "--cwd", args.cwd,
-            "--timeout", str(args.timeout)]
-    if args.library_dir:
-        argv.extend(["--library-dir", args.library_dir])
-    for value in args.fixed_arg:
-        argv.append(f"--fixed-arg={value}")
-    for value in args.artifact:
-        argv.extend(["--artifact", value])
-    argv.extend(["--input-mode", args.input_mode])
-    for value in args.input_prefix:
-        argv.append(f"--input-prefix={value}")
-    argv.append("--")
-    return {args.name: {"argv": argv, "cwd": args.cwd, "timeout_s": args.timeout,
-                        "extra_args": args.input_mode == "text"}}
-
-
-def _run_toolchain(args: argparse.Namespace) -> int:
-    forwarded = list(args.arguments)
-    if forwarded and forwarded[0] == "--":
-        forwarded.pop(0)
-    if args.input_mode == "none":
-        if forwarded:
-            raise SystemExit("this configured toolchain takes no worker-supplied input")
-    elif len(forwarded) != 1:
-        raise SystemExit("text mode requires exactly one positional input string")
-    if any("\0" in item or len(item.encode()) > 4096 for item in forwarded):
-        raise SystemExit("input must be at most 4096 bytes without NUL")
-    if forwarded and forwarded[0].startswith("-"):
-        raise SystemExit("text input may not begin with '-' because that could override configured options")
-    command = [args.executable, *args.fixed_arg, *args.artifact,
-               *args.input_prefix, *forwarded]
-    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
-    if args.library_dir:
-        env["LD_LIBRARY_PATH"] = args.library_dir
-    # Give the selected process an empty, private home instead of ambient
-    # credentials, model settings, package state, or host service config.
-    with tempfile.TemporaryDirectory(prefix="palette-toolchain-") as home:
-        env["HOME"] = home
-        env["TMPDIR"] = home
-        try:
-            completed = subprocess.run(command, cwd=args.cwd, env=env,
-                                       stdin=subprocess.DEVNULL, timeout=args.timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise SystemExit(f"configured toolchain exceeded its {args.timeout:g}s timeout") from exc
-        except OSError as exc:
-            raise SystemExit(f"could not start configured toolchain: {exc}") from exc
-    return completed.returncode
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="action", required=True)
-
-    config = subparsers.add_parser("config", help="emit one generic fixed toolchain command")
-    config.add_argument("--name", required=True)
-    config.add_argument("--executable", required=True, type=_existing_executable)
-    config.add_argument("--cwd", required=True, type=_existing_directory)
-    config.add_argument("--library-dir", type=_existing_directory)
-    config.add_argument("--fixed-arg", action="append", default=[])
-    config.add_argument("--artifact", action="append", type=_existing_file, default=[])
-    config.add_argument("--input-mode", choices=("none", "text"), default="none")
-    config.add_argument("--input-prefix", action="append", default=[],
-                        help="fixed backend arguments placed before the one text input")
-    config.add_argument("--timeout", type=float, default=600)
-
-    run = subparsers.add_parser("run", help=argparse.SUPPRESS)
-    run.add_argument("--executable", required=True, type=_existing_executable)
-    run.add_argument("--cwd", required=True, type=_existing_directory)
-    run.add_argument("--library-dir", type=_existing_directory)
-    run.add_argument("--fixed-arg", action="append", default=[])
-    run.add_argument("--artifact", action="append", type=_existing_file, default=[])
-    run.add_argument("--input-mode", choices=("none", "text"), default="none")
-    run.add_argument("--input-prefix", action="append", default=[])
-    run.add_argument("--timeout", type=float, default=600)
-    run.add_argument("arguments", nargs=argparse.REMAINDER)
-
-    args = parser.parse_args()
-    if args.action == "config":
-        if not args.name or any(ch in args.name for ch in "\0/\\"):
-            parser.error("--name must be a non-empty command name without path separators")
-        if not 0 < args.timeout <= 14400:
-            parser.error("--timeout must be in (0, 14400]")
-        if args.input_mode == "text" and not args.input_prefix:
-            parser.error("--input-mode text requires a fixed --input-prefix")
-        if args.input_mode == "none" and args.input_prefix:
-            parser.error("--input-prefix requires --input-mode text")
-        print(json.dumps(_toolchain_config(args), indent=2))
-        return 0
-    if not 0 < args.timeout <= 14400:
-        parser.error("--timeout must be in (0, 14400]")
-    return _run_toolchain(args)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
