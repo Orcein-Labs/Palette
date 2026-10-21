@@ -9,17 +9,13 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
 use super::{atomic_json, Fault};
 use crate::{sandbox, util, PREWARM};
@@ -27,12 +23,8 @@ use crate::{sandbox, util, PREWARM};
 const SCHEMA: &str = "palette.preparation.v1";
 const CACHES_LINE: &str = "palette_preparation_caches=";
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    util::to_hex(&Sha256::digest(bytes))
-}
-
 fn file_digest(path: &Path) -> std::io::Result<String> {
-    fs::read(path).map(|b| sha256_hex(&b))
+    fs::read(path).map(|b| util::sha256_hex(&b))
 }
 
 /// Julia's error output without colour codes, cut in the middle: the cause
@@ -127,7 +119,7 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
         "project": project.to_string_lossy(),
         "repo": repo.to_string_lossy(),
         "source": digests(sources)?,
-        "workload": sha256_hex(PREWARM.as_bytes()),
+        "workload": util::sha256_hex(PREWARM.as_bytes()),
         "runtime": {"binary": julia_bin, "version": String::from_utf8_lossy(&out.stdout).trim(),
                     "machine": std::env::consts::ARCH},
         "task_environment": task_environment,
@@ -136,27 +128,11 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
     }))
 }
 
-/// A string as Python's `json.dumps` writes it (`ensure_ascii`).
-fn py_json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in Value::String(s.into()).to_string().chars() {
-        // Python also escapes DEL, which serde leaves alone.
-        if c.is_ascii() && c != '\x7f' {
-            out.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                out.push_str(&format!("\\u{unit:04x}"));
-            }
-        }
-    }
-    out
-}
-
 /// Where the record for `identity` lives. The key is the one Python wrote, so
 /// records already on disk are found.
 pub(crate) fn record_path(identity: &Value, state_dir: Option<&Path>) -> PathBuf {
-    let field = |k: &str| py_json_str(identity[k].as_str().unwrap_or(""));
-    let key = sha256_hex(format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")).as_bytes());
+    let field = |k: &str| util::py_json_str(identity[k].as_str().unwrap_or(""));
+    let key = util::sha256_hex(format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")).as_bytes());
     let dir = match state_dir {
         Some(dir) => dir.to_path_buf(),
         None => Path::new(identity["depot"].as_str().unwrap_or("")).join(".palette-preparation"),
@@ -238,44 +214,6 @@ pub(crate) fn status(identity: &Value, state_dir: Option<&Path>) -> Value {
     Value::Object(record)
 }
 
-/// The output of `argv` and its exit code (minus the signal that ended it),
-/// or, once `timeout` passes, the output so far with the process killed.
-fn run_captured(argv: &[String], timeout: Option<Duration>) -> std::io::Result<(i32, String, String, bool)> {
-    let mut child = Command::new(&argv[0]).args(&argv[1..])
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let collect = |mut pipe: Box<dyn Read + Send>| {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&buf);
-        let reader = std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
-                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
-            }
-        });
-        (buf, reader)
-    };
-    let (out, out_reader) = collect(Box::new(child.stdout.take().expect("piped stdout")));
-    let (err, err_reader) = collect(Box::new(child.stderr.take().expect("piped stderr")));
-    let deadline = timeout.map(|t| Instant::now() + t);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait()? {
-            // Its output ends when it does.
-            let _ = (out_reader.join(), err_reader.join());
-            break (status, false);
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            // A process it left behind may hold the pipes open, so the output
-            // is what arrived by now.
-            break (child.wait()?, true);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let code = status.code().unwrap_or_else(|| -status.signal().unwrap_or(0));
-    let text = |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().unwrap()).into_owned();
-    Ok((code, text(&out), text(&err), timed_out))
-}
-
 /// Prewarms the depot with `host_bin prewarm` and records the result, unless
 /// a prepared record for the same identity exists and `force` is false. One
 /// preparation runs at a time per record.
@@ -323,7 +261,7 @@ pub(crate) fn prepare(project_dir: &Path, repo_dir: &Path, state_dir: Option<&Pa
     let argv: Vec<String> = vec![host_bin.to_string_lossy().into_owned(), "prewarm".into(), "--project-dir".into(),
                                  project_dir.to_string_lossy().into_owned(), "--repo-dir".into(), repo_dir.to_string_lossy().into_owned()];
     let fields = record.as_object_mut().expect("a record is an object");
-    let outcome = run_captured(&argv, timeout.map(Duration::from_secs_f64))
+    let outcome = super::run_captured(&argv, None, timeout.map(Duration::from_secs_f64))
         .map_err(|e| format!("OSError: {e}: {}", argv[0]))
         .and_then(|(code, stdout, mut stderr, timed_out)| {
             if timed_out {
@@ -415,7 +353,7 @@ mod tests {
     fn record_keys_match_the_python_ones() {
         // hashlib.sha256(json.dumps(["/p", "/r é", "/d\"\n"]).encode()).hexdigest()
         let identity = json!({"project": "/p", "repo": "/r é", "depot": "/d\"\n"});
-        assert_eq!(py_json_str("/r é😀\u{7f}"), "\"/r \\u00e9\\ud83d\\ude00\\u007f\"");
+        assert_eq!(util::py_json_str("/r é😀\u{7f}"), "\"/r \\u00e9\\ud83d\\ude00\\u007f\"");
         assert_eq!(record_path(&identity, Some(Path::new("/s"))),
                    Path::new("/s/e867693d64c661e80e711d5167eab68536a50b4360d1761d8e282da977f17ecf.json"));
         assert_eq!(record_path(&json!({"project": "/p", "repo": "/r", "depot": "/d"}), None).parent().unwrap(), Path::new("/d/.palette-preparation"));
@@ -444,7 +382,7 @@ mod tests {
         let cache = root.join("x.ji");
         fs::write(&cache, "cache").unwrap();
         write_record(root, &identity, json!({"state": "prepared", "returncode": 0, "error": "warnings",
-                                             "cache_files": {cache.to_str().unwrap(): sha256_hex(b"cache")}}));
+                                             "cache_files": {cache.to_str().unwrap(): util::sha256_hex(b"cache")}}));
         let prepared = status(&identity, Some(root));
         assert_eq!((prepared["state"].as_str(), &prepared["error"], &prepared["stderr"]), (Some("prepared"), &Value::Null, &json!("warnings")));
         fs::write(&cache, "changed").unwrap();

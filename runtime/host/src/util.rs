@@ -309,6 +309,28 @@ pub fn py_str(s: &str) -> String {
     }
 }
 
+/// The SHA-256 of `bytes` in lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    to_hex(&Sha256::digest(bytes))
+}
+
+/// A string as Python's `json.dumps` writes it (`ensure_ascii`).
+pub fn py_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in serde_json::Value::String(s.into()).to_string().chars() {
+        // Python also escapes DEL, which serde leaves alone.
+        if c.is_ascii() && c != '\x7f' {
+            out.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

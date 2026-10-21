@@ -1,6 +1,7 @@
 //! `palette-host mcp`: the MCP front door, ported from the Python router and
 //! adapter. Wired into the binary in slice C.
 
+pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;
 pub(crate) mod preparation;
@@ -10,6 +11,11 @@ pub(crate) mod transport;
 
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
@@ -67,6 +73,61 @@ pub(crate) fn atomic_json(path: &Path, value: &Value) -> std::io::Result<()> {
     util::write_then(&tmp, text.as_bytes(), 0o600, || fs::rename(&tmp, path))
 }
 
+/// The output of `argv` and its exit code (minus the signal that ended it),
+/// or, once `timeout` passes, the output so far with the process killed.
+/// `input`, if any, is written to its stdin, which then closes.
+pub(crate) fn run_captured(argv: &[String], input: Option<&[u8]>, timeout: Option<Duration>)
+    -> std::io::Result<(i32, String, String, bool)> {
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    let mut child = Command::new(&argv[0]).args(&argv[1..])
+        .stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
+        let input = input.to_vec();
+        // A child that never reads must not block the timeout below.
+        std::thread::spawn(move || {
+            let _ = pipe.write_all(&input);
+        });
+    }
+    let collect = |mut pipe: Box<dyn Read + Send>| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+        (buf, reader)
+    };
+    let (out, out_reader) = collect(Box::new(child.stdout.take().expect("piped stdout")));
+    let (err, err_reader) = collect(Box::new(child.stderr.take().expect("piped stderr")));
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut status = None;
+    let timed_out = loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        // Its output ends once it and every process it left holding the
+        // pipes have exited.
+        if status.is_some() && out_reader.is_finished() && err_reader.is_finished() {
+            break false;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            if status.is_none() {
+                let _ = child.kill();
+                status = Some(child.wait()?);
+            }
+            // The output is what arrived by now.
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let status = status.expect("the loop ends with a status");
+    let code = status.code().unwrap_or_else(|| -status.signal().unwrap_or(0));
+    let text = |b: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock().unwrap()).into_owned();
+    Ok((code, text(&out), text(&err), timed_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +141,17 @@ mod tests {
         for bad in ["", ".a", "-a", "_a", "a/b", "a b", "ü", &"a".repeat(65), "a\n"] {
             assert!(!valid_id(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_descendant_holding_the_pipes_cannot_outlast_the_timeout() {
+        let argv: Vec<String> = ["/bin/sh", "-c", "echo started; sleep 30 & exit 0"].map(String::from).into();
+        let begun = Instant::now();
+        let (code, stdout, _, timed_out) = run_captured(&argv, None, Some(Duration::from_millis(500))).unwrap();
+        assert!(begun.elapsed() < Duration::from_secs(10), "{:?}", begun.elapsed());
+        assert_eq!((code, stdout.as_str(), timed_out), (0, "started\n", true));
+        let (code, stdout, _, timed_out) = run_captured(&["/bin/cat".to_string()], Some(b"fed"), Some(Duration::from_secs(30))).unwrap();
+        assert_eq!((code, stdout.as_str(), timed_out), (0, "fed", false));
     }
 
     #[test]
