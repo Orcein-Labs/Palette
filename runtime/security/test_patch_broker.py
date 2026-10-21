@@ -610,18 +610,18 @@ class PatchTests(unittest.TestCase):
                    "PALETTE_CAPABILITY_CEILING": str(ceiling)}
             request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
 
-            def list_tools(script, child_env):
-                result = subprocess.run([sys.executable, str(Path(__file__).with_name(script))],
+            def list_tools(command, child_env):
+                result = subprocess.run([env["PALETTE_HOST"], "mcp", *command],
                     input=request, text=True, capture_output=True, timeout=30, env=child_env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 replies = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
                 self.assertEqual(len(replies), 1, result.stdout)
                 return replies[0]["result"]["tools"]
 
-            adapter_tools = list_tools("operator_mcp.py", {**env, "PALETTE_REPAIR_CONFIG": str(config_path)})
+            adapter_tools = list_tools(["child"], {**env, "PALETTE_REPAIR_CONFIG": str(config_path)})
             self.assertEqual({tool["name"] for tool in adapter_tools}, {"palette", "palette_control"})
-            router_before = list_tools("operator_workspace_router.py", env)
-            router_after = list_tools("operator_workspace_router.py", {**env, "PALETTE_REPAIR_CONFIG": str(config_path)})
+            router_before = list_tools([], env)
+            router_after = list_tools([], {**env, "PALETTE_REPAIR_CONFIG": str(config_path)})
             self.assertEqual({tool["name"] for tool in router_after},
                              {"palette", "palette_control", "palette_workspace", "palette_patch"})
             self.assertEqual(router_after, router_before)

@@ -21,7 +21,7 @@ usage: palette-host serve init|inspect|prepare|launch|client --profile P [option
   inspect     report the profile's layout without starting a worker
   prepare     instantiate Julia, build the host and prewarm the depot (an
               administrator action, run with package networking on)
-  launch      run the MCP stdio adapter under the profile's environment
+  launch      run palette-host mcp start under the profile's environment
   client      print an MCP client entry that launches this server over SSH
 
   --profile P       the server profile (required)
@@ -301,10 +301,9 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
             println!("{}", serde_json::to_string_pretty(&entry).expect("JSON values serialize"));
         }
         _ => {
-            let python = python3("the Palette MCP adapter runs on it")?;
-            let entry = p.repo.join("runtime/security/serve_palette.py");
-            let e = Command::new(&python).arg(&entry).env_clear().envs(environment(&p)?).exec();
-            return Err(format!("{}: {e}", python.display()));
+            let host = p.repo.join(HOST);
+            let e = Command::new(&host).args(["mcp", "start"]).env_clear().envs(environment(&p)?).exec();
+            return Err(format!("{}: {e}", host.display()));
         }
     }
     Ok(0)

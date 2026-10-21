@@ -16,7 +16,6 @@ import unittest
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
-ROUTER = REPO / "runtime/security/operator_workspace_router.py"
 HOST = REPO / "runtime/host/target/release/palette-host"
 sys.path.insert(0, str(REPO / "runtime/security"))
 import palette_mcp_client  # noqa: E402
@@ -59,7 +58,7 @@ class PaletteDaemonProcess(unittest.TestCase):
         self.start_daemon()
 
     def start_daemon(self):
-        self.proc = subprocess.Popen([sys.executable, str(ROUTER), "--socket", str(self.sockpath)],
+        self.proc = subprocess.Popen([str(HOST), "mcp", "--socket", str(self.sockpath)],
                                      cwd=self.project, env=self.env, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True)
         with selectors.DefaultSelector() as selector:
@@ -166,7 +165,7 @@ class PaletteDaemonProcess(unittest.TestCase):
         # A non-socket file or symlink is never unlinked/replaced by startup.
         self.stop_daemon()
         self.sockpath.write_text("owned")
-        result = subprocess.run([sys.executable, str(ROUTER), "--socket", str(self.sockpath)],
+        result = subprocess.run([str(HOST), "mcp", "--socket", str(self.sockpath)],
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.sockpath.read_text(), "owned")
@@ -174,7 +173,7 @@ class PaletteDaemonProcess(unittest.TestCase):
         target = Path(self.tmp.name) / "target"
         target.write_text("owned")
         self.sockpath.symlink_to(target)
-        result = subprocess.run([sys.executable, str(ROUTER), "--socket", str(self.sockpath)],
+        result = subprocess.run([str(HOST), "mcp", "--socket", str(self.sockpath)],
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(self.sockpath.is_symlink())
@@ -185,7 +184,7 @@ class PaletteDaemonProcess(unittest.TestCase):
         shared.chmod(0o770)
         private_child = shared / "private"
         private_child.mkdir(mode=0o700)
-        result = subprocess.run([sys.executable, str(ROUTER), "--socket", str(private_child / "daemon.sock")],
+        result = subprocess.run([str(HOST), "mcp", "--socket", str(private_child / "daemon.sock")],
                                 env=self.env, capture_output=True, text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((private_child / "daemon.sock").exists())
@@ -202,214 +201,6 @@ class PaletteDaemonProcess(unittest.TestCase):
         with self.assertRaises(PermissionError):
             palette_mcp_client.verify_peer_uid(peer)
 
-
-class WorkspaceControlSynchronization(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="palette-workspace-control-")
-        root = Path(self.tmp.name)
-        self.project = root / "project"
-        self.project.mkdir()
-        self.env = {**os.environ, "PALETTE_REPO": str(REPO),
-                    "OPERATOR_WORKSPACE": str(self.project),
-                    "PALETTE_STATE_DIR": str(root / "legacy"),
-                    "PALETTE_WORKSPACE_STATE_ROOT": str(root / "worlds"),
-                    "PALETTE_SCRATCH_ROOT": str(root / "scratch")}
-
-    def tearDown(self):
-        sys.modules.pop("operator_workspace_router", None)
-        self.tmp.cleanup()
-
-    def test_close_waits_for_an_in_flight_call_and_status_observes_stopped_worker(self):
-        with mock.patch.dict(os.environ, self.env):
-            sys.modules.pop("operator_workspace_router", None)
-            import operator_workspace_router as router
-
-            entry = router.workspace_control({"action": "create", "workspace_id": "sync-world", "scope": "open"})
-
-            class LiveProcess:
-                pid = 12345
-                stopped = False
-
-                def poll(self):
-                    return 0 if self.stopped else None
-
-            class BlockingChild:
-                def __init__(self):
-                    self.lock = CloseTrackingLock()
-                    self.proc = LiveProcess()
-
-                def stop(self):
-                    with self.lock:
-                        self.proc.stopped = True
-                        self.proc = None
-
-            class CloseTrackingLock:
-                def __init__(self):
-                    self.inner = threading.RLock()
-                    self.close_waiting = threading.Event()
-
-                def acquire(self, *args, **kwargs):
-                    if threading.current_thread().name == "close-world":
-                        self.close_waiting.set()
-                    return self.inner.acquire(*args, **kwargs)
-
-                def release(self):
-                    return self.inner.release()
-
-                def __enter__(self):
-                    self.acquire()
-                    return self
-
-                def __exit__(self, *_):
-                    self.release()
-
-            child = BlockingChild()
-            router.children[entry["state_dir"]] = child
-            in_flight = threading.Event()
-            release_call = threading.Event()
-            close_done = threading.Event()
-            close_result = {}
-
-            def hold_call_lock():
-                with child.lock:
-                    in_flight.set()
-                    release_call.wait()
-
-            def close_world():
-                close_result["value"] = router.workspace_control({"action": "close", "workspace_id": "sync-world"})
-                close_done.set()
-
-            active_call = threading.Thread(target=hold_call_lock)
-            active_call.start()
-            closer = None
-            try:
-                self.assertTrue(in_flight.wait(5), "could not reserve the simulated in-flight call")
-                closer = threading.Thread(target=close_world, name="close-world")
-                closer.start()
-                self.assertTrue(child.lock.close_waiting.wait(5), "close did not wait for the worker lock")
-                self.assertFalse(close_done.is_set(), "close returned while the call still held the worker lock")
-            finally:
-                release_call.set()
-                active_call.join(timeout=5)
-                if closer:
-                    closer.join(timeout=5)
-            self.assertFalse(active_call.is_alive())
-            self.assertFalse(closer and closer.is_alive())
-            self.assertTrue(close_result["value"]["state_retained"])
-            status = router.workspace_control({"action": "status", "workspace_id": "sync-world"})
-            self.assertFalse(status["running"], status)
-
-    def test_waiting_on_one_workspace_does_not_hold_registry_lock(self):
-        with mock.patch.dict(os.environ, self.env):
-            sys.modules.pop("operator_workspace_router", None)
-            import operator_workspace_router as router
-
-            entry = router.workspace_control({"action": "create", "workspace_id": "busy-world", "scope": "open"})
-            waiting = threading.Event()
-
-            class TrackedLock:
-                def __init__(self):
-                    self.inner = threading.RLock()
-
-                def acquire(self, *args, **kwargs):
-                    if threading.current_thread().name == "same-workspace-call":
-                        waiting.set()
-                    return self.inner.acquire(*args, **kwargs)
-
-                def release(self):
-                    return self.inner.release()
-
-                def __enter__(self):
-                    self.acquire()
-                    return self
-
-                def __exit__(self, *_):
-                    self.release()
-
-            class LiveProcess:
-                pid = 54321
-
-                def poll(self):
-                    return None
-
-            child = router.Child(entry)
-            child.lock = TrackedLock()
-            child.start = lambda: setattr(child, "proc", LiveProcess())
-            child.exchange = lambda *_: {"ok": True}
-            router.children[entry["state_dir"]] = child
-            in_flight = threading.Event()
-            release_call = threading.Event()
-
-            def hold_worker_lock():
-                with child.lock:
-                    in_flight.set()
-                    release_call.wait()
-
-            holder = threading.Thread(target=hold_worker_lock, name="in-flight-call")
-            holder.start()
-            caller = None
-            try:
-                self.assertTrue(in_flight.wait(5), "could not reserve the simulated in-flight call")
-                caller = threading.Thread(target=lambda: child.call("palette", {}), name="same-workspace-call")
-                caller.start()
-                self.assertTrue(waiting.wait(5), "second call did not wait on the workspace lock")
-                acquired = router.children_lock.acquire(blocking=False)
-                self.assertTrue(acquired, "a busy workspace held the global registry lock")
-                router.children_lock.release()
-            finally:
-                release_call.set()
-                holder.join(timeout=5)
-                if caller:
-                    caller.join(timeout=5)
-            self.assertFalse(holder.is_alive())
-            self.assertFalse(caller and caller.is_alive())
-
-    def test_start_reservations_do_not_double_count_live_workers(self):
-        with mock.patch.dict(os.environ, self.env):
-            sys.modules.pop("operator_workspace_router", None)
-            import operator_workspace_router as router
-
-            router.MAX_LIVE = 2
-            entries = [router.workspace_control({"action": "create", "workspace_id": name, "scope": "open"})
-                       for name in ("starting-a", "starting-b")]
-
-            class LiveProcess:
-                def poll(self):
-                    return None
-
-            start_barrier = threading.Barrier(2)
-            children = []
-            for entry in entries:
-                child = router.Child(entry)
-
-                def start(worker=child):
-                    worker.proc = LiveProcess()
-                    start_barrier.wait(timeout=5)
-
-                child.start = start
-                child.exchange = lambda *_: {"ok": True}
-                router.children[entry["state_dir"]] = child
-                children.append(child)
-
-            outcomes = {}
-            errors = {}
-
-            def call_worker(index, child):
-                try:
-                    outcomes[index] = child.call("palette", {})
-                except Exception as exc:
-                    errors[index] = exc
-
-            callers = [threading.Thread(target=call_worker, args=(index, child))
-                       for index, child in enumerate(children)]
-            for caller in callers:
-                caller.start()
-            for caller in callers:
-                caller.join(timeout=10)
-            self.assertFalse(any(caller.is_alive() for caller in callers), "concurrent starts did not finish")
-            self.assertFalse(errors, errors)
-            self.assertEqual(outcomes, {0: {"ok": True}, 1: {"ok": True}})
-            self.assertFalse(router.starting_children)
 
 if __name__ == "__main__":
     unittest.main()
