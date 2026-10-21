@@ -8,6 +8,8 @@ pub(crate) mod lineage;
 pub(crate) mod patch;
 pub(crate) mod preparation;
 pub(crate) mod receipts;
+pub(crate) mod registry;
+pub(crate) mod repair;
 pub(crate) mod time_machine;
 pub(crate) mod transport;
 

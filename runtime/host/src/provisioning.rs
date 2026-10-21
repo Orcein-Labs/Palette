@@ -30,7 +30,7 @@ fn has_duplicates(items: &[&str]) -> bool {
     !items.iter().all(|i| seen.insert(i))
 }
 
-fn julia_identifier(name: &str) -> bool {
+pub(crate) fn julia_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -268,6 +268,57 @@ pub(crate) fn require_disjoint<W: AsRef<Path>, P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
+/// The options whose next argv token names a fixed artifact.
+const PATH_ARGUMENT_OPTIONS: &[&str] = &[
+    "--executable", "--artifact", "--library", "--library-dir", "--model", "--model-path", "--weights", "--weights-file", "--weights-path",
+];
+
+/// The artifact paths named in a host command's frozen argv, as
+/// provisioning.py `_configured_path_arguments` reads them: absolute tokens,
+/// absolute `--option=` values and the absolute token after a path option,
+/// with the runner's `--fixed-arg` wrappers unwrapped first.
+pub(crate) fn configured_path_arguments(argv: &[&str]) -> Vec<String> {
+    let (mut direct, mut fixed) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < argv.len() {
+        let item = argv[i];
+        if item == "--fixed-arg" && i + 1 < argv.len() {
+            fixed.push(argv[i + 1]);
+            i += 2;
+            continue;
+        }
+        if let Some(value) = item.strip_prefix("--fixed-arg=") {
+            fixed.push(value);
+        } else {
+            direct.push(item);
+        }
+        i += 1;
+    }
+    let mut result = Vec::new();
+    for tokens in [direct, fixed] {
+        let mut i = 0;
+        while i < tokens.len() {
+            let item = tokens[i];
+            if item.starts_with('/') {
+                result.push(item.to_string());
+            }
+            match item.split_once('=') {
+                Some((_, value)) if value.starts_with('/') => result.push(value.to_string()),
+                Some(_) => {}
+                None if PATH_ARGUMENT_OPTIONS.contains(&item) && i + 1 < tokens.len() => {
+                    if tokens[i + 1].starts_with('/') {
+                        result.push(tokens[i + 1].to_string());
+                    }
+                    i += 1;
+                }
+                None => {}
+            }
+            i += 1;
+        }
+    }
+    result
+}
+
 /// The version every adapter reports: the top-level `version` in the
 /// checkout's Project.toml.
 pub(crate) fn palette_version(repo: &Path) -> Result<String, String> {
@@ -470,6 +521,14 @@ mod tests {
         );
         assert_eq!(text(command_parents(&ceiling).unwrap()), ["/", "/locks", "/m", "/opt/bin", "/t"]);
         assert!(protected_host_paths(&json!({"zz": {}}), true, true, &env).is_err());
+    }
+
+    #[test]
+    fn path_arguments_unwrap_fixed_args_as_provisioning_py_does() {
+        let argv = ["/opt/run", "--model", "rel", "--weights", "/w.bin", "--x=/cfg", "--fixed-arg=--model=/m.bin", "--fixed-arg", "--library",
+            "--fixed-arg", "/lib", "/a=/b", "--fixed-arg"];
+        assert_eq!(configured_path_arguments(&argv), ["/opt/run", "/w.bin", "/cfg", "/a=/b", "/b", "/m.bin", "/lib"]);
+        assert_eq!(configured_path_arguments(&["--model"]), Vec::<String>::new());
     }
 
     #[test]
