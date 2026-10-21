@@ -100,11 +100,11 @@ fn stdout(o: &Output) -> String {
 fn suite(call: &Call) -> Option<&str> {
     let script = call.args.split(' ').next()?;
     let stem = Path::new(script).file_stem()?.to_str()?;
-    (call.tool == "python3" && stem.starts_with("test_") && stem != "test_fs_digest").then_some(stem)
+    (call.tool == "python3" && stem.starts_with("test_")).then_some(stem)
 }
 
 #[test]
-fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
+fn runs_every_gate_then_each_suite_whole_against_the_host() {
     let f = Fixture::new();
     let out = f.verify(&[], &[]);
     assert!(out.status.success(), "{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
@@ -115,7 +115,7 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
     for call in &calls {
         assert_eq!(call.cwd, r.to_string(), "{} ran outside the checkout", call.args);
     }
-    let gates: Vec<String> = calls.iter().take(10).map(|c| format!("{} {}", c.tool, c.args)).collect();
+    let gates: Vec<String> = calls.iter().take(9).map(|c| format!("{} {}", c.tool, c.args)).collect();
     assert!(gates[0].starts_with(&format!("julia --startup-file=no --project={} -e using Palette", f.dir.join("project").display())));
     assert!(gates[0].ends_with(&format!(" {r}")));
     assert_eq!(
@@ -127,28 +127,21 @@ fn runs_every_gate_then_each_suite_whole_against_both_hosts() {
             format!("julia --startup-file=no --project={r} {r}/runtime/integrations/gesso/test_gesso.jl"),
             format!("cargo test --manifest-path {r}/runtime/host/Cargo.toml"),
             format!("cargo test --locked --manifest-path {r}/runtime/xtask/Cargo.toml"),
-            format!("python3 {r}/runtime/security/test_fs_digest.py -v"),
             format!("cargo build --release --manifest-path {r}/runtime/host/Cargo.toml"),
             format!("cargo run --release --quiet --manifest-path {r}/runtime/host/Cargo.toml --bin palette-host -- prepare --project-dir {} --repo-dir {r}", f.dir.join("project").display()),
         ]
     );
-    assert!(calls.iter().take(10).all(|c| c.host == "unset"));
-    let suites: Vec<(&str, &str)> = calls[10..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
+    assert!(calls.iter().take(9).all(|c| c.host == "unset"));
+    let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
     let shared = ["test_provisioning", "test_patch_broker", "test_workspace_router", "test_receipt_query", "test_read_roots", "test_palette_daemon"];
-    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_time_machine", "test_tools"];
-    let expected: Vec<(&str, &str)> = shared
-        .iter()
-        .map(|s| (*s, "unset"))
-        .chain(hosted.iter().chain(&["test_xray", "test_host_command"]).map(|s| (*s, host.as_str())))
-        .chain(hosted.iter().map(|s| (*s, "unset")))
-        .collect();
+    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_time_machine", "test_tools", "test_xray", "test_host_command"];
+    let expected: Vec<(&str, &str)> =
+        shared.iter().map(|s| (*s, "unset")).chain(hosted.iter().map(|s| (*s, host.as_str()))).collect();
     assert_eq!(suites, expected);
-    assert!(calls[10..].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
-    assert!(calls[10].args.starts_with(&format!("{r}/runtime/security/test_provisioning.py")));
+    assert!(calls[9..].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
+    assert!(calls[9].args.starts_with(&format!("{r}/runtime/security/test_provisioning.py")));
     let text = stdout(&out);
-    let rust = text.find("\noperator implementation: rust\n").expect("the rust heading");
-    let python = text.find("\noperator implementation: python\n").expect("the python heading");
-    assert!(rust < python && text.matches("operator implementation:").count() == 2);
+    assert!(!text.contains("operator implementation:"));
     assert!(text.contains(&format!("\nverification: julia --startup-file=no --project={r} {r}/test/runtests.jl\n")));
     assert!(text.ends_with("\nAll operator verification gates passed (shard 1/1).\n"));
 }
@@ -160,7 +153,7 @@ fn shards_deal_each_listed_case_to_exactly_one_shard() {
     let mut listed = BTreeSet::new();
     for index in 1..=4 {
         let shard = format!("{index}/4");
-        let out = f.verify(&["--implementation", "rust", "--shard", &shard], &[]);
+        let out = f.verify(&["--shard", &shard], &[]);
         let text = stdout(&out);
         assert!(out.status.success(), "{text}");
         assert!(text.ends_with(&format!("\nAll operator verification gates passed (shard {shard}).\n")));
@@ -199,7 +192,7 @@ fn a_failing_gate_stops_verification() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("verification failed"));
     assert!(!stdout(&out).contains("All operator verification gates passed"));
 
-    let out = f.verify(&["--implementation", "python"], &[("FAIL_SUITE", "test_session")]);
+    let out = f.verify(&[], &[("FAIL_SUITE", "test_session")]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(suite(f.calls().last().unwrap()), Some("test_session"));
 }
