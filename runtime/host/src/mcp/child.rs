@@ -55,6 +55,20 @@ pub(crate) fn text_result(event: &Value, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": event.to_string()}], "isError": is_error})
 }
 
+/// A failed call's reply. A preparation failure is the environment's, so it
+/// does not send the agent to check the connection.
+fn tool_failure(e: &Fault, connection_failure: Option<&Value>) -> Value {
+    if e.kind == "PreparationFailed" {
+        return text_result(&json!({"success": false, "error": e.message}), true);
+    }
+    let mut event = json!({"success": false,
+        "error": format!("{e}. Check connection status and restoration evidence; work may not have completed.")});
+    if let Some(failure) = connection_failure {
+        event["connection_failure"] = failure.clone();
+    }
+    text_result(&event, true)
+}
+
 /// Waits up to `timeout` for `child` to exit; its return code as Python's
 /// subprocess gives it (minus the signal that ended it), or None.
 pub(crate) fn wait_for(child: &mut Child, timeout: Duration) -> Option<i32> {
@@ -897,18 +911,6 @@ impl Adapter {
         }
     }
 
-    fn tool_failure(&self, e: &Fault) -> Value {
-        if e.kind == "PreparationFailed" {
-            return text_result(&json!({"success": false, "error": e.message}), true);
-        }
-        let mut event = json!({"success": false,
-            "error": format!("{e}. Check connection status and restoration evidence; work may not have completed.")});
-        if let Some(failure) = &self.connection_failure {
-            event["connection_failure"] = failure.clone();
-        }
-        text_result(&event, true)
-    }
-
     fn tool_call(&mut self, params: &Value, caller: Option<&str>) -> Result<Value, Fault> {
         let empty = json!({});
         let args = params.get("arguments").unwrap_or(&empty);
@@ -975,7 +977,7 @@ impl Adapter {
                 if !params.is_object() {
                     return Err(fail(no_get(params)));
                 }
-                self.tool_call(params, caller.as_deref()).unwrap_or_else(|e| self.tool_failure(&e))
+                self.tool_call(params, caller.as_deref()).unwrap_or_else(|e| tool_failure(&e, self.connection_failure.as_ref()))
             }
             _ => return Ok(Some(json!({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Unknown method"}}))),
         };
@@ -1065,6 +1067,18 @@ mod tests {
         let scratch = project_result(&obj(json!({"epoch": "e", "bindings": ["a (Int64)"]})), false, true, &mut fresh);
         assert_eq!(scratch.get("bindings"), Some(&json!(["a (Int64)"])));
         assert!(fresh.0.is_empty());
+    }
+
+    #[test]
+    fn a_preparation_failure_is_not_reported_as_a_connection_problem() {
+        let error = |e: Fault| -> String {
+            let reply = tool_failure(&e, None);
+            assert_eq!(reply["isError"], json!(true));
+            serde_json::from_str::<Value>(reply["content"][0]["text"].as_str().unwrap()).unwrap()["error"].as_str().unwrap().into()
+        };
+        assert_eq!(error(Fault::new("PreparationFailed", "Palette could not prepare its Julia environment")),
+                   "Palette could not prepare its Julia environment");
+        assert!(error(Fault::new("RuntimeError", "operator died")).contains("Check connection status"));
     }
 
     #[test]

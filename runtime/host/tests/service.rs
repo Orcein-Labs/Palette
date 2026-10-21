@@ -47,12 +47,14 @@ impl Fixture {
         let _ = fs::remove_dir_all(&root);
         let f = Fixture { root };
         write(&f.bin().join("systemctl"), FAKE_SYSTEMCTL, 0o755);
-        write(&f.bin().join("python3"), "#!/bin/sh\n", 0o755);
-        write(&f.repo().join("runtime/security/operator_workspace_router.py"), "# fixture\n", 0o644);
         write(&f.repo().join("runtime/host/target/release/palette-host"), "#!/bin/sh\n", 0o755);
         fs::create_dir_all(f.runtime()).unwrap();
         fs::create_dir_all(f.root.join("home")).unwrap();
         f
+    }
+
+    fn host(&self) -> PathBuf {
+        self.repo().join("runtime/host/target/release/palette-host")
     }
 
     fn bin(&self) -> PathBuf {
@@ -136,7 +138,7 @@ fn install_updates_only_owned_units_and_runs_fake_systemctl() {
     assert!(!f.units().join("palette-tunnel.service").exists());
     assert_eq!(mode(&daemon), 0o600);
     let unit = fs::read_to_string(&daemon).unwrap();
-    assert!(unit.contains(&format!("ExecStart=\"{}\" ", f.bin().join("python3").display())));
+    assert!(unit.contains(&format!("ExecStart=\"{}\" \"mcp\" \"--socket\" ", f.host().display())), "{unit}");
     assert!(unit.contains("workspace's name"));
 
     for unit in ["palette.service", "palette-tunnel.service"] {
@@ -171,12 +173,14 @@ fn install_updates_only_owned_units_and_runs_fake_systemctl() {
 }
 
 #[test]
-fn install_writes_an_absolute_interpreter_found_through_a_relative_path_entry() {
+fn install_writes_an_absolute_host_for_a_relative_repo_dir() {
     let f = Fixture::new();
-    let out = f.command(&args(&f.install_args())).env("PATH", "bin:/usr/bin:/bin").output().unwrap();
+    let mut install = f.install_args();
+    install[2] = "repo".into();
+    let out = f.command(&args(&install)).current_dir(&f.root).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let unit = fs::read_to_string(f.units().join("palette.service")).unwrap();
-    assert!(unit.contains(&format!("ExecStart=\"{}\" ", f.bin().join("python3").display())), "{unit}");
+    assert!(unit.contains(&format!("ExecStart=\"{}\" \"mcp\" ", f.host().display())), "{unit}");
 }
 
 #[test]

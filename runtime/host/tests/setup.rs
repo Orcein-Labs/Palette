@@ -142,8 +142,8 @@ impl Fixture {
         self.root.join("server.env")
     }
 
-    /// An SDK with the files setup reads, a prepared runtime and fake Python
-    /// entry points; it has no .git, so setup does not build a host.
+    /// An SDK with the files setup reads, a fake host that serves MCP and a
+    /// fake prewarm; it has no .git, so setup does not build a host.
     fn make_repo(&self, name: &str) -> PathBuf {
         let repo = self.root.join(name);
         for dir in ["runtime/integrations/teamlab", "runtime/plugins/palette", "runtime/licenses"] {
@@ -151,9 +151,8 @@ impl Fixture {
         }
         fs::copy(source().join("Project.toml"), repo.join("Project.toml")).unwrap();
         write(&repo.join("Manifest.toml"), "", 0o644);
-        write(&repo.join("runtime/host/target/release/palette-host"), "#!/bin/sh\n", 0o755);
+        write(&repo.join("runtime/host/target/release/palette-host"), FAKE_SERVER, 0o755);
         write(&repo.join("runtime/security/prewarm_depot.py"), FAKE_PREWARM, 0o755);
-        write(&repo.join("runtime/security/serve_palette.py"), FAKE_SERVER, 0o755);
         repo
     }
 

@@ -12,7 +12,7 @@
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
 //!   palette-host serve      init|inspect|prepare|launch|client --profile P ... (see serve --help)
 //!   palette-host patch      --storage S review|approve ID [--digest D] | apply-helper
-//!   palette-host mcp        [--socket PATH] | child   (the MCP router, or one workspace's adapter)
+//!   palette-host mcp        [--socket PATH] | start | child   (the MCP router, its client entry, or one workspace's adapter)
 
 mod broker;
 mod cli;
@@ -183,6 +183,7 @@ fn main() {
         Some("patch") => mcp::patch::main(rest),
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
+            Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
         _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve|patch|mcp ...".into()),
