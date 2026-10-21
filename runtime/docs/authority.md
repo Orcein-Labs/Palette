@@ -158,7 +158,7 @@ Rust tests (`case_p01`–`case_p04` in `sandbox.rs`).
 | Session: persistent and ephemeral turns, kill detection, session roots, session depots, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
 | Session bridge: the stdio protocol of `palette-host session` | `test_session_cli.py` |
 | Revival: what a replacement kernel restores, rebuilds or reports lost | `test_revival.py` |
-| Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `test_host_bridge.py` |
+| Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `runtime/conformance/tests/host_bridge.rs` |
 
 The host trusts the operating system's namespace, filesystem, and Landlock
 mechanisms. Unmanaged host writers do not participate in Palette's patch lock.
