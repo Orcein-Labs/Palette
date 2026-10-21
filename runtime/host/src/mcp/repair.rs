@@ -1,5 +1,4 @@
-//! Tested repairs with a disposable, zero-authority verification worker,
-//! ported from `repair_broker.py`.
+//! Tested repairs with a disposable, zero-authority verification worker.
 //!
 //! The model may suggest file contents, but the operator supplies patch
 //! roots, ordinary path classes and fixed test recipes. Candidate code runs
@@ -1010,7 +1009,7 @@ mod tests {
         let classes = json!({"project": [["runtime", "runtime"], ["tools", "tools"], ["recipes", "recipes"], ["adapters", "adapters"]]});
         let repair = f.repair(json!({"project": python_recipe("fixed-unittest-v1", &["-B", "-m", "unittest"])}), classes);
         let classify = |path: &str| repair.patches.classify(&"project".into(), &path.into()).unwrap();
-        assert!(!classify("runtime/security/patch_broker.py").self_apply);
+        assert!(!classify("runtime/security/host_adapter.py").self_apply);
         assert!(!classify("runtime/capabilities/manifest.json").self_apply);
         assert_eq!(classify("settings/credentials.json").class, "forbidden");
         assert!(!classify("unclassified/app.py").self_apply);
@@ -1092,6 +1091,115 @@ mod tests {
         assert_eq!(f.read("recipes/value.py"), "VALUE = 'before'\n");
     }
 
+    /// The Julia on PATH, with its install prefix as the read root.
+    fn julia_recipe(id: &str, script: &str) -> Value {
+        let exe = util::resolve(Path::new(&crate::sandbox::resolve_julia().expect("julia on PATH")));
+        let prefix = exe.parent().and_then(Path::parent).unwrap().to_string_lossy().into_owned();
+        json!({"id": id, "argv": [exe, "--startup-file=no", script], "read_roots": [prefix]})
+    }
+
+    #[test]
+    fn r07_julia_candidate_runs_in_disposable_worker() {
+        let f = Fixture::new();
+        fs::create_dir(f.root.join("tools")).unwrap();
+        fs::write(f.root.join("tools/value.jl"), "answer() = 0\n").unwrap();
+        fs::write(f.root.join("test_value.jl"), "using Test; include(\"tools/value.jl\"); @test answer() == 42\n").unwrap();
+        let repair = f.repair(json!({"project": julia_recipe("julia-value-v1", "test_value.jl")}), json!({"project": [["tools", "tools"]]}));
+        let proposal = propose(&repair, "tools/value.jl", "answer() = 0\n", "answer() = 42\n");
+        repair.start_test(&proposal["repair_id"], "world-a").unwrap();
+        let tested = repair.wait_test(&proposal["repair_id"], "world-a").unwrap();
+        assert_eq!(tested["status"], "tested", "{tested}");
+        assert_eq!(apply(&repair, &proposal).unwrap()["status"], "applied");
+        assert_eq!(f.read("tools/value.jl"), "answer() = 42\n");
+    }
+
+    #[test]
+    fn r11_a_whitelisted_read_only_capability_source_is_tested_before_apply() {
+        let f = Fixture::new();
+        let registry = f.tmp.join("runtime-capabilities");
+        let capability = registry.join("gesso-fixture");
+        fs::create_dir_all(&capability).unwrap();
+        let source = capability.join("gesso.jl");
+        let manifest = capability.join("capability.json");
+        fs::write(&source, "gesso() = :before\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o440)).unwrap();
+        fs::write(&manifest, json!({"id": "gesso-fixture", "version": "1", "source": "gesso.jl",
+            "entrypoint": "gesso", "dependencies": [], "requires": []}).to_string()).unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(capability.join("verify_gesso.jl"), "using Test; include(\"gesso.jl\"); @test gesso() === :after\n").unwrap();
+        let options = Options { auto_apply_prefixes: json!({"gesso": [["adapters", "gesso.jl"]]}),
+            registry_root: Some(registry.to_string_lossy().into_owned()),
+            sandbox_source_paths: json!({"gesso": ["gesso.jl"]}), ..Options::default() };
+        let mut broker = PatchBroker::new(&f.tmp.join("gesso-grants"), &roots(&[("gesso", &capability)]), options).unwrap();
+        broker.host = host();
+        let recipes = json!({"gesso": julia_recipe("fixed-julia-gesso-v1", "verify_gesso.jl")});
+        let repair = Arc::new(RepairBroker::new(broker, recipes.as_object().unwrap(), &json!({"gesso": [["adapters", "gesso.jl"]]}), &[]).unwrap());
+        assert_eq!(repair.patches.classify(&"gesso".into(), &"gesso.jl".into()).unwrap().class, "adapters");
+        let changes = json!([{"path": "gesso.jl", "before_sha256": sha("gesso() = :before\n"), "content": "gesso() = :after\n"}]);
+        let args = json!({"target": "gesso", "changes": changes});
+        let manual = repair.patches.prepare(args.as_object().unwrap(), "world-a").unwrap();
+        let apply_args = json!({"action": "apply", "request_id": manual["request_id"]});
+        let refused = repair.patches.call(apply_args.as_object().unwrap(), "world-a", &Map::new(), &mut Silent).unwrap();
+        assert_eq!(refused["status"], "approval_required", "{refused}");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "gesso() = :before\n");
+        let proposal = repair.propose(args.as_object().unwrap(), "world-a").unwrap();
+        assert_eq!(proposal["classifications"][0]["class"], "adapters");
+        repair.start_test(&proposal["repair_id"], "world-a").unwrap();
+        let tested = repair.wait_test(&proposal["repair_id"], "world-a").unwrap();
+        assert_eq!(tested["status"], "tested", "{tested}");
+        let applied = apply(&repair, &proposal).unwrap();
+        assert_eq!(applied["status"], "applied", "{applied}");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "gesso() = :after\n");
+        assert_eq!(fs::metadata(&source).unwrap().mode() & 0o777, 0o440);
+        let kept: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(kept["source"], "gesso.jl");
+    }
+
+    #[test]
+    fn r14_a_repair_approval_is_reclassified_at_apply() {
+        let f = Fixture::new().recipes();
+        let mut repair = RepairBroker::new(patches(&f.store, &roots(&[("project", &f.root)])),
+            json!({"project": python_recipe("fixed-unittest-v1", &UNITTEST)}).as_object().unwrap(),
+            &json!({"project": [["recipes", "recipes"]]}), &[]).unwrap();
+        let proposal = propose(&repair, "recipes/value.py", "VALUE = 'before'\n", "VALUE = 'after'\n");
+        assert_eq!(repair.test(&proposal["repair_id"], "world-a").unwrap()["status"], "tested");
+        // The path turns protected between the repair's approval and the write.
+        let sha = proposal["patch_sha256"].as_str().unwrap();
+        repair.patches.approve(&proposal["patch_request_id"], sha, "isolated_tested_repair:fixed-unittest-v1").unwrap();
+        repair.patches.protected_paths.push(f.root.join("recipes"));
+        assert_eq!(kind(repair.patches.apply(&proposal["patch_request_id"], "world-a")), "PermissionError");
+        assert_eq!(f.read("recipes/value.py"), "VALUE = 'before'\n");
+        repair.patches.protected_paths.pop();
+        assert_eq!(apply(&repair, &proposal).unwrap()["status"], "applied");
+        assert_eq!(f.read("recipes/value.py"), "VALUE = 'after'\n");
+    }
+
+    #[test]
+    fn r16_a_recipe_mounts_only_its_declared_toolchain() {
+        let f = Fixture::new();
+        // A relocated toolchain: a bin/ symlink to the real interpreter.
+        let home = util::resolve(Path::new(&std::env::var("HOME").unwrap()));
+        let toolchain = util::resolve(&util::mkdtemp_in(&home, "palette-python-toolchain-").unwrap());
+        let binary = toolchain.join("bin/python3");
+        fs::create_dir(binary.parent().unwrap()).unwrap();
+        let real = util::resolve(&util::which("python3").unwrap());
+        symlink(&real, &binary).unwrap();
+        let prefix = real.parent().and_then(Path::parent).unwrap().to_string_lossy().into_owned();
+        let code = "import sys; print('PYTHON_TOOLCHAIN_OK:' + str(sys.version_info.major))";
+        let run = |roots: Value| {
+            let recipe = normalize_recipe(&json!({"id": "relocated-python-v1", "argv": [binary, "-B", "-c", code], "read_roots": roots})).unwrap();
+            run_isolated_test(&f.root, &recipe).unwrap()
+        };
+        let passed = run(json!([toolchain, prefix]));
+        let failed = run(json!([prefix]));
+        fs::remove_dir_all(&toolchain).unwrap();
+        assert_eq!(passed["status"], "passed", "{passed:?}");
+        assert!(passed["output"].as_str().unwrap().contains("PYTHON_TOOLCHAIN_OK:3"), "{passed:?}");
+        assert_eq!(failed["status"], "failed", "{failed:?}");
+        assert_ne!(failed["exit_code"], 0);
+        assert!(failed["output"].as_str().unwrap().contains("No such file or directory"), "{failed:?}");
+    }
+
     #[test]
     fn a_failed_verification_is_recorded() {
         let f = Fixture::new().recipes();
@@ -1142,74 +1250,5 @@ mod tests {
         assert_ne!(applied["status"], "applied", "{applied}");
         assert!(!trusted.join("helper.jl").exists());
         assert_eq!(repair.patches.inspect(&proposed["patch_request_id"], Some("world-a")).unwrap()["status"], "pending");
-    }
-
-    /// Replays a scripted session for the scratch parity check against
-    /// `repair_broker.py`: `cargo test repair_parity -- --ignored`.
-    #[test]
-    #[ignore]
-    fn repair_parity() {
-        let Ok(request) = std::env::var("PALETTE_REPAIR_PARITY") else { return };
-        let request: Value = serde_json::from_str(&fs::read_to_string(request).unwrap()).unwrap();
-        let shown = |r: Result<Value, Fault>| r.map_or_else(|f| json!({"error": f.to_string()}), |v| json!({"ok": v}));
-        let options = Options { auto_apply_prefixes: request["patch_auto"].clone(), ..Options::default() };
-        let built = PatchBroker::new(Path::new(request["storage"].as_str().unwrap()), request["roots"].as_object().unwrap(), options)
-            .and_then(|mut patches| {
-                patches.host = host();
-                let protected: Vec<PathBuf> = strings(&request["protected"]).into_iter().map(PathBuf::from).collect();
-                RepairBroker::new(patches, request["recipes"].as_object().unwrap(), &request["auto"], &protected)
-            });
-        let mut out = Map::new();
-        match built {
-            Err(f) => {
-                out.insert("init".into(), json!({"error": f.to_string()}));
-            }
-            Ok(repair) => {
-                out.insert("init".into(), json!({"ok": null}));
-                let repair = Arc::new(repair);
-                let mut last = Map::new();
-                let mut results = Vec::new();
-                for step in request["steps"].as_array().unwrap() {
-                    let current = |key: &str| last.get(key).cloned().unwrap_or(Value::Null);
-                    let result = match step[0].as_str().unwrap() {
-                        "call" => {
-                            let mut args = step[1].as_object().unwrap().clone();
-                            for (key, slot) in [("repair_id", "$last"), ("request_id", "$patch")] {
-                                if args.get(key).and_then(Value::as_str) == Some(slot) {
-                                    args.insert(key.into(), current(if key == "repair_id" { "repair_id" } else { "patch_request_id" }));
-                                }
-                            }
-                            repair.call(&args, "world-a", &Map::new(), &mut Silent)
-                        }
-                        "test" => repair.test(&current("repair_id"), "world-a"),
-                        "wait" => repair.wait_test(&current("repair_id"), "world-a"),
-                        "approve" => repair.patches.approve(&current("patch_request_id"), current("patch_sha256").as_str().unwrap(), "parity")
-                            .map(|()| Value::Null),
-                        "write" => {
-                            fs::write(step[1].as_str().unwrap(), step[2].as_str().unwrap()).unwrap();
-                            Ok(Value::Null)
-                        }
-                        "tamper" => {
-                            let path = repair.record_path(&current("repair_id")).unwrap();
-                            let mut record: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-                            record[step[1].as_str().unwrap()] = step[2].clone();
-                            fs::write(&path, record.to_string()).unwrap();
-                            Ok(Value::Null)
-                        }
-                        other => panic!("unknown step {other}"),
-                    };
-                    if let Ok(Value::Object(fields)) = &result {
-                        for key in ["repair_id", "patch_request_id", "patch_sha256"] {
-                            if let Some(value) = fields.get(key) {
-                                last.insert(key.into(), value.clone());
-                            }
-                        }
-                    }
-                    results.push(shown(result));
-                }
-                out.insert("steps".into(), Value::Array(results));
-            }
-        }
-        fs::write(std::env::var("PALETTE_REPAIR_PARITY_OUT").unwrap(), Value::Object(out).to_string()).unwrap();
     }
 }

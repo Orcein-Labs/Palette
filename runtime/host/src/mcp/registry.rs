@@ -1,5 +1,4 @@
-//! The host-side index of sandboxed Julia capability source, ported from
-//! runtime_registry.py. It reports content and authority facts and hands
+//! The host-side index of sandboxed Julia capability source. It reports content and authority facts and hands
 //! source text to the Julia worker; it never runs capability code.
 //!
 //! The active generation is what workers see. A refresh loads the root again
@@ -111,7 +110,6 @@ pub(crate) struct Registry {
     repo: Option<PathBuf>,
     host_binary: Option<PathBuf>,
     ceiling: Value,
-    adapter_identity: Map<String, Value>,
     active: Entries,
     active_generation: String,
     staged: Option<(Entries, String)>,
@@ -140,38 +138,14 @@ impl Registry {
             repo: repo.map(util::resolve),
             host_binary: host_binary.map(util::resolve),
             ceiling: ceiling.clone(),
-            adapter_identity: Map::new(),
             active: Entries::new(),
             active_generation: String::new(),
             staged: None,
             runtime_identity: Value::Null,
         };
-        registry.adapter_identity = registry.adapter_hashes()?;
         (registry.active, registry.active_generation) = registry.load()?;
         registry.runtime_identity = registry.identity()?;
         Ok(registry)
-    }
-
-    /// The adapter source the identity covers: `runtime/security/*.py`
-    /// without the tests, by path in the checkout.
-    fn adapter_hashes(&self) -> Result<Map<String, Value>, Fault> {
-        let mut observed = Map::new();
-        let Some(repo) = &self.repo else { return Ok(observed) };
-        let dir = repo.join("runtime/security");
-        if !dir.is_dir() {
-            return Ok(observed);
-        }
-        let mut paths = Vec::new();
-        glob(&dir, ".py", false, &mut paths);
-        paths.sort();
-        for path in paths {
-            if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("test_")) {
-                continue;
-            }
-            let rel = path.strip_prefix(repo).unwrap_or(&path).to_string_lossy().into_owned();
-            observed.insert(rel, Value::String(sha_file(&path)?));
-        }
-        Ok(observed)
     }
 
     /// The version and content digest of the runtime that runs capabilities:
@@ -198,12 +172,7 @@ impl Registry {
             protected.insert("palette-host".into(), Value::String(sha_file(binary)?));
         }
         let version = self.repo.as_deref().and_then(|r| provisioning::palette_version(r).ok()).unwrap_or_else(|| "unknown".into());
-        let adapter = digest(&Value::Object(self.adapter_identity.clone()));
-        Ok(json!({
-            "version": version,
-            "content_sha256": digest(&json!({"runtime": protected, "adapter_content_sha256": adapter})),
-            "adapter_content_sha256": adapter,
-        }))
+        Ok(json!({"version": version, "content_sha256": digest(&json!({"runtime": protected}))}))
     }
 
     fn generation(entries: &Entries) -> String {
@@ -680,47 +649,5 @@ mod tests {
         assert_eq!(status(&registry), "ready");
         let names: Vec<Value> = registry.toolchains().iter().map(|t| t["name"].clone()).collect();
         assert_eq!(names, [json!("julia"), json!("model"), json!("python"), json!("rust")]);
-    }
-
-    /// Drives the registry from a request file for the scratch parity check
-    /// against runtime_registry.py: `PALETTE_REGISTRY_PARITY=<request.json>
-    /// PALETTE_REGISTRY_PARITY_OUT=<out.json> cargo test -- --ignored
-    /// registry_parity`. The request names root, ceiling, workspace,
-    /// state_dir, repo and host_binary, and lists steps: `["handle", action,
-    /// payload, epoch]`, `["commit"]`, `["cancel"]` or `["toolchains"]`.
-    #[test]
-    #[ignore]
-    fn registry_parity() {
-        let Ok(request) = std::env::var("PALETTE_REGISTRY_PARITY") else { return };
-        let request: Value = serde_json::from_str(&fs::read_to_string(request).unwrap()).unwrap();
-        let path = |k: &str| request[k].as_str().map(util::expand_user);
-        let shown = |r: Result<Value, Fault>| r.map_or_else(|f| json!({"error": f.to_string()}), |v| json!({"ok": v}));
-        let mut out = Map::new();
-        match Registry::new(&path("root").unwrap(), &request["ceiling"], &path("workspace").unwrap(), &path("state_dir").unwrap(),
-                            path("repo").as_deref(), path("host_binary").as_deref()) {
-            Err(f) => {
-                out.insert("init".into(), json!({"error": f.to_string()}));
-            }
-            Ok(mut registry) => {
-                out.insert("init".into(), json!({"ok": {"generation": registry.active_generation, "identity": registry.runtime_identity,
-                                                        "adapter": registry.adapter_identity}}));
-                let steps = request["steps"].as_array().cloned().unwrap_or_default();
-                let results: Vec<Value> = steps.iter().map(|step| match step[0].as_str() {
-                    Some("handle") => shown(match step[2].as_object() {
-                        Some(payload) => registry.handle(&step[1], payload, &step[3]),
-                        None => Err(Fault::value("palette.runtime payload must be an object")),
-                    }),
-                    Some("commit") => shown(registry.commit_refresh()),
-                    Some("cancel") => {
-                        registry.cancel_refresh();
-                        json!({"ok": null})
-                    }
-                    Some("toolchains") => json!({"ok": registry.toolchains()}),
-                    other => panic!("unknown step {other:?}"),
-                }).collect();
-                out.insert("steps".into(), Value::Array(results));
-            }
-        }
-        fs::write(std::env::var("PALETTE_REGISTRY_PARITY_OUT").unwrap(), Value::Object(out).to_string()).unwrap();
     }
 }
