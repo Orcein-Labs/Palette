@@ -1,8 +1,8 @@
 //! Recorded test-case seconds: dealing the suites' cases across CI shards by
 //! them, and recording them from CI job logs.
 //!
-//! Cases are keyed `suite:Class.method` (`test_session:TestSession.test_x`).
-//! Both hosts share a case's record.
+//! Cases are keyed `suite:Class.method` (`test_session:TestSession.test_x`),
+//! or `target:case` for a conformance target (`xray:unknown_call_is_an_error`).
 
 use crate::Fail;
 use std::collections::BTreeMap;
@@ -112,7 +112,7 @@ pub fn case_seconds(log: &str) -> Result<BTreeMap<String, f64>, String> {
             case = Some(found);
         }
         if let (Some(s), Some(c), Some(p)) = (&suite, &case, previous) {
-            if ["... ok", "... FAIL", "... ERROR", "... skipped"].iter().any(|end| text.contains(end)) {
+            if ["... ok", "... FAIL", "... ERROR", "... skipped", "... ignored"].iter().any(|end| text.contains(end)) {
                 seconds.insert(format!("{s}:{c}"), ((at - p) as f64 / 1e6).round_ties_even());
                 (case, previous) = (None, Some(at));
             }
@@ -178,8 +178,14 @@ fn word_len(s: &str) -> usize {
     s.find(|c: char| !word_char(c)).unwrap_or(s.len())
 }
 
-/// The suite a `verification:` line runs: the first `/test_*.py` it names.
+/// The suite a `verification:` line runs: the target of a conformance
+/// `cargo test --test <target>`, or else the first `/test_*.py` it names.
 fn suite_in(command: &str) -> Option<String> {
+    if command.contains("/runtime/conformance/Cargo.toml ") {
+        let target = command.split_once(" --test ")?.1;
+        let target = &target[..word_len(target)];
+        return (!target.is_empty()).then(|| target.to_string());
+    }
     command.match_indices('/').find_map(|(at, _)| {
         let rest = &command[at + 1..];
         let word = &rest[..word_len(rest)];
@@ -187,8 +193,13 @@ fn suite_in(command: &str) -> Option<String> {
     })
 }
 
-/// `Class.method` from a unittest line `test_x (__main__.Class.test_x) ...`.
+/// `Class.method` from a unittest line `test_x (__main__.Class.test_x) ...`,
+/// or the case of a libtest line `test case_name ... ok`.
 fn case_in(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix("test ") {
+        let case = &rest[..word_len(rest)];
+        return (!case.is_empty() && rest[case.len()..].starts_with(" ...")).then(|| case.to_string());
+    }
     let method = &text[..word_len(text)];
     if method.len() <= "test".len() || !method.starts_with("test") {
         return None;
@@ -278,13 +289,27 @@ mod tests {
 2026-10-20T10:01:00.0000000Z verification: python3 /w/runtime/security/test_tools.py -v cases
 2026-10-20T10:02:01.5000000Z test_x (__main__.TestTools.test_x) ... skipped 'no'
 short line ... ok
+2026-10-20T10:03:00.0000000Z verification: cargo test --release --locked --manifest-path /w/runtime/conformance/Cargo.toml --test xray -- --test-threads=1
+2026-10-20T10:03:00.1000000Z running 2 tests
+2026-10-20T10:03:09.0000000Z test call_numbers_restart_per_kernel ... ok
+2026-10-20T10:03:15.0000000Z test unknown_call_is_an_error ... FAILED
+2026-10-20T10:03:15.0000000Z test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
 ";
 
     #[test]
     fn reads_case_seconds_from_a_job_log() {
         let got = case_seconds(LOG).unwrap();
         // 4.4 rounds to 4; 3.0 from the end of test_one; 61.5 rounds half to even.
-        assert_eq!(got, weights(&[("test_session:TestSession.test_one", 4.0), ("test_session:TestSession.test_two", 3.0), ("test_tools:TestTools.test_x", 62.0)]));
+        assert_eq!(
+            got,
+            weights(&[
+                ("test_session:TestSession.test_one", 4.0),
+                ("test_session:TestSession.test_two", 3.0),
+                ("test_tools:TestTools.test_x", 62.0),
+                ("xray:call_numbers_restart_per_kernel", 9.0),
+                ("xray:unknown_call_is_an_error", 6.0),
+            ])
+        );
         assert!(case_seconds("2026-13-20T10:00:00.0000000Z x").is_err());
     }
 
