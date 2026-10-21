@@ -10,7 +10,7 @@ the adapter's credentials.
 Generate a command entry from operator-selected files:
 
 ```sh
-python3 runtime/security/provisioning.py config \
+runtime/host/target/release/palette-host toolchain config \
   --name inference \
   --executable /opt/toolchain/bin/infer \
   --cwd /opt/models \

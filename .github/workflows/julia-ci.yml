@@ -221,9 +221,8 @@ jobs:
       with:
         python-version: '3.12'
     - uses: dtolnay/rust-toolchain@stable
-    - name: Check generic toolchain boundaries and client packaging
+    - name: Check client packaging
       run: |
-        python3 runtime/security/test_provisioning.py
         sh -n runtime/scripts/install.sh
         cargo xtask bundles --output-dir "$RUNNER_TEMP/palette-bundles"
     - name: Configure runner Bubblewrap namespaces
@@ -232,6 +231,8 @@ jobs:
       run: |
         julia --project=@. -e 'using Pkg; Pkg.instantiate()'
         cargo build --manifest-path runtime/host/Cargo.toml --release --locked
+    - name: Check generic toolchain boundaries
+      run: python3 runtime/security/test_provisioning.py
     - name: Check the host's unit tests and its setup and service commands
       run: cargo test --manifest-path runtime/host/Cargo.toml --locked
     - name: Check optional Gesso installer and extension loading

@@ -117,7 +117,7 @@ else
 fi
 sdk=$versions/$id
 
-# The sandbox needs Python 3 and bubblewrap, and on some distributions an
+# The sandbox needs bubblewrap, and on some distributions an
 # AppArmor profile; installing those is the one step that needs root.
 sandbox="$sdk/runtime/scripts/setup-sandbox-host.sh"
 if ! sh "$sandbox" check 2>/dev/null; then
