@@ -90,29 +90,34 @@ pub fn ceiling_dir(ceiling: &Value) -> Option<PathBuf> {
 /// `with_teamlab` finds it: `PALETTE_TEAMLAB_DIR` (empty or `off` for none),
 /// else `$XDG_DATA_HOME/palette/teamlab`, else `~/.local/share/palette/teamlab`.
 pub fn user_dir() -> Option<PathBuf> {
-    dir_from_env(|k| std::env::var(k).ok())
+    dir_from_env(|k| std::env::var(k).ok()).ok().flatten()
 }
 
-fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+/// The shop `PALETTE_TEAMLAB_DIR` or the XDG default names, or None when it
+/// is empty or `off`. `~` and `~/x` expand to HOME; any other path that is
+/// not absolute (`~user` too) is refused.
+pub(crate) fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Result<Option<PathBuf>, String> {
     let configured = match var("PALETTE_TEAMLAB_DIR") {
         Some(d) => d,
         None => {
             let data = var("XDG_DATA_HOME").map(PathBuf::from).filter(|d| d.is_absolute())
-                .or_else(|| Some(Path::new(&var("HOME")?).join(".local/share")))?;
-            return Some(data.join("palette/teamlab"));
+                .or_else(|| Some(Path::new(&var("HOME")?).join(".local/share")));
+            return Ok(data.map(|d| d.join("palette/teamlab")));
         }
     };
     if matches!(configured.trim(), "" | "off") {
-        return None;
+        return Ok(None);
     }
-    // `~` and `~/x` expand to HOME. `~user` gives None: only the news line
-    // reads this, and it then stays quiet.
+    let home = || var("HOME").map(PathBuf::from);
     let path = match configured.strip_prefix('~') {
-        Some("") => PathBuf::from(var("HOME")?),
-        Some(rest) => Path::new(&var("HOME")?).join(rest.strip_prefix('/')?),
-        None => PathBuf::from(&configured),
+        Some("") => home(),
+        Some(rest) => rest.strip_prefix('/').and_then(|rest| Some(home()?.join(rest))),
+        None => Some(PathBuf::from(&configured)),
     };
-    path.is_absolute().then_some(path)
+    match path.filter(|p| p.is_absolute()) {
+        Some(p) => Ok(Some(p)),
+        None => Err(format!("PALETTE_TEAMLAB_DIR must be an absolute path, not {}", util::py_str(&configured))),
+    }
 }
 
 /// 1-32 of `[a-z0-9._-]`, starting with a letter or digit, and not "all",
@@ -1491,15 +1496,19 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| {
             pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
         };
-        assert_eq!(dir_from_env(env(&[("HOME", "/h")])), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("XDG_DATA_HOME", "/x")])), Some(PathBuf::from("/x/palette/teamlab")));
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("XDG_DATA_HOME", "rel")])), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab")])), Some(PathBuf::from("/lab")));
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~/lab")])), Some(PathBuf::from("/h/lab")));
-        assert_eq!(dir_from_env(env(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~")])), Some(PathBuf::from("/h")));
-        for off in ["", "off", "relative", "~root/lab"] {
-            let pairs: &'static [(&str, &str)] = Box::leak(Box::new([("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", off)]));
-            assert_eq!(dir_from_env(env(pairs)), None, "{off:?}");
+        let dir = |pairs| dir_from_env(env(pairs)).unwrap();
+        assert_eq!(dir(&[("HOME", "/h")]), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
+        assert_eq!(dir(&[("HOME", "/h"), ("XDG_DATA_HOME", "/x")]), Some(PathBuf::from("/x/palette/teamlab")));
+        assert_eq!(dir(&[("HOME", "/h"), ("XDG_DATA_HOME", "rel")]), Some(PathBuf::from("/h/.local/share/palette/teamlab")));
+        assert_eq!(dir(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab")]), Some(PathBuf::from("/lab")));
+        assert_eq!(dir(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~/lab")]), Some(PathBuf::from("/h/lab")));
+        assert_eq!(dir(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "~")]), Some(PathBuf::from("/h")));
+        assert_eq!(dir(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "")]), None);
+        assert_eq!(dir(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", " off ")]), None);
+        assert_eq!(dir(&[]), None);
+        for relative in ["relative", "~root/lab"] {
+            let pairs: &'static [(&str, &str)] = Box::leak(Box::new([("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", relative)]));
+            assert_eq!(dir_from_env(env(pairs)).unwrap_err(), format!("PALETTE_TEAMLAB_DIR must be an absolute path, not '{relative}'"));
         }
     }
 

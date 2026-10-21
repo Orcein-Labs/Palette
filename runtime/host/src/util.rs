@@ -163,6 +163,76 @@ pub fn fmt_g(x: f64) -> String {
     }
 }
 
+/// The significant digits and decimal exponent of `s`, a Rust `{:e}`
+/// rendering of a finite number: "-1.25e3" is (true, "125", 3).
+fn sci_parts(s: &str) -> (bool, String, i32) {
+    let (neg, s) = s.strip_prefix('-').map_or((false, s), |rest| (true, rest));
+    let (mantissa, exp) = s.split_once('e').unwrap_or((s, "0"));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_end_matches('0');
+    (neg, if digits.is_empty() { "0".into() } else { digits.into() }, exp.parse().unwrap_or(0))
+}
+
+/// `digits` (d.ddd x 10^exp) in positional or scientific notation, Python
+/// style: no trailing zeros, an exponent of at least two digits with a sign,
+/// and `point` appends ".0" to a whole positional number.
+fn py_digits(neg: bool, digits: &str, exp: i32, scientific: bool, point: bool) -> String {
+    let sign = if neg { "-" } else { "" };
+    if scientific {
+        let (head, tail) = digits.split_at(1);
+        let frac = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let esign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{frac}e{esign}{:02}", exp.abs());
+    }
+    let n = digits.len() as i32;
+    let text = if exp < 0 {
+        format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+    } else if exp + 1 >= n {
+        format!("{digits}{}{}", "0".repeat((exp + 1 - n) as usize), if point { ".0" } else { "" })
+    } else {
+        let (int, frac) = digits.split_at((exp + 1) as usize);
+        format!("{int}.{frac}")
+    };
+    format!("{sign}{text}")
+}
+
+fn py_special(x: f64) -> Option<String> {
+    if x.is_nan() {
+        Some("nan".into())
+    } else if x.is_infinite() {
+        Some(if x > 0.0 { "inf" } else { "-inf" }.into())
+    } else {
+        None
+    }
+}
+
+/// `x` as Python's `f"{x:g}"`: six significant digits, scientific below
+/// 1e-4 and from 1e6. Unlike `fmt_g`, which keeps every digit for values
+/// handed to another process, this is for text a person reads.
+pub fn py_g(x: f64) -> String {
+    if let Some(s) = py_special(x) {
+        return s;
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    let (neg, digits, exp) = sci_parts(&format!("{x:.5e}"));
+    py_digits(neg, &digits, exp, !(-4..6).contains(&exp), false)
+}
+
+/// `x` as Python's `repr(float)`: the shortest digits that read back as
+/// `x`, scientific below 1e-4 and from 1e16.
+pub fn py_repr_f64(x: f64) -> String {
+    if let Some(s) = py_special(x) {
+        return s;
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.into();
+    }
+    let (neg, digits, exp) = sci_parts(&format!("{x:e}"));
+    py_digits(neg, &digits, exp, !(-4..16).contains(&exp), true)
+}
+
 /// A word the shell reads back as `s`, as Python's `shlex.quote`.
 pub fn shquote(s: &str) -> String {
     if s.is_empty() {
@@ -178,13 +248,29 @@ pub fn shjoin<S: AsRef<str>>(words: &[S]) -> String {
     words.iter().map(|w| shquote(w.as_ref())).collect::<Vec<_>>().join(" ")
 }
 
-/// `s` with a leading `~` or `~/` taken as the home directory.
+/// `s` with a leading `~` taken as the home directory and `~name` as that
+/// user's, as `os.path.expanduser` does: an unknown user leaves `s` as it is.
 pub fn expand_user(s: &str) -> PathBuf {
-    match s.strip_prefix('~') {
-        Some("") => home(),
-        Some(rest) if rest.starts_with('/') => home().join(&rest[1..]),
-        _ => PathBuf::from(s),
+    let Some(rest) = s.strip_prefix('~') else { return PathBuf::from(s) };
+    let (name, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let Some(dir) = (if name.is_empty() { Some(home()) } else { user_home(name) }) else { return PathBuf::from(s) };
+    let dir = dir.to_string_lossy().trim_end_matches('/').to_string();
+    PathBuf::from(if dir.is_empty() && tail.is_empty() { "/".to_string() } else { dir + tail })
+}
+
+/// The home directory of the user `name` in the password database.
+fn user_home(name: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwnam_r(cname.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) };
+    if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
+        return None;
     }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
 /// True for a file this user may execute.
@@ -212,4 +298,42 @@ pub fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<(), String
     let tmp = parent.join(format!(".{}.{}", name.to_string_lossy(), std::process::id()));
     let _ = fs::remove_file(&tmp);
     write_then(&tmp, contents.as_bytes(), mode, || fs::rename(&tmp, path)).map_err(at)
+}
+
+/// Python's repr of a string.
+pub fn py_str(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{s}\"")
+    } else {
+        format!("'{}'", s.replace('\'', "\\'"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floats_print_as_python_prints_them() {
+        for (x, g, r) in [
+            (60.0, "60", "60.0"),
+            (1800.0, "1800", "1800.0"),
+            (604800.0, "604800", "604800.0"),
+            (0.5, "0.5", "0.5"),
+            (1234567.0, "1.23457e+06", "1234567.0"),
+            (1e6, "1e+06", "1000000.0"),
+            (123456.7, "123457", "123456.7"),
+            (0.0001, "0.0001", "0.0001"),
+            (0.00001234, "1.234e-05", "1.234e-05"),
+            (1e16, "1e+16", "1e+16"),
+            (1e15, "1e+15", "1000000000000000.0"),
+            (0.1 + 0.2, "0.3", "0.30000000000000004"),
+            (-2.5, "-2.5", "-2.5"),
+            (0.0, "0", "0.0"),
+            (f64::INFINITY, "inf", "inf"),
+            (999999.5, "1e+06", "999999.5"),
+        ] {
+            assert_eq!((py_g(x), py_repr_f64(x)), (g.to_string(), r.to_string()), "{x}");
+        }
+    }
 }
