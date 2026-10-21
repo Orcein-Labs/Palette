@@ -18,32 +18,47 @@ print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[
 "#;
 
 /// Suites that start no session host.
-const SHARED_SUITES: [&str; 2] = [
-    "runtime/security/test_workspace_router.py",
-    "runtime/security/test_palette_daemon.py",
-];
+const SHARED_SUITES: [&str; 1] = ["runtime/security/test_workspace_router.py"];
 /// Suites run against the host binary.
-const HOST_SUITES: [&str; 10] = [
+const HOST_SUITES: [&str; 8] = [
     "test_authority.py",
     "test_session.py",
     "test_session_cli.py",
     "test_revival.py",
     "test_host_bridge.py",
     "test_contexts.py",
-    "test_time_machine.py",
     "test_tools.py",
-    "test_xray.py",
     "test_host_command.py",
 ];
+/// The ported suites: test targets of runtime/conformance, run against the host binary.
+const CONFORMANCE_TARGETS: [&str; 3] = ["palette_daemon", "time_machine", "xray"];
+const CONFORMANCE_MANIFEST: &str = "runtime/conformance/Cargo.toml";
 
 macro_rules! argv {
     ($($word:expr),* $(,)?) => { vec![$(OsString::from($word)),*] };
 }
 
+enum Suite {
+    /// A unittest module; its cases are `Class.method`.
+    Python(PathBuf),
+    /// A conformance test target; its cases are the test functions.
+    Rust(&'static str),
+}
+
 struct Run {
-    suite: PathBuf,
+    suite: Suite,
     /// PALETTE_HOST_BIN for the suite, or unset for one that starts no host.
     host: Option<PathBuf>,
+}
+
+impl Run {
+    /// The suite's name in case keys and messages.
+    fn name(&self) -> &str {
+        match &self.suite {
+            Suite::Python(p) => stem(p),
+            Suite::Rust(target) => target,
+        }
+    }
 }
 
 struct Gates {
@@ -76,21 +91,34 @@ impl Gates {
         Ok(())
     }
 
-    /// Every case in `runs`, as (run, `Class.method`), in listing order.
+    /// `cargo test` of one conformance target, with the arguments for libtest.
+    fn cargo_test(&self, target: &str, libtest: &[&str]) -> Vec<OsString> {
+        let mut words = argv!["cargo", "test", "--release", "--locked", "--manifest-path", self.root.join(CONFORMANCE_MANIFEST), "--test", target, "--"];
+        words.extend(libtest.iter().map(OsString::from));
+        words
+    }
+
+    /// Every case in `runs`, as (run, case), in listing order.
     fn cases(&self, runs: &[Run]) -> Result<Vec<(usize, String)>, Fail> {
         let mut cases = Vec::new();
         for (i, run) in runs.iter().enumerate() {
-            let stem = stem(&run.suite);
-            let out = self
-                .command(&["python3".into(), "-c".into(), LIST_TESTS.into(), stem.into()], run.host.as_deref())
-                .current_dir(run.suite.parent().expect("suites live in a directory"))
-                .stderr(Stdio::inherit())
-                .output()
-                .map_err(|e| format!("listing {stem}: {e}"))?;
+            let name = run.name();
+            let mut command = match &run.suite {
+                Suite::Python(suite) => {
+                    let mut c = self.command(&["python3".into(), "-c".into(), LIST_TESTS.into(), name.into()], run.host.as_deref());
+                    c.current_dir(suite.parent().expect("suites live in a directory"));
+                    c
+                }
+                Suite::Rust(target) => self.command(&self.cargo_test(target, &["--list", "--format", "terse"]), run.host.as_deref()),
+            };
+            let out = command.stderr(Stdio::inherit()).output().map_err(|e| format!("listing {name}: {e}"))?;
             if !out.status.success() {
-                return Err(Fail::Failed(format!("listing the cases of {stem} failed ({})", out.status)));
+                return Err(Fail::Failed(format!("listing the cases of {name} failed ({})", out.status)));
             }
-            let ids: Vec<String> = serde_json::from_slice(&out.stdout).map_err(|e| format!("listing {stem}: {e}"))?;
+            let ids: Vec<String> = match run.suite {
+                Suite::Python(_) => serde_json::from_slice(&out.stdout).map_err(|e| format!("listing {name}: {e}"))?,
+                Suite::Rust(_) => String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.strip_suffix(": test")).map(str::to_string).collect(),
+            };
             cases.extend(ids.into_iter().map(|id| (i, id)));
         }
         Ok(cases)
@@ -101,17 +129,27 @@ impl Gates {
             None
         } else {
             let cases = self.cases(runs)?;
-            let keys: Vec<String> = cases.iter().map(|(i, id)| format!("{}:{id}", stem(&runs[*i].suite))).collect();
+            let keys: Vec<String> = cases.iter().map(|(i, id)| format!("{}:{id}", runs[*i].name())).collect();
             let dealt = shard.deal(&keys, &timings::load(&self.root.join(timings::WEIGHTS))?);
             Some(cases.into_iter().zip(dealt).filter_map(|(case, m)| m.then_some(case)).collect())
         };
         for (i, run) in runs.iter().enumerate() {
-            let mut words = argv!["python3", &run.suite, "-v"];
+            let mut words = match &run.suite {
+                Suite::Python(suite) => argv!["python3", suite, "-v"],
+                Suite::Rust(target) => self.cargo_test(target, &["--test-threads=1"]),
+            };
             if let Some(mine) = &mine {
                 let tests: Vec<&String> = mine.iter().filter(|(r, _)| *r == i).map(|(_, id)| id).collect();
                 if tests.is_empty() {
-                    println!("\nverification: {} has no cases in shard {}/{}", file_name(&run.suite), shard.index, shard.count);
+                    let shown = match &run.suite {
+                        Suite::Python(suite) => file_name(suite),
+                        Suite::Rust(target) => format!("conformance target {target}"),
+                    };
+                    println!("\nverification: {shown} has no cases in shard {}/{}", shard.index, shard.count);
                     continue;
+                }
+                if let Suite::Rust(_) = run.suite {
+                    words.push("--exact".into());
                 }
                 words.extend(tests.into_iter().map(OsString::from));
             }
@@ -193,8 +231,9 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
         None,
     )?;
     let host = root.join("runtime/host/target/release/palette-host");
-    let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: root.join(s), host: None }).collect();
-    runs.extend(HOST_SUITES.iter().map(|s| Run { suite: root.join("runtime/security").join(s), host: Some(host.clone()) }));
+    let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: Suite::Python(root.join(s)), host: None }).collect();
+    runs.extend(HOST_SUITES.iter().map(|s| Run { suite: Suite::Python(root.join("runtime/security").join(s)), host: Some(host.clone()) }));
+    runs.extend(CONFORMANCE_TARGETS.iter().map(|t| Run { suite: Suite::Rust(t), host: Some(host.clone()) }));
     gates.run_suites(&shard, &runs)?;
     println!("\nAll operator verification gates passed (shard {}/{}).", shard.index, shard.count);
     Ok(())
