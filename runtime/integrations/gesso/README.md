@@ -10,7 +10,7 @@ local SmolLM2 snapshot, Palette package store, model artifact store, and
 capability registry paths:
 
 ```sh
-python3 runtime/integrations/gesso/install.py \
+julia --project='/path/to/Palette' runtime/integrations/gesso/install.jl \
   --gesso-source '/path/to/Gesso' \
   --model-source '/path/to/Gesso/snapshots/SmolLM2-135M' \
   --package-store '/var/lib/palette/packages' \
