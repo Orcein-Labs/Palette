@@ -238,9 +238,9 @@ jobs:
         runtime/host/target/release/palette-host prepare
         --project-dir "$GITHUB_WORKSPACE"
         --timeout-s 720
-    - name: Check routing, ownership, recovery and one-shot patch authority
+    - name: Check routing, ownership, recovery and client-confirmed patches
       env:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_entry_points
+      run: python3 -m unittest -v test_workspace_router

@@ -3,7 +3,7 @@
 Tests for the tool lifecycle and the code graph: a helper used in 3
 successful calls is promoted to a project tool, a fresh session lists it from
 the index and loads it on its first call, X-Ray cites its evidence, a human
-approval through the patch broker makes it trusted, and a hash mismatch drops
+approval through the router's palette_patch makes it trusted, and a hash mismatch drops
 it back to a project tool. The kernel cannot write the trusted directory.
 
 Run:
@@ -13,6 +13,7 @@ Run:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from patch_broker import PatchBroker, TRUSTED_TOOLS_TARGET, patch_roots_from_env  # noqa: E402
+from host_adapter import HOST_BIN  # noqa: E402
 from test_revival import KernelTestCase  # noqa: E402
 
 DEFINE = '''
@@ -51,6 +52,39 @@ class ToolsTest(KernelTestCase):
         self.assertFalse(r["success"], r)
         self.assertIn(text, json.dumps(r))
         return r
+
+    def router_apply(self, args, *, confirm):
+        """Prepare the patch through `palette-host mcp`, then apply it and answer the elicitation."""
+        root = Path(tempfile.mkdtemp(prefix="palette-tools-router-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "project").mkdir()
+        env = {**os.environ, **self.env, "OPERATOR_WORKSPACE": str(root / "project"),
+               "PALETTE_STATE_DIR": str(root / "state"), "PALETTE_WORKSPACE_STATE_ROOT": str(root / "registry"),
+               "PALETTE_PATCH_ROOTS": "{}", "PALETTE_RUNTIME_ROOT": str(root / "runtime"),
+               "PALETTE_TEAMLAB_DIR": str(root / "teamlab")}
+        proc = subprocess.Popen([HOST_BIN, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, env=env)
+        def exchange(value):
+            proc.stdin.write(json.dumps(value) + "\n")
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+        def tool(id_, arguments):
+            return exchange({"jsonrpc": "2.0", "id": id_, "method": "tools/call",
+                             "params": {"name": "palette_patch", "arguments": arguments}})
+        try:
+            exchange({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                      "params": {"capabilities": {"elicitation": {"form": {}}}}})
+            prepared = json.loads(tool(1, {"action": "prepare", "target": args["target"],
+                                           "changes": args["changes"]})["result"]["content"][0]["text"])
+            prompt = tool(2, {"action": "apply", "request_id": prepared["request_id"]})
+            self.assertEqual(prompt["method"], "elicitation/create", prompt)
+            answer = {"action": "accept", "content": {"confirm": True}} if confirm else {"action": "decline"}
+            result = exchange({"jsonrpc": "2.0", "id": prompt["id"], "result": answer})
+            return json.loads(result["result"]["content"][0]["text"])
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=60)
+            proc.stdout.close()
 
     def promote_double_it(self):
         k = self.kernel()
@@ -155,19 +189,13 @@ class ToolsTest(KernelTestCase):
         finally:
             k.close()
         self.assertEqual(request["tool"], "palette_patch")
-        store = Path(tempfile.mkdtemp(prefix="palette-tools-grants-"))
-        self.addCleanup(shutil.rmtree, store, True)
-        broker = PatchBroker(store, patch_roots_from_env({"PALETTE_PATCH_ROOTS": "{}", **self.env}))
         args = request["arguments"]
-        self.assertEqual(args["target"], TRUSTED_TOOLS_TARGET)
-        prepared = broker.prepare({"target": args["target"], "changes": args["changes"]}, "world-a")
-        with self.assertRaises(PermissionError):
-            broker.apply(prepared["request_id"], "world-a")
-        approved = subprocess.run([sys.executable, str(Path(__file__).with_name("patch_broker.py")), "--storage", str(store),
-                                   "approve", prepared["request_id"], "--digest", prepared["patch_sha256"]],
-                                  capture_output=True, text=True)
-        self.assertEqual(approved.returncode, 0, approved.stderr)
-        self.assertEqual(broker.apply(prepared["request_id"], "world-a")["status"], "applied")
+        self.assertEqual(args["target"], "trusted_tools")
+        # Declined, then confirmed: the human answers the router's elicitation.
+        self.assertEqual(self.router_apply(args, confirm=False)["status"], "not_approved")
+        self.assertEqual(list(self.trusted.iterdir()), [])
+        receipt = self.router_apply(args, confirm=True)
+        self.assertEqual((receipt["status"], receipt["granted_by"]), ("applied", "mcp_client_confirmed_user"))
 
         k = self.kernel(self.fresh_state())
         try:

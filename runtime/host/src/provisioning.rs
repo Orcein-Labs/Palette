@@ -1,4 +1,4 @@
-//! The operator's trusted configuration, as provisioning.py reads it: the
+//! The operator's trusted configuration: the
 //! capability ceiling, the TeamLab grant, the paths a writable root must
 //! not overlap, and the MCP client's agent name.
 
@@ -273,8 +273,7 @@ const PATH_ARGUMENT_OPTIONS: &[&str] = &[
     "--executable", "--artifact", "--library", "--library-dir", "--model", "--model-path", "--weights", "--weights-file", "--weights-path",
 ];
 
-/// The artifact paths named in a host command's frozen argv, as
-/// provisioning.py `_configured_path_arguments` reads them: absolute tokens,
+/// The artifact paths named in a host command's frozen argv: absolute tokens,
 /// absolute `--option=` values and the absolute token after a path option,
 /// with the runner's `--fixed-arg` wrappers unwrapped first.
 pub(crate) fn configured_path_arguments(argv: &[&str]) -> Vec<String> {
