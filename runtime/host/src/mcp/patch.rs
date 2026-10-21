@@ -23,7 +23,7 @@ use crate::{provisioning, sandbox, util};
 pub(crate) const MAX_BYTES: usize = 65536;
 const REQUEST_FIELDS: [&str; 10] = ["request_id", "workspace_id", "target", "root", "root_identity", "changes",
                                     "preview", "created_at", "expiry", "allowed_operations"];
-const AUTO_APPLY_CLASSES: [&str; 4] = ["runtime", "tools", "recipes", "adapters"];
+pub(crate) const AUTO_APPLY_CLASSES: [&str; 4] = ["runtime", "tools", "recipes", "adapters"];
 const IMMUTABLE_CREDENTIAL_COMPONENTS: [&str; 5] = [".ssh", ".aws", ".gnupg", "credentials", "secrets"];
 const CREDENTIAL_DIRS: [&str; 3] = [".ssh", ".aws", ".gnupg"];
 /// The directory of human-approved kernel tools (PALETTE_TRUSTED_TOOLS). Only
@@ -188,7 +188,7 @@ fn write_json(path: &Path, value: &Map<String, Value>) -> Result<(), Fault> {
 
 // -- Python's view of JSON values --------------------------------------------
 
-fn unhashable(v: &Value, what: &str) -> Result<(), Fault> {
+pub(crate) fn unhashable(v: &Value, what: &str) -> Result<(), Fault> {
     match v {
         Value::Array(_) | Value::Object(_) => {
             let t = util::py_type_name(v);
@@ -199,13 +199,13 @@ fn unhashable(v: &Value, what: &str) -> Result<(), Fault> {
 }
 
 /// `roots.get(key)`: only a string can be a configured target.
-fn root_of<'a>(roots: &'a BTreeMap<String, String>, key: &Value) -> Result<Option<&'a String>, Fault> {
+pub(crate) fn root_of<'a>(roots: &'a BTreeMap<String, String>, key: &Value) -> Result<Option<&'a String>, Fault> {
     unhashable(key, "dict key")?;
     Ok(key.as_str().and_then(|k| roots.get(k)))
 }
 
 /// `value[key]`.
-fn index<'a>(value: &'a Value, key: &str) -> Result<&'a Value, Fault> {
+pub(crate) fn index<'a>(value: &'a Value, key: &str) -> Result<&'a Value, Fault> {
     match value {
         Value::Object(m) => m.get(key).ok_or_else(|| Fault::new("KeyError", util::py_str(key))),
         Value::Array(_) => Err(Fault::new("TypeError", "list indices must be integers or slices, not str")),
@@ -214,7 +214,7 @@ fn index<'a>(value: &'a Value, key: &str) -> Result<&'a Value, Fault> {
     }
 }
 
-fn field<'a>(record: &'a Map<String, Value>, key: &str) -> Result<&'a Value, Fault> {
+pub(crate) fn field<'a>(record: &'a Map<String, Value>, key: &str) -> Result<&'a Value, Fault> {
     record.get(key).ok_or_else(|| Fault::new("KeyError", util::py_str(key)))
 }
 
@@ -226,7 +226,7 @@ fn get<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>, Fault> {
     }
 }
 
-fn no_attribute(value: &Value, name: &str) -> Fault {
+pub(crate) fn no_attribute(value: &Value, name: &str) -> Fault {
     Fault::new("AttributeError", format!("'{}' object has no attribute '{name}'", util::py_type_name(value)))
 }
 
@@ -238,7 +238,7 @@ fn path_arg(value: &Value) -> Result<&str, Fault> {
 }
 
 /// `for item in value`.
-fn py_iter(value: &Value) -> Result<Vec<Value>, Fault> {
+pub(crate) fn py_iter(value: &Value) -> Result<Vec<Value>, Fault> {
     match value {
         Value::Array(a) => Ok(a.clone()),
         Value::Object(m) => Ok(m.keys().map(|k| Value::String(k.clone())).collect()),
@@ -248,7 +248,7 @@ fn py_iter(value: &Value) -> Result<Vec<Value>, Fault> {
 }
 
 /// `a, b = value`.
-fn unpack_pair(value: &Value) -> Result<(Value, Value), Fault> {
+pub(crate) fn unpack_pair(value: &Value) -> Result<(Value, Value), Fault> {
     if !matches!(value, Value::Array(_) | Value::Object(_) | Value::String(_)) {
         return Err(Fault::new("TypeError", format!("cannot unpack non-iterable {} object", util::py_type_name(value))));
     }
@@ -261,7 +261,7 @@ fn unpack_pair(value: &Value) -> Result<(Value, Value), Fault> {
     }
 }
 
-fn truthy(value: &Value) -> bool {
+pub(crate) fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -284,7 +284,7 @@ fn contains(value: &Value, needle: &str) -> Result<bool, Fault> {
 }
 
 /// `(value or {}).items()`.
-fn items(value: &Value) -> Result<Vec<(String, Value)>, Fault> {
+pub(crate) fn items(value: &Value) -> Result<Vec<(String, Value)>, Fault> {
     match value {
         _ if !truthy(value) => Ok(Vec::new()),
         Value::Object(m) => Ok(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
@@ -308,12 +308,12 @@ fn py_eq(a: &Value, b: &Value) -> bool {
 // -- Descriptor-relative file access -----------------------------------------
 
 /// An OS error as Python's str() of it, with no filename.
-fn bare_os(e: &io::Error) -> Fault {
+pub(crate) fn bare_os(e: &io::Error) -> Fault {
     let kind = Fault::os(e, Path::new("")).kind;
     Fault::new(kind, e.raw_os_error().map_or_else(|| e.to_string(), util::py_errno))
 }
 
-fn c_name(name: &str) -> Result<CString, Fault> {
+pub(crate) fn c_name(name: &str) -> Result<CString, Fault> {
     CString::new(name).map_err(|_| Fault::value("embedded null byte"))
 }
 
@@ -336,7 +336,7 @@ fn identity(fd: RawFd) -> Result<Value, Fault> {
 }
 
 /// The directory holding `relative` under `root`, and its last part.
-fn parent_fd(root: RawFd, relative: &Value) -> Result<(OwnedFd, String), Fault> {
+pub(crate) fn parent_fd(root: RawFd, relative: &Value) -> Result<(OwnedFd, String), Fault> {
     let mut parts = parent_path_parts(relative)?;
     let name = parts.pop().expect("a relative path has a part");
     let mut fd = unsafe { BorrowedFd::borrow_raw(root) }.try_clone_to_owned().map_err(|e| bare_os(&e))?;
@@ -346,11 +346,11 @@ fn parent_fd(root: RawFd, relative: &Value) -> Result<(OwnedFd, String), Fault> 
     Ok((fd, name))
 }
 
-type Snapshot = Option<(String, Vec<u8>, u32)>;
+pub(crate) type Snapshot = Option<(String, Vec<u8>, u32)>;
 
 /// The digest, bytes and permission bits of a regular file, or nothing if
 /// it does not exist.
-fn file_snapshot(dir: RawFd, name: &str) -> Result<Snapshot, Fault> {
+pub(crate) fn file_snapshot(dir: RawFd, name: &str) -> Result<Snapshot, Fault> {
     let fd = match util::open_at(dir, &c_name(name)?, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
         Ok(fd) => fd,
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -369,11 +369,11 @@ fn file_snapshot(dir: RawFd, name: &str) -> Result<Snapshot, Fault> {
     Ok(Some((util::sha256_hex(&data), data, metadata.mode() & 0o7777)))
 }
 
-fn sha_value(snapshot: &Snapshot) -> Value {
+pub(crate) fn sha_value(snapshot: &Snapshot) -> Value {
     snapshot.as_ref().map_or(Value::Null, |(sha, _, _)| Value::String(sha.clone()))
 }
 
-fn decode(data: &[u8]) -> Result<&str, Fault> {
+pub(crate) fn decode(data: &[u8]) -> Result<&str, Fault> {
     std::str::from_utf8(data).map_err(|e| Fault::new("UnicodeDecodeError", util::py_utf8_error(data, &e)))
 }
 
@@ -759,7 +759,7 @@ impl PatchBroker {
     }
 
     /// The broker-wide lock, held until the returned file drops.
-    fn locked(&self) -> Result<File, Fault> {
+    pub(crate) fn locked(&self) -> Result<File, Fault> {
         let path = self.storage.join("broker.lock");
         let lock = OpenOptions::new().append(true).create(true).read(true).open(&path).map_err(|e| Fault::os(&e, &path))?;
         flock(&lock)?;
@@ -785,7 +785,7 @@ impl PatchBroker {
         stream.write_all(line.as_bytes()).and_then(|()| stream.sync_all()).map_err(|e| bare_os(&e))
     }
 
-    fn unknown_target(&self, target: &Value) -> Fault {
+    pub(crate) fn unknown_target(&self, target: &Value) -> Fault {
         let configured = if self.roots.is_empty() { "none".to_string() } else { self.roots.keys().cloned().collect::<Vec<_>>().join(", ") };
         Fault::permission(format!("{} is not a patch target; the host configures them in PALETTE_PATCH_ROOTS (configured: {configured})",
                                   util::py_repr(target)))
@@ -1291,7 +1291,13 @@ mod tests {
             let _held = broker.target_locked(&f.root.to_string_lossy()).unwrap();
             assert!(!try_lock());
         }
-        assert!(try_lock());
+        // A process spawned concurrently by another test briefly shares the
+        // fd table (and so this lock) until its exec closes the descriptor.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !try_lock() {
+            assert!(std::time::Instant::now() < deadline, "target lock still held after release");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
