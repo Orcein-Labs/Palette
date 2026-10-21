@@ -78,9 +78,6 @@ impl GenerationStore {
             None => self.current_id()?,
         };
         if id == "builtin" {
-            if !self.fallback_host.is_file() {
-                return Err(fault(format!("Builtin host is missing: {}", self.fallback_host.display())));
-            }
             return Ok(Generation { id, repo: self.fallback_repo.clone(), host: self.fallback_host.clone() });
         }
 
@@ -209,8 +206,5 @@ mod tests {
         }
         fs::write(&pointer, "{\"format\":1,\"generation_id\":\"-x\"}").unwrap();
         assert_eq!(store.current_id().unwrap_err().message, "Invalid generation_id");
-
-        let missing = GenerationStore::new(&t.0.join("gens"), &t.0.join("repo"), &t.0.join("no-host"));
-        assert_eq!(msg(missing.resolve(Some("builtin"))), format!("GenerationError: Builtin host is missing: {}", t.0.join("no-host").display()));
     }
 }

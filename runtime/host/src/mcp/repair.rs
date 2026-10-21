@@ -27,6 +27,7 @@ const MAX_TREE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TREE_FILES: u64 = 20000;
 const MAX_TEST_OUTPUT: usize = 8192;
 const TEST_TIMEOUT: Duration = Duration::from_secs(180);
+#[cfg(test)]
 const WAIT_TIMEOUT: Duration = Duration::from_secs(180 + 30);
 const SKIPPED_DIRS: [&str; 4] = [".git", ".codex", "__pycache__", ".julia"];
 
@@ -616,6 +617,7 @@ impl RepairBroker {
         Ok(json!({"status": "testing", "repair_id": repair_id}))
     }
 
+    #[cfg(test)]
     pub fn wait_test(&self, repair_id: &Value, workspace: &str) -> Result<Value, Fault> {
         self.read(repair_id, Some(workspace))?;
         let job = repair_id.as_str().and_then(|id| self.jobs.lock().unwrap().get(id).cloned())
