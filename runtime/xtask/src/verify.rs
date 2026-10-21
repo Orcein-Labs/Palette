@@ -18,14 +18,13 @@ print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[
 "#;
 
 /// Suites that start no session host.
-const SHARED_SUITES: [&str; 7] = [
+const SHARED_SUITES: [&str; 6] = [
     "runtime/security/test_provisioning.py",
     "runtime/security/test_patch_broker.py",
     "runtime/security/test_workspace_router.py",
     "runtime/security/test_receipt_query.py",
     "runtime/security/test_read_roots.py",
     "runtime/security/test_palette_daemon.py",
-    "runtime/integrations/gesso/test_gesso.py",
 ];
 /// Suites run once per host implementation.
 const HOST_SUITES: [&str; 8] = [
@@ -199,6 +198,7 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
         gates.run(argv!["git", "diff", "--check"], None)?;
         gates.run(argv!["node", root.join("runtime/scripts/check-test-policy.mjs")], None)?;
         gates.run(argv!["julia", "--startup-file=no", format!("--project={}", root.display()), root.join("test/runtests.jl")], None)?;
+        gates.run(argv!["julia", "--startup-file=no", format!("--project={}", root.display()), root.join("runtime/integrations/gesso/test_gesso.jl")], None)?;
         gates.run(argv!["cargo", "test", "--manifest-path", &host_manifest], None)?;
         gates.run(argv!["cargo", "test", "--locked", "--manifest-path", root.join("runtime/xtask/Cargo.toml")], None)?;
         gates.run(argv!["python3", root.join("runtime/security/test_fs_digest.py"), "-v"], None)?;
