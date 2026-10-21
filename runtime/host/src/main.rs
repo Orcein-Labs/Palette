@@ -6,6 +6,7 @@
 //!   palette-host broker     --socket PATH --ceiling C --receipts FILE [--session-id ID] [--project P --repo R --depot D]
 //!   palette-host subset     REQUESTED_JSON PARENT_JSON
 //!   palette-host prewarm    --project-dir P [--repo-dir R]
+//!   palette-host prepare    --project-dir P [--repo-dir R] [--state-dir S] [--host-bin H] [--status] [--force] [--timeout-s T]
 //!   palette-host teamlab-news [--agent A]
 //!   palette-host setup      [--repo-dir R] [--no-register] [--replace] [--no-check] ... (see setup --help)
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
@@ -115,7 +116,7 @@ fn subset(argv: &[String]) -> Result<i32, String> {
 /// worker's own sandbox so the caches record the paths a worker sees. Run once
 /// per depot, and again after Palette or the project changes. A successful
 /// run publishes a snapshot of the depot for session clones.
-const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
+pub(crate) const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
 
 fn prewarm(argv: &[String]) -> Result<i32, String> {
     let f = flags(argv, &[])?;
@@ -174,11 +175,12 @@ fn main() {
         Some("broker") => run_broker(rest),
         Some("subset") => subset(rest),
         Some("prewarm") => prewarm(rest),
+        Some("prepare") => flags(rest, &["status", "force"]).and_then(|f| mcp::preparation::main(&f)),
         Some("teamlab-news") => teamlab_news(rest),
         Some("setup") => setup::main(rest),
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|teamlab-news|setup|service|serve ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,

@@ -3,6 +3,7 @@
 
 pub(crate) mod generation;
 pub(crate) mod lineage;
+pub(crate) mod preparation;
 pub(crate) mod receipts;
 pub(crate) mod time_machine;
 pub(crate) mod transport;
