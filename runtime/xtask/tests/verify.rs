@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Logs `name|cwd|PALETTE_HOST_BIN|args`. As python3, `-c` lists three cases
 /// for the suite named by the code's argument, and fails a suite named in
-/// FAIL_SUITE; any other stub named in FAIL_TOOL fails.
+/// FAIL_SUITE; as cargo, `--list` lists three cases of the `--test` target.
+/// Any other stub named in FAIL_TOOL fails.
 const STUB: &str = r#"#!/bin/sh
 name=${0##*/}
 if [ "$name" = python3 ] && [ "$1" = -c ]; then
@@ -19,6 +20,14 @@ if [ "$name" = python3 ] && [ "$1" = -c ]; then
   echo '["Case.test_one", "Case.test_two", "Case.test_three"]'
   exit 0
 fi
+case " $* " in *" --list "*)
+  all="$*"
+  target=${all#* --test }
+  target=${target%% *}
+  echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|list $target" >> "$STUB_LOG"
+  printf 'one: test\ntwo: test\nthree: test\n'
+  exit 0
+esac
 echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|$*" >> "$STUB_LOG"
 [ "$name" = "$FAIL_TOOL" ] && exit 1
 case "$1" in */"$FAIL_SUITE".py) exit 1 ;; esac
@@ -96,11 +105,24 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// The suite stem a call ran (`python3 <dir>/<stem>.py -v ...`), if it ran one.
+const CONFORMANCE_TARGETS: [&str; 3] = ["palette_daemon", "time_machine", "xray"];
+
+/// The suite a call ran (`python3 <dir>/<stem>.py -v ...`, or the conformance
+/// `cargo test ... --test <target> -- ...`), if it ran one.
 fn suite(call: &Call) -> Option<&str> {
+    if call.tool == "cargo" {
+        let (_, target) = call.args.split_once("/runtime/conformance/Cargo.toml --test ")?;
+        return target.split(' ').next();
+    }
     let script = call.args.split(' ').next()?;
     let stem = Path::new(script).file_stem()?.to_str()?;
     (call.tool == "python3" && stem.starts_with("test_")).then_some(stem)
+}
+
+/// The cases a suite call names: after `-v` for unittest, after `--exact` for libtest.
+fn named_cases(call: &Call) -> Vec<&str> {
+    let after = if call.tool == "cargo" { " --exact " } else { ".py -v " };
+    call.args.split_once(after).map_or(Vec::new(), |(_, cases)| cases.split(' ').collect())
 }
 
 #[test]
@@ -133,13 +155,18 @@ fn runs_every_gate_then_each_suite_whole_against_the_host() {
     );
     assert!(calls.iter().take(9).all(|c| c.host == "unset"));
     let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
-    let shared = ["test_workspace_router", "test_palette_daemon"];
-    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_time_machine", "test_tools", "test_xray", "test_host_command"];
-    let expected: Vec<(&str, &str)> =
-        shared.iter().map(|s| (*s, "unset")).chain(hosted.iter().map(|s| (*s, host.as_str()))).collect();
+    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_tools", "test_host_command"];
+    let expected: Vec<(&str, &str)> = [("test_workspace_router", "unset")]
+        .into_iter()
+        .chain(hosted.iter().chain(&CONFORMANCE_TARGETS).map(|s| (*s, host.as_str())))
+        .collect();
     assert_eq!(suites, expected);
-    assert!(calls[9..].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
+    assert!(calls[9..18].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
     assert!(calls[9].args.starts_with(&format!("{r}/runtime/security/test_workspace_router.py")));
+    assert_eq!(
+        calls[18].args,
+        format!("test --release --locked --manifest-path {r}/runtime/conformance/Cargo.toml --test palette_daemon -- --test-threads=1")
+    );
     let text = stdout(&out);
     assert!(!text.contains("operator implementation:"));
     assert!(text.contains(&format!("\nverification: julia --startup-file=no --project={r} {r}/test/runtests.jl\n")));
@@ -162,10 +189,15 @@ fn shards_deal_each_listed_case_to_exactly_one_shard() {
         assert!(calls.iter().any(|c| c.args.starts_with("build --release")));
         for call in &calls {
             if let Some(stem) = call.args.strip_prefix("list ") {
-                assert!(Path::new(&call.cwd).join(format!("{stem}.py")).is_file(), "{stem} was listed outside its directory");
+                if call.tool == "cargo" {
+                    assert!(CONFORMANCE_TARGETS.contains(&stem), "{stem} is not a conformance target");
+                } else {
+                    assert!(Path::new(&call.cwd).join(format!("{stem}.py")).is_file(), "{stem} was listed outside its directory");
+                }
+                assert_ne!(call.host, "/inherited/palette-host", "{stem} was listed with the inherited host");
                 listed.insert(stem.to_string());
             } else if let Some(stem) = suite(call) {
-                let cases: Vec<&str> = call.args.split(' ').skip(2).collect();
+                let cases = named_cases(call);
                 assert!(!cases.is_empty(), "a sharded run names its cases");
                 ran.extend(cases.into_iter().map(|c| (stem.to_string(), c.to_string())));
             }
@@ -175,8 +207,8 @@ fn shards_deal_each_listed_case_to_exactly_one_shard() {
         assert_eq!(skipped + suites_run, 12, "every suite runs or says it has no cases");
     }
     assert_eq!(listed.len(), 12);
-    let mut expected: Vec<(String, String)> =
-        listed.iter().flat_map(|s| ["Case.test_one", "Case.test_two", "Case.test_three"].map(|c| (s.clone(), c.to_string()))).collect();
+    let cases = |s: &str| if CONFORMANCE_TARGETS.contains(&s) { ["one", "two", "three"] } else { ["Case.test_one", "Case.test_two", "Case.test_three"] };
+    let mut expected: Vec<(String, String)> = listed.iter().flat_map(|s| cases(s).map(|c| (s.clone(), c.to_string()))).collect();
     expected.sort();
     ran.sort();
     assert_eq!(ran, expected, "each case runs on exactly one shard");
