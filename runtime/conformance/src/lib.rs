@@ -226,6 +226,27 @@ impl Kernel {
         serde_json::from_str(&line).unwrap_or_else(|e| panic!("reply {line:?}: {e}"))
     }
 
+    /// Writes one raw line to the bridge (a request or a host reply).
+    pub fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().expect("the kernel is open");
+        writeln!(stdin, "{message}").and_then(|()| stdin.flush()).expect("writing to the bridge");
+    }
+
+    /// The bridge's next line, or None if none arrives within `timeout` or it exited.
+    pub fn read(&mut self, timeout: Duration) -> Option<Value> {
+        if !self.stdout.buffer().contains(&b'\n') {
+            use std::os::fd::AsRawFd;
+            let mut fd = libc::pollfd { fd: self.stdout.get_ref().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            if unsafe { libc::poll(&mut fd, 1, ms) } <= 0 {
+                return None;
+            }
+        }
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("reading from the bridge");
+        (!line.is_empty()).then(|| serde_json::from_str(&line).unwrap_or_else(|e| panic!("bridge line {line:?}: {e}")))
+    }
+
     pub fn close(&mut self) {
         if self.stdin.take().is_some() && wait_timeout(&mut self.child, Duration::from_secs(60)).is_none() {
             let _ = self.child.kill();
@@ -242,6 +263,80 @@ impl Drop for Kernel {
             let _ = self.child.wait();
         }
     }
+}
+
+/// A `palette-host broker` process serving one ceiling on a socket in `dir`.
+pub struct Broker {
+    child: Option<Child>,
+    pub sock: PathBuf,
+    pub receipts: PathBuf,
+}
+
+impl Broker {
+    pub fn start(dir: &Path, ceiling: &Value) -> Broker {
+        let (sock, receipts) = (dir.join("broker.sock"), dir.join("receipts.jsonl"));
+        let mut child = Command::new(host_bin())
+            .arg("broker")
+            .arg("--socket")
+            .arg(&sock)
+            .args(["--ceiling", &ceiling.to_string()])
+            .arg("--receipts")
+            .arg(&receipts)
+            .args(["--session-id", "test", "--child-timeout", "90"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("starting palette-host broker");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).expect("reading the broker READY");
+        let mut broker = Broker { child: Some(child), sock, receipts };
+        let ready: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        if ready["kind"] != "READY" {
+            broker.close();
+            panic!("broker did not start: {line:?}");
+        }
+        broker
+    }
+
+    /// One request of `category` and its raw reply, denials included.
+    pub fn request(&self, category: &str, params: Value) -> Value {
+        let mut conn = std::os::unix::net::UnixStream::connect(&self.sock).unwrap_or_else(|e| panic!("{}: {e}", self.sock.display()));
+        writeln!(conn, "{}", json!({"id": "t", "category": category, "params": params})).expect("writing to the broker");
+        let mut line = String::new();
+        BufReader::new(conn).read_line(&mut line).expect("reading the broker reply");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("broker reply {line:?}: {e}"))
+    }
+
+    /// Closes the broker's stdin and waits for it to exit (killing it after 30 s).
+    pub fn close(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            drop(child.stdin.take());
+            if wait_timeout(&mut child, Duration::from_secs(30)).is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// The host's ceiling-subset rule: whether `requested` is within `parent`, and why not.
+pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
+    let out = run(Command::new(host_bin()).arg("subset").arg(requested.to_string()).arg(parent.to_string()), "", Duration::from_secs(30));
+    assert!(out.status.success(), "palette-host subset: {}", String::from_utf8_lossy(&out.stderr));
+    let r: Value = serde_json::from_slice(&out.stdout).expect("subset prints JSON");
+    (r["ok"] == true, r["reason"].as_str().unwrap_or_default().to_string())
+}
+
+/// `r`, once it is known to be a successful call.
+pub fn ok(r: Value) -> Value {
+    assert_eq!(r["success"], true, "{r}");
+    r
 }
 
 /// The text of the `  heading: ...` line of a revival report, or "".

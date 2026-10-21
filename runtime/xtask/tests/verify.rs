@@ -105,7 +105,7 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-const CONFORMANCE_TARGETS: [&str; 3] = ["palette_daemon", "time_machine", "xray"];
+const CONFORMANCE_TARGETS: [&str; 7] = ["palette_daemon", "time_machine", "xray", "contexts", "host_bridge", "host_command", "tools"];
 
 /// The suite a call ran (`python3 <dir>/<stem>.py -v ...`, or the conformance
 /// `cargo test ... --test <target> -- ...`), if it ran one.
@@ -155,16 +155,16 @@ fn runs_every_gate_then_each_suite_whole_against_the_host() {
     );
     assert!(calls.iter().take(9).all(|c| c.host == "unset"));
     let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
-    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival", "test_host_bridge", "test_contexts", "test_tools", "test_host_command"];
+    let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival"];
     let expected: Vec<(&str, &str)> = [("test_workspace_router", "unset")]
         .into_iter()
         .chain(hosted.iter().chain(&CONFORMANCE_TARGETS).map(|s| (*s, host.as_str())))
         .collect();
     assert_eq!(suites, expected);
-    assert!(calls[9..18].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
+    assert!(calls[9..14].iter().all(|c| c.args.ends_with(".py -v")), "a whole run names no cases");
     assert!(calls[9].args.starts_with(&format!("{r}/runtime/security/test_workspace_router.py")));
     assert_eq!(
-        calls[18].args,
+        calls[14].args,
         format!("test --release --locked --manifest-path {r}/runtime/conformance/Cargo.toml --test palette_daemon -- --test-threads=1")
     );
     let text = stdout(&out);
