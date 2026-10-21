@@ -6,6 +6,7 @@
 /Manifest.toml
 /runtime/host/target/
 /runtime/xtask/target/
+/runtime/conformance/target/
 /deps/
 node_modules/
 

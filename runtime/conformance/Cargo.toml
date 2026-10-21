@@ -1,0 +1,11 @@
+[package]
+license = "AGPL-3.0-only"
+name = "palette-conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Palette's process conformance suites: real sessions, kernels and daemons of a built palette-host, run by cargo xtask verify"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+libc = "0.2"
