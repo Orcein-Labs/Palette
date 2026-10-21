@@ -12,12 +12,11 @@
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
 //!   palette-host serve      init|inspect|prepare|launch|client --profile P ... (see serve --help)
 //!   palette-host patch      --storage S review|approve ID [--digest D] | apply-helper
+//!   palette-host mcp        [--socket PATH] | child   (the MCP router, or one workspace's adapter)
 
 mod broker;
 mod cli;
-#[allow(dead_code)] // `palette-host mcp` is wired in slice C
 mod mcp;
-#[allow(dead_code)] // wired into `palette-host mcp` in slice C
 mod provisioning;
 mod receipt_archive;
 mod sandbox;
@@ -182,7 +181,11 @@ fn main() {
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
         Some("patch") => mcp::patch::main(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve|patch ...".into()),
+        Some("mcp") => match rest.first().map(String::as_str) {
+            Some("child") => Ok(mcp::child::main()),
+            _ => mcp::router::main(rest),
+        },
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve|patch|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
