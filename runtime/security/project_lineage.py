@@ -126,11 +126,17 @@ def ensure_project_lineage(registry: dict, root: Path, project_root_id: str) -> 
             f"Multiple non-empty legacy project states exist for {project_root_id}; refusing to choose"
         )
 
-    lock = None
+    # Lock every state directory this call removes or replaces, empty ones
+    # included: a live owner may not have written anything yet.
+    locks = []
     source = legacy_nonempty[0] if legacy_nonempty else None
     try:
+        for _, _, legacy in aliases:
+            if legacy != target and legacy.exists():
+                locks.append(_acquire_migration_lock(legacy))
+        if source is not None and target.exists():
+            locks.append(_acquire_migration_lock(target))
         if source is not None:
-            lock = _acquire_migration_lock(source)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if target.exists():
                 if target.is_symlink() or not target.is_dir():
@@ -149,7 +155,7 @@ def ensure_project_lineage(registry: dict, root: Path, project_root_id: str) -> 
                 legacy.rmdir()
         return target, lid
     finally:
-        if lock is not None:
+        for lock in locks:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
 
