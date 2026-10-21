@@ -40,7 +40,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-# The broker and worker launcher under test: the Rust host when PALETTE_HOST_BIN is set.
+# The broker and worker launcher under test: the Rust host.
 from host_adapter import B, HOST_BIN, create_session_depot, remove_session_depot, run_worker  # noqa: E402
 from launch_worker import build_package_installer_argv, default_depot, package_store_paths, resolve_real_julia_binary  # noqa: E402
 
@@ -368,36 +368,12 @@ class TestReceiptsFailClosed(unittest.TestCase):
     def test_a_broker_that_cannot_open_its_receipt_log_does_not_start(self):
         receipts = os.path.join(self.tmp, "receipts.jsonl")
         os.mkdir(receipts)
-        # The Python broker names the log; the Rust one never prints READY.
-        with self.assertRaisesRegex(RuntimeError, "receipt log|did not start"):
+        with self.assertRaisesRegex(RuntimeError, "did not start"):
             B.Broker({}, receipts, "test-session")
 
 
-class TestExternalWriteNoFollow(unittest.TestCase):
-    """The Python broker's write walk; the Rust one has the same unit test."""
-
-    def test_a_symlink_swapped_in_after_the_check_is_never_followed(self):
-        import broker as python_broker
-        base = Path(tempfile.mkdtemp(prefix="palette-fs-write-"))
-        self.addCleanup(shutil.rmtree, base, True)
-        allowed, outside = base / "allowed", base / "outside"
-        (allowed / "sub").mkdir(parents=True)
-        outside.mkdir()
-        root = allowed.resolve()
-        python_broker._write_beneath(root, root / "new" / "dir" / "f.txt", b"ok")
-        self.assertEqual((allowed / "new" / "dir" / "f.txt").read_text(), "ok")
-        (allowed / "sub" / "f.txt").symlink_to(outside / "victim")
-        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
-            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
-        shutil.rmtree(allowed / "sub")
-        (allowed / "sub").symlink_to(outside)
-        with self.assertRaisesRegex(python_broker.CapabilityDenied, "symlink"):
-            python_broker._write_beneath(root, root / "sub" / "f.txt", b"x")
-        self.assertEqual(list(outside.iterdir()), [])
-
-
 class TestExternalWriteRootsPinned(unittest.TestCase):
-    """allowed_dirs resolve once, at broker start, on either backend."""
+    """allowed_dirs resolve once, at broker start."""
 
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix="palette-fs-pin-"))
@@ -458,13 +434,11 @@ class TestCeilingFileProtected(unittest.TestCase):
         self.assertIn("ceiling.json", out)
 
     def test_a_broker_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
-        command = [HOST_BIN, "broker"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("broker.py"))]
-        self._refused(command + ["--socket", str(self.base / "b.sock"), "--ceiling", str(self.ceiling),
+        self._refused([HOST_BIN, "broker", "--socket", str(self.base / "b.sock"), "--ceiling", str(self.ceiling),
                                  "--receipts", str(self.base / "receipts" / "receipts.jsonl")], 60, subprocess.PIPE)
 
     def test_a_session_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
-        command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("session_cli.py"))]
-        self._refused(command + ["--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
+        self._refused([HOST_BIN, "session", "--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
                                  "--scratch-root", str(self.base / "scratch"),
                                  "--receipts-dir", str(self.base / "receipts")], 300, subprocess.DEVNULL)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Executable tests for runtime/security/session.py -- Palette's persistent worker.
+Executable tests for `palette-host session` -- Palette's persistent worker.
 
 Same evidence standard as runtime/security/test_authority.py: real sandboxes, real
 broker, real host filesystem checks, never the worker's own self-report
@@ -116,12 +116,8 @@ class TestSessionLifecycle(SessionTestCase):
     def test_killed_worker_is_detected_not_hung_or_silently_respawned(self):
         s = PaletteSession(project_dir=PROJECT_DIR, ceiling={})
         try:
-            if HOST_BIN:
-                for pid in s.worker_pids():
-                    os.kill(pid, 9)
-            else:
-                s._proc.kill()
-                s._proc.wait()
+            for pid in s.worker_pids():
+                os.kill(pid, 9)
             with self.assertRaises(SessionDeadError):
                 s.turn("1 + 1")
         finally:
@@ -133,17 +129,11 @@ class TestSessionLifecycle(SessionTestCase):
         deep = Path(tempfile.mkdtemp(prefix="palette-deep-")) / ("d" * 60) / ("e" * 60)
         s = PaletteSession(project_dir=PROJECT_DIR, ceiling={}, workspace_dir=str(deep))
         try:
-            if not HOST_BIN:
-                sock_dir = s._broker_sock_dir
-                self.assertLessEqual(len(str(Path(sock_dir) / "broker.sock").encode()), 100)
             self.assertEqual(s.turn("1 + 1")["data"], 2)
         finally:
             s.close()
-            if HOST_BIN:
-                self.assertFalse(deep.exists(), "the session's scratch root outlived it")
+            self.assertFalse(deep.exists(), "the session's scratch root outlived it")
             shutil.rmtree(deep.parent.parent, ignore_errors=True)
-        if not HOST_BIN:
-            self.assertFalse(Path(sock_dir).exists())
 
     def test_turn_after_close_raises(self):
         s = PaletteSession(project_dir=PROJECT_DIR, ceiling={})
@@ -166,8 +156,7 @@ class TestSessionLifecycle(SessionTestCase):
                     root.mkdir()
                     (root / "broker").write_text("not a directory")
                     os.environ["JULIA_DEPOT_PATH"] = str(depot)
-                    error = SessionDeadError if HOST_BIN else subprocess.CalledProcessError if copy_fails else FileExistsError
-                    with self.assertRaises(error):
+                    with self.assertRaises(SessionDeadError):
                         PaletteSession(project_dir=PROJECT_DIR, ceiling={}, workspace_dir=str(root))
                     clone_root = Path(tmp, ".palette-depot-clones")
                     self.assertTrue(clone_root.is_dir(), "startup never reached depot cloning")
@@ -186,8 +175,7 @@ class TestSessionScratchOwnership(SessionTestCase):
     them. Receipts written without a receipts directory outlive the session."""
 
     def _bridge(self):
-        command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(Path(__file__).with_name("session_cli.py"))]
-        proc = subprocess.Popen(command + ["--project-dir", PROJECT_DIR, "--ceiling", "{}"],
+        proc = subprocess.Popen([HOST_BIN, "session", "--project-dir", PROJECT_DIR, "--ceiling", "{}"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdin.close(), proc.stdout.close()))
         hello = json.loads(proc.stdout.readline() or "{}")
@@ -247,7 +235,7 @@ class TestSessionScratchOwnership(SessionTestCase):
             root.mkdir()
             elsewhere.mkdir(mode=0o755)
             (root / "broker").symlink_to(elsewhere)
-            with self.assertRaises(SessionDeadError if HOST_BIN else RuntimeError):
+            with self.assertRaises(SessionDeadError):
                 PaletteSession(project_dir=PROJECT_DIR, ceiling={}, workspace_dir=str(root))
             self.assertEqual(list(elsewhere.iterdir()), [], "the broker used the symlink's target")
             self.assertEqual(stat.S_IMODE(elsewhere.stat().st_mode), 0o755)

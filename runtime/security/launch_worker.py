@@ -693,9 +693,9 @@ def resolve_real_julia_binary() -> str:
     testing that `julia -e ...` invoked WITHOUT an explicit stdin (the
     default: inherit the caller's own stdin fd) silently breaks the
     CALLER's own subsequent reads from its own stdin -- invisible for
-    every one-shot caller so far (nothing before runtime/security/session_cli.py
+    every one-shot caller so far (nothing before the session bridge
     depended on a live stdin pipe surviving past this call), but fatal for
-    a persistent process like session_cli.py, which reads turn requests
+    a persistent process like the session bridge, which reads turn requests
     from its own stdin for its entire lifetime. This one call, running
     inside a session's broker thread the moment any ephemeral turn
     requested spawn_child_worker, would have corrupted that whole

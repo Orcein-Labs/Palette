@@ -1,7 +1,6 @@
 """host_command: operator-named host commands, run outside the sandbox.
 
-Every case runs against both brokers -- broker.py in-process and the Rust
-`palette-host broker` over its socket -- so the two stay in parity.
+Every case runs against `palette-host broker` over its socket.
 """
 from __future__ import annotations
 
@@ -17,8 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from broker import Broker, ceiling_is_subset  # noqa: E402
-from host_adapter import HOST_BIN, _RustBrokerServer  # noqa: E402
+from host_adapter import HOST_BIN, B, _RustBrokerServer  # noqa: E402
 
 
 def pid_dead(pid, timeout=5.0):
@@ -50,17 +48,6 @@ def write_fifo(path, text="go"):
 FLOCK = next((f for f in ("/usr/bin/flock", "/bin/flock") if os.path.isfile(f)), None)
 
 
-class PythonBroker:
-    def __init__(self, ceiling, tmp):
-        self.b = Broker(ceiling, str(tmp / "receipts.jsonl"), "test")
-
-    def __call__(self, params):
-        return self.b.handle_request({"category": "host_command", "params": params})
-
-    def close(self):
-        self.b.close()
-
-
 class RustBroker:
     def __init__(self, ceiling, tmp):
         self.sock = str(tmp / "broker.sock")
@@ -76,11 +63,10 @@ class RustBroker:
         self.server.shutdown()
 
 
-class HostCommandParity:
-    Broker = None
+class HostCommandTest(unittest.TestCase):
 
     def setUp(self):
-        if self.Broker is RustBroker and not (HOST_BIN and Path(HOST_BIN).is_file()):
+        if not Path(HOST_BIN).is_file():
             raise unittest.SkipTest("no palette-host binary (set PALETTE_HOST_BIN)")
         self.tmp = Path(tempfile.mkdtemp(prefix="palette-hostcmd-")).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -112,7 +98,7 @@ class HostCommandParity:
                 "lock-nodir": {"argv": ["/bin/true"], "cwd": d, "lock": str(self.tmp / "missing" / "gpu.lock")},
                 "lock-isdir": {"argv": ["/bin/true"], "cwd": d, "lock": d},
             })
-        self.b = self.Broker(commands, self.tmp)
+        self.b = RustBroker(commands, self.tmp)
 
     def tearDown(self):
         self.b.close()
@@ -254,22 +240,14 @@ class HostCommandParity:
         self.assertLess(time.monotonic() - started, 5)
 
 
-class PythonHostCommandTest(HostCommandParity, unittest.TestCase):
-    Broker = PythonBroker
-
-
-class RustHostCommandTest(HostCommandParity, unittest.TestCase):
-    Broker = RustBroker
-
-
 class CeilingSubsetTest(unittest.TestCase):
     def test_child_keeps_only_parent_commands_unchanged(self):
         parent = {"host_command": {"commands": {"render": {"argv": ["/bin/true"], "cwd": "/tmp"}}}}
-        self.assertTrue(ceiling_is_subset({"host_command": {"commands": {}}}, parent)[0])
-        self.assertTrue(ceiling_is_subset(parent, parent)[0])
-        self.assertFalse(ceiling_is_subset({"host_command": {"commands": {"render": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}}, parent)[0])
-        self.assertFalse(ceiling_is_subset({"host_command": {"commands": {"sh": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}}, parent)[0])
-        self.assertFalse(ceiling_is_subset(parent, {})[0])
+        self.assertTrue(B.ceiling_is_subset({"host_command": {"commands": {}}}, parent)[0])
+        self.assertTrue(B.ceiling_is_subset(parent, parent)[0])
+        self.assertFalse(B.ceiling_is_subset({"host_command": {"commands": {"render": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}}, parent)[0])
+        self.assertFalse(B.ceiling_is_subset({"host_command": {"commands": {"sh": {"argv": ["/bin/sh"], "cwd": "/tmp"}}}}, parent)[0])
+        self.assertFalse(B.ceiling_is_subset(parent, {})[0])
 
 
 if __name__ == "__main__":

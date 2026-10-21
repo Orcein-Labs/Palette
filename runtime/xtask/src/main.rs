@@ -12,7 +12,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: cargo xtask <task>
 
 tasks:
-  verify --project-dir DIR [--implementation both|rust|python] [--shard I/N]
+  verify --project-dir DIR [--shard I/N]
       Run Palette's Julia, Rust and real operator conformance gates. DIR is an
       instantiated environment with this checkout plus JSON, CSV, DataFrames,
       EzXML and IJulia. Shard I of N runs the shared gates on shard 1 and a

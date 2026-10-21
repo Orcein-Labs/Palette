@@ -30,12 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from host_adapter import session_cmd  # noqa: E402
 
-CLI = str(Path(__file__).resolve().parent / "session_cli.py")
 PROJECT_DIR = os.environ.get("PALETTE_TEST_PROJECT_DIR", str(Path.home() / ".palette-trial/project"))
 
 
 class Kernel:
-    """One session_cli process: one kernel, over the given workspace and state directory."""
+    """One session bridge process: one kernel, over the given workspace and state directory."""
 
     def __init__(self, workspace: str, state: str, timeout: float = 20, env: dict | None = None,
                  extra_args: list[str] | None = None, ceiling: dict | None = None):
