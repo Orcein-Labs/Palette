@@ -17,7 +17,7 @@ const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 const BUNDLED_CAPABILITIES: &[&str] = &["teamlab"];
 const CHECK_TIMEOUT: Duration = Duration::from_secs(600);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
-const NOTICE: &str = "Palette client integration\nCopyright (c) 2026 Matt C\nApache-2.0. Core runtime is separately licensed AGPL-3.0-only.\n";
+const NOTICE: &str = "Palette client integration\nCopyright (c) 2026 Matt C\nAGPL-3.0-only.\n";
 const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
 const USAGE: &str = "\
@@ -563,13 +563,13 @@ fn write_plugin(repo: &Path, plugin: &Path, entry: &Value) -> Result<(), String>
     fs::write(&config_path, pretty(&config)).map_err(at(&config_path))?;
     for (from, to) in [
         ("runtime/plugins/palette/assets/palette.svg", "assets/palette.svg"),
-        ("runtime/licenses/Apache-2.0.txt", "LICENSE"),
+        ("LICENSE", "LICENSE"),
         ("runtime/licenses/MIT-INHERITED.txt", "MIT-INHERITED.txt"),
     ] {
         fs::copy(repo.join(from), plugin.join(to)).map_err(at(&repo.join(from)))?;
     }
     fs::write(plugin.join("NOTICE"), NOTICE).map_err(at(&plugin.join("NOTICE")))?;
-    manifest.as_object_mut().ok_or("plugin.json must be a JSON object")?.insert("license".into(), json!("Apache-2.0"));
+    manifest.as_object_mut().ok_or("plugin.json must be a JSON object")?.insert("license".into(), json!("AGPL-3.0-only"));
     fs::write(&manifest_path, pretty(&manifest)).map_err(at(&manifest_path))
 }
 

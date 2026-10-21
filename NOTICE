@@ -7,7 +7,6 @@ Copyright (c) 2026 Prime Intellect
 Copyright (c) 2026 MattC
 
 The original grant and notices are preserved in runtime/licenses/MIT-INHERITED.txt.
-Core's outgoing license is AGPL-3.0-only; specifically identified client/plugin
-components and documentation are Apache-2.0. See runtime/licenses/README.md.
+Palette's outgoing license is AGPL-3.0-only. See runtime/licenses/README.md.
 The combined Palette distribution has been modified; this licensing and client
 packaging update is dated 2026-10-04. Earlier license grants remain in force.

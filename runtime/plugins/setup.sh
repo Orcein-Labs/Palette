@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 # Prepare Palette on Linux, register it with local clients, and check it works.
 # Builds the sandbox host if this source has none, then runs `palette-host setup`
 # with the arguments given here (see `sh setup.sh --help`).

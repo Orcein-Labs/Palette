@@ -22,7 +22,7 @@ revisions, environment versions, hashes, attribution, and failed attempts for
 future research publication. Public `runtime/docs/` should explain supported behavior,
 installation, and limits. Never include credentials or private deployment state.
 
-The optional [operator briefing](BRAIN_BLAST.md) helps users discover how to work
+The optional [operator briefing](docs/brain-blast.md) helps users discover how to work
 in a persistent Julia world; its examples should stay executable and its claims
 should match the current implementation.
 
@@ -34,9 +34,7 @@ research toolkits, UI extensions, and agent orchestration should be independentl
 installable plugins. Propose a concrete Core contract change before building a
 large feature into the kernel. Maintainers may redirect features to the ecosystem.
 
-Contribute Palette-owned Core changes under AGPL-3.0-only and identified client,
-plugin, and documentation changes under Apache-2.0, as specified in
+Contribute Palette-owned changes under AGPL-3.0-only, as specified in
 [runtime/licenses/README.md](runtime/licenses/README.md). Retain third-party
 attribution and compatible license notices. No copyright assignment is required.
-A dedicated Apache-2.0 community-plugin repository is planned; until it is
-established, host plugins independently and document their supported contracts.
+Host plugins independently and document their supported contracts.

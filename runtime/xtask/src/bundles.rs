@@ -84,14 +84,14 @@ fn build(source: &Files, revision: &str) -> Result<Vec<(&'static str, Vec<u8>)>,
     let file = |name: &str| source.get(name).cloned().ok_or_else(|| format!("revision {revision} has no {name}"));
     let manifest: Value = serde_json::from_slice(&file("runtime/plugins/palette/plugin.json")?).map_err(|e| format!("plugin.json: {e}"))?;
     let field = |key: &str| manifest.get(key).cloned().ok_or_else(|| format!("plugin.json has no {key}"));
-    let (inherited, license, notice) = (file("runtime/licenses/MIT-INHERITED.txt")?, file("runtime/licenses/Apache-2.0.txt")?, file("NOTICE")?);
-    let brain_blast = String::from_utf8(file("BRAIN_BLAST.md")?).map_err(|e| format!("BRAIN_BLAST.md: {e}"))?;
+    let (inherited, license, notice) = (file("runtime/licenses/MIT-INHERITED.txt")?, file("LICENSE")?, file("NOTICE")?);
+    let brain_blast = String::from_utf8(file("docs/brain-blast.md")?).map_err(|e| format!("docs/brain-blast.md: {e}"))?;
     let mut shared: Files = source.iter().filter(|(n, _)| !EXCLUDED.contains(&n.as_str())).map(|(n, d)| (format!("sdk/{n}"), d.clone())).collect();
     shared.extend([
         ("templates/palette-plugin.json".into(), file("runtime/plugins/palette/plugin.json")?),
         ("setup.sh".into(), file("runtime/plugins/setup.sh")?),
-        ("INSTALL.md".into(), file("runtime/plugins/DISTRIBUTION.md")?),
-        ("BRAIN_BLAST.md".into(), brain_blast.replace("(runtime/docs/", "(sdk/runtime/docs/").into_bytes()),
+        ("INSTALL.md".into(), file("runtime/docs/install.md")?),
+        ("BRAIN_BLAST.md".into(), brain_blast.replace("(../runtime/docs/", "(sdk/runtime/docs/").into_bytes()),
         ("LICENSE".into(), license.clone()),
         ("NOTICE".into(), notice.clone()),
         ("licenses/AGPL-3.0-only.txt".into(), file("LICENSE")?),
@@ -115,7 +115,7 @@ fn build(source: &Files, revision: &str) -> Result<Vec<(&'static str, Vec<u8>)>,
     desktop.extend([("LICENSE".into(), license), ("NOTICE".into(), notice), ("MIT-INHERITED.txt".into(), inherited)]);
 
     let mut portable = under(source, "runtime/plugins/palette/");
-    portable.insert("README.md".into(), file("runtime/plugins/DISTRIBUTION.md")?);
+    portable.insert("README.md".into(), file("runtime/docs/install.md")?);
     let mut claude_manifest = serde_json::Map::new();
     for key in ["name", "version", "description", "author", "license", "repository"] {
         claude_manifest.insert(key.into(), field(key)?);
