@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 # What operators and clients start.
-ENTRY_POINTS = ("generation_runtime", "install_operator_plugin", "palette_mcp_client", "prewarm_depot")
+ENTRY_POINTS = ("generation_runtime",)
 REFERENCE_ONLY = {"session", "broker", "session_cli", "host_adapter"}
 
 
