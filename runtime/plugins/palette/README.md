@@ -20,8 +20,7 @@ From the Palette repository root, after installing the runtime prerequisites:
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 cargo build --manifest-path runtime/host/Cargo.toml --release --locked
-python3 runtime/security/prewarm_depot.py --project-dir "$PWD" \
-  --host-bin "$PWD/runtime/host/target/release/palette-host"
+runtime/host/target/release/palette-host prepare --project-dir "$PWD"
 python3 runtime/security/install_operator_plugin.py --format portable \
   --plugin-dir "$HOME/.local/share/palette-plugin" \
   --workspace-dir /absolute/path/to/workspace \

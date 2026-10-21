@@ -15,7 +15,7 @@ from unittest.mock import patch
 import patch_broker as patch_broker_module
 from patch_broker import PatchBroker, TRUSTED_TOOLS_TARGET, approval_mode, patch_roots_from_env, request_digest
 from repair_broker import RepairBroker, normalize_recipe, run_isolated_test
-from prewarm_depot import resolve_real_julia_binary
+from launch_worker import resolve_real_julia_binary
 
 
 def python_test_recipe(recipe_id, *arguments, executable=None, toolchain_root=None,

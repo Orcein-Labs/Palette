@@ -170,7 +170,7 @@ jobs:
         echo "JULIA_CPU_TARGET=$JULIA_CPU_TARGET" > "$RUNNER_TEMP/palette-task.env"
         echo "PALETTE_TASK_ENV=$RUNNER_TEMP/palette-task.env" >> "$GITHUB_ENV"
 
-    # The depot holds the packages and the caches prewarm_depot.py compiles;
+    # The depot holds the packages and the caches `palette-host prepare` compiles;
     # the gates still run prewarm, which only recompiles what changed.
     - name: Restore the Julia depot
       id: depot
@@ -241,13 +241,12 @@ jobs:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
       run: >-
-        python3 runtime/security/prewarm_depot.py
+        runtime/host/target/release/palette-host prepare
         --project-dir "$GITHUB_WORKSPACE"
-        --host-bin "$GITHUB_WORKSPACE/runtime/host/target/release/palette-host"
         --timeout-s 720
     - name: Check routing, ownership, recovery and one-shot patch authority
       env:
         JULIA_NUM_THREADS: '1'
         JULIA_PKG_OFFLINE: 'true'
         PYTHONPATH: runtime/security
-      run: python3 -m unittest -v test_workspace_router test_patch_broker test_depot_clones test_entry_points test_preparation_messages
+      run: python3 -m unittest -v test_workspace_router test_patch_broker test_depot_clones test_entry_points

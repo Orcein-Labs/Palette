@@ -1,6 +1,6 @@
-//! The preparation record, ported from `prewarm_depot.py`: whether the depot
-//! has been prewarmed for this project, Palette's sources and this Julia, and
-//! the run of `palette-host prewarm` that makes it so.
+//! The preparation record: whether the depot has been prewarmed for this
+//! project, Palette's sources and this Julia, and the run of `palette-host
+//! prewarm` that makes it so.
 //!
 //! The record lives at `<depot>/.palette-preparation/<key>.json` (or in a
 //! given state directory), keyed by the project, the repo and the depot. A

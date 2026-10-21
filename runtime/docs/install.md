@@ -140,8 +140,7 @@ Run it before connecting an interactive client, and after runtime or source
 updates:
 
 ```sh
-python3 runtime/security/prewarm_depot.py --project-dir "$PWD" \
-  --host-bin "$PWD/runtime/host/target/release/palette-host"
+runtime/host/target/release/palette-host prepare --project-dir "$PWD"
 ```
 
 A successful command records `state: prepared`; sessions validate its source,

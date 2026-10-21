@@ -39,13 +39,14 @@ esac
 
 /// Prewarming starts sessions under the server's environment, so it needs
 /// the deployed capabilities and the ceiling.
-const FAKE_PREWARM: &str = r##"#!/bin/sh
-[ -f "$PALETTE_CAPABILITY_CEILING" ] && [ -d "$PALETTE_RUNTIME_ROOT/teamlab" ] || exit 3
-echo '{"prewarmed":true}'
-"##;
-
 /// A palette server that keeps x between calls, unless FAKE_PALETTE=forget.
+/// As `prepare`, it checks the capabilities exist and prints a record.
 const FAKE_SERVER: &str = r##"#!/bin/sh
+if [ "$1" = prepare ]; then
+  [ -f "$PALETTE_CAPABILITY_CEILING" ] && [ -d "$PALETTE_RUNTIME_ROOT/teamlab" ] || exit 3
+  echo '{"state":"prepared"}'
+  exit 0
+fi
 env > "$FAKE_PALETTE_ENV"
 x=
 reply() { printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$1"; }
@@ -142,8 +143,8 @@ impl Fixture {
         self.root.join("server.env")
     }
 
-    /// An SDK with the files setup reads, a fake host that serves MCP and a
-    /// fake prewarm; it has no .git, so setup does not build a host.
+    /// An SDK with the files setup reads and a fake host that serves MCP and
+    /// prepares; it has no .git, so setup does not build a host.
     fn make_repo(&self, name: &str) -> PathBuf {
         let repo = self.root.join(name);
         for dir in ["runtime/integrations/teamlab", "runtime/plugins/palette", "runtime/licenses"] {
@@ -154,7 +155,6 @@ impl Fixture {
         }
         write(&repo.join("Manifest.toml"), "", 0o644);
         write(&repo.join("runtime/host/target/release/palette-host"), FAKE_SERVER, 0o755);
-        write(&repo.join("runtime/security/prewarm_depot.py"), FAKE_PREWARM, 0o755);
         repo
     }
 

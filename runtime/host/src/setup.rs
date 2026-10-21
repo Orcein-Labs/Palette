@@ -606,10 +606,10 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
         None => Vec::new(),
     };
     let mut tools = Vec::new();
-    for name in ["julia", "bwrap", "python3"] {
+    for name in ["julia", "bwrap"] {
         tools.push(util::which(name).ok_or_else(|| format!("missing prerequisite on PATH: {name}"))?);
     }
-    let (julia, python) = (&tools[0], text(&tools[2]));
+    let julia = &tools[0];
     if !repo.join("Project.toml").is_file() {
         return Err(format!("not a Palette SDK: {}", repo.display()));
     }
@@ -681,10 +681,9 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
             }
             let mut offline = env.clone();
             offline.push(("JULIA_PKG_OFFLINE".into(), "true".into()));
-            let prewarm = text(&repo.join("runtime/security/prewarm_depot.py"));
             step(
                 "Preparing the sandbox (the first run takes several minutes)",
-                &args(&[&python, &prewarm, "--project-dir", &text(&repo), "--host-bin", &text(&host)]),
+                &args(&[&text(&host), "prepare", "--project-dir", &text(&repo)]),
                 &offline,
                 true,
             )?;
