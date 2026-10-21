@@ -418,7 +418,9 @@ fn confine_writes(_root: RawFd) -> Result<(), Fault> {
 /// Writes an approved record's changes, each atomically, after checking
 /// every precondition. Runs in the apply-helper process, which it confines.
 fn apply_files(record: &Value) -> Result<Value, Fault> {
-    let root = c_name(path_arg(index(record, "root")?)?)?;
+    let root = index(record, "root")?;
+    let root = c_name(root.as_str().ok_or_else(|| Fault::new("TypeError", format!(
+        "open: path should be string, bytes or os.PathLike, not {}", util::py_type_name(root))))?)?;
     let root_fd = util::open_at(libc::AT_FDCWD, &root, libc::O_RDONLY | libc::O_DIRECTORY, 0)
         .map_err(|e| Fault::os(&e, Path::new(&*root.to_string_lossy())))?;
     if &identity(root_fd.as_raw_fd())? != index(record, "root_identity")? {
