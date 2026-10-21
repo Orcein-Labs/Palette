@@ -20,18 +20,9 @@ print(json.dumps(list(ids(unittest.defaultTestLoader.loadTestsFromName(sys.argv[
 /// Suites that start no session host.
 const SHARED_SUITES: [&str; 1] = ["runtime/security/test_workspace_router.py"];
 /// Suites run against the host binary.
-const HOST_SUITES: [&str; 8] = [
-    "test_authority.py",
-    "test_session.py",
-    "test_session_cli.py",
-    "test_revival.py",
-    "test_host_bridge.py",
-    "test_contexts.py",
-    "test_tools.py",
-    "test_host_command.py",
-];
+const HOST_SUITES: [&str; 4] = ["test_authority.py", "test_session.py", "test_session_cli.py", "test_revival.py"];
 /// The ported suites: test targets of runtime/conformance, run against the host binary.
-const CONFORMANCE_TARGETS: [&str; 3] = ["palette_daemon", "time_machine", "xray"];
+const CONFORMANCE_TARGETS: [&str; 7] = ["palette_daemon", "time_machine", "xray", "contexts", "host_bridge", "host_command", "tools"];
 const CONFORMANCE_MANIFEST: &str = "runtime/conformance/Cargo.toml";
 
 macro_rules! argv {
