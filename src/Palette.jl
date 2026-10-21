@@ -1754,7 +1754,7 @@ This is the ONLY code path in this package that can reach outside the
 sandbox's own bounded filesystem/network envelope. It does not perform any
 external effect itself: it connects to the host capability broker over the
 Unix socket named by the `PALETTE_BROKER_SOCKET` environment variable (set
-by `runtime/security/launch_worker.py`, reachable only because that one socket path
+by `palette-host`'s sandbox launcher, reachable only because that one socket path
 was explicitly bind-mounted into this sandbox), sends one JSON request, and
 returns the broker's JSON response. The broker -- a separate process
 running outside this sandbox's OS namespace entirely -- decides whether to
