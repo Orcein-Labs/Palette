@@ -391,11 +391,19 @@ pub fn py_type_name(v: &serde_json::Value) -> &'static str {
 /// `json.dumps(v)` (or with `indent`) as Python writes it, keys sorted.
 pub fn py_dumps(v: &serde_json::Value, indent: Option<usize>) -> String {
     let mut out = String::new();
-    dump_into(v, indent, 0, &mut out);
+    dump_into(v, indent, ", ", 0, &mut out);
     out
 }
 
-fn dump_into(v: &serde_json::Value, indent: Option<usize>, depth: usize, out: &mut String) {
+/// `json.dumps(v, sort_keys=True, separators=(",", ":"))`: compact, with
+/// Python's ASCII escapes and float spelling.
+pub fn py_dumps_compact(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    dump_into(v, None, ",", 0, &mut out);
+    out
+}
+
+fn dump_into(v: &serde_json::Value, indent: Option<usize>, comma: &str, depth: usize, out: &mut String) {
     use serde_json::Value;
     let items: Vec<(Option<&String>, &Value)> = match v {
         Value::Array(a) if !a.is_empty() => a.iter().map(|x| (None, x)).collect(),
@@ -413,14 +421,14 @@ fn dump_into(v: &serde_json::Value, indent: Option<usize>, depth: usize, out: &m
     out.push(if v.is_array() { '[' } else { '{' });
     for (i, (key, x)) in items.into_iter().enumerate() {
         if i > 0 {
-            out.push_str(if indent.is_some() { "," } else { ", " });
+            out.push_str(if indent.is_some() { "," } else { comma });
         }
         newline(out, depth + 1);
         if let Some(k) = key {
             out.push_str(&py_json_str(k));
-            out.push_str(": ");
+            out.push_str(if comma == "," { ":" } else { ": " });
         }
-        dump_into(x, indent, depth + 1, out);
+        dump_into(x, indent, comma, depth + 1, out);
     }
     newline(out, depth);
     out.push(if v.is_array() { ']' } else { '}' });
