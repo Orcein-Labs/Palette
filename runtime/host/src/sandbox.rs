@@ -1765,6 +1765,15 @@ mod tests {
         remove_session_depot(&overlay);
         assert!(fs::symlink_metadata(&overlay).is_err() && fs::symlink_metadata(clone_owner_path(&overlay)).is_err());
         let copy = copied_depot(&depot);
+        // A child another test thread forked holds the hold's copy until it
+        // execs, so the snapshot may survive one sweep.
+        for _ in 0..200 {
+            if !first.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            try_sweep_depot_snapshots(&depot);
+        }
         assert!(!first.exists(), "a removed overlay kept its snapshot held");
         assert_eq!(fs::read_to_string(copy.join("cache")).unwrap(), "second");
         assert!(second.is_dir());
