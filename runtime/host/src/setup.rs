@@ -625,7 +625,6 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
         return Err("Workspace must not overlap source, depot, capabilities, configuration, or host state".into());
     }
     let host = repo.join("runtime/host/target/release/palette-host");
-    let serve = text(&repo.join("runtime/security/serve_palette.py"));
     // The client starts the server with this environment, not the shell's, so
     // it names the Julia found now and keeps packages beside the other data.
     let mut launch_env: Vec<(String, String)> = [
@@ -653,10 +652,9 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     launch_env.push(("PATH".into(), format!("{}:{SYSTEM_PATH}", text(julia.parent().expect("a file on PATH")))));
     let launcher = output.join("palette-mcp");
     let script = format!(
-        "#!/bin/sh\n# Palette-managed launcher\nexec env {} {} {} \"$@\"\n",
+        "#!/bin/sh\n# Palette-managed launcher\nexec env {} {} mcp start \"$@\"\n",
         launch_env.iter().map(|(k, v)| shquote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" "),
-        shquote(&python),
-        shquote(&serve)
+        shquote(&text(&host)),
     );
 
     // A failed install, build, prewarm or check puts the capabilities and
@@ -720,8 +718,8 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
 
     util::write_atomic(&launcher, &script, 0o755)?;
     let entry = json!({
-        "command": python,
-        "args": [serve],
+        "command": text(&host),
+        "args": ["mcp", "start"],
         "env": launch_env.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<_, _>>(),
     });
     write_plugin(&repo, &output.join("palette-local-plugin"), &entry)?;

@@ -12,7 +12,7 @@ already granted for earlier releases or change third-party ownership.
 | Julia worker, `runtime/scripts/session_loop.jl` | AGPL-3.0-only |
 | Broker, authority, execution and revival machinery in `runtime/security/` | AGPL-3.0-only |
 | Client packages, installers and packaging helpers under `runtime/plugins/` | Apache-2.0 |
-| Local client installation/entrypoint: `runtime/security/install_operator_plugin.py`, `runtime/security/serve_palette.py` | Apache-2.0 |
+| Local client installation: `runtime/security/install_operator_plugin.py` | Apache-2.0 |
 | Public API/protocol/install docs, `runtime/docs/`, and root README/contribution/security/briefing docs | Apache-2.0 |
 | Tests and other source/tooling not explicitly excepted above | AGPL-3.0-only |
 

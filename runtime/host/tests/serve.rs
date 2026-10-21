@@ -62,9 +62,13 @@ impl Fixture {
     /// A stub that logs its argv, then its environment, to the record. The
     /// path is written into the stub, since serve passes no ambient variable.
     fn recorder(&self, name: &str) {
+        self.recorder_at(&self.bin().join(name));
+    }
+
+    fn recorder_at(&self, path: &Path) {
         let log = self.record().to_string_lossy().replace('\'', "'\\''");
         let script = format!("#!/bin/sh\n{{ printf '%s\\n' \"$0\" \"$@\"; echo ---; env; echo ===; }} >> '{log}'\n");
-        write(&self.bin().join(name), &script, 0o755);
+        write(path, &script, 0o755);
     }
 
     /// A repo whose sources are this checkout's and whose release host is
@@ -196,7 +200,7 @@ fn init_removes_a_profile_it_cannot_use() {
 fn launch_passes_only_the_profile_environment() {
     let f = Fixture::new();
     f.init();
-    f.recorder("python3");
+    f.recorder_at(&f.repo().join(HOST));
     let path = format!("{}:/usr/bin:/bin", f.bin().display());
     let out = f
         .command(&["launch", "--profile", &f.profile().to_string_lossy()], &path)
@@ -210,7 +214,7 @@ fn launch_passes_only_the_profile_environment() {
     let calls = f.calls();
     assert_eq!(calls.len(), 1);
     let (argv, env) = &calls[0];
-    assert_eq!(argv[1..], [f.repo().join("runtime/security/serve_palette.py").to_string_lossy().into_owned()]);
+    assert_eq!(argv[1..], ["mcp", "start"]);
     for secret in ["OPENAI_API_KEY", "PALETTE_HOST_COMMANDS", "PALETTE_PATCH_ROOTS"] {
         assert!(!env.contains_key(secret), "{secret} was inherited");
     }
