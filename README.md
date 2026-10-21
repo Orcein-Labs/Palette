@@ -159,7 +159,7 @@ For the complete Linux process conformance gates, prepare a Julia environment
 with this checkout plus JSON, CSV, DataFrames, EzXML, and IJulia, then run:
 
 ```sh
-cargo xtask verify --project-dir /absolute/path/to/test-env --implementation both
+cargo xtask verify --project-dir /absolute/path/to/test-env
 ```
 
 Run it from the checkout root. `--shard I/N` runs the shared gates on shard 1

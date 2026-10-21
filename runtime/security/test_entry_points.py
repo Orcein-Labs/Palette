@@ -1,9 +1,8 @@
 """Production entry points run sessions and brokers through the Rust host.
 
-The Python session, broker and their command-line bridge are a reference
-implementation that the security suites run against the Rust host. No
-production entry point may reach them, so a change made only to the Python
-twin can never be what a deployment runs.
+The Python host is retired. What remains of it -- the test adapter and the
+worker launcher the suites use for depots and installer argv -- is test
+support, and no production entry point may reach it.
 """
 import ast
 import json
@@ -16,7 +15,7 @@ sys.path.insert(0, str(HERE))
 
 # What operators and clients start.
 ENTRY_POINTS = ("generation_runtime",)
-REFERENCE_ONLY = {"session", "broker", "session_cli", "host_adapter"}
+REFERENCE_ONLY = {"host_adapter", "launch_worker"}
 
 
 def local_imports(module: str, local: set[str]) -> set[str]:
@@ -35,7 +34,7 @@ def local_imports(module: str, local: set[str]) -> set[str]:
 
 
 class ProductionEntryPointsTest(unittest.TestCase):
-    def test_no_entry_point_reaches_the_python_session_or_broker(self):
+    def test_no_entry_point_reaches_the_test_support(self):
         local = {path.stem for path in HERE.glob("*.py") if not path.stem.startswith("test_")}
         for entry in ENTRY_POINTS:
             with self.subTest(entry=entry):
@@ -47,7 +46,7 @@ class ProductionEntryPointsTest(unittest.TestCase):
                         seen.add(module)
                         stack.extend(local_imports(module, local))
                 self.assertEqual(seen & REFERENCE_ONLY, set(),
-                                 f"{entry} imports the reference-only Python host")
+                                 f"{entry} imports test support")
 
     def test_entry_points_name_the_rust_host(self):
         for entry in ("generation_runtime",):

@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from host_adapter import session_cmd  # noqa: E402
 
 REPO_DIR = str(Path(__file__).resolve().parents[2])
-CLI = str(Path(__file__).resolve().parent / "session_cli.py")
 PROJECT_DIR = os.environ.get(
     "PALETTE_TEST_PROJECT_DIR",
     REPO_DIR,
@@ -1236,8 +1235,6 @@ class TestRepoDirResolution(unittest.TestCase):
 
     def test_a_binary_outside_a_checkout_needs_an_explicit_repo_dir(self):
         from host_adapter import HOST_BIN
-        if not HOST_BIN:
-            raise unittest.SkipTest("Rust host only: the Python CLI is always inside its checkout")
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / "palette-host"
             shutil.copy2(HOST_BIN, binary)

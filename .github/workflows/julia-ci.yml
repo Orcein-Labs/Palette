@@ -128,10 +128,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pull requests and pushes check the Rust host only. The Python host is
-        # the conformance oracle until it is removed (runtime/docs/authority.md)
-        # and runs nightly and on manual dispatch.
-        implementation: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["rust", "python"]' || '["rust"]') }}
         # cargo xtask verify runs the shared gates on shard 1 and deals the test
         # cases across the shards by runtime/security/test-case-seconds.json.
         shard: [1, 2, 3, 4]
@@ -195,7 +191,6 @@ jobs:
       run: >-
         cargo xtask verify
         --project-dir "$GITHUB_WORKSPACE/security-test-env"
-        --implementation "${{ matrix.implementation }}"
         --shard "${{ matrix.shard }}/4"
 
     - name: Report the depot size sessions clone
@@ -203,7 +198,7 @@ jobs:
       run: du -sh ~/.julia ~/.palette-depot-snapshots 2>/dev/null || true
 
     - name: Save the Julia depot
-      if: always() && matrix.shard == 1 && matrix.implementation == 'rust' && steps.depot.outputs.cache-hit != 'true'
+      if: always() && matrix.shard == 1 && steps.depot.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:
         path: ~/.julia
