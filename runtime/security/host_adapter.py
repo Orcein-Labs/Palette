@@ -22,10 +22,38 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 HOST_BIN = os.environ.get("PALETTE_HOST_BIN") or str(HERE.parent / "host/target/release/palette-host")
 
-import launch_worker as _launch  # noqa: E402
+_session_depots = {}
 
-create_session_depot = _launch.create_session_depot
-remove_session_depot = _launch.remove_session_depot
+
+def create_session_depot():
+    """A session depot held by a `palette-host session-depot` process until remove_session_depot."""
+    proc = subprocess.Popen([HOST_BIN, "session-depot"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    ready = json.loads(proc.stdout.readline() or "{}")
+    if ready.get("kind") != "READY":
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(f"palette-host session-depot did not start: {ready!r}")
+    _session_depots[ready["depot"]] = proc
+    return ready["depot"]
+
+
+def remove_session_depot(depot):
+    proc = _session_depots.pop(depot)
+    proc.stdin.close()
+    proc.wait(timeout=120)
+    proc.stdout.close()
+
+
+def julia_binary() -> str:
+    """The real julia binary past the juliaup shim, resolved as palette-host's resolve_julia does."""
+    pinned = os.environ.get("PALETTE_JULIA_BIN")
+    if pinned:
+        if not Path(pinned).is_file():
+            raise RuntimeError(f"PALETTE_JULIA_BIN is not a file: {pinned}")
+        return pinned
+    out = subprocess.run(["julia", "-e", "print(Sys.BINDIR)"], capture_output=True, text=True, check=True,
+                         stdin=subprocess.DEVNULL)
+    return str(Path(out.stdout.strip()) / "julia")
 
 
 def scratch_root() -> str:

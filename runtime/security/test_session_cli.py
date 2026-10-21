@@ -208,10 +208,9 @@ class TestSessionCli(unittest.TestCase):
 
     def test_ephemeral_turn_does_not_break_the_stdin_pipe_for_later_turns(self):
         """The regression this file exists for. An ephemeral turn routes
-        through spawn_child_worker, which calls launch_worker.run_worker,
-        which calls resolve_real_julia_binary -- both subprocess.run
-        `julia` invocations that used to inherit (and silently break)
-        this CLI process's own stdin. If the fix regresses, this test
+        through spawn_child_worker, which resolves the julia binary and
+        runs a worker -- both `julia` invocations that used to inherit (and
+        silently break) this CLI process's own stdin. If the fix regresses, this test
         hangs or fails on the turn AFTER the ephemeral one, not the
         ephemeral one itself."""
         r1 = self._turn("x = 42")
