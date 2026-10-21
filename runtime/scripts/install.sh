@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 # Install Palette on Linux (or inside WSL2) and connect it to local clients:
 #   curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
 # Run again to update; `install.sh --update` installs a newer release only.

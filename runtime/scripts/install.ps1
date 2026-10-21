@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 # Install Palette on Windows. Palette runs in WSL2; this sets WSL2 up, installs
 # Palette inside it, and connects Claude Desktop, Claude Code and Codex:
 #   powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
