@@ -1,5 +1,4 @@
-//! Canonical durable state for project-scoped workspaces, ported from
-//! `project_lineage.py`.
+//! Canonical durable state for project-scoped workspaces.
 //!
 //! Project scope is a continuity boundary, not a caller or workspace-name
 //! boundary: every alias that selects the same configured project_root_id

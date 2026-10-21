@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for the Time Machine (src/time_machine.jl, time_machine.py): named
+Tests for the Time Machine (src/time_machine.jl, `palette-host control`): named
 checkpoints of the live world, restored or forked by a new kernel, with a
 receipt of each identity the checkpoint recorded.
 
@@ -14,14 +14,12 @@ Run:
 from __future__ import annotations
 
 import json
-import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import time_machine  # noqa: E402
+from host_adapter import control  # noqa: E402
 from test_revival import KernelTestCase  # noqa: E402
 
 MEAN = "summarize(xs) = sum(xs) / length(xs)\n"
@@ -30,7 +28,7 @@ MAX = "summarize(xs) = maximum(xs)\n"
 
 class TimeMachineTest(KernelTestCase):
     def checkpoint_names(self):
-        return [c["name"] for c in time_machine.list_checkpoints(self.state)["checkpoints"]]
+        return [c["name"] for c in control("checkpoints", self.state)["checkpoints"]]
 
     def good_then_broken(self):
         """A world checkpointed as `good`, then changed in code, data and ENV."""
@@ -46,7 +44,7 @@ class TimeMachineTest(KernelTestCase):
 
     def test_seven_step_restore_and_undo(self):
         self.good_then_broken()
-        time_machine.request_restore(self.state, "good")
+        control("restore", self.state, checkpoint="good")
         out, r = self.revive('(summarize(data), result, ENV["TM_MODE"], Palette.revival()["checkpoint"])')
         self.assertTrue(r["success"], r)
         value, result, mode, receipt = r["data"]
@@ -69,14 +67,14 @@ class TimeMachineTest(KernelTestCase):
         # The world it replaced was kept, so the restore can be undone.
         auto = receipt["saved_before_restore"]
         self.assertIn(auto, self.checkpoint_names())
-        time_machine.request_restore(self.state, auto)
+        control("restore", self.state, checkpoint=auto)
         out, r = self.revive('c = Palette.revival()["checkpoint"]; (summarize(data), ENV["TM_MODE"], c["identical"], c["saved_before_restore"])')
         self.assertEqual(r["data"][:3], [9.0, "broken", True], out)
         self.assertRegex(r["data"][3], r"^auto-\d{8}-\d{6}-before-undo$")   # undoing an undo does not nest names
 
     def test_restore_survives_a_later_plain_revival(self):
         self.good_then_broken()
-        time_machine.request_restore(self.state, "good")
+        control("restore", self.state, checkpoint="good")
         self.revive('nothing')
         out, r = self.revive('summarize(data)')
         self.assertEqual(r["data"], 3.0, out)   # still the checkpoint's code, not the workspace file's
@@ -84,7 +82,7 @@ class TimeMachineTest(KernelTestCase):
     def test_fork_records_its_parent(self):
         self.good_then_broken()
         before = json.loads(Path(self.state, "world.json").read_text())["id"]
-        time_machine.request_restore(self.state, "good", fork=True)
+        control("restore", self.state, checkpoint="good", fork=True)
         out, r = self.revive('c = Palette.checkpoints(); w = c.world; (w["id"], w["parent"]["world"], w["parent"]["checkpoint"], c.checkpoints[1]["name"])')
         self.assertTrue(r["success"], r)
         self.assertIn("Forked a new world from checkpoint `good`", out)
@@ -98,7 +96,7 @@ class TimeMachineTest(KernelTestCase):
         data_file = cdir / record["data"][0]["file"]
         data_file.unlink()   # a hard link: replace it rather than write through to the live snapshot
         data_file.write_bytes(b"not the saved data")
-        time_machine.request_restore(self.state, "good")
+        control("restore", self.state, checkpoint="good")
         out, r = self.revive('(summarize(data), Palette.revival()["checkpoint"]["event"])')
         self.assertIn("Restoring checkpoint `good` failed", out)
         self.assertIn("damaged", out)
@@ -109,7 +107,7 @@ class TimeMachineTest(KernelTestCase):
         record = json.loads(Path(self.state, "checkpoints", "good", "checkpoint.json").read_text())
         sha = next(iter(record["includes"][0]["files"].values()))
         Path(self.state, "blobs", sha).write_text("summarize(xs) = 0.0\n")
-        time_machine.request_restore(self.state, "good")
+        control("restore", self.state, checkpoint="good")
         out, r = self.revive('summarize(data)')
         self.assertIn("Restoring checkpoint `good` failed", out)
         self.assertEqual(r["data"], 9.0, out)
@@ -122,7 +120,7 @@ class TimeMachineTest(KernelTestCase):
         self.session('Palette.checkpoint("after-edit")', 'nothing')
         record = json.loads(Path(self.state, "checkpoints", "after-edit", "checkpoint.json").read_text())
         self.assertEqual([i["kept"] for i in record["includes"]], [False])
-        time_machine.request_restore(self.state, "after-edit")
+        control("restore", self.state, checkpoint="after-edit")
         out, r = self.revive('Palette.revival()["checkpoint"]')
         receipt = r["data"]
         self.assertFalse(receipt["identical"], out)
@@ -140,9 +138,9 @@ class TimeMachineTest(KernelTestCase):
         self.assertIn("checkpoint name", r[4]["error"])
         self.assertEqual(self.checkpoint_names(), ["one"])
         with self.assertRaises(ValueError):
-            time_machine.request_restore(self.state, "missing")
+            control("restore", self.state, checkpoint="missing")
         with self.assertRaises(ValueError):
-            time_machine.request_restore(self.state, "../one")
+            control("restore", self.state, checkpoint="../one")
         out, r = self.revive('Palette.forget_checkpoint("one")')
         self.assertTrue(r["success"], r)
         self.assertEqual(self.checkpoint_names(), [])
@@ -166,7 +164,7 @@ class TimeMachineTest(KernelTestCase):
         self.good_then_broken()
         env = {"PALETTE_AUTO_CHECKPOINTS": "2"}
         for _ in range(3):
-            time_machine.request_restore(self.state, "good")
+            control("restore", self.state, checkpoint="good")
             out, r = self.revive("nothing", env=env)
             self.assertTrue(r["success"], r)
         autos = [n for n in self.checkpoint_names() if n.startswith("auto-")]
@@ -174,39 +172,9 @@ class TimeMachineTest(KernelTestCase):
         self.assertIn("Removed the oldest automatic checkpoint", out)
         self.assertIn("good", self.checkpoint_names())   # named checkpoints are never pruned
         # Each kept checkpoint is still whole.
-        time_machine.request_restore(self.state, autos[0])
+        control("restore", self.state, checkpoint=autos[0])
         out, r = self.revive("summarize(data)", env=env)
         self.assertEqual(r["data"], 3.0, out)
-
-
-class CarryCheckpointsTest(unittest.TestCase):
-    def test_fresh_world_keeps_checkpoints(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            old, new = Path(tmp, "old"), Path(tmp, "new")
-            (old / "checkpoints" / "a").mkdir(parents=True)
-            (old / "checkpoints" / "a" / "checkpoint.json").write_text(json.dumps({"name": "a", "created": "t"}))
-            (old / "blobs").mkdir()
-            (old / "manifest.json").write_text("{}")
-            time_machine.carry_checkpoints(old, new)
-            self.assertEqual(sorted(p.name for p in new.iterdir()), ["blobs", "checkpoints"])
-            self.assertEqual([c["name"] for c in time_machine.list_checkpoints(new)["checkpoints"]], ["a"])
-
-
-class RetireWorldTest(unittest.TestCase):
-    def test_keeps_checkpoints_and_the_newest_retired_worlds(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp, "world")
-            for age in range(4):
-                old = Path(tmp, f"world.retired-{age}")
-                old.mkdir()
-                os.utime(old, (1_000_000 + age, 1_000_000 + age))
-            (state / "checkpoints" / "a").mkdir(parents=True)
-            (state / "manifest.json").write_text("{}")
-            retired = Path(time_machine.retire_world(state))
-            self.assertTrue((retired / "manifest.json").is_file())
-            self.assertEqual([p.name for p in state.iterdir()], ["checkpoints"])
-            kept = {p.name for p in Path(tmp).iterdir() if ".retired-" in p.name}
-            self.assertEqual(kept, {retired.name, "world.retired-2", "world.retired-3"})   # the oldest two went
 
 
 if __name__ == "__main__":

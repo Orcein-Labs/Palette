@@ -27,8 +27,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// The longest --max-turn-timeout this host takes (7 days); the Python host
-/// and launchers share it as source_transport.LONGEST_TURN_TIMEOUT.
+/// The longest --max-turn-timeout this host takes (7 days); mcp::transport
+/// checks launch requests against it.
 pub(crate) const LONGEST_TURN_TIMEOUT: f64 = 604800.0;
 
 static OUT: Mutex<()> = Mutex::new(());

@@ -1,5 +1,4 @@
-//! The host-owned registry of Palette backend generations, ported from
-//! `generation_runtime.py`.
+//! The host-owned registry of Palette backend generations.
 //!
 //! A generation is a Palette checkout and the `palette-host` that runs its
 //! sessions. `builtin` is the checkout and host this router runs from; others
