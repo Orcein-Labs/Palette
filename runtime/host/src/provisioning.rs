@@ -458,7 +458,15 @@ mod tests {
         let home = [("HOME", "/h")];
         assert_eq!(with_teamlab(json!({}), vars(&home)).unwrap(), json!({"teamlab": {"dir": "/h/.local/share/palette/teamlab"}}));
         assert_eq!(with_teamlab(json!({"teamlab": {"dir": "/mine"}}), vars(&home)).unwrap(), json!({"teamlab": {"dir": "/mine"}}));
-        assert_eq!(with_teamlab(json!({}), vars(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "off")])).unwrap(), json!({}));
+        for off in ["off", "", " "] {
+            assert_eq!(with_teamlab(json!({}), vars(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", off)])).unwrap(), json!({}));
+        }
+        assert_eq!(
+            with_teamlab(json!({"spawn_child_worker": {}}), vars(&[("PALETTE_TEAMLAB_DIR", "/lab")])).unwrap(),
+            json!({"spawn_child_worker": {}, "teamlab": {"dir": "/lab"}})
+        );
+        let granted = with_teamlab(json!({}), vars(&[("PALETTE_TEAMLAB_DIR", "/lab")])).unwrap();
+        assert!(protected_host_paths(&granted, false, false, vars(&[])).unwrap().contains(&PathBuf::from("/lab")));
         assert_eq!(with_teamlab(json!({}), vars(&[("HOME", "/h"), ("PALETTE_TEAMLAB_DIR", "/lab//x/")])).unwrap(), json!({"teamlab": {"dir": "/lab/x"}}));
         assert_eq!(
             with_teamlab(json!({}), vars(&[("PALETTE_TEAMLAB_DIR", "lab")])).unwrap_err(),
@@ -481,6 +489,11 @@ mod tests {
         assert_eq!(name("  !! "), None);
         assert_eq!(name(&format!("{}-xyz", "a".repeat(31))), Some("a".repeat(31)));
         assert_eq!(name("zé"), Some("z".into()));
+        assert_eq!(name("Kilo Code"), Some("kilo-code".into()));
+        assert_eq!(name("_odd.name_"), Some("odd.name".into()));
+        assert_eq!(name(&"x".repeat(40)), Some("x".repeat(32)));
+        assert_eq!(name("All."), None);
+        assert_eq!(name("---"), None);
         assert_eq!(agent_name(Some(&json!(1))), None);
         assert_eq!(agent_name(None), None);
     }
@@ -521,6 +534,46 @@ mod tests {
         );
         assert_eq!(text(command_parents(&ceiling).unwrap()), ["/", "/locks", "/m", "/opt/bin", "/t"]);
         assert!(protected_host_paths(&json!({"zz": {}}), true, true, &env).is_err());
+    }
+
+    #[test]
+    fn nested_operator_artifacts_are_protected_but_caller_input_is_not() {
+        let root = fs::canonicalize(util::mkdtemp("palette-protected-artifacts-").unwrap()).unwrap();
+        let p = |rel: &str| root.join(rel);
+        let s = |p: &Path| p.display().to_string();
+        let (model, weights, artifact, tokenizer, config) =
+            (p("models/runner.gguf"), p("weights/fixed.safetensors"), p("assets/tokenizer.json"), p("assets/vocab.model"), p("config/runner.toml"));
+        let (library, executable, lock) = (p("lib"), p("bin/runner"), p("locks/gpu.lock"));
+        let paths = [&model, &weights, &artifact, &tokenizer, &config, &library, &executable, &lock];
+        for path in paths {
+            fs::create_dir_all(if *path == library { path.as_path() } else { path.parent().unwrap() }).unwrap();
+        }
+        let argv = ["/opt/palette-host".to_string(), "toolchain".into(), "run".into(),
+            "--executable".into(), s(&executable), format!("--executable={}", s(&executable)), format!("--model={}", s(&model)),
+            "--weights".into(), s(&weights), format!("--weights={}", s(&weights)),
+            "--artifact".into(), s(&artifact), format!("--artifact={}", s(&artifact)),
+            format!("--tokenizer={}", s(&tokenizer)), format!("--config={}", s(&config)),
+            "--library-dir".into(), s(&library), format!("--library-dir={}", s(&library)),
+            format!("--fixed-arg=--model={}", s(&model)), format!("--fixed-arg=--tokenizer={}", s(&tokenizer)),
+            format!("--fixed-arg=--config={}", s(&config)), "--fixed-arg=--weights".into(), format!("--fixed-arg={}", s(&weights)),
+            "--fixed-arg".into(), "--library-dir".into(), "--fixed-arg".into(), s(&library)];
+        let ceiling = json!({"host_command": {"commands": {
+            "inference": {"argv": argv, "cwd": s(&root), "lock": s(&lock), "extra_args": true}}}});
+        let protected = protected_host_paths(&ceiling, false, false, vars(&[("HOME", "/h")])).unwrap();
+        let parents = command_parents(&ceiling).unwrap();
+        for path in paths {
+            assert!(protected.contains(path), "{} is not protected", path.display());
+            assert!(parents.contains(&path.parent().unwrap().to_path_buf()));
+            assert!(require_disjoint(&[path.parent().unwrap()], &protected, &parents).unwrap_err().contains("parent of a host-command path"));
+        }
+        // A sibling inside a command's parent cannot rename the command path,
+        // so it may be writable.
+        let sibling = root.parent().unwrap().join(format!("{}-sibling", root.file_name().unwrap().to_string_lossy()));
+        assert!(require_disjoint(&[&sibling], &protected, &parents).is_ok());
+        assert!(!protected.contains(&root.parent().unwrap().to_path_buf()));
+        // A path the caller passes at run time is input, not configuration.
+        assert!(!protected.contains(&root.join("caller-selected-model.gguf")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
