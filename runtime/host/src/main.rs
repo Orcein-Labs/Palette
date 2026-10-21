@@ -13,6 +13,10 @@
 
 mod broker;
 mod cli;
+#[allow(dead_code)] // `palette-host mcp` is wired in slice C
+mod mcp;
+#[allow(dead_code)] // wired into `palette-host mcp` in slice C
+mod provisioning;
 mod receipt_archive;
 mod sandbox;
 mod serve;
