@@ -1,5 +1,4 @@
-//! The host side of the Execution X-Ray receipt query, ported from
-//! `receipt_query.py`: reads receipts.jsonl and calls.jsonl without a kernel
+//! The host side of the Execution X-Ray receipt query: reads receipts.jsonl and calls.jsonl without a kernel
 //! and joins a kernel call to the host receipts it caused. Read-only.
 
 use std::fs;
@@ -185,5 +184,38 @@ mod tests {
         assert_eq!(err(json!({"limit": -1}), None), "ValueError: limit must be between 1 and 500");
         assert_eq!(err(json!({"call": 2}), None), "ValueError: no record of call 2");
         assert_eq!(err(json!({"call": 9, "epoch": "e2"}), None), "ValueError: no record of call 9 in epoch e2");
+    }
+
+    #[test]
+    fn missing_files_read_as_empty_and_nothing_is_written() {
+        let t = Tmp(util::mkdtemp("palette-receipts-").unwrap());
+        let empty = run(&t, json!({}), None).unwrap();
+        assert_eq!((empty["matched"].as_u64(), empty["returned"].as_u64(), empty["unreadable_lines"].as_u64()), (Some(0), Some(0), Some(0)));
+        assert!(empty["call"].is_null());
+        let gone = query(&t.0.join("does-not-exist"), json!({"kind": "fs_digest"}).as_object().unwrap(), None).unwrap();
+        assert_eq!(gone["receipts"], json!([]));
+        // A call needs calls.jsonl.
+        fs::write(t.0.join("receipts.jsonl"), "{\"session_request\": \"E1:1\", \"timestamp\": 1}\n").unwrap();
+        assert_eq!(run(&t, json!({"call": 1}), None).unwrap_err().to_string(), "ValueError: no record of call 1");
+
+        let t = fixture();
+        let snapshot = || {
+            let mut files: Vec<_> = fs::read_dir(&t.0).unwrap().flatten().map(|e| (e.file_name(), fs::read(e.path()).unwrap())).collect();
+            files.sort();
+            files
+        };
+        let before = snapshot();
+        run(&t, json!({"call": 1, "limit": 10}), Some(json!("e1"))).unwrap();
+        assert_eq!(before, snapshot());
+    }
+
+    #[test]
+    fn time_bounds_are_inclusive() {
+        let t = fixture();
+        let stamps = |args: Value| -> Vec<Value> {
+            run(&t, args, None).unwrap()["receipts"].as_array().unwrap().iter().map(|r| r["timestamp"].clone()).collect()
+        };
+        assert_eq!(stamps(json!({"since": 20.5, "until": 30})), [json!(20.5), json!(30)]);
+        assert_eq!(stamps(json!({"until": 10})), [json!(10)]);
     }
 }

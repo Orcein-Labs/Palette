@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Tests for Execution X-Ray: Palette.xray(n) in the kernel, and the host
-receipts of call n (receipt_query.py, palette_control action=receipts).
+receipts of call n (`palette-host control receipts`, palette_control action=receipts).
 The Rust host stamps the receipts, so `cargo xtask verify` runs these on it only.
 
 The join is the point: every capability request a call made appears in the
@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import receipt_query  # noqa: E402
+from host_adapter import control  # noqa: E402
 from test_revival import KernelTestCase  # noqa: E402
 
 DIGEST = 'Palette.fs_digest([joinpath(pwd(), "a.txt")])'
@@ -70,7 +70,7 @@ class XRayTest(KernelTestCase):
             xray = x["data"]
             asked = [q["id"] for q in xray["capability_requests"]]
             self.assertEqual(len(asked), n, xray)
-            found = receipt_query.query(self.receipts, call=r["call"], epoch=epoch)
+            found = control("receipts", self.receipts, call=r["call"], epoch=epoch)
             self.assertEqual([q["request_id"] for q in found["receipts"]], asked, found)   # 100% join, both ways
             self.assertEqual(found["call"]["session_request"], xray["session_request"])
         approved = {q["category"]: q["approved"] for q in x1["data"]["capability_requests"]}
@@ -107,7 +107,7 @@ class XRayTest(KernelTestCase):
             epoch = k.hello["epoch"]
         finally:
             k.close()
-        contexts = [receipt_query.query(self.receipts, call=r["call"], epoch=epoch)["call"]["context"] for r in calls]
+        contexts = [control("receipts", self.receipts, call=r["call"], epoch=epoch)["call"]["context"] for r in calls]
         self.assertEqual(contexts, ["normal", "traced", "normal", "memoized", "normal"])
 
     def test_call_numbers_restart_per_kernel(self):
@@ -124,8 +124,8 @@ class XRayTest(KernelTestCase):
         finally:
             k.close()
         self.assertEqual(first["call"], second["call"])
-        self.assertEqual(len(receipt_query.query(self.receipts, call=first["call"], epoch=e1)["receipts"]), 1)
-        self.assertEqual(receipt_query.query(self.receipts, call=second["call"], epoch=e2)["receipts"], [])
+        self.assertEqual(len(control("receipts", self.receipts, call=first["call"], epoch=e1)["receipts"]), 1)
+        self.assertEqual(control("receipts", self.receipts, call=second["call"], epoch=e2)["receipts"], [])
 
     def test_unknown_call_is_an_error(self):
         k = self.kernel()

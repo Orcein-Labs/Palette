@@ -15,7 +15,7 @@
 # the same. Workspace files are never rewritten: git owns files.
 
 const TIME_MACHINE_FORMAT = 1
-const CHECKPOINT_NAME = r"^[A-Za-z0-9._-]{1,64}$"   # as CHECKPOINT_NAME in time_machine.py
+const CHECKPOINT_NAME = r"^[A-Za-z0-9._-]{1,64}$"   # as checkpoint_name in runtime/host/src/mcp/time_machine.rs
 const MAX_WORLD_HISTORY = 200
 # Automatic checkpoints a restore keeps: the oldest beyond this are removed. At
 # least 1, so the restore's own undo checkpoint survives.

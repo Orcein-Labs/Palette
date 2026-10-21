@@ -2,7 +2,8 @@
 The host the tests run against: the Rust `palette-host` binary, from
 PALETTE_HOST_BIN or else this checkout's release build. Every entry point the
 tests use -- the session bridge, one-shot workers, the broker, the
-ceiling-subset rule, a whole session -- goes through it.
+ceiling-subset rule, a whole session, the kernel-free control actions -- goes
+through it.
 
 Test support only: nothing here runs in a session.
 """
@@ -19,7 +20,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-HOST_BIN = os.environ.get("PALETTE_HOST_BIN") or str(HERE.parents[1] / "host/target/release/palette-host")
+HOST_BIN = os.environ.get("PALETTE_HOST_BIN") or str(HERE.parent / "host/target/release/palette-host")
 
 import launch_worker as _launch  # noqa: E402
 
@@ -34,6 +35,16 @@ def scratch_root() -> str:
 def session_cmd(root: str | None = None) -> list[str]:
     """The command that starts the session bridge (its arguments follow)."""
     return [HOST_BIN, "session", "--scratch-root", root or scratch_root()]
+
+
+def control(action, directory, **args):
+    """palette_control's kernel-free actions (checkpoints, restore, receipts) via `palette-host control`."""
+    out = subprocess.run([HOST_BIN, "control", action, str(directory), json.dumps(args)],
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+    if out.returncode != 0:
+        message = out.stderr.strip().removeprefix("palette-host: ")
+        raise (ValueError if message.startswith("ValueError: ") else RuntimeError)(message.removeprefix("ValueError: "))
+    return json.loads(out.stdout)
 
 
 def run_worker(*, workspace_dir, project_dir, repo_dir, script, broker_socket_dir=None, network_enabled=False,

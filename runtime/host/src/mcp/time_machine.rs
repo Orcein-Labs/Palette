@@ -1,5 +1,4 @@
-//! The host side of the Time Machine (src/time_machine.jl), ported from
-//! `time_machine.py`: lists checkpoints without a kernel and asks the next
+//! The host side of the Time Machine (src/time_machine.jl): lists checkpoints without a kernel and asks the next
 //! kernel to restore one.
 
 use std::fs;
