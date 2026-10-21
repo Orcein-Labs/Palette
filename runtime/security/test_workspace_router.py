@@ -258,7 +258,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         for fmt in ("portable", "codex"):
             with self.subTest(format=fmt):
                 plugin = Path(self.tmp.name) / fmt
-                command = [sys.executable, str(REPO / "runtime/security/install_operator_plugin.py"), "--format", fmt,
+                command = [str(HOST), "install-plugin", "--format", fmt,
                     "--plugin-dir", str(plugin), "--workspace-dir", str(self.workspace), "--bin-dir", str(Path(self.tmp.name) / "bin")]
                 install_env = {**os.environ, "XDG_RUNTIME_DIR": str(Path(self.tmp.name) / "runtime")}
                 subprocess.run(command, capture_output=True, text=True, check=True, env=install_env)
@@ -271,12 +271,12 @@ class WorkspaceRouterIntegration(unittest.TestCase):
                 entry = json.loads(config_path.read_text())["mcpServers"]["palette"]
                 self.assertEqual(entry["env"]["INSTALL_TEST_PRESERVED"], "yes")
                 self.assertEqual(json.loads(config_path.read_text())["INSTALL_TEST_ROOT_PRESERVED"], "yes")
-                self.assertEqual(entry["command"], sys.executable)
-                self.assertEqual(Path(entry["args"][0]), REPO / "runtime/security/palette_mcp_client.py")
+                self.assertEqual(Path(entry["command"]), HOST)
+                self.assertEqual(entry["args"], ["mcp", "connect"])
                 self.assertEqual(entry["env"]["PALETTE_SERVICE"], "palette.service")
                 self.assertIn("PALETTE_SOCKET", entry["env"])
         wrapper = Path(self.tmp.name) / "bin/palette-mcp"
-        self.assertIn(str(REPO / "runtime/security/palette_mcp_client.py"), wrapper.read_text())
+        self.assertIn(f"exec {HOST} mcp connect", wrapper.read_text())
 
     def test_thread_project_open_and_revival(self):
         # Thread A and B are truly separate worlds.

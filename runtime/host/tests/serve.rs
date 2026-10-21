@@ -255,9 +255,10 @@ fn prepare_provisions_with_package_networking_on() {
     let f = Fixture::new();
     f.init();
     fs::create_dir_all(f.repo()).unwrap();
-    for tool in ["julia", "cargo", "bwrap", "python3"] {
+    for tool in ["julia", "cargo", "bwrap"] {
         f.recorder(tool);
     }
+    f.recorder_at(&f.repo().join(HOST));
     let path = f.bin().to_string_lossy().into_owned();
     let profile = f.profile().to_string_lossy().into_owned();
     let out = f.command(&["prepare", "--profile", &profile], &(path.clone() + ":/usr/bin:/bin")).output().unwrap();
@@ -272,7 +273,7 @@ fn prepare_provisions_with_package_networking_on() {
     assert_eq!(argv, [
         vec![tool("julia"), "--startup-file=no".into(), format!("--project={repo}"), "-e".into(), "using Pkg; Pkg.instantiate()".into()],
         vec![tool("cargo"), "build".into(), "--release".into(), "--locked".into(), "--manifest-path".into(), format!("{repo}/runtime/host/Cargo.toml")],
-        vec![tool("python3"), format!("{repo}/runtime/security/prewarm_depot.py"), "--project-dir".into(), repo.clone(), "--host-bin".into(), format!("{repo}/{HOST}")],
+        vec![format!("{repo}/{HOST}"), "prepare".into(), "--project-dir".into(), repo.clone()],
     ]);
     for (_, env) in &calls {
         assert_eq!(env["JULIA_PKG_OFFLINE"], "false");

@@ -204,11 +204,13 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
         gates.run(argv!["python3", root.join("runtime/security/test_fs_digest.py"), "-v"], None)?;
     }
     gates.run(argv!["cargo", "build", "--release", "--manifest-path", &host_manifest], None)?;
-    let host = root.join("runtime/host/target/release/palette-host");
+    // Through cargo, which has just built it, so the stubbed tests run no real host.
     gates.run(
-        argv!["python3", root.join("runtime/security/prewarm_depot.py"), "--project-dir", &project, "--repo-dir", &root, "--host-bin", &host],
+        argv!["cargo", "run", "--release", "--quiet", "--manifest-path", &host_manifest, "--bin", "palette-host", "--",
+              "prepare", "--project-dir", &project, "--repo-dir", &root],
         None,
     )?;
+    let host = root.join("runtime/host/target/release/palette-host");
     let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: root.join(s), implementation: None, host: None }).collect();
     for implementation in implementations {
         let host = (implementation == "rust").then(|| host.clone());

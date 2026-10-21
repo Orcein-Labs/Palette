@@ -1150,7 +1150,7 @@ fn safe_socket_path(path: &str) -> Result<PathBuf, Fault> {
     Ok(path)
 }
 
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let r = unsafe {
@@ -1218,7 +1218,7 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
         [] => None,
         [flag, path] if flag == "--socket" => Some(path.as_str()),
         [flag] if flag.starts_with("--socket=") => Some(&flag["--socket=".len()..]),
-        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp start | palette-host mcp child".into()),
+        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp start | palette-host mcp connect | palette-host mcp child".into()),
     }.filter(|p| !p.is_empty());
     let r = match Router::new() {
         Ok(r) => Arc::new(r),
