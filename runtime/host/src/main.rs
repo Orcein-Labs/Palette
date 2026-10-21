@@ -11,6 +11,7 @@
 //!   palette-host setup      [--repo-dir R] [--no-register] [--replace] [--no-check] ... (see setup --help)
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
 //!   palette-host serve      init|inspect|prepare|launch|client --profile P ... (see serve --help)
+//!   palette-host patch      --storage S review|approve ID [--digest D] | apply-helper
 
 mod broker;
 mod cli;
@@ -180,7 +181,8 @@ fn main() {
         Some("setup") => setup::main(rest),
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve ...".into()),
+        Some("patch") => mcp::patch::main(rest),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|service|serve|patch ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
