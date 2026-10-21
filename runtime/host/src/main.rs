@@ -12,6 +12,7 @@
 //!   palette-host service    install|start|stop|restart|status [--unit U] ... (see service --help)
 //!   palette-host serve      init|inspect|prepare|launch|client --profile P ... (see serve --help)
 //!   palette-host patch      --storage S review|approve ID [--digest D] | apply-helper
+//!   palette-host toolchain config --name N --executable E --cwd C ... | run ...  (one fixed operator toolchain)
 //!   palette-host mcp        [--socket PATH] | start | child   (the MCP router, its client entry, or one workspace's adapter)
 
 mod broker;
@@ -26,6 +27,7 @@ mod service;
 mod session;
 mod setup;
 mod teamlab;
+mod toolchain;
 mod util;
 
 use serde_json::{json, Value};
@@ -183,13 +185,14 @@ fn main() {
         Some("service") => service::main(rest),
         Some("serve") => serve::main(rest),
         Some("patch") => mcp::patch::main(rest),
+        Some("toolchain") => toolchain::main(rest),
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
             Some("connect") if rest.len() == 1 => Ok(mcp::client::main()),
             Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|mcp ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|toolchain|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,

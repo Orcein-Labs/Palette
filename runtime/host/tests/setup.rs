@@ -110,7 +110,6 @@ impl Fixture {
         for name in CLIENTS {
             write(&f.bin().join(name), CLIENT_STUB, 0o755);
         }
-        write(&f.bin().join("python3"), "#!/bin/sh\nexec sh \"$@\"\n", 0o755);
         for name in ["julia", "bwrap"] {
             write(&f.bin().join(name), "#!/bin/sh\nexit 0\n", 0o755);
         }
