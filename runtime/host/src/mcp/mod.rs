@@ -1,7 +1,8 @@
 //! `palette-host mcp`: the MCP front door, ported from the Python router and
-//! adapter. Wired into the binary in slice C.
+//! adapter. `router` serves agents; `child` is one workspace's adapter.
 
 pub(crate) mod casefold;
+pub(crate) mod child;
 pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;
@@ -10,6 +11,7 @@ pub(crate) mod preparation;
 pub(crate) mod receipts;
 pub(crate) mod registry;
 pub(crate) mod repair;
+pub(crate) mod router;
 pub(crate) mod time_machine;
 pub(crate) mod transport;
 

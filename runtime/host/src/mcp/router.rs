@@ -1,0 +1,1360 @@
+//! `palette-host mcp`: the workspace router, ported from
+//! `operator_workspace_router.py`.
+//!
+//! The router is the MCP server agents talk to. It keeps a registry of
+//! logical workspaces (thread, project or open worlds), starts one
+//! `palette-host mcp child` adapter per live workspace and forwards
+//! `palette` and `palette_control` calls to it, serves `palette_workspace`
+//! itself, and brokers `palette_patch` through the patch broker. It serves
+//! stdio, or a private Unix socket with `--socket PATH`.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Map, Value};
+
+use super::child::{self, env, get, no_get};
+use super::generation::GenerationStore;
+use super::patch::{self, PatchBroker};
+use super::{atomic_json, lineage, py_json_loads, transport, valid_id, Fault};
+use crate::{provisioning, util};
+
+const FRAME_LIMIT: usize = 1048576;
+const CONTROL_ACTIONS: [&str; 8] =
+    ["status", "prepare", "restart", "checkpoints", "restore", "receipts", "generation_status", "activate_generation"];
+const INSTRUCTIONS: &str = "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities.";
+const ROUTING: [&str; 2] = ["workspace_id", "context_id"];
+
+/// A mutex lock that outlives a panicked holder, as Python's locks do.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn mkdir_private(path: &Path) -> Result<(), Fault> {
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(path).map_err(|e| Fault::os(&e, path))
+}
+
+fn disjoint<W: AsRef<Path>, P: AsRef<Path>, Q: AsRef<Path>>(writable: &[W], protected: &[P], parents: &[Q]) -> Result<(), Fault> {
+    provisioning::require_disjoint(writable, protected, parents).map_err(Fault::permission)
+}
+
+const NONE: &[PathBuf] = &[];
+
+fn ceiling() -> Result<Value, Fault> {
+    provisioning::with_teamlab(provisioning::operator_ceiling(env).map_err(Fault::value)?, env).map_err(Fault::value)
+}
+
+fn version(repo: &Path) -> Result<String, Fault> {
+    provisioning::palette_version(repo).map_err(|e| Fault::new("OSError", e))
+}
+
+/// `entry[key]`, as Python's KeyError.
+fn key<'a>(entry: &'a Map<String, Value>, key: &str) -> Result<&'a Value, Fault> {
+    entry.get(key).ok_or_else(|| Fault::new("KeyError", format!("'{key}'")))
+}
+
+fn text<'a>(entry: &'a Map<String, Value>, field: &str) -> &'a str {
+    entry.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+/// `entry.get("lineage_id", entry["workspace_id"])`.
+fn lineage_or_id(entry: &Map<String, Value>) -> String {
+    match entry.get("lineage_id") {
+        Some(Value::String(s)) => s.clone(),
+        _ => text(entry, "workspace_id").to_string(),
+    }
+}
+
+fn path_value(value: &Value) -> Result<PathBuf, Fault> {
+    value.as_str().map(PathBuf::from).ok_or_else(|| Fault::new("TypeError", format!(
+        "expected str, bytes or os.PathLike object, not {}", util::py_type_name(value))))
+}
+
+type Lines = Receiver<Result<String, Fault>>;
+type Frames = Receiver<Result<Value, Fault>>;
+
+/// The lines of `reader`, lossily decoded. With `limit`, a longer line ends
+/// the stream with a ValueError.
+fn lines(reader: impl Read + Send + 'static, limit: Option<usize>) -> Lines {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let read = match limit {
+                Some(n) => reader.by_ref().take(n as u64 + 1).read_until(b'\n', &mut buf),
+                None => reader.read_until(b'\n', &mut buf),
+            };
+            if matches!(read, Ok(0) | Err(_)) {
+                return;
+            }
+            if limit.is_some_and(|n| buf.len() > n) {
+                let _ = tx.send(Err(Fault::value("MCP frame exceeded 1 MiB")));
+                return;
+            }
+            if tx.send(Ok(String::from_utf8_lossy(&buf).into_owned())).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// A workspace child's stdout as JSON frames, then the error that ended it.
+fn pump(stdout: impl Read + Send + 'static) -> Frames {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        let end = loop {
+            buf.clear();
+            match reader.by_ref().take(FRAME_LIMIT as u64 + 1).read_until(b'\n', &mut buf) {
+                Ok(0) => break Fault::new("EOFError", "Workspace child exited; last call completion may be unknown"),
+                Err(e) => break patch::bare_os(&e),
+                Ok(_) => {}
+            }
+            if buf.len() > FRAME_LIMIT {
+                break Fault::value("Workspace child frame exceeded 1 MiB");
+            }
+            match py_json_loads(&String::from_utf8_lossy(&buf)) {
+                Ok(frame) => {
+                    if tx.send(Ok(frame)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => break e,
+            }
+        };
+        let _ = tx.send(Err(end));
+    });
+    rx
+}
+
+/// The next frame before `deadline`, or Python's `queue.Empty`.
+fn receive(frames: &Frames, deadline: Instant) -> Result<Value, Fault> {
+    let wait = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+    match frames.recv_timeout(wait) {
+        Ok(item) => item,
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(Fault::new("Empty", "")),
+    }
+}
+
+#[derive(Default)]
+struct Proc {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    /// The flock on the state directory's owner lock; the child holds it too.
+    lease: Option<File>,
+    generation_id: Option<String>,
+}
+
+/// One workspace's adapter (Python's `Child`). `call` is held for a whole
+/// call and holds its frames; `proc` only briefly. Lock order: the router's
+/// `children`, then `proc`.
+struct Worker {
+    entry: Map<String, Value>,
+    key: String,
+    call: Mutex<Option<Frames>>,
+    proc: Mutex<Proc>,
+    last_used: Mutex<Instant>,
+}
+
+#[derive(Default)]
+struct Children {
+    map: HashMap<String, Arc<Worker>>,
+    starting: HashSet<String>,
+    stopping: HashSet<String>,
+}
+
+pub(crate) struct Router {
+    repo: PathBuf,
+    base: PathBuf,
+    legacy: PathBuf,
+    legacy_receipts: PathBuf,
+    root: PathBuf,
+    generations: GenerationStore,
+    generation_lock: Mutex<()>,
+    max_live: usize,
+    idle: Duration,
+    limits: (f64, f64),
+    command_parents: Vec<PathBuf>,
+    project_roots: BTreeMap<String, PathBuf>,
+    tools: Value,
+    children: Mutex<Children>,
+}
+
+fn scratch_root(root: &Path) -> PathBuf {
+    env("PALETTE_SCRATCH_ROOT").map(PathBuf::from).unwrap_or_else(|| root.join("scratch"))
+}
+
+impl Router {
+    pub fn new() -> Result<Router, Fault> {
+        let (repo, host) = child::repo_and_host().map_err(|e| Fault::new("RuntimeError", e))?;
+        let repo = util::resolve(Path::new(&repo));
+        let base = util::resolve(Path::new(&env("OPERATOR_WORKSPACE").ok_or_else(|| Fault::new("KeyError", "'OPERATOR_WORKSPACE'"))?));
+        let legacy = util::resolve(&env("PALETTE_STATE_DIR").map(PathBuf::from)
+            .unwrap_or_else(|| child::default_state_dir(&base.to_string_lossy())));
+        let legacy_receipts = child::receipts_dir(&legacy);
+        let root = util::resolve(&env("PALETTE_WORKSPACE_STATE_ROOT").map(PathBuf::from).unwrap_or_else(child::default_workspace_root));
+        let generations = GenerationStore::new(&root.join("runtime-generations"), &repo, Path::new(&host));
+        let max_live = env("PALETTE_MAX_LIVE_WORKSPACES").unwrap_or_else(|| "4".into());
+        let max_live: i64 = max_live.trim().replace('_', "").parse().map_err(|_| Fault::value(format!(
+            "invalid literal for int() with base 10: {}", util::py_repr(&Value::String(max_live.clone())))))?;
+        let idle = env("PALETTE_WORKSPACE_IDLE_SECONDS").unwrap_or_else(|| "900".into());
+        let idle: f64 = idle.trim().parse().map_err(|_| Fault::value(format!(
+            "could not convert string to float: {}", util::py_repr(&Value::String(idle.clone())))))?;
+        let limits = transport::turn_limits(env).map_err(Fault::value)?;
+        if max_live < 1 || idle <= 0.0 {
+            return Err(Fault::value("Workspace limits must be positive"));
+        }
+        disjoint(&[&base], &[&repo, &root, &legacy, &legacy_receipts, &scratch_root(&root)], NONE)?;
+        disjoint(&[&root, &legacy, &legacy_receipts], &[&repo], NONE)?;
+        disjoint(&[&legacy, &legacy_receipts], &[&root], NONE)?;
+        // A missing default workspace failed the first call, not start-up.
+        mkdir_private(&base)?;
+        let command_parents = provisioning::command_parents(&provisioning::operator_ceiling(env).map_err(Fault::value)?)
+            .map_err(Fault::value)?;
+        let mut router = Router {
+            repo, base, legacy, legacy_receipts, root, generations,
+            generation_lock: Mutex::new(()),
+            max_live: max_live as usize,
+            idle: Duration::try_from_secs_f64(idle).unwrap_or(Duration::MAX),
+            limits,
+            command_parents,
+            project_roots: BTreeMap::new(),
+            tools: Value::Null,
+            children: Mutex::new(Children::default()),
+        };
+        router.project_roots = router.configured_project_roots()?;
+        router.tools = tools(limits);
+        Ok(router)
+    }
+
+    /// What a workspace may not overlap: Palette's own state and install,
+    /// the read roots, the host-command paths, the Julia install and depots,
+    /// the configured host files and the patch targets.
+    fn workspace_protected_paths(&self) -> Result<Vec<PathBuf>, Fault> {
+        let mut protected = vec![self.base.clone(), self.repo.clone(), self.root.clone(), self.legacy.clone(),
+                                 self.legacy_receipts.clone(), scratch_root(&self.root)];
+        let split = |key: &str| env(key).unwrap_or_default().split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect::<Vec<_>>();
+        protected.extend(split("PALETTE_READ_ROOTS"));
+        protected.extend(provisioning::protected_host_paths(&ceiling()?, true, true, env).map_err(Fault::value)?);
+        // The default depot stays protected even when JULIA_DEPOT_PATH points
+        // elsewhere: it holds juliaup toolchains and config/startup.jl, which a
+        // host started without the override would still run.
+        protected.push(util::home().join(".julia"));
+        protected.extend(split("JULIA_DEPOT_PATH"));
+        let julia = env("PALETTE_JULIA_BIN").filter(|s| !s.is_empty()).map(PathBuf::from).or_else(|| util::which("julia"));
+        if let Some(julia) = julia {
+            let julia = util::resolve(&util::expand_user(&julia.to_string_lossy()));
+            if let Some(prefix) = julia.parent().and_then(Path::parent) {
+                protected.push(prefix.to_path_buf());
+            }
+        }
+        for name in ["PALETTE_HOST", "PALETTE_TASK_TOOLS", "PALETTE_TASK_ENV", "PALETTE_PACKAGE_DEPOT",
+                     "PALETTE_RUNTIME_ROOT", "PALETTE_SOCKET", "PALETTE_CAPABILITY_CEILING", "PALETTE_REPAIR_CONFIG"] {
+            if let Some(value) = env(name).filter(|s| !s.is_empty()) {
+                protected.push(util::expand_user(&value));
+            }
+        }
+        for raw in patch::patch_roots_from_env(env)?.values() {
+            match raw.as_str() {
+                Some(path) if path.starts_with('/') => protected.push(util::expand_user(path)),
+                _ => return Err(Fault::value("PALETTE_PATCH_ROOTS must map target IDs to absolute paths")),
+            }
+        }
+        Ok(protected)
+    }
+
+    /// PALETTE_PROJECT_ROOTS: id -> an existing directory a workspace may
+    /// write, disjoint from everything protected and from each other.
+    fn configured_project_roots(&self) -> Result<BTreeMap<String, PathBuf>, Fault> {
+        let text = env("PALETTE_PROJECT_ROOTS").unwrap_or_else(|| "{}".into());
+        let Ok(Value::Object(configured)) = serde_json::from_str::<Value>(&text) else {
+            return Err(Fault::value("PALETTE_PROJECT_ROOTS must be a JSON object"));
+        };
+        let mut roots = BTreeMap::from([("default".to_string(), self.base.clone())]);
+        let protected = self.workspace_protected_paths()?;
+        for (id, raw) in &configured {
+            if !valid_id(id) || id == "default" {
+                return Err(Fault::value("PALETTE_PROJECT_ROOTS keys must be valid non-default project root IDs"));
+            }
+            let Some(raw) = raw.as_str().filter(|p| p.starts_with('/')) else {
+                return Err(Fault::value(format!("Project root {id} must be an absolute path")));
+            };
+            let path = util::resolve_strict(Path::new(raw)).map_err(|_| Fault::value(format!("Project root {id} is unavailable")))?;
+            if !path.is_dir() {
+                return Err(Fault::value(format!("Project root {id} is not a directory")));
+            }
+            let others: Vec<&PathBuf> = protected.iter().chain(roots.values()).collect();
+            if let Err(e) = provisioning::require_disjoint(&[&path], &others, &self.command_parents) {
+                return Err(Fault::permission(format!(
+                    "Project root {id}: {e}. Host-command directories and binaries, their parents, \
+                     and Palette's own install and config are protected, because a kernel that could write \
+                     them could change what the host runs. Give the kernel read access with PALETTE_READ_ROOTS \
+                     instead, and change the tree through host commands.")));
+            }
+            roots.insert(id.clone(), path);
+        }
+        Ok(roots)
+    }
+
+    // -- Registry -------------------------------------------------------------
+
+    /// Runs `f` on the registry under its lock, saving it if `f` succeeds
+    /// and changed it.
+    fn with_registry<T>(&self, f: impl FnOnce(&mut Value) -> Result<T, Fault>) -> Result<T, Fault> {
+        mkdir_private(&self.root)?;
+        let lock_path = self.root.join("registry.lock");
+        let lock = OpenOptions::new().read(true).append(true).create(true).open(&lock_path).map_err(|e| Fault::os(&e, &lock_path))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(patch::bare_os(&std::io::Error::last_os_error()));
+        }
+        let path = self.root.join("registry.json");
+        let mut value = if path.exists() {
+            py_json_loads(&fs::read_to_string(&path).map_err(|e| Fault::os(&e, &path))?)?
+        } else {
+            json!({"format": 1, "workspaces": {}, "active": {}})
+        };
+        let Some(fields) = value.as_object_mut() else { return Err(no_get(&value)) };
+        let format_1 = match fields.get("format") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Number(n)) => n.as_f64() == Some(1.0),
+            _ => false,
+        };
+        if !format_1 || !fields.get("workspaces").is_some_and(Value::is_object) {
+            return Err(Fault::value("Unsupported workspace registry"));
+        }
+        fields.entry("active").or_insert_with(|| json!({}));
+        let before = value.clone();
+        let out = f(&mut value)?;
+        if value != before {
+            atomic_json(&path, &value).map_err(Fault::io)?;
+        }
+        drop(lock);
+        Ok(out)
+    }
+
+    fn context_key(&self, context: &str) -> String {
+        util::sha256_hex(format!("{}\0{context}", self.base.display()).as_bytes())
+    }
+
+    fn default_entry(&self) -> Map<String, Value> {
+        let base = self.base.to_string_lossy();
+        let Value::Object(entry) = json!({"workspace_id": "default", "scope": "project", "project_root_id": "default",
+            "workspace_dir": base, "project_dir": base, "state_dir": self.legacy.to_string_lossy(),
+            "lineage_id": "legacy:default", "legacy": true}) else { unreachable!() };
+        entry
+    }
+
+    fn visible(&self, entry: &Map<String, Value>, context: &Value) -> Result<bool, Fault> {
+        let root_id = entry.get("project_root_id").map_or(Some("default"), Value::as_str);
+        let Some(project_root) = root_id.and_then(|id| self.project_roots.get(id)) else { return Ok(false) };
+        let scope = key(entry, "scope")?;
+        Ok(scope == "open"
+            || scope == "project" && *key(entry, "project_dir")? == *project_root.to_string_lossy()
+            || scope == "thread" && patch::truthy(context) && key(entry, "owner_context")? == context)
+    }
+
+    /// The registry entry `args` select, checked against the configured
+    /// layout and visible to its context.
+    fn resolve(&self, args: &Map<String, Value>) -> Result<Map<String, Value>, Fault> {
+        let context = args.get("context_id").cloned().unwrap_or(Value::Null);
+        self.with_registry(|reg| {
+            let explicit = args.get("workspace_id").filter(|v| patch::truthy(v));
+            let active = match &context {
+                Value::String(c) if !c.is_empty() => reg["active"].get(self.context_key(c)),
+                _ => reg["active"].get(""),
+            }.filter(|v| patch::truthy(v));
+            let identifier = explicit.or(active).cloned().unwrap_or_else(|| "default".into());
+            let entry = if identifier == "default" {
+                Some(Value::Object(self.default_entry()))
+            } else {
+                identifier.as_str().and_then(|id| reg["workspaces"].get(id)).filter(|e| !e.is_null()).cloned()
+            };
+            let Some(entry) = entry else { return Err(Fault::value("Unknown workspace_id")) };
+            let identifier = identifier.as_str().unwrap_or_default();
+            if !valid_id(identifier) {
+                return Err(Fault::value("Invalid workspace_id in registry"));
+            }
+            let Value::Object(mut entry) = entry else {
+                return Err(Fault::new("TypeError", "Workspace registry entry is not an object"));
+            };
+            entry.entry("project_root_id").or_insert_with(|| "default".into());
+            let Some(project_root) = entry["project_root_id"].as_str().and_then(|id| self.project_roots.get(id)) else {
+                return Err(Fault::permission("Workspace project root is not configured"));
+            };
+            if !matches!(entry.get("scope").and_then(Value::as_str), Some("thread" | "project" | "open")) {
+                return Err(Fault::permission("Workspace scope is invalid"));
+            }
+            let layout = || Fault::permission("Workspace registry paths differ from the configured layout");
+            if identifier == "default" {
+                if util::resolve(Path::new(text(&entry, "state_dir"))) != util::resolve(&self.legacy) {
+                    return Err(layout());
+                }
+            } else {
+                entry = lineage::normalize_entry(reg, &self.root, &entry)?;
+            }
+            let root_text = Value::String(project_root.to_string_lossy().into_owned());
+            let expected_project = if entry["scope"] == "project" { root_text.clone() } else { Value::Null };
+            if entry.get("workspace_dir") != Some(&root_text) || *get(&Value::Object(entry.clone()), "project_dir") != expected_project {
+                return Err(layout());
+            }
+            if !self.visible(&entry, &context)? {
+                return Err(Fault::permission("Workspace is outside this context's scope"));
+            }
+            Ok(entry)
+        })
+    }
+
+    // -- Workers --------------------------------------------------------------
+
+    fn child_for(&self, entry: &Map<String, Value>) -> Arc<Worker> {
+        let key = text(entry, "state_dir").to_string();
+        let mut children = lock(&self.children);
+        Arc::clone(children.map.entry(key.clone()).or_insert_with(|| Arc::new(Worker {
+            entry: entry.clone(),
+            key,
+            call: Mutex::new(None),
+            proc: Mutex::new(Proc::default()),
+            last_used: Mutex::new(Instant::now()),
+        })))
+    }
+
+    fn stop_idle(&self, except: Option<&Arc<Worker>>) {
+        let idle = |w: &Worker| lock(&w.proc).child.is_some() && lock(&w.last_used).elapsed() >= self.idle;
+        let candidates: Vec<Arc<Worker>> = {
+            let children = lock(&self.children);
+            children.map.values().filter(|w| !except.is_some_and(|e| Arc::ptr_eq(e, w)) && idle(w)).cloned().collect()
+        };
+        for w in candidates {
+            let Ok(_call) = w.call.try_lock() else { continue };
+            let still_idle = {
+                let _children = lock(&self.children);
+                idle(&w)
+            };
+            if still_idle {
+                w.stop_proc(self);
+            }
+        }
+    }
+
+    /// Stops every worker; with `wait`, after its in-flight call.
+    fn stop_all(&self, wait: bool) {
+        let owned: Vec<Arc<Worker>> = lock(&self.children).map.values().cloned().collect();
+        for w in owned {
+            let _call = wait.then(|| lock(&w.call));
+            w.stop_proc(self);
+        }
+    }
+
+    // -- Controls -------------------------------------------------------------
+
+    fn workspace_control(&self, args: &Map<String, Value>) -> Result<Value, Fault> {
+        let action = key(args, "action")?.as_str().unwrap_or_default();
+        let context = args.get("context_id").cloned().unwrap_or(Value::Null);
+        let has_context = patch::truthy(&context);
+        if action != "create" && args.contains_key("project_root_id") {
+            return Err(Fault::value("project_root_id is only valid when creating a workspace"));
+        }
+        let attach = args.get("attach").map_or(true, patch::truthy);
+        if action == "create" {
+            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("thread").to_string();
+            if scope == "thread" && !has_context {
+                return Err(Fault::value("Thread scope requires context_id (a routing key, not authenticated identity)"));
+            }
+            let project_root_id = args.get("project_root_id").and_then(Value::as_str).unwrap_or("default").to_string();
+            let Some(project_root) = self.project_roots.get(&project_root_id) else {
+                return Err(Fault::value("Unknown project_root_id"));
+            };
+            let identifier = match args.get("workspace_id") {
+                Some(id) => id.as_str().unwrap_or_default().to_string(),
+                None => format!("ws-{}", util::hex(32)),
+            };
+            if !valid_id(&identifier) || identifier == "default" {
+                return Err(Fault::value("Invalid or reserved workspace_id"));
+            }
+            return self.with_registry(|reg| {
+                if reg["workspaces"].get(&identifier).is_some() {
+                    return Err(Fault::value("workspace_id already exists"));
+                }
+                let state = if scope == "project" {
+                    lineage::project_state_dir(&self.root, &project_root_id)?
+                } else {
+                    lineage::workspace_state_dir(&self.root, &identifier)?
+                };
+                mkdir_private(&state)?;
+                let root_text = project_root.to_string_lossy();
+                let mut entry = json!({"workspace_id": identifier, "scope": scope, "project_root_id": project_root_id,
+                    "owner_context": if scope == "thread" { context.clone() } else { Value::Null },
+                    "project_dir": if scope == "project" { json!(root_text) } else { Value::Null },
+                    "workspace_dir": root_text, "state_dir": state.to_string_lossy(),
+                    "lineage_id": lineage::lineage_id(&scope, &project_root_id, &identifier)?});
+                reg["workspaces"][&identifier] = entry.clone();
+                if scope == "project" {
+                    lineage::ensure_project_lineage(reg, &self.root, &project_root_id)?;
+                    entry = reg["workspaces"][&identifier].clone();
+                }
+                if has_context && attach {
+                    reg["active"][self.context_key(context.as_str().unwrap_or_default())] = json!(identifier);
+                }
+                entry["active_for_context"] = json!(has_context && attach);
+                Ok(entry)
+            });
+        }
+        if action == "list" {
+            return self.with_registry(|reg| {
+                let mut entries = Vec::new();
+                for e in reg["workspaces"].as_object().into_iter().flat_map(|w| w.values()) {
+                    let Value::Object(e) = e else {
+                        return Err(Fault::new("TypeError", "Workspace registry entry is not an object"));
+                    };
+                    let mut e = e.clone();
+                    e.entry("project_root_id").or_insert_with(|| "default".into());
+                    entries.push(e);
+                }
+                let mut workspaces = vec![Value::Object(self.default_entry())];
+                for e in &entries {
+                    if self.visible(e, &context)? {
+                        workspaces.push(Value::Object(e.clone()));
+                    }
+                }
+                let roots: Vec<Value> = self.project_roots.iter()
+                    .map(|(id, path)| json!({"project_root_id": id, "workspace_dir": path.to_string_lossy()})).collect();
+                let mut listing = json!({"workspaces": workspaces, "available_project_roots": roots,
+                                         "identity": "caller-supplied context routing; not authentication"});
+                // Counted, not named: another context's threads stay out of this listing.
+                let others = entries.iter()
+                    .filter(|e| e.get("scope") == Some(&json!("thread")) && *e.get("owner_context").unwrap_or(&Value::Null) != context)
+                    .count();
+                if others > 0 {
+                    listing["other_thread_workspaces"] = json!(others);
+                    listing["note"] = json!(format!("{others} thread workspace(s) belong to other context_id values and are not listed; \
+                                                     list again with the context_id that created one to see it."));
+                }
+                Ok(listing)
+            });
+        }
+        let entry = self.resolve(args)?;
+        if action == "attach" {
+            if !has_context || !args.get("workspace_id").is_some_and(patch::truthy) {
+                return Err(Fault::value("Attach requires context_id and workspace_id"));
+            }
+            self.with_registry(|reg| {
+                reg["active"][self.context_key(context.as_str().unwrap_or_default())] = entry["workspace_id"].clone();
+                Ok(())
+            })?;
+            return Ok(json!({"active_workspace_id": entry["workspace_id"]}));
+        }
+        let state_dir = text(&entry, "state_dir").to_string();
+        let worker = lock(&self.children).map.get(&state_dir).cloned();
+        let current = |w: &Arc<Worker>| lock(&self.children).map.get(&state_dir).is_some_and(|c| Arc::ptr_eq(c, w));
+        if action == "close" {
+            // close is linearized against starts and waits for any in-flight call
+            // to finish before stopping the worker. A later call may start it again.
+            if let Some(w) = worker {
+                let _call = lock(&w.call);
+                let has_proc = lock(&w.proc).child.is_some();
+                if current(&w) && has_proc {
+                    w.stop_proc(self);
+                }
+            }
+            return Ok(json!({"workspace_id": entry["workspace_id"], "closed": true, "state_retained": true}));
+        }
+        let (running, pid) = match worker {
+            Some(w) => {
+                let _call = lock(&w.call);
+                if current(&w) { w.pid() } else { (false, None) }
+            }
+            None => (false, None),
+        };
+        let mut status = entry;
+        status.insert("running".into(), json!(running));
+        status.insert("local_adapter_pid".into(), json!(pid));
+        status.insert("observation".into(), json!("running describes this router; another router may hold ownership"));
+        Ok(Value::Object(status))
+    }
+
+    fn generation_control(&self, args: &Map<String, Value>, entry: &Map<String, Value>) -> Result<Value, Fault> {
+        let action = key(args, "action")?.as_str().unwrap_or_default();
+        if action == "generation_status" {
+            let current = self.generations.resolve(None)?;
+            return Ok(json!({"generation_id": current.id, "available_generations": self.generations.available()}));
+        }
+        if action != "activate_generation" {
+            return Err(Fault::value("Unknown generation action"));
+        }
+        let Some(generation_id) = args.get("generation_id").filter(|v| patch::truthy(v)) else {
+            return Err(Fault::value("activate_generation requires generation_id"));
+        };
+        let generation_id = generation_id.as_str().unwrap_or_default();
+
+        let _generation = lock(&self.generation_lock);
+        let previous_id = self.generations.current_id()?;
+        let target = self.generations.resolve(Some(generation_id))?;
+        if target.id == previous_id {
+            return Ok(json!({"generation_id": previous_id, "previous_generation_id": previous_id, "changed": false}));
+        }
+
+        self.stop_all(true);
+        self.generations.activate(generation_id)?;
+        let smoke = || -> Result<Value, Fault> {
+            let smoke = self.child_for(entry).call(self, "palette", smoke_call())?;
+            let value = py_json_loads(content_text(&smoke)?)?;
+            if patch::truthy(get(&smoke, "isError")) || *get(&value, "success") == Value::Bool(false) {
+                let error = child::text_or_empty(get(&value, "error"));
+                return Err(Fault::new("RuntimeError", if error.is_empty() { "new generation smoke call failed".into() } else { error }));
+            }
+            Ok(json!({"generation_id": generation_id, "previous_generation_id": previous_id, "changed": true,
+                      "smoke_epoch": get(&value, "epoch"), "lineage_id": entry.get("lineage_id")}))
+        };
+        match smoke() {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.stop_all(true);
+                self.generations.activate(&previous_id)?;
+                let mut detail = format!("generation activation failed and rolled back: {e}");
+                if let Err(rollback) = self.child_for(entry).call(self, "palette", smoke_call()) {
+                    detail += &format!("; rollback restart also failed: {rollback}");
+                }
+                Err(Fault::new("RuntimeError", detail))
+            }
+        }
+    }
+}
+
+fn smoke_call() -> Map<String, Value> {
+    let Value::Object(args) = json!({"code": "nothing", "view": "full"}) else { unreachable!() };
+    args
+}
+
+/// `result["content"][0]["text"]`.
+fn content_text(result: &Value) -> Result<&str, Fault> {
+    let item = result.get("content").ok_or_else(|| Fault::new("KeyError", "'content'"))?
+        .get(0).ok_or_else(|| Fault::new("IndexError", "list index out of range"))?;
+    let text = item.get("text").ok_or_else(|| Fault::new("KeyError", "'text'"))?;
+    text.as_str().ok_or_else(|| Fault::new("TypeError", format!(
+        "the JSON object must be str, bytes or bytearray, not {}", util::py_type_name(text))))
+}
+
+impl Worker {
+    fn alive(&self) -> bool {
+        lock(&self.proc).child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    fn pid(&self) -> (bool, Option<u32>) {
+        let mut proc = lock(&self.proc);
+        match proc.child.as_mut() {
+            Some(c) => match c.try_wait() {
+                Ok(None) => (true, Some(c.id())),
+                _ => (false, None),
+            },
+            None => (false, None),
+        }
+    }
+
+    fn call(self: &Arc<Self>, r: &Router, name: &str, args: Map<String, Value>) -> Result<Value, Fault> {
+        r.stop_idle(Some(self));
+        let mut frames = lock(&self.call);
+        if lock(&self.proc).child.is_some() && !self.alive() {
+            self.stop_proc(r);
+        }
+        let reserved = {
+            let mut children = lock(&r.children);
+            if lock(&self.proc).child.is_none() {
+                let mut occupied: HashSet<&String> = children.map.iter().filter(|(_, w)| w.alive()).map(|(k, _)| k).collect();
+                occupied.extend(children.starting.iter());
+                occupied.extend(children.stopping.iter());
+                if occupied.len() >= r.max_live {
+                    return Err(Fault::new("RuntimeError", format!("Live workspace limit ({}); close an unused workspace first", r.max_live)));
+                }
+                children.starting.insert(self.key.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if reserved {
+            let started = self.start(r, &mut frames);
+            lock(&r.children).starting.remove(&self.key);
+            started?;
+        }
+        let result = self.exchange(r, &mut frames, "tools/call", json!({"name": name, "arguments": args}));
+        if result.is_err() {
+            self.stop_proc(r);
+        }
+        *lock(&self.last_used) = Instant::now();
+        result
+    }
+
+    /// Starts this workspace's adapter under the active generation, holding
+    /// the state directory's ownership lease.
+    fn start(&self, r: &Router, frames: &mut Option<Frames>) -> Result<(), Fault> {
+        if self.alive() {
+            return Ok(());
+        }
+        self.stop_proc(r);
+        let state = util::resolve(Path::new(text(&self.entry, "state_dir")));
+        let workspace = util::resolve(Path::new(text(&self.entry, "workspace_dir")));
+        let generation = r.generations.resolve(None)?;
+        let generation_repo = util::resolve(&generation.repo);
+        let generation_host = util::resolve(&generation.host);
+        // The builtin generation's adapter is this binary; another
+        // generation's is its own host.
+        let launcher = if generation.id == "builtin" { PathBuf::from(child::current_exe()) } else { generation_host.clone() };
+        let mut protected = r.workspace_protected_paths()?;
+        protected.extend([generation_repo.clone(), generation_host.clone(), util::resolve(&launcher)]);
+        if workspace == r.base {
+            protected.retain(|p| *p != r.base);
+        } else {
+            protected.push(r.base.clone());
+        }
+        disjoint(&[&workspace], &protected, &r.command_parents)?;
+        let mut state_protected = vec![r.repo.clone(), generation_repo.clone()];
+        state_protected.extend(["patches", "registry.json", "registry.lock", "client-capabilities.json", "scratch", "runtime-generations"]
+            .map(|name| r.root.join(name)));
+        disjoint(&[&state], &state_protected, NONE)?;
+        if let Some(parent) = state.parent() {
+            mkdir_private(parent)?;
+        }
+        // Outside the state mount; a worker cannot unlink its ownership lock.
+        let lease_path = lineage::owner_lock_path(&state);
+        let lease = OpenOptions::new().read(true).append(true).create(true).open(&lease_path).map_err(|e| Fault::os(&e, &lease_path))?;
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(Fault::new("RuntimeError", "Workspace already owned by another router; close it there before attaching here"));
+            }
+            return Err(patch::bare_os(&e));
+        }
+        let lease_fd = lease.as_raw_fd();
+        lock(&self.proc).lease = Some(lease);
+
+        let scratch = scratch_root(&r.root).join(util::sha256_hex(state.to_string_lossy().as_bytes()));
+        mkdir_private(&scratch)?;
+        let mut command = Command::new(&launcher);
+        command.args(["mcp", "child"])
+            .current_dir(text(&self.entry, "workspace_dir"))
+            .env("OPERATOR_WORKSPACE", text(&self.entry, "workspace_dir"))
+            .env("PALETTE_STATE_DIR", &state)
+            .env("PALETTE_WORKSPACE_ID", lineage_or_id(&self.entry))
+            .env("PALETTE_REPO", &generation_repo)
+            .env("PALETTE_HOST", &generation_host)
+            .env("PALETTE_SCRATCH_ROOT", &scratch)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        unsafe {
+            command.pre_exec(move || {
+                // The child inherits the lease, and none of the signals this
+                // router blocks to wait for them on one thread.
+                let flags = libc::fcntl(lease_fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(lease_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut none: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut none);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+                Ok(())
+            });
+        }
+        let spawned = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                self.stop_proc(r);
+                return Err(Fault::os(&e, &launcher));
+            }
+        };
+        let mut spawned = spawned;
+        let stdout = spawned.stdout.take().expect("piped stdout");
+        {
+            let mut proc = lock(&self.proc);
+            proc.stdin = spawned.stdin.take();
+            proc.child = Some(spawned);
+            proc.generation_id = Some(generation.id.clone());
+        }
+        *frames = Some(pump(stdout));
+        let initialized = version(&r.repo).and_then(|v| self.exchange(r, frames, "initialize", json!({
+            "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "palette-router", "version": v}})));
+        if let Err(e) = initialized {
+            self.stop_proc(r);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn exchange(&self, r: &Router, frames: &mut Option<Frames>, method: &str, params: Value) -> Result<Value, Fault> {
+        let rid = util::hex(32);
+        let line = json!({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}).to_string() + "\n";
+        {
+            let mut proc = lock(&self.proc);
+            let stdin = proc.stdin.as_mut().ok_or_else(|| Fault::new("AttributeError", "'NoneType' object has no attribute 'stdin'"))?;
+            stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).map_err(|e| patch::bare_os(&e))?;
+        }
+        // A start, its preparation and the call, whose own limit the child enforces.
+        let arguments = params.get("arguments").and_then(Value::as_object).cloned().unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs_f64(150.0 + transport::call_limit(&arguments, r.limits));
+        let Some(frames) = frames.as_ref() else { return Err(Fault::new("Empty", "")) };
+        loop {
+            let frame = receive(frames, deadline)?;
+            if frame.get("id") != Some(&json!(rid)) {
+                continue;
+            }
+            if let Some(error) = frame.get("error") {
+                return Err(Fault::new("RuntimeError", match error {
+                    Value::String(s) => s.clone(),
+                    e => util::py_repr(e),
+                }));
+            }
+            return frame.get("result").cloned().ok_or_else(|| Fault::new("KeyError", "'result'"));
+        }
+    }
+
+    /// Closes the adapter's stdin, waits for it to save and exit (40 s, then
+    /// SIGTERM, then SIGKILL), then releases the lease.
+    fn stop_proc(&self, r: &Router) {
+        let (child, stdin, lease) = {
+            let mut children = lock(&r.children);
+            let mut proc = lock(&self.proc);
+            let child = proc.child.take();
+            if child.is_some() {
+                children.stopping.insert(self.key.clone());
+            }
+            (child, proc.stdin.take(), proc.lease.take())
+        };
+        drop(stdin);
+        let stopped = child.is_some();
+        if let Some(mut child) = child {
+            child::retire(&mut child, Duration::from_secs(40));
+        }
+        drop(lease);
+        if stopped {
+            lock(&r.children).stopping.remove(&self.key);
+        }
+    }
+}
+
+// -- Tools --------------------------------------------------------------------
+
+fn patch_schema() -> Value {
+    json!({"type": "object", "properties": {
+        "action": {"enum": ["read", "prepare", "status", "apply"]},
+        "target": {"type": "string"}, "path": {"type": "string"}, "request_id": {"type": "string"},
+        "changes": {"type": "array", "maxItems": 16, "items": {"type": "object", "properties": {
+            "path": {"type": "string"}, "before_sha256": {"type": ["string", "null"]}, "content": {"type": "string"}},
+            "required": ["path", "before_sha256", "content"], "additionalProperties": false}}},
+        "required": ["action"], "additionalProperties": false})
+}
+
+fn tools(limits: (f64, f64)) -> Value {
+    let mut palette = child::palette_schema(limits);
+    palette["required"] = json!([]);
+    let mut control = child::control_schema(&CONTROL_ACTIONS);
+    control["properties"]["generation_id"] = json!({"type": "string", "maxLength": 64});
+    let workspace = json!({"type": "object", "properties": {
+        "action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]},
+        "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}},
+        "required": ["action"], "additionalProperties": false});
+    let tools = [
+        ("palette", format!("Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. {}", transport::PALETTE_GUIDE), palette),
+        ("palette_control", format!("Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot and keeps its checkpoints. {}", transport::CONTROL_GUIDE), control),
+        ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.".into(), workspace),
+        ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.".into(), patch_schema()),
+    ];
+    Value::Array(tools.into_iter().map(|(name, description, mut schema)| {
+        schema["properties"]["workspace_id"] = json!({"type": "string", "maxLength": 64});
+        schema["properties"]["context_id"] = json!({"type": "string", "maxLength": 256});
+        json!({"name": name, "description": description, "inputSchema": schema,
+               "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false}})
+    }).collect())
+}
+
+/// The top-level checks the router makes against a tool's schema.
+fn validate(args: &Value, schema: &Value) -> Result<(), Fault> {
+    let invalid = || Fault::value("Invalid tool arguments");
+    let properties = schema["properties"].as_object().ok_or_else(invalid)?;
+    let args = args.as_object().ok_or_else(invalid)?;
+    let required = schema["required"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if args.keys().any(|k| !properties.contains_key(k)) || required.iter().any(|k| !k.as_str().is_some_and(|k| args.contains_key(k))) {
+        return Err(invalid());
+    }
+    for (key, value) in args {
+        let spec = &properties[key];
+        let bad = || Fault::value(format!("Invalid {key}"));
+        if let Some(choices) = spec.get("enum").and_then(Value::as_array) {
+            if !choices.contains(value) {
+                return Err(bad());
+            }
+        }
+        match spec.get("type").and_then(Value::as_str) {
+            Some("string") => {
+                let longest = spec.get("maxLength").and_then(Value::as_u64).unwrap_or(FRAME_LIMIT as u64);
+                if !value.as_str().is_some_and(|s| !s.is_empty() && s.chars().count() as u64 <= longest) {
+                    return Err(bad());
+                }
+            }
+            Some("boolean") if !value.is_boolean() => return Err(bad()),
+            Some("number") => {
+                let lo = spec.get("exclusiveMinimum").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+                let hi = spec.get("maximum").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+                if !value.as_f64().is_some_and(|v| lo < v && v <= hi) {
+                    return Err(Fault::value(format!("Invalid {key}: must be a number in ({}, {}]", util::py_g(lo), util::py_g(hi))));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The patch broker's channel to the MCP client: the same input and output
+/// the router serves.
+struct StreamClient<'a> {
+    input: &'a Lines,
+    out: &'a mut dyn Write,
+}
+
+impl patch::Client for StreamClient<'_> {
+    fn send(&mut self, message: &Value) -> std::io::Result<()> {
+        self.out.write_all(format!("{message}\n").as_bytes())?;
+        self.out.flush()
+    }
+    fn recv(&mut self, timeout: Duration) -> Option<String> {
+        match self.input.recv_timeout(timeout) {
+            Ok(Ok(line)) => Some(line),
+            _ => None,
+        }
+    }
+}
+
+struct Session<'a> {
+    r: &'a Router,
+    broker: PatchBroker,
+    capabilities: Map<String, Value>,
+    caller: Option<String>,
+}
+
+impl Session<'_> {
+    /// One message's result, or None for a notification.
+    fn handle(&mut self, raw: &str, mid: &mut Value, input: &Lines, out: &mut dyn Write) -> Result<Option<Value>, Fault> {
+        let msg = py_json_loads(raw)?;
+        let Some(fields) = msg.as_object() else { return Err(no_get(&msg)) };
+        *mid = get(&msg, "id").clone();
+        let method = match fields.get("method") {
+            None => "",
+            Some(Value::String(s)) => s.as_str(),
+            Some(v) => return Err(patch::no_attribute(v, "startswith")),
+        };
+        if method.starts_with("notifications/") {
+            return Ok(None);
+        }
+        let empty = json!({});
+        let params = match fields.get("params") {
+            None => &empty,
+            Some(p) => p,
+        };
+        let result = match method {
+            "initialize" => {
+                if !params.is_object() {
+                    return Err(no_get(params));
+                }
+                let client_info = get(params, "clientInfo");
+                self.caller = if !patch::truthy(client_info) {
+                    None
+                } else if client_info.is_object() {
+                    provisioning::agent_name(client_info.get("name"))
+                } else {
+                    return Err(no_get(client_info));
+                };
+                let capabilities = params.get("capabilities").unwrap_or(&empty);
+                let Some(capabilities) = capabilities.as_object() else { return Err(no_get(capabilities)) };
+                self.capabilities = capabilities.clone();
+                atomic_json(&self.r.root.join("client-capabilities.json"), &json!({
+                    "elicitation": capabilities.get("elicitation"), "protocolVersion": params.get("protocolVersion")}))
+                    .map_err(Fault::io)?;
+                json!({"protocolVersion": params.get("protocolVersion").cloned().unwrap_or_else(|| json!("2024-11-05")),
+                       "capabilities": {"tools": {}},
+                       "serverInfo": {"name": "palette", "version": version(&self.r.repo)?},
+                       "instructions": INSTRUCTIONS})
+            }
+            "ping" => json!({}),
+            "tools/list" => json!({"tools": self.r.tools}),
+            "tools/call" => {
+                if !params.is_object() {
+                    return Err(no_get(params));
+                }
+                let name = get(params, "name");
+                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                self.tool_call(name, args, input, out)
+                    .unwrap_or_else(|e| child::text_result(&json!({"success": false, "error": e.to_string()}), true))
+            }
+            _ => return Err(Fault::value("Unsupported method")),
+        };
+        Ok(Some(result))
+    }
+
+    fn tool_call(&mut self, name: &Value, args: Value, input: &Lines, out: &mut dyn Write) -> Result<Value, Fault> {
+        let r = self.r;
+        let tool = r.tools.as_array().into_iter().flatten().find(|t| t["name"] == *name)
+            .ok_or_else(|| Fault::value("Unknown tool"))?;
+        validate(&args, &tool["inputSchema"])?;
+        let name = name.as_str().unwrap_or_default();
+        let Value::Object(mut args) = args else { unreachable!("validated") };
+        if name == "palette" {
+            let (routing, routed): (Map<String, Value>, Map<String, Value>) = args.into_iter().partition(|(k, _)| ROUTING.contains(&k.as_str()));
+            let normalized = transport::normalize_palette_call(&Value::Object(routed)).map_err(|e| Fault::new("SourceTransportError", e))?;
+            args = routing;
+            args.extend(normalized);
+        }
+        if name == "palette_workspace" {
+            return Ok(child::text_result(&r.workspace_control(&args)?, false));
+        }
+        let entry = r.resolve(&args)?;
+        if name == "palette_patch" {
+            let mut client = StreamClient { input, out };
+            return Ok(child::text_result(&self.broker.call(&args, &lineage_or_id(&entry), &self.capabilities, &mut client)?, false));
+        }
+        if name == "palette_control" && matches!(args["action"].as_str(), Some("generation_status" | "activate_generation")) {
+            return Ok(child::text_result(&r.generation_control(&args, &entry)?, false));
+        }
+        let mut forwarded: Map<String, Value> = args.into_iter().filter(|(k, _)| !ROUTING.contains(&k.as_str())).collect();
+        if name == "palette" {
+            if let Some(caller) = &self.caller {
+                forwarded.insert("caller".into(), json!(caller));
+            }
+        }
+        let worker = r.child_for(&entry);
+        let mut result = worker.call(r, name, forwarded)?;
+        let mut value = py_json_loads(content_text(&result)?)?;
+        let Some(fields) = value.as_object_mut() else { return Err(patch::no_attribute(&value, "update")) };
+        let generation_id = match lock(&worker.proc).generation_id.clone() {
+            Some(id) => id,
+            None => r.generations.current_id()?,
+        };
+        fields.insert("workspace_id".into(), entry["workspace_id"].clone());
+        fields.insert("workspace_scope".into(), entry["scope"].clone());
+        fields.insert("project_root_id".into(), entry["project_root_id"].clone());
+        fields.insert("lineage_id".into(), entry.get("lineage_id").cloned().unwrap_or(Value::Null));
+        fields.insert("generation_id".into(), json!(generation_id));
+        fields.insert("workspace_dir".into(), entry["workspace_dir"].clone());
+        fields.insert("legacy_shared".into(), entry.get("legacy").cloned().unwrap_or(json!(false)));
+        result["content"][0]["text"] = json!(value.to_string());
+        Ok(result)
+    }
+}
+
+/// Serves MCP frames from `input` to `out` until the input ends.
+fn serve_stream(r: &Router, input: &Lines, out: &mut dyn Write) -> Result<(), Fault> {
+    let roots: Vec<PathBuf> = patch::patch_roots_from_env(env)?.values().map(path_value).collect::<Result<_, _>>()?;
+    disjoint(&roots, &[&r.root, &r.legacy, &r.legacy_receipts], NONE)?;
+    let ceiling = ceiling()?;
+    let config = child::repair_config()?;
+    let runtime_root = util::resolve(&util::expand_user(&env("PALETTE_RUNTIME_ROOT")
+        .unwrap_or_else(|| r.repo.join("runtime/capabilities").to_string_lossy().into_owned())));
+    let mut protected = provisioning::protected_host_paths(&ceiling, true, false, env).map_err(Fault::value)?;
+    protected.extend([r.root.clone(), r.legacy.clone(), r.legacy_receipts.clone()]);
+    let broker = child::patch_broker(&r.root.join("patches"), &config, &protected, &runtime_root)?;
+    let mut session = Session { r, broker, capabilities: Map::new(), caller: None };
+    loop {
+        let raw = match input.recv() {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+        let mut mid = Value::Null;
+        let frame = match session.handle(&raw, &mut mid, input, out) {
+            Ok(None) => continue,
+            Ok(Some(result)) => json!({"jsonrpc": "2.0", "id": mid, "result": result}),
+            Err(e) => json!({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": e.message}}),
+        };
+        out.write_all(format!("{frame}\n").as_bytes()).and_then(|()| out.flush()).map_err(Fault::io)?;
+    }
+}
+
+// -- Socket mode --------------------------------------------------------------
+
+fn lstat(path: &Path) -> std::io::Result<fs::Metadata> {
+    fs::symlink_metadata(path)
+}
+
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// `path` made absolute, its directories created 0700 where missing, once
+/// every ancestor is a real directory nobody else can swap and a stale
+/// socket there is removed.
+fn safe_socket_path(path: &str) -> Result<PathBuf, Fault> {
+    let path = util::absolute(&util::expand_user(path));
+    let parts: Vec<_> = path.components().skip(1).collect();
+    let mut current = PathBuf::from("/");
+    let mut directories = Vec::new();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        current.push(part);
+        let st = match lstat(&current) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                fs::DirBuilder::new().mode(0o700).create(&current).map_err(|e| Fault::os(&e, &current))?;
+                lstat(&current).map_err(|e| Fault::os(&e, &current))?
+            }
+            r => r.map_err(|e| Fault::os(&e, &current))?,
+        };
+        if !st.file_type().is_dir() {
+            return Err(Fault::value("Palette socket path components must be real directories"));
+        }
+        directories.push(st);
+    }
+    for (index, st) in directories.iter().enumerate() {
+        let mode = st.permissions().mode();
+        if mode & 0o022 != 0 {
+            if mode & libc::S_ISVTX as u32 == 0 || index + 1 == directories.len() {
+                return Err(Fault::permission("Palette socket path has a writable non-sticky ancestor"));
+            }
+            let child = &directories[index + 1];
+            if child.uid() != uid() || child.permissions().mode() & 0o077 != 0 {
+                return Err(Fault::permission("A sticky socket-path ancestor must contain a private directory owned by this user"));
+            }
+        }
+    }
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let parent_stat = lstat(parent).map_err(|e| Fault::os(&e, parent))?;
+    if parent_stat.uid() != uid() || parent_stat.permissions().mode() & 0o077 != 0 {
+        return Err(Fault::permission("Palette socket parent must be owned by this user with private permissions"));
+    }
+    let st = match lstat(&path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(path),
+        r => r.map_err(|e| Fault::os(&e, &path))?,
+    };
+    use std::os::unix::fs::FileTypeExt;
+    if !st.file_type().is_socket() {
+        return Err(Fault::value("Palette socket path exists and is not a socket"));
+    }
+    if st.uid() != uid() {
+        return Err(Fault::permission("Palette socket is owned by another user"));
+    }
+    // A stale socket may be removed; a live one is rejected by the connect probe.
+    if UnixStream::connect(&path).is_ok() {
+        return Err(Fault::new("RuntimeError", "Palette daemon socket is already accepting connections"));
+    }
+    fs::remove_file(&path).map_err(|e| Fault::os(&e, &path))?;
+    Ok(path)
+}
+
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len)
+    };
+    (r == 0).then_some(cred.uid)
+}
+
+/// The Python OSError family, which a socket client's disconnect raises.
+fn is_os_error(kind: &str) -> bool {
+    kind == "OSError" || kind.ends_with("Error") && [
+        "FileNotFoundError", "PermissionError", "BlockingIOError", "BrokenPipeError", "ConnectionError",
+        "ConnectionResetError", "ConnectionAbortedError", "ConnectionRefusedError", "TimeoutError",
+        "NotADirectoryError", "IsADirectoryError", "FileExistsError", "InterruptedError",
+        "ProcessLookupError", "ChildProcessError",
+    ].contains(&kind)
+}
+
+fn serve_connection(r: &Router, stream: UnixStream) {
+    if peer_uid(&stream) != Some(uid()) {
+        return;
+    }
+    let Ok(reader) = stream.try_clone() else { return };
+    let input = lines(reader, Some(FRAME_LIMIT));
+    let mut out = &stream;
+    match serve_stream(r, &input, &mut out) {
+        Err(e) if !is_os_error(e.kind) => eprintln!("Palette socket client rejected: {e}"),
+        _ => {}
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+fn serve_socket(r: Arc<Router>, path: &str) -> Result<(), Fault> {
+    let path = safe_socket_path(path)?;
+    let old = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(&path);
+    unsafe { libc::umask(old) };
+    let listener = listener.map_err(|e| Fault::os(&e, &path))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| Fault::os(&e, &path))?;
+    let owned_inode = fs::metadata(&path).map_err(|e| Fault::os(&e, &path))?.ino();
+    let on_signal = Arc::clone(&r);
+    let socket = path.clone();
+    child::exit_on_signal(move || {
+        on_signal.stop_all(false);
+        use std::os::unix::fs::FileTypeExt;
+        if lstat(&socket).is_ok_and(|st| st.file_type().is_socket() && st.ino() == owned_inode) {
+            let _ = fs::remove_file(&socket);
+        }
+    });
+    eprintln!("Palette daemon listening on {}", path.display());
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let r = Arc::clone(&r);
+                std::thread::spawn(move || serve_connection(&r, stream));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// `palette-host mcp [--socket PATH]`. Returns the exit code.
+pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
+    let socket = match rest {
+        [] => None,
+        [flag, path] if flag == "--socket" => Some(path.as_str()),
+        [flag] if flag.starts_with("--socket=") => Some(&flag["--socket=".len()..]),
+        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp child".into()),
+    }.filter(|p| !p.is_empty());
+    let r = match Router::new() {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            eprintln!("palette-host mcp: {e}");
+            return Ok(1);
+        }
+    };
+    if let Some(path) = socket {
+        if let Err(e) = serve_socket(r, path) {
+            eprintln!("palette-host mcp: {e}");
+        }
+        return Ok(1);
+    }
+    let on_signal = Arc::clone(&r);
+    child::exit_on_signal(move || on_signal.stop_all(false));
+    let input = lines(std::io::stdin(), None);
+    let served = serve_stream(&r, &input, &mut std::io::stdout().lock());
+    r.stop_all(true);
+    match served {
+        Ok(()) => Ok(0),
+        Err(e) => {
+            eprintln!("palette-host mcp: {e}");
+            Ok(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema(name: &str) -> Value {
+        tools((60.0, 1800.0)).as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["inputSchema"].clone()
+    }
+
+    fn err(args: Value, name: &str) -> String {
+        validate(&args, &schema(name)).unwrap_err().message
+    }
+
+    #[test]
+    fn tools_carry_routing_fields_and_the_generation_actions() {
+        let tools = tools((60.0, 1800.0));
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["palette", "palette_control", "palette_workspace", "palette_patch"]);
+        for tool in tools.as_array().unwrap() {
+            let props = &tool["inputSchema"]["properties"];
+            assert_eq!(props["workspace_id"], json!({"type": "string", "maxLength": 64}));
+            assert_eq!(props["context_id"], json!({"type": "string", "maxLength": 256}));
+            assert_eq!(tool["annotations"]["destructiveHint"], json!(true));
+        }
+        assert_eq!(schema("palette")["required"], json!([]));
+        assert_eq!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().len(), 8);
+        assert_eq!(schema("palette_control")["properties"]["generation_id"]["maxLength"], json!(64));
+        assert!(tools[0]["description"].as_str().unwrap().ends_with(transport::PALETTE_GUIDE));
+    }
+
+    #[test]
+    fn validation_follows_the_python_checks() {
+        assert!(validate(&json!({"action": "list"}), &schema("palette_workspace")).is_ok());
+        assert_eq!(err(json!([]), "palette_workspace"), "Invalid tool arguments");
+        assert_eq!(err(json!({}), "palette_workspace"), "Invalid tool arguments");
+        assert_eq!(err(json!({"action": "list", "x": 1}), "palette_workspace"), "Invalid tool arguments");
+        assert_eq!(err(json!({"action": "nope"}), "palette_workspace"), "Invalid action");
+        assert_eq!(err(json!({"action": "list", "attach": 1}), "palette_workspace"), "Invalid attach");
+        assert_eq!(err(json!({"action": "list", "workspace_id": ""}), "palette_workspace"), "Invalid workspace_id");
+        assert_eq!(err(json!({"action": "list", "workspace_id": "a".repeat(65)}), "palette_workspace"), "Invalid workspace_id");
+        assert!(validate(&json!({"action": "list", "context_id": "ü".repeat(256)}), &schema("palette_workspace")).is_ok());
+        assert_eq!(err(json!({"action": "receipts", "since": true}), "palette_control"),
+                   "Invalid since: must be a number in (-inf, inf]");
+        assert!(validate(&json!({"action": "receipts", "since": 1.5}), &schema("palette_control")).is_ok());
+        let timeout = &schema("palette")["properties"]["timeout_s"];
+        if timeout.get("exclusiveMinimum").is_some() {
+            assert_eq!(err(json!({"code": "1", "timeout_s": 0}), "palette"), "Invalid timeout_s: must be a number in (0, 1800]");
+        }
+    }
+
+    #[test]
+    fn socket_paths_must_be_private() {
+        let dir = util::mkdtemp("palette-router-sock-").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let sock = dir.join("new/palette.sock");
+        assert_eq!(safe_socket_path(sock.to_str().unwrap()).unwrap(), sock);
+        assert_eq!(fs::metadata(dir.join("new")).unwrap().permissions().mode() & 0o777, 0o700);
+
+        fs::write(dir.join("new/file"), "").unwrap();
+        assert_eq!(safe_socket_path(dir.join("new/file").to_str().unwrap()).unwrap_err().message,
+                   "Palette socket path exists and is not a socket");
+        std::os::unix::fs::symlink(dir.join("new"), dir.join("link")).unwrap();
+        assert_eq!(safe_socket_path(dir.join("link/s").to_str().unwrap()).unwrap_err().message,
+                   "Palette socket path components must be real directories");
+        fs::create_dir(dir.join("open")).unwrap();
+        fs::set_permissions(dir.join("open"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(safe_socket_path(dir.join("open/s").to_str().unwrap()).unwrap_err().message,
+                   "Palette socket parent must be owned by this user with private permissions");
+        fs::set_permissions(dir.join("open"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(safe_socket_path(dir.join("open/s").to_str().unwrap()).unwrap_err().message,
+                   "Palette socket path has a writable non-sticky ancestor");
+
+        // A stale socket is removed; a live one is refused.
+        let live = dir.join("new/live.sock");
+        let listener = UnixListener::bind(&live).unwrap();
+        assert_eq!(safe_socket_path(live.to_str().unwrap()).unwrap_err().message,
+                   "Palette daemon socket is already accepting connections");
+        drop(listener);
+        // A test forking concurrently can hold the listener between its fork
+        // and exec, which keeps the socket accepting for a moment.
+        let mut stale = safe_socket_path(live.to_str().unwrap());
+        for _ in 0..50 {
+            if stale.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            stale = safe_socket_path(live.to_str().unwrap());
+        }
+        assert_eq!(stale.unwrap(), live);
+        assert!(!live.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stream_lines_stop_at_the_frame_limit() {
+        let input = lines(std::io::Cursor::new(b"a\nbcd\n".to_vec()), Some(3));
+        assert_eq!(input.recv().unwrap().unwrap(), "a\n");
+        assert_eq!(input.recv().unwrap().unwrap_err().message, "MCP frame exceeded 1 MiB");
+        assert!(input.recv().is_err());
+        let input = lines(std::io::Cursor::new(b"x\ny".to_vec()), None);
+        assert_eq!((input.recv().unwrap().unwrap(), input.recv().unwrap().unwrap()), ("x\n".into(), "y".into()));
+    }
+
+    #[test]
+    fn child_frames_end_with_why() {
+        let frames = pump(std::io::Cursor::new(b"{\"id\":1}\n".to_vec()));
+        assert_eq!(frames.recv().unwrap().unwrap(), json!({"id": 1}));
+        assert_eq!(frames.recv().unwrap().unwrap_err().kind, "EOFError");
+        let frames = pump(std::io::Cursor::new(b"nope\n".to_vec()));
+        assert_eq!(frames.recv().unwrap().unwrap_err().kind, "JSONDecodeError");
+        let frames = pump(std::io::Cursor::new(vec![b' '; FRAME_LIMIT + 2]));
+        assert_eq!(frames.recv().unwrap().unwrap_err().message, "Workspace child frame exceeded 1 MiB");
+    }
+}

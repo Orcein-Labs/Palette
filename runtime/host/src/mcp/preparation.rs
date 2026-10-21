@@ -74,7 +74,7 @@ fn files_ending(dir: &Path, suffix: &str, recursive: bool, out: &mut BTreeSet<Pa
 fn digests(paths: BTreeSet<PathBuf>) -> Result<Value, Fault> {
     let mut map = Map::new();
     for p in paths {
-        let digest = file_digest(&p).map_err(|e| Fault::new("OSError", format!("{e}: {}", p.display())))?;
+        let digest = file_digest(&p).map_err(|e| Fault::os(&e, &p))?;
         map.insert(p.to_string_lossy().into_owned(), Value::String(digest));
     }
     Ok(Value::Object(map))
@@ -101,12 +101,12 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
     files_ending(&package_environment, "Manifest.toml", false, &mut environment_files);
 
     let out = Command::new(julia_bin).args(["--startup-file=no", "--version"]).stdin(Stdio::null()).output()
-        .map_err(|e| Fault::new("OSError", format!("{e}: {julia_bin}")))?;
+        .map_err(|e| Fault::os(&e, Path::new(julia_bin)))?;
     if !out.status.success() {
         return Err(Fault::new("CalledProcessError", format!("{julia_bin} --startup-file=no --version failed ({})", out.status)));
     }
     let task_environment = match std::env::var("PALETTE_TASK_ENV") {
-        Ok(p) if !p.is_empty() => Value::String(file_digest(Path::new(&p)).map_err(|e| Fault::new("OSError", format!("{e}: {p}")))?),
+        Ok(p) if !p.is_empty() => Value::String(file_digest(Path::new(&p)).map_err(|e| Fault::os(&e, Path::new(&p)))?),
         _ => Value::Null,
     };
     Ok(json!({
@@ -256,7 +256,7 @@ pub(crate) fn prepare(project_dir: &Path, repo_dir: &Path, state_dir: Option<&Pa
                                  project_dir.to_string_lossy().into_owned(), "--repo-dir".into(), repo_dir.to_string_lossy().into_owned()];
     let fields = record.as_object_mut().expect("a record is an object");
     let outcome = super::run_captured(&argv, None, timeout.map(Duration::from_secs_f64))
-        .map_err(|e| format!("OSError: {e}: {}", argv[0]))
+        .map_err(|e| Fault::os(&e, Path::new(&argv[0])).to_string())
         .and_then(|(code, stdout, mut stderr, timed_out)| {
             if timed_out {
                 // A hung prewarm otherwise ends as a cancelled CI step with no output at all.
@@ -272,7 +272,7 @@ pub(crate) fn prepare(project_dir: &Path, repo_dir: &Path, state_dir: Option<&Pa
             let caches: Vec<String> = serde_json::from_str(caches).map_err(|e| format!("ValueError: {CACHES_LINE} {e}"))?;
             let mut inventory = Map::new();
             for p in caches {
-                let digest = file_digest(Path::new(&p)).map_err(|e| format!("OSError: {e}: {p}"))?;
+                let digest = file_digest(Path::new(&p)).map_err(|e| Fault::os(&e, Path::new(&p)).to_string())?;
                 inventory.insert(p, Value::String(digest));
             }
             fields.insert("cache_files".into(), Value::Object(inventory));
