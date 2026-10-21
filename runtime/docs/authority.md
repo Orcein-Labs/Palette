@@ -138,39 +138,26 @@ creates that name first can stop sessions from starting but cannot change the
 files.
 
 Production entry points start sessions and brokers through the Rust host,
-`palette-host`. The Python session, broker and `session_cli.py` are a reference
-implementation for the conformance suites (`cargo xtask verify --implementation
-python`); no production entry point imports them.
+`palette-host`, the only host.
 
-## Python host: scheduled for removal
+## The Python host is retired
 
-> **The Python host is kept for one more release, only as the conformance
-> oracle. It is deleted once the Rust host has its own conformance tests for
-> every category the oracle covers.** Do not add features to it.
-
-The Python host is `session.py`, `broker.py`, `launch_worker.py`,
-`session_cli.py` and the Python branch of `host_adapter.py`. Today it earns its
-place by running the same assertions as the Rust host, so a divergence between
-the two shows up as a failure on one side. That is how A3 and the D11 control
-were caught.
-
-The oracle covers these categories, one suite each, as run by
-`cargo xtask verify --implementation python`:
+The Python session, broker and `session_cli.py` were a second host that ran the
+same conformance suites as the Rust host, so a divergence showed up as a
+failure on one side. That is how A3 and the D11 control were caught. Each
+category below now asserts absolute expected values against `palette-host`, so
+the second host no longer decides right from wrong, and it has been deleted
+along with the `--implementation` option of `cargo xtask verify`.
+`launch_worker.py` remains only as test support and goes with the rest of the
+Python port.
 
 | Category | Suite |
 |---|---|
 | Authority: bind layout, read and write roots, network, credentials, broker ceilings | `test_authority.py` |
 | Session: persistent and ephemeral turns, kill detection, session roots, session depots, receipts, broker socket privacy, approved and denied writes | `test_session.py` |
-| Session bridge: the stdio protocol of `session_cli` / `palette-host session` | `test_session_cli.py` |
+| Session bridge: the stdio protocol of `palette-host session` | `test_session_cli.py` |
 | Revival: what a replacement kernel restores, rebuilds or reports lost | `test_revival.py` |
 | Host bridge: mid-call host requests from the kernel, limited to the types its ceiling names | `test_host_bridge.py` |
-
-Delete the Python host when each row has Rust-side coverage that does not need
-the Python run to tell right from wrong. Then drop the `python` leg of the
-nightly CI matrix and the `--implementation` option.
-
-Pull-request and push CI run the Rust host only. The `[rust, python]` matrix
-runs nightly and on manual dispatch.
 
 The host trusts the operating system's namespace, filesystem, and Landlock
 mechanisms. Unmanaged host writers do not participate in Palette's patch lock.

@@ -1,12 +1,8 @@
-# Scheduled for removal: the Python host is kept for one more release, only as
-# the conformance oracle. See "Python host: scheduled for removal" in
-# runtime/docs/authority.md.
 """
-The host the tests run against. With PALETTE_HOST_BIN set, every entry point
-the tests use -- the session bridge, one-shot workers, the broker, the
-ceiling-subset rule, a whole session -- is the Rust `palette-host` binary;
-otherwise the Python modules in this directory. The tests' assertions are the
-same either way, so one suite is the conformance suite for both.
+The host the tests run against: the Rust `palette-host` binary, from
+PALETTE_HOST_BIN or else this checkout's release build. Every entry point the
+tests use -- the session bridge, one-shot workers, the broker, the
+ceiling-subset rule, a whole session -- goes through it.
 
 Test support only: nothing here runs in a session.
 """
@@ -18,17 +14,14 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-HOST_BIN = os.environ.get("PALETTE_HOST_BIN") or None
+HOST_BIN = os.environ.get("PALETTE_HOST_BIN") or str(HERE.parents[1] / "host/target/release/palette-host")
 
 import launch_worker as _launch  # noqa: E402
-from session import PaletteSession as _PythonSession, SessionDeadError as _PythonSessionDeadError  # noqa: E402
 
 create_session_depot = _launch.create_session_depot
 remove_session_depot = _launch.remove_session_depot
@@ -39,17 +32,12 @@ def scratch_root() -> str:
 
 
 def session_cmd(root: str | None = None) -> list[str]:
-    """The command that starts the session bridge (session_cli's arguments follow)."""
-    command = [HOST_BIN, "session"] if HOST_BIN else [sys.executable, str(HERE / "session_cli.py")]
-    return command + ["--scratch-root", root or scratch_root()]
+    """The command that starts the session bridge (its arguments follow)."""
+    return [HOST_BIN, "session", "--scratch-root", root or scratch_root()]
 
 
 def run_worker(*, workspace_dir, project_dir, repo_dir, script, broker_socket_dir=None, network_enabled=False,
                depot_clone_dir=None, timeout=60.0, **_ignored):
-    if not HOST_BIN:
-        return _launch.run_worker(workspace_dir=workspace_dir, project_dir=project_dir, repo_dir=repo_dir,
-                                  script=script, broker_socket_dir=broker_socket_dir, network_enabled=network_enabled,
-                                  depot_clone_dir=depot_clone_dir, timeout=timeout)
     argv = [HOST_BIN, "run-worker", "--workspace", workspace_dir, "--project", project_dir, "--repo", repo_dir,
             "--script", script, "--timeout", str(timeout)]
     if broker_socket_dir:
@@ -102,13 +90,10 @@ class _RustBrokerServer:
 
 
 class _BrokerNamespace:
-    """What the tests used from broker.py."""
+    """The broker surface the tests drive."""
 
     @staticmethod
     def ceiling_is_subset(requested, parent):
-        if not HOST_BIN:
-            import broker
-            return broker.ceiling_is_subset(requested, parent)
         out = subprocess.run([HOST_BIN, "subset", json.dumps(requested), json.dumps(parent)], capture_output=True,
                              text=True, check=True, stdin=subprocess.DEVNULL)
         r = json.loads(out.stdout)
@@ -117,10 +102,6 @@ class _BrokerNamespace:
     @staticmethod
     def serve(sock_path, ceiling, receipts, session_id, stop_event=None, depot_dir=None, project_dir=None,
               repo_dir=None, child_timeout=90.0):
-        if not HOST_BIN:
-            import broker
-            return broker.serve(sock_path, ceiling, receipts, session_id, stop_event=stop_event, depot_dir=depot_dir,
-                                project_dir=project_dir, repo_dir=repo_dir, child_timeout=child_timeout)
         server = _RustBrokerServer(sock_path, ceiling, receipts, session_id, depot_dir, project_dir, repo_dir,
                                    child_timeout)
         if stop_event is None:
@@ -132,15 +113,9 @@ class _BrokerNamespace:
         return server, None
 
     class Broker:
-        """A broker the test calls in-process; with the Rust host, a broker
-        process the calls go to over its socket."""
+        """A broker process the test's calls go to over its socket."""
 
-        def __init__(self, ceiling, receipts, session_id, **kw):
-            if not HOST_BIN:
-                import broker
-                self._b = broker.Broker(ceiling, receipts, session_id, **kw)
-                return
-            self._b = None
+        def __init__(self, ceiling, receipts, session_id, **_kw):
             self._dir = Path(receipts).parent
             self._sock = str(Path("/tmp") / f"njl-adapter-{uuid.uuid4().hex[:10]}.sock")
             self._server = _RustBrokerServer(self._sock, ceiling, receipts, session_id)
@@ -157,8 +132,6 @@ class _BrokerNamespace:
 
         def handle_request(self, req):
             """One raw request and its raw reply, denials included."""
-            if self._b is not None:
-                return self._b.handle_request(req)
             with socket.socket(socket.AF_UNIX) as s:
                 s.connect(self._sock)
                 s.sendall((json.dumps(req) + "\n").encode())
@@ -166,14 +139,12 @@ class _BrokerNamespace:
                     return json.loads(reply.readline())
 
         def _handle_network_access(self, params):
-            if self._b is not None:
-                return self._b._handle_network_access(params)
             return self._call("network_access", params)
 
         def __del__(self):
             # A broker that failed to start has no server to stop.
             server = getattr(self, "_server", None)
-            if getattr(self, "_b", 1) is None and server is not None:
+            if server is not None:
                 server.shutdown()
 
 
@@ -184,8 +155,8 @@ class SessionDeadError(Exception):
     pass
 
 
-class RustSession:
-    """A whole session through the Rust bridge, with PaletteSession's surface."""
+class PaletteSession:
+    """A whole session through the host's session bridge."""
 
     def __init__(self, *, project_dir, ceiling, workspace_dir=None, turn_timeout=60.0, task_workspace_dir=None, **_ignored):
         workspace_dir = workspace_dir or scratch_root()
@@ -261,13 +232,3 @@ class RustSession:
     def __exit__(self, *exc):
         self.close()
 
-
-def PaletteSession(**kwargs):
-    if HOST_BIN:
-        return RustSession(**kwargs)
-    kwargs["workspace_dir"] = kwargs.get("workspace_dir") or scratch_root()
-    return _PythonSession(**kwargs)
-
-
-if not HOST_BIN:
-    SessionDeadError = _PythonSessionDeadError
