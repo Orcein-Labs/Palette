@@ -19,6 +19,9 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(600);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 const NOTICE: &str = "Palette client integration\nCopyright (c) 2026 Matt C\nAGPL-3.0-only.\n";
 const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
+const LAUNCHER_HEADER: &str = "#!/bin/sh\n# Palette-managed launcher\n";
+/// Names the daemon unit sets itself; its environment file may not carry them.
+const UNIT_OWNED_ENV: &[&str] = &["PALETTE_REPO", "PALETTE_HOST", "PALETTE_SOCKET", "OPERATOR_WORKSPACE"];
 
 const USAGE: &str = "\
 usage: palette-host setup [options]
@@ -42,6 +45,8 @@ Prepare Palette on Linux, register it with local clients, and check it works.
   --no-register            do not add the server to local agent clients
   --replace                take over a client's palette server that runs something else
   --no-check               do not make test calls at the end
+  --no-service             do not run Palette as the user's palette.service; each client starts
+                           its own server, and `pal` is unavailable
 
 $PALETTE_HOME defaults to $XDG_DATA_HOME/palette, or ~/.local/share/palette.
 ";
@@ -49,7 +54,7 @@ $PALETTE_HOME defaults to $XDG_DATA_HOME/palette, or ~/.local/share/palette.
 const VALUE_FLAGS: &[&str] = &[
     "repo-dir", "output-dir", "data-dir", "depot-dir", "runtime-root", "ceiling", "host-commands", "read-roots", "wsl-distribution",
 ];
-const BOOLEAN_FLAGS: &[&str] = &["help", "connect-only", "no-register", "replace", "no-check"];
+const BOOLEAN_FLAGS: &[&str] = &["help", "connect-only", "no-register", "replace", "no-check", "no-service"];
 
 fn env_dir(var: &str) -> Option<PathBuf> {
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
@@ -573,6 +578,40 @@ fn write_plugin(repo: &Path, plugin: &Path, entry: &Value) -> Result<(), String>
     fs::write(&manifest_path, pretty(&manifest)).map_err(at(&manifest_path))
 }
 
+/// The daemon's environment file: the launch environment, minus what the unit
+/// sets itself, single-quoted for systemd (read roots hold spaces).
+fn daemon_env(launch_env: &[(String, String)]) -> Result<String, String> {
+    let mut body = String::from("# Palette-managed: rewritten by palette-host setup\n");
+    for (k, v) in launch_env.iter().filter(|(k, _)| !UNIT_OWNED_ENV.contains(&k.as_str())) {
+        if v.contains(['\'', '\\', '\n', '\0']) {
+            return Err(format!("{k} holds a quote, backslash or newline, which the daemon environment file cannot carry"));
+        }
+        body.push_str(&format!("{k}='{v}'\n"));
+    }
+    Ok(body)
+}
+
+/// Writes and starts the user's palette.service, then waits until it answers.
+fn install_daemon(repo: &Path, workspace: &Path, env_file: &Path, launch_env: &[(String, String)]) -> Result<(), String> {
+    if env_dir("XDG_RUNTIME_DIR").is_none() || util::which("systemctl").is_none() {
+        return Err("no user systemd session".into());
+    }
+    if let Some(dir) = env_file.parent() {
+        fs::create_dir_all(dir).map_err(at(dir))?;
+    }
+    util::write_atomic(env_file, &daemon_env(launch_env)?, 0o600)?;
+    let args: Vec<String> = ["install", "--repo-dir", &text(repo), "--workspace-dir", &text(workspace), "--env-file", &text(env_file)]
+        .iter().map(|s| s.to_string()).collect();
+    crate::service::main(&args)?;
+    for action in ["enable", "restart"] {
+        let status = Command::new("systemctl").args(["--user", action, "palette.service"]).status().map_err(|e| format!("systemctl: {e}"))?;
+        if !status.success() {
+            return Err(format!("systemctl --user {action} palette.service failed: {status}"));
+        }
+    }
+    crate::mcp::client::start_service(&crate::mcp::client::socket_path()?).map(drop)
+}
+
 pub fn main(argv: &[String]) -> Result<i32, String> {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
@@ -649,10 +688,12 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     }
     launch_env.push(("JULIA_DEPOT_PATH".into(), text(&depot)));
     launch_env.push(("JULIA_PKG_OFFLINE".into(), "true".into()));
+    // The kernel is a numeric workbench: all cores unless the operator says otherwise.
+    launch_env.push(("JULIA_NUM_THREADS".into(), std::env::var("JULIA_NUM_THREADS").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "auto".into())));
     launch_env.push(("PATH".into(), format!("{}:{SYSTEM_PATH}", text(julia.parent().expect("a file on PATH")))));
     let launcher = output.join("palette-mcp");
     let script = format!(
-        "#!/bin/sh\n# Palette-managed launcher\nexec env {} {} mcp start \"$@\"\n",
+        "{LAUNCHER_HEADER}exec env {} {} mcp start \"$@\"\n",
         launch_env.iter().map(|(k, v)| shquote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" "),
         shquote(&text(&host)),
     );
@@ -715,10 +756,27 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     drop(snapshot);
     prepared?;
 
+    // One daemon serves every client and `pal`, so they share a kernel; without
+    // a user systemd each client starts its own server.
+    let daemon = !f.contains_key("no-service") && !f.contains_key("wsl-distribution") && {
+        let env_file = ceiling.parent().expect("a file path").join("daemon.env");
+        install_daemon(&repo, &workspace, &env_file, &launch_env)
+            .map_err(|e| eprintln!("Palette daemon not installed ({e}); each client starts its own server"))
+            .is_ok()
+    };
+    let mode = if daemon { "connect" } else { "start" };
+    let script = if daemon { format!("{LAUNCHER_HEADER}exec {} mcp connect \"$@\"\n", shquote(&text(&host))) } else { script };
     util::write_atomic(&launcher, &script, 0o755)?;
+    let pal = output.join("pal");
+    if daemon {
+        util::write_atomic(&pal, &format!("{LAUNCHER_HEADER}exec {} pal \"$@\"\n", shquote(&text(&host))), 0o755)?;
+    } else if fs::read_to_string(&pal).is_ok_and(|t| t.starts_with(LAUNCHER_HEADER)) {
+        // Without a daemon `pal` has nothing to reach.
+        fs::remove_file(&pal).map_err(at(&pal))?;
+    }
     let entry = json!({
         "command": text(&host),
-        "args": ["mcp", "start"],
+        "args": ["mcp", mode],
         "env": launch_env.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<_, _>>(),
     });
     write_plugin(&repo, &output.join("palette-local-plugin"), &entry)?;
@@ -758,6 +816,16 @@ mod tests {
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn daemon_env_quotes_values_and_leaves_unit_names_out() {
+        let env = |pairs: &[(&str, &str)]| daemon_env(&pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>());
+        let body = env(&[("PALETTE_REPO", "/r"), ("PALETTE_READ_ROOTS", "/a b:/c"), ("OPERATOR_WORKSPACE", "/w"), ("JULIA_NUM_THREADS", "auto")]).unwrap();
+        assert_eq!(body, "# Palette-managed: rewritten by palette-host setup\nPALETTE_READ_ROOTS='/a b:/c'\nJULIA_NUM_THREADS='auto'\n");
+        for bad in ["it's", "a\\b", "a\nb"] {
+            assert!(env(&[("PALETTE_READ_ROOTS", bad)]).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
