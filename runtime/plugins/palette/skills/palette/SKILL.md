@@ -35,4 +35,6 @@ configured. Host programs run through the commands the operator allows:
 `Palette.host_commands()` lists them. `Palette.host_command(name, args...)`
 runs one and waits. With `wait=false` it returns a job id at once, for work
 longer than a turn. Then `Palette.host_command_poll(job)` returns the output
-so far and finally the result, and `Palette.host_jobs()` lists the jobs.
+since the previous poll and finally the result, and `Palette.host_jobs()`
+lists the jobs. The daemon has a private `/tmp`, so host commands do not see
+yours: have long jobs write their logs and outputs under a project directory.
