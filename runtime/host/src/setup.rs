@@ -578,6 +578,28 @@ fn write_plugin(repo: &Path, plugin: &Path, entry: &Value) -> Result<(), String>
     fs::write(&manifest_path, pretty(&manifest)).map_err(at(&manifest_path))
 }
 
+/// The launcher that starts a server of its own with this environment.
+fn start_script(launch_env: &[(String, String)], host: &Path) -> String {
+    format!(
+        "{LAUNCHER_HEADER}exec env {} {} mcp start \"$@\"\n",
+        launch_env.iter().map(|(k, v)| shquote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" "),
+        shquote(&text(host)),
+    )
+}
+
+/// The launch environment with the workspace and its state moved under
+/// `scratch`, so a check runs beside a daemon that owns the real ones.
+fn trial_env(launch_env: &[(String, String)], scratch: &Path) -> Vec<(String, String)> {
+    let moved = [("OPERATOR_WORKSPACE", "workspace"), ("PALETTE_STATE_DIR", "state"), ("PALETTE_WORKSPACE_STATE_ROOT", "worlds")];
+    launch_env
+        .iter()
+        .map(|(k, v)| match moved.iter().find(|(name, _)| name == k) {
+            Some((_, sub)) => (k.clone(), text(&scratch.join(sub))),
+            None => (k.clone(), v.clone()),
+        })
+        .collect()
+}
+
 /// The daemon's environment file: the launch environment, minus what the unit
 /// sets itself, single-quoted for systemd (read roots hold spaces).
 fn daemon_env(launch_env: &[(String, String)]) -> Result<String, String> {
@@ -692,11 +714,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     launch_env.push(("JULIA_NUM_THREADS".into(), std::env::var("JULIA_NUM_THREADS").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "auto".into())));
     launch_env.push(("PATH".into(), format!("{}:{SYSTEM_PATH}", text(julia.parent().expect("a file on PATH")))));
     let launcher = output.join("palette-mcp");
-    let script = format!(
-        "{LAUNCHER_HEADER}exec env {} {} mcp start \"$@\"\n",
-        launch_env.iter().map(|(k, v)| shquote(&format!("{k}={v}"))).collect::<Vec<_>>().join(" "),
-        shquote(&text(&host)),
-    );
+    let script = start_script(&launch_env, &host);
 
     // A failed install, build, prewarm or check puts the capabilities and
     // ceiling back, so the installation that worked keeps a runtime it matches.
@@ -742,10 +760,15 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
         if !f.contains_key("no-check") {
             // Check the new launcher before it replaces the old one, so a
             // failed update leaves the installation that worked.
+            // The trial gets its own workspace and state: a running daemon
+            // holds the lease on the real ones.
             let trial = output.join(format!(".palette-mcp.trial.{}", std::process::id()));
-            util::write_atomic(&trial, &script, 0o755)?;
+            let scratch = data.join(format!(".check.{}", std::process::id()));
+            fs::create_dir_all(scratch.join("workspace")).map_err(at(&scratch))?;
+            util::write_atomic(&trial, &start_script(&trial_env(&launch_env, &scratch), &host), 0o755)?;
             let checked = check(&trial);
             let _ = fs::remove_file(&trial);
+            let _ = fs::remove_dir_all(&scratch);
             checked.map_err(|e| format!("The check failed, so this installation was not switched on: {e}"))?;
         }
         Ok(())
@@ -826,6 +849,28 @@ mod tests {
         for bad in ["it's", "a\\b", "a\nb"] {
             assert!(env(&[("PALETTE_READ_ROOTS", bad)]).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn trial_env_moves_only_the_workspace_and_its_state() {
+        let pairs = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let env = pairs(&[
+            ("PALETTE_REPO", "/r"),
+            ("OPERATOR_WORKSPACE", "/d/workspace"),
+            ("PALETTE_STATE_DIR", "/d/state"),
+            ("PALETTE_WORKSPACE_STATE_ROOT", "/d/worlds"),
+            ("PALETTE_PACKAGE_DEPOT", "/d/packages"),
+        ]);
+        assert_eq!(
+            trial_env(&env, Path::new("/d/.check.7")),
+            pairs(&[
+                ("PALETTE_REPO", "/r"),
+                ("OPERATOR_WORKSPACE", "/d/.check.7/workspace"),
+                ("PALETTE_STATE_DIR", "/d/.check.7/state"),
+                ("PALETTE_WORKSPACE_STATE_ROOT", "/d/.check.7/worlds"),
+                ("PALETTE_PACKAGE_DEPOT", "/d/packages"),
+            ])
+        );
     }
 
     #[test]
