@@ -139,7 +139,9 @@ fn env_file_line(path: Option<&str>) -> Result<String, String> {
     path.map_or(Ok(String::new()), |p| Ok(format!("EnvironmentFile={}\n", unit_path(&operator_env_file(p)?)?)))
 }
 
-fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, env_file: Option<&str>) -> Result<String, String> {
+/// Behind a tunnel, remote chats reach the daemon, so it runs without the
+/// operator's host commands; local agents alone keep them.
+fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, env_file: Option<&str>, behind_tunnel: bool) -> Result<String, String> {
     let (repo, sock) = (util::resolve(repo), util::resolve(sock));
     let workspace = workspace.ok_or("--workspace-dir is required because the daemon needs its default workspace")?;
     let host = repo.join("runtime/host/target/release/palette-host");
@@ -153,6 +155,7 @@ fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, env_fi
         env.push_str(&format!("{}Environment={key}={}", if i > 0 { "\n" } else { "" }, unit_quote(text(value)?)?));
     }
     let command = quote_all(&[text(&host)?, "mcp", "--socket", text(&sock)?])?;
+    let unset = if behind_tunnel { " PALETTE_HOST_COMMANDS" } else { "" };
     Ok(format!(
         "[Unit]
 Description=Palette Julia operator daemon
@@ -169,7 +172,7 @@ UMask=0077
 PrivateTmp=yes
 NoNewPrivileges=yes
 {env}
-UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY PALETTE_HOST_COMMANDS
+UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY{unset}
 StandardOutput=journal
 StandardError=journal
 
@@ -245,7 +248,6 @@ fn install(f: &HashMap<String, String>) -> Result<i32, String> {
     let get = |k: &str| f.get(k).map(String::as_str);
     let sock = socket_path(get("socket"))?;
     let repo = PathBuf::from(get("repo-dir").map(str::to_string).map_or_else(crate::cli::default_repo_dir, Ok)?);
-    let daemon = render_palette_unit(&repo, get("workspace-dir"), &sock, get("env-file"))?;
     // Both units are checked before either is written.
     let tunnel = match (get("tunnel-client"), get("tunnel-profile")) {
         (Some(client), Some(profile)) => Some(render_tunnel_unit(client, profile, get("tunnel-env-file"), get("tunnel-profile-dir"), Some(&sock))?),
@@ -253,6 +255,8 @@ fn install(f: &HashMap<String, String>) -> Result<i32, String> {
         _ => return Err("--tunnel-client and --tunnel-profile must be supplied together".into()),
     };
     let dir = unit_dir();
+    let tunnel_enabled = dir.join("default.target.wants").join(TUNNEL).exists();
+    let daemon = render_palette_unit(&repo, get("workspace-dir"), &sock, get("env-file"), tunnel.is_some() || tunnel_enabled)?;
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (daemon_path, tunnel_path) = (dir.join(DAEMON), dir.join(TUNNEL));
     util::write_atomic(&daemon_path, &daemon, 0o600)?;
@@ -357,7 +361,7 @@ mod tests {
         }
 
         fn daemon(&self, env_file: Option<&str>) -> Result<String, String> {
-            render_palette_unit(&self.repo(), self.workspace().to_str(), &self.sock(), env_file)
+            render_palette_unit(&self.repo(), self.workspace().to_str(), &self.sock(), env_file, true)
         }
     }
 
@@ -417,9 +421,18 @@ WantedBy=default.target
     }
 
     #[test]
+    fn daemon_unit_keeps_host_commands_without_a_tunnel() {
+        let f = Fixture::new();
+        let local = render_palette_unit(&f.repo(), f.workspace().to_str(), &f.sock(), None, false).unwrap();
+        assert!(local.contains("UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY\n"));
+        assert!(!local.contains("PALETTE_HOST_COMMANDS"));
+        assert!(f.daemon(None).unwrap().contains("OPENAI_ADMIN_KEY PALETTE_HOST_COMMANDS\n"));
+    }
+
+    #[test]
     fn daemon_unit_requires_workspace_and_host() {
         let f = Fixture::new();
-        let render = |workspace: Option<&str>| render_palette_unit(&f.repo(), workspace, &f.sock(), None);
+        let render = |workspace: Option<&str>| render_palette_unit(&f.repo(), workspace, &f.sock(), None, true);
         assert!(render(None).unwrap_err().contains("--workspace-dir is required"));
         let host = f.repo().join("runtime/host/target/release/palette-host");
         fs::set_permissions(&host, fs::Permissions::from_mode(0o600)).unwrap();

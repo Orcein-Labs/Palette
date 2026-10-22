@@ -187,6 +187,10 @@ fn teamlab_news(argv: &[String]) -> Result<i32, String> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    // Installed as a `pal` link, the binary is the shell shim.
+    if argv.first().and_then(|a| std::path::Path::new(a).file_name()).is_some_and(|n| n == "pal") {
+        std::process::exit(mcp::pal::main(argv.get(1..).unwrap_or(&[])));
+    }
     let rest = argv.get(2..).unwrap_or(&[]);
     let code = match argv.get(1).map(String::as_str) {
         Some("session") => Ok(cli::main(rest)),
@@ -204,13 +208,14 @@ fn main() {
         Some("patch") => mcp::patch::main(rest),
         Some("control") => mcp::control::main(rest),
         Some("toolchain") => toolchain::main(rest),
+        Some("pal") => Ok(mcp::pal::main(rest)),
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
             Some("connect") if rest.len() == 1 => Ok(mcp::client::main()),
             Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|control|toolchain|mcp ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|control|toolchain|pal|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,
