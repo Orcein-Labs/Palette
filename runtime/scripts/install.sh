@@ -154,6 +154,12 @@ set -- --repo-dir "$sdk" --output-dir "$home/client" --data-dir "$home/data" --d
 "$sdk/runtime/host/target/release/palette-host" setup "$@" || exit 1
 ln -sfn "versions/$id" "$home/current.new" && mv -T "$home/current.new" "$home/current"
 
+# `pal` goes on PATH when setup wrote it, unless something else holds the name.
+bin=${PALETTE_BIN_DIR:-$HOME/.local/bin}
+if [ -x "$home/client/pal" ] && [ -d "$bin" ] && { [ ! -e "$bin/pal" ] || [ -L "$bin/pal" ]; }; then
+    ln -sfn "$home/client/pal" "$bin/pal"
+fi
+
 # Remove all but the two newest earlier versions, and the layout before
 # versions/, skipping any a running process still uses.
 in_use() { grep -qsaF "$1/" /proc/[0-9]*/cmdline; }

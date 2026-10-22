@@ -962,6 +962,11 @@ fn try_sweep_depot_snapshots(depot: &Path) {
     }
 }
 
+/// A JULIA_NUM_THREADS value: "auto" or counts such as "16" or "16,1".
+fn julia_threads_spec(n: &str) -> bool {
+    n == "auto" || (!n.is_empty() && n.len() <= 16 && n.split(',').all(|c| !c.is_empty() && (c == "auto" || c.bytes().all(|b| b.is_ascii_digit()))))
+}
+
 /// A benchmark's toolchain activation (KEY=VALUE lines), given to the kernel
 /// as the other contestants get it.
 pub fn read_task_env(path: Option<&str>) -> Result<BTreeMap<String, String>, String> {
@@ -1318,6 +1323,12 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
     if let Some(environment) = package_environment.as_deref() {
         push(&["--setenv", "PALETTE_PACKAGE_ENVIRONMENT", environment.to_str().ok_or("package environment path is not UTF-8")?]);
     }
+    // The operator's thread count reaches the kernel; a task environment overrides it.
+    if let Some(n) = std::env::var("JULIA_NUM_THREADS").ok().filter(|n| julia_threads_spec(n)) {
+        if !task_env.contains_key("JULIA_NUM_THREADS") {
+            push(&["--setenv", "JULIA_NUM_THREADS", &n]);
+        }
+    }
     for (k, v) in &task_env {
         push(&["--setenv", k, v]);
     }
@@ -1344,6 +1355,16 @@ mod tests {
         let path = root.join(name);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn julia_thread_counts_are_validated() {
+        for ok in ["16", "auto", "16,1", "8,auto"] {
+            assert!(julia_threads_spec(ok), "{ok}");
+        }
+        for bad in ["", "16 --x", "-t", "1,,2", "$(id)", "99999999999999999"] {
+            assert!(!julia_threads_spec(bad), "{bad}");
+        }
     }
 
     #[test]

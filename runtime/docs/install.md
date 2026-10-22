@@ -33,6 +33,12 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
    configuration and the `palette-mcp` stdio launcher. It checks the new
    launcher (`x = 41`, then `x + 1`, then TeamLab's status) before it replaces
    the old one, so a failed update leaves the working installation in use.
+   Where a user systemd session is available (not with `--no-service` or
+   `--wsl-distribution`), it then installs, enables and restarts
+   `palette.service` with `config/daemon.env`, points `palette-mcp` at it
+   (`palette-host mcp connect`), and writes `client/pal`, which the installer
+   links into `~/.local/bin` (`PALETTE_BIN_DIR`). Every client and `pal` then
+   share one kernel. Without the daemon each client starts its own server.
 5. Registers the server with Claude Code, Codex, Grok and Antigravity, those
    that are installed. A client that already runs this launcher is left alone.
    A client whose `palette` server runs something else keeps it, and setup
@@ -52,7 +58,8 @@ The installation lives in `PALETTE_HOME` (default `~/.local/share/palette`):
 |---|---|
 | `versions/<tag>` | One directory per installed version, never changed once complete. The two newest before the current one are kept, and older ones are removed unless a running process uses them |
 | `current` | Link to the version in use. A client already running keeps its version until it restarts |
-| `client/` | `palette-mcp`, the launcher every client runs, and generated client configuration |
+| `client/` | `palette-mcp`, the launcher every client runs; `pal`, the shell command for the daemon; generated client configuration |
+| `config/daemon.env` | The daemon's environment, mode 0600, rewritten by every install |
 | `capabilities/` | Capability registry (`PALETTE_RUNTIME_ROOT`); the installer replaces `teamlab/` and leaves other entries alone |
 | `config/ceiling.json` | Capability ceiling (`PALETTE_CAPABILITY_CEILING`), mode 0600; edit it to grant more |
 | `data/`, `depot/` | Workspace, saved worlds and package store; the prepared Julia depot |
@@ -191,8 +198,8 @@ runtime/host/target/release/palette-host service status
 identity output includes the systemd main PID and process start ticks. The
 stdio MCP client connects to this socket and exits independently. Restarting
 the tunnel alone leaves the daemon and its workspace state in place; use
-`systemctl --user restart palette-tunnel.service` for that operation. The
-installer writes units but does not enable them for login or boot. Start the
+`systemctl --user restart palette-tunnel.service` for that operation. `palette-host service install` writes units but does not enable them; the
+Palette installer enables `palette.service` itself (see step 4). Start the
 daemon with `palette-host service start`; manage the optional tunnel with
 `palette-host service restart --unit palette-tunnel.service` (the same `--unit`
 selector works with `start`, `stop`, and `status`) and enable
@@ -205,7 +212,8 @@ recovery. State remains in the configured durable state root.
 Pass `--env-file /absolute/path/to/operator.env` to `install` when the daemon
 needs additional operator policy such as `PALETTE_CAPABILITY_CEILING` or host
 command/read-root configuration. The file must already be operator-owned with
-mode `0600`; Palette never creates or copies it. The service's checkout,
+mode `0600`; `service install` never creates or copies it (the Palette
+installer writes its own `config/daemon.env`). The service's checkout,
 workspace, and socket values remain authoritative.
 
 The Chat tunnel is a separately owned optional service. Palette does not

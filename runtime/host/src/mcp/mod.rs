@@ -8,6 +8,7 @@ pub(crate) mod control;
 pub(crate) mod difflib;
 pub(crate) mod generation;
 pub(crate) mod lineage;
+pub(crate) mod pal;
 pub(crate) mod patch;
 pub(crate) mod preparation;
 pub(crate) mod receipts;

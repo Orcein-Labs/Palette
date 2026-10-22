@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::util;
 
-fn socket_path() -> Result<PathBuf, String> {
+pub(crate) fn socket_path() -> Result<PathBuf, String> {
     if let Some(explicit) = std::env::var("PALETTE_SOCKET").ok().filter(|v| !v.is_empty()) {
         return Ok(util::expand_user(&explicit));
     }
@@ -31,7 +31,7 @@ fn connect(path: &PathBuf) -> Result<UnixStream, Result<String, std::io::Error>>
     }
 }
 
-fn start_service(path: &PathBuf) -> Result<UnixStream, String> {
+pub(crate) fn start_service(path: &PathBuf) -> Result<UnixStream, String> {
     match connect(path) {
         Ok(s) => return Ok(s),
         Err(Ok(fatal)) => return Err(fatal),
