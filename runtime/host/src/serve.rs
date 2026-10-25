@@ -167,6 +167,10 @@ fn load_profile(path: &Path) -> Result<Profile, String> {
 /// The runtime's whole environment. Transport and model credentials, and any
 /// ambient Palette setting, are not inherited.
 fn environment(p: &Profile) -> Result<Vec<(String, String)>, String> {
+    environment_with_offline(p, std::env::var("JULIA_PKG_OFFLINE").ok())
+}
+
+fn environment_with_offline(p: &Profile, offline: Option<String>) -> Result<Vec<(String, String)>, String> {
     let mut env: Vec<(String, String)> =
         ["HOME", "PATH", "LANG", "LC_ALL"].iter().filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v))).collect();
     let mut set = |k: &str, p: &Path| -> Result<(), String> {
@@ -199,9 +203,7 @@ fn environment(p: &Profile) -> Result<Vec<(String, String)>, String> {
     if !p.patch_roots.is_empty() {
         env.push(("PALETTE_PATCH_ROOTS".into(), Value::Object(p.patch_roots.clone()).to_string()));
     }
-    if let Some(offline) = std::env::var("JULIA_PKG_OFFLINE")
-        .ok()
-        .or_else(|| (p.mode == "sandbox").then(|| "true".into()))
+    if let Some(offline) = offline.or_else(|| (p.mode == "sandbox").then(|| "true".into()))
     {
         env.push(("JULIA_PKG_OFFLINE".into(), offline));
     }
@@ -368,7 +370,7 @@ mod tests {
     }
 
     fn env_of(p: &Profile) -> HashMap<String, String> {
-        environment(p).unwrap().into_iter().collect()
+        environment_with_offline(p, None).unwrap().into_iter().collect()
     }
 
     #[test]
@@ -416,15 +418,20 @@ mod tests {
         assert_eq!(env["OPERATOR_WORKSPACE"], at("workspace"));
         assert_eq!(env["PALETTE_HOST"], f.root.join("repo").join(HOST).to_str().unwrap());
         assert_eq!(env["JULIA_DEPOT_PATH"], f.root.join("depot").to_str().unwrap());
-        assert_eq!(env["JULIA_PKG_OFFLINE"], "true");
+        assert_eq!(env["PALETTE_MODE"], "operator");
+        assert!(!env.contains_key("JULIA_PKG_OFFLINE"));
         let inherited = ["HOME", "PATH", "LANG", "LC_ALL"];
         let named = [
             "PALETTE_REPO", "PALETTE_HOST", "PALETTE_DATA_HOME", "OPERATOR_WORKSPACE", "PALETTE_STATE_DIR",
             "PALETTE_WORKSPACE_STATE_ROOT", "PALETTE_SCRATCH_ROOT", "PALETTE_PACKAGE_DEPOT", "PALETTE_CAPABILITY_CEILING",
-            "PALETTE_RUNTIME_ROOT", "JULIA_DEPOT_PATH", "JULIA_PKG_OFFLINE", "PALETTE_TURN_TIMEOUT", "PALETTE_MAX_TURN_TIMEOUT",
+            "PALETTE_RUNTIME_ROOT", "PALETTE_MODE", "JULIA_DEPOT_PATH", "PALETTE_TURN_TIMEOUT", "PALETTE_MAX_TURN_TIMEOUT",
         ];
         assert!(env.keys().all(|k| inherited.contains(&k.as_str()) || named.contains(&k.as_str())), "{:?}", env.keys());
         assert!(named.iter().all(|k| env.contains_key(*k)));
+        let sandbox = f.load(json!({"mode": "sandbox"})).unwrap();
+        assert_eq!(env_of(&sandbox)["JULIA_PKG_OFFLINE"], "true");
+        let explicit: HashMap<_, _> = environment_with_offline(&sandbox, Some("false".into())).unwrap().into_iter().collect();
+        assert_eq!(explicit["JULIA_PKG_OFFLINE"], "false");
     }
 
     #[test]
