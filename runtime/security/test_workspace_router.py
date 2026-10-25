@@ -586,6 +586,7 @@ class WorkspaceRouterIntegration(unittest.TestCase):
         ceiling_path.write_text(json.dumps({"host_request": {"allowed_types": ["palette.runtime"]}}))
         self.proc.stdin.close(); self.proc.wait(timeout=60); self.proc.stdout.close()
         self.env["PALETTE_CAPABILITY_CEILING"] = str(ceiling_path)
+        self.env["PALETTE_MODE"] = "sandbox"
         self.start_router()
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                           "params": {"clientInfo": {"name": "claude-code"}}}) + "\n")
