@@ -156,6 +156,8 @@ fn render_palette_unit(repo: &Path, workspace: Option<&str>, sock: &Path, env_fi
     }
     let command = quote_all(&[text(&host)?, "mcp", "--socket", text(&sock)?])?;
     let unset = if behind_tunnel { " PALETTE_HOST_COMMANDS" } else { "" };
+    // The broker and operator workers need the user's host /tmp. Sandbox
+    // workers establish their own private temporary filesystem.
     Ok(format!(
         "[Unit]
 Description=Palette Julia operator daemon
@@ -169,7 +171,7 @@ RestartSec=2s
 RuntimeDirectory=palette
 RuntimeDirectoryMode=0700
 UMask=0077
-PrivateTmp=yes
+PrivateTmp=no
 NoNewPrivileges=yes
 {env}
 UnsetEnvironment=CONTROL_PLANE_API_KEY OPENAI_API_KEY OPENAI_ADMIN_KEY{unset}
@@ -394,7 +396,7 @@ RestartSec=2s
 RuntimeDirectory=palette
 RuntimeDirectoryMode=0700
 UMask=0077
-PrivateTmp=yes
+PrivateTmp=no
 NoNewPrivileges=yes
 Environment=PALETTE_REPO={repo}
 Environment=PALETTE_HOST={host}
