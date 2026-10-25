@@ -177,7 +177,7 @@ fn dead(msg: impl Into<String>) -> SessionError {
 fn check_scratch_cleanup_root(root: &Path, protected: &[(&str, &Path)]) -> Result<(), String> {
     for (name, path) in protected {
         if path.starts_with(root) {
-            return Err(format!("session scratch root {} contains protected {name} {}",
+            return Err(format!("session scratch root {} overlaps protected {name} {}",
                                root.display(), path.display()));
         }
     }
