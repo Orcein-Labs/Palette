@@ -2352,9 +2352,18 @@ fn read_tail(mut r: impl Read + Send + 'static, cap: usize) -> (SharedTail, std:
 /// written, so a character is never split between two reads.
 fn read_since(tail: &SharedTail, seen: &mut u64, whole: bool) -> (String, u64) {
     let t = tail.lock().unwrap();
-    let skipped = t.start.saturating_sub(*seen);
-    let from = (*seen).max(t.start) - t.start;
+    let mut skipped = t.start.saturating_sub(*seen);
+    let mut from = (*seen).max(t.start) - t.start;
     let mut bytes = &t.kept[from as usize..];
+    // The byte cap can begin inside a UTF-8 character. Trim its continuation
+    // bytes only after eviction; naturally invalid stream bytes stay lossy.
+    if skipped > 0 {
+        while bytes.first().is_some_and(|b| *b & 0b1100_0000 == 0b1000_0000) {
+            bytes = &bytes[1..];
+            from += 1;
+            skipped += 1;
+        }
+    }
     if !whole {
         if let Err(e) = std::str::from_utf8(bytes) {
             if e.error_len().is_none() {
@@ -2364,6 +2373,11 @@ fn read_since(tail: &SharedTail, seen: &mut u64, whole: bool) -> (String, u64) {
     }
     *seen = t.start + from + bytes.len() as u64;
     (String::from_utf8_lossy(bytes).into_owned(), skipped)
+}
+
+fn read_retained_tail(tail: &SharedTail) -> (String, u64) {
+    let mut seen = 0;
+    read_since(tail, &mut seen, true)
 }
 
 /// An operator-named host command (the broker's host_command), started in a
@@ -2392,10 +2406,17 @@ struct JobState {
 
 pub struct HostJobResult {
     pub returncode: i32,
+    /// Output since the last read (all retained output for a synchronous call).
     pub stdout: String,
+    /// Output since the last read (all retained output for a synchronous call).
     pub stderr: String,
-    /// Bytes of each stream dropped from the tail before they were read.
+    /// Bytes omitted from these deltas because they had fallen out of the cap.
     pub skipped: [u64; 2],
+    /// Bounded full-stream tails, including output returned by earlier polls.
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    /// Bytes omitted before each retained full-stream tail, including a partial UTF-8 prefix.
+    pub tail_skipped: [u64; 2],
     pub timed_out: bool,
     pub cancelled: bool,
     pub seconds: f64,
@@ -2510,9 +2531,12 @@ impl HostJob {
         }
         let (stdout, s0) = read_since(&self.tails[0], &mut self.seen[0], true);
         let (stderr, s1) = read_since(&self.tails[1], &mut self.seen[1], true);
+        let (stdout_tail, t0) = read_retained_tail(&self.tails[0]);
+        let (stderr_tail, t1) = read_retained_tail(&self.tails[1]);
         Ok(HostJobResult {
             returncode: status.code().unwrap_or_else(|| -status.signal().unwrap_or(0)),
-            stdout, stderr, skipped: [s0, s1], timed_out, cancelled,
+            stdout, stderr, skipped: [s0, s1], stdout_tail, stderr_tail,
+            tail_skipped: [t0, t1], timed_out, cancelled,
             seconds: self.started.elapsed().as_secs_f64(),
         })
     }
