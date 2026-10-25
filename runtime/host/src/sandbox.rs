@@ -294,11 +294,15 @@ fn reject_symlink_tree(path: &Path, label: &str, allow_contained: bool) -> Resul
 }
 
 fn configured_ceiling_paths() -> Result<Option<serde_json::Value>, String> {
-    let mut ceiling = if let Ok(config) = std::env::var("PALETTE_CAPABILITY_CEILING") {
+    configured_ceiling_paths_with(|key| std::env::var(key).ok())
+}
+
+fn configured_ceiling_paths_with(var: impl Fn(&str) -> Option<String>) -> Result<Option<serde_json::Value>, String> {
+    let mut ceiling = if let Some(config) = var("PALETTE_CAPABILITY_CEILING").filter(|value| !value.trim().is_empty()) {
         let text = if Path::new(&config).is_file() { fs::read_to_string(&config).map_err(|e| e.to_string())? } else { config };
         Some(serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("operator capability ceiling: {e}"))?)
     } else { None };
-    if let Ok(path) = std::env::var("PALETTE_HOST_COMMANDS") {
+    if let Some(path) = var("PALETTE_HOST_COMMANDS").filter(|value| !value.is_empty()) {
         let legacy: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("operator host commands: {e}"))?;
         let commands = legacy.as_object().ok_or("PALETTE_HOST_COMMANDS must contain an object")?;
@@ -1403,6 +1407,18 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_config_overrides_disable_ceiling_files() {
+        for ceiling in ["", " \n"] {
+            let configured = configured_ceiling_paths_with(|key| Some(match key {
+                "PALETTE_CAPABILITY_CEILING" => ceiling.into(),
+                "PALETTE_HOST_COMMANDS" => String::new(),
+                _ => unreachable!(),
+            })).unwrap();
+            assert!(configured.is_none());
+        }
+    }
     use std::os::unix::fs::symlink;
 
     fn dir(root: &Path, name: &str) -> PathBuf {
