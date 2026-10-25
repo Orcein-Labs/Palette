@@ -12,10 +12,14 @@ function with_fake_broker(f, reply)
     seen = Any[]
     task = @async while isopen(server)
         conn = try accept(server) catch; break end
-        req = JSON.parse(readline(conn))
-        push!(seen, req)
-        write(conn, JSON.json(reply(req["params"]["type"], req["params"]["payload"])) * "\n")
-        close(conn)
+        try
+            req = JSON.parse(readline(conn))
+            push!(seen, req)
+            type, payload = req["category"] == "host_request" ? (req["params"]["type"], req["params"]["payload"]) : (req["category"], req["params"])
+            write(conn, JSON.json(reply(type, payload)) * "\n")
+        finally
+            close(conn)
+        end
     end
     old = get(ENV, "PALETTE_BROKER_SOCKET", nothing)
     ENV["PALETTE_BROKER_SOCKET"] = path
@@ -308,6 +312,36 @@ end
     finally
         old === nothing ? delete!(ENV, "PALETTE_BROKER_SOCKET") : (ENV["PALETTE_BROKER_SOCKET"] = old)
         close(server)
+    end
+end
+
+@testset "host_command vector args and completed result cache" begin
+    job, polls = "host-command-vector", Ref(0)
+    okay, denied = result -> Dict("approved" => true, "result" => result), Dict("approved" => false, "reason" => "not in ceiling")
+    reply = function (_, payload)
+        get(payload, "name", "") == "denied" && return denied
+        if payload["action"] == "start"
+            return okay(Dict("job" => job, "running" => true))
+        elseif payload["action"] == "poll" && payload["job"] == job
+            polls[] += 1
+            return okay(polls[] == 1 ? Dict("job" => job, "running" => true, "stdout" => "first\n", "stderr" => "") :
+                Dict("job" => job, "running" => false, "stdout" => "last\n", "stderr" => "warn\n",
+                     "stdout_tail" => "first\nlast\n", "stderr_tail" => "warn\n"))
+        end
+        okay(Dict("returncode" => 0, "stdout" => "", "stderr" => ""))
+    end
+    try
+        with_fake_broker(reply) do seen
+            @test (Palette.host_command(job, AbstractString[SubString("git", 1, 3), "π"]; wait=false)["job"],
+                   Palette.Api.host_command(job, String[]; wait=false)["job"]) == (job, job)
+            @test [(r["params"]["args"], r["params"]["cwd"]) for r in seen[1:2]] == [(["git", "π"], pwd()), (String[], pwd())]
+            first, finished = Palette.host_command_poll(job), Palette.host_command_poll(job)
+            @test first["stdout"] == "first\n" && finished["running"] === false && finished["stdout"] == "last\n" && finished["stderr"] == "warn\n"
+            @test finished["stdout_tail"] == "first\nlast\n" && finished["stderr_tail"] == "warn\n" && Palette.host_command_poll(job) == finished && length(seen) == 4
+            @test_throws ErrorException Palette.Api.host_command("denied", AbstractString["π"]); @test_throws MethodError Palette.host_command("invalid", Any["x"])
+        end
+    finally
+        pop!(Palette.HOST_JOBS, job, nothing); pop!(Palette.HOST_JOB_RESULTS, job, nothing); filter!(id -> id != job, Palette.HOST_JOB_RESULT_ORDER)
     end
 end
 

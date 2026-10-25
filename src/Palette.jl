@@ -790,6 +790,8 @@ const rlm = Palette.rlm
 request_capability(category::String, params::Dict=Dict{String,Any}(); kwargs...) =
     Palette.request_capability(category, params; kwargs...)
 host_command(name::AbstractString, args::AbstractString...; kwargs...) = Palette.host_command(name, args...; kwargs...)
+host_command(name::AbstractString, args::AbstractVector{<:AbstractString}; kwargs...) =
+    Palette.host_command(name, args; kwargs...)
 host_command_poll(job::AbstractString) = Palette.host_command_poll(job)
 host_command_wait(job::AbstractString; kw...) = Palette.host_command_wait(job; kw...)
 host_command_cancel(job::AbstractString) = Palette.host_command_cancel(job)
@@ -1836,12 +1838,14 @@ end
 """
     Palette.host_command(name, args...; wait=true, timeout_s=nothing) -> Dict
 
-Run a command the operator named in this session's ceiling, on the host,
-outside the sandbox: the way a kernel reaches a GPU, a renderer or a build
-it cannot run itself. The ceiling fixes the command's program, working
-directory and timeout; `timeout_s` may shorten that timeout for this call,
-never extend it. `args` are passed only to a command whose ceiling entry
-sets `extra_args`. Never a shell. Broker-side ceiling shape:
+Run a command on the host without a shell. A configured alias uses its fixed
+argv, working directory, timeout and `extra_args` policy. In operator mode,
+an unregistered name resolves through host `PATH` or as a path and runs from
+the current Julia working directory. Sandbox mode allows only configured
+aliases. Synchronous direct operator commands default to 60 seconds; async
+jobs default to 14,400 seconds. Direct commands accept `timeout_s` up to
+14,400; an alias's configured timeout can only be shortened. `host_commands()`
+lists configured aliases. Broker-side alias ceiling shape:
 `{"host_command": {"commands": {"render": {"argv": ["/abs/prog", ...],
 "cwd": "/abs/dir", "timeout_s": 600, "extra_args": false}}}}`. A command
 with `"lock": "/abs/file"` runs under an exclusive flock on that file, shared
@@ -1859,11 +1863,18 @@ KiB; `stdout_skipped_bytes` counts what was dropped), `timed_out`,
 id, for work longer than a turn: `host_command_poll(job)` returns the
 output since the last poll while it runs, then the result;
 `host_command_cancel(job)` kills it; `host_jobs()` lists the jobs held.
+
+Pass argv as separate strings or an `AbstractVector{<:AbstractString}`;
+vector elements, including an empty vector, are forwarded individually.
+Completed results also include `stdout_tail` and `stderr_tail`, each with the
+last 16 KiB of its full stream. Their `*_tail_skipped_bytes` fields report
+bytes dropped before the retained tails. Async `stdout` and `stderr` remain
+per-poll deltas.
 """
 function host_command(name::AbstractString, args::AbstractString...; wait::Bool=true,
                       timeout_s::Union{Nothing,Real}=nothing)
     params = Dict{String,Any}("name" => String(name), "args" => collect(String, args),
-                              "action" => wait ? "run" : "start")
+                              "action" => wait ? "run" : "start", "cwd" => pwd())
     timeout_s === nothing || (params["timeout_s"] = Float64(timeout_s))
     # The broker enforces the command's deadline; this wait only has to
     # outlast it (14400 s is the most a ceiling may set).
@@ -1872,6 +1883,9 @@ function host_command(name::AbstractString, args::AbstractString...; wait::Bool=
     wait || (HOST_JOBS[result["job"]] = String(name))
     return result
 end
+
+host_command(name::AbstractString, args::AbstractVector{<:AbstractString}; kwargs...) =
+    host_command(name, args...; kwargs...)
 
 # Jobs this kernel started and has not seen finish, id => command name, for
 # the turn's jobs line. The broker holds the jobs themselves; a revived
@@ -1910,7 +1924,9 @@ end
 
 For a `host_command(...; wait=false)` job: while it runs, `running => true`
 with the `stdout` and `stderr` it wrote since the last poll; once it has
-finished, its result, holding only output no earlier poll returned.
+finished, its final delta and the bounded `stdout_tail` and `stderr_tail` of
+the full streams. Tail skipped-byte fields report any output older than the
+retained tails.
 Polling a finished job again returns the same result (the kernel keeps the
 last 16). `host_command_wait` blocks until the job finishes.
 """
@@ -1920,7 +1936,7 @@ host_command_poll(job::AbstractString) = host_job_request("poll", job)
     Palette.host_command_wait(job; timeout_s=nothing, interval_s=5) -> Dict
 
 Block until a `host_command(...; wait=false)` job finishes and return its
-result, with all the output no earlier poll returned. Returns the running
+final delta and bounded full-stream tails. Returns the running
 poll (`running => true`) if `timeout_s` passes first; the job keeps running.
 Waiting counts against the call's own deadline, so give the call one longer
 than the wait.
