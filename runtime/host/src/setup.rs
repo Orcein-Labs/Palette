@@ -4,6 +4,7 @@
 use crate::util::{shjoin, shquote};
 use crate::{cli, provisioning, sandbox, util};
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -13,6 +14,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn operator_path(path: &str) -> String {
+    let mut seen = HashSet::new();
+    path.split(':').filter(|entry| {
+        let path = Path::new(entry);
+        if !path.is_absolute() || path.starts_with("/tmp") { return false; }
+        let Ok(canonical) = fs::canonicalize(path) else { return false; };
+        canonical.is_dir() && !canonical.starts_with("/tmp") && seen.insert(canonical)
+    }).collect::<Vec<_>>().join(":")
+}
 /// The capabilities every installation deploys into its runtime root.
 const BUNDLED_CAPABILITIES: &[&str] = &["teamlab"];
 const CHECK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -742,7 +753,15 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     }
     // The kernel is a numeric workbench: all cores unless the operator says otherwise.
     launch_env.push(("JULIA_NUM_THREADS".into(), std::env::var("JULIA_NUM_THREADS").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "auto".into())));
-    launch_env.push(("PATH".into(), format!("{}:{SYSTEM_PATH}", text(julia.parent().expect("a file on PATH")))));
+    let julia_bin = text(julia.parent().expect("a file on PATH"));
+    let path = if mode == "operator" {
+        let inherited = std::env::var("PATH").unwrap_or_else(|_| SYSTEM_PATH.into());
+        let selected = operator_path(&format!("{julia_bin}:{inherited}"));
+        if selected.is_empty() { operator_path(SYSTEM_PATH) } else { selected }
+    } else {
+        format!("{julia_bin}:{SYSTEM_PATH}")
+    };
+    launch_env.push(("PATH".into(), path));
     let launcher = output.join("palette-mcp");
     let script = start_script(&launch_env, &host);
 
@@ -857,6 +876,13 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn op009_operator_path_keeps_durable_directories_in_order() {
+        assert_eq!(operator_path(":/usr/bin:relative:/tmp:/tmp/does-not-exist:/usr:/usr/bin:/no-such-palette-directory"), "/usr/bin:/usr");
+        assert_eq!(operator_path(":.:relative:/tmp"), "");
+        assert_eq!(operator_path("/proc/self/root/tmp:/usr/bin"), "/usr/bin");
+    }
 
     fn tmp() -> PathBuf {
         util::mkdtemp("palette-setup-test-").unwrap()
