@@ -11,8 +11,13 @@
 //! as the host (cli.rs) and the kernel (contexts.jl).
 
 use serde_json::{json, Map, Value};
+use std::time::Duration;
 
 use crate::{cli, util};
+
+pub(crate) const PREPARATION_TIMEOUT_SECS: u64 = 1800;
+pub(crate) const WORKER_STARTUP_TIMEOUT_SECS: u64 = 180;
+const ROUTER_TRANSPORT_GRACE_SECS: u64 = 30;
 
 pub(crate) fn normalize_palette_call(args: &Value) -> Result<Map<String, Value>, String> {
     let mut value = args.as_object().ok_or("Palette arguments must be an object")?.clone();
@@ -109,6 +114,34 @@ pub(crate) fn call_limit(args: &Map<String, Value>, limits: (f64, f64)) -> f64 {
         Some(t) if 0.0 < t && t <= limits.1 && !ephemeral => t,
         _ => limits.0,
     }
+}
+
+/// The MCP router must allow enough time for the adapter work it triggers.
+/// A normal Julia call may prepare the package depot before starting the
+/// worker; restart/restore may do the same, while their first `nothing` call
+/// still uses the ordinary call limit.
+pub(crate) fn response_timeout(method: &str, params: &Value, limits: (f64, f64)) -> Duration {
+    let fallback = 150.0 + limits.0;
+    if method != "tools/call" {
+        return Duration::from_secs_f64(fallback);
+    }
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return Duration::from_secs_f64(fallback);
+    };
+    let empty = Map::new();
+    let args = params.get("arguments").and_then(Value::as_object).unwrap_or(&empty);
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let prepares = name == "palette"
+        || (name == "palette_control" && (action == "prepare"
+            || (matches!(action, "restart" | "restore") && args.get("prepare") != Some(&Value::Bool(false)))));
+    let starts_worker = name == "palette"
+        || (name == "palette_control" && matches!(action, "restart" | "restore"));
+    let runs_call = starts_worker;
+    let seconds = if prepares { PREPARATION_TIMEOUT_SECS as f64 } else { 0.0 }
+        + if starts_worker { WORKER_STARTUP_TIMEOUT_SECS as f64 } else { 0.0 }
+        + if runs_call { call_limit(args, limits) } else { 0.0 }
+        + ROUTER_TRANSPORT_GRACE_SECS as f64;
+    Duration::from_secs_f64(seconds)
 }
 
 pub(crate) fn timeout_schema(limits: (f64, f64)) -> Value {
@@ -218,6 +251,21 @@ mod tests {
         assert_eq!(seconds_text(60.0), "60");
         assert_eq!(seconds_text(1234567.0), "1234567.0");
         assert_eq!(seconds_text(0.1 + 0.2), "0.30000000000000004");
+    }
+
+    #[test]
+    fn response_timeout_covers_preparation_worker_start_and_call() {
+        let limits = (60.0, 1800.0);
+        let timeout = |name: &str, args: Value| {
+            response_timeout("tools/call", &json!({"name": name, "arguments": args}), limits).as_secs()
+        };
+        assert_eq!(timeout("palette", json!({"code": "42"})), 2070);
+        assert_eq!(timeout("palette", json!({"code": "42", "timeout_s": 120})), 2130);
+        assert_eq!(timeout("palette_control", json!({"action": "prepare"})), 1830);
+        assert_eq!(timeout("palette_control", json!({"action": "restart", "prepare": false})), 270);
+        assert_eq!(timeout("palette_control", json!({"action": "restore"})), 2070);
+        assert_eq!(timeout("palette_control", json!({"action": "status"})), 30);
+        assert_eq!(response_timeout("initialize", &Value::Null, limits).as_secs(), 210);
     }
 
     #[test]

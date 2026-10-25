@@ -122,26 +122,32 @@ fn read_json(path: &Path, var: &str, shown: &str) -> Result<Value, String> {
 /// (unset or blank grants nothing), with the legacy `PALETTE_HOST_COMMANDS`
 /// file merged into its host commands, validated.
 pub(crate) fn operator_ceiling(var: impl Fn(&str) -> Option<String>) -> Result<Value, String> {
-    let mut parsed = match var("PALETTE_CAPABILITY_CEILING").filter(|s| !s.trim().is_empty()) {
-        None => json!({}),
-        Some(selected) => {
-            let path = util::expand_user(&selected);
-            read_json(&path, "PALETTE_CAPABILITY_CEILING", &path.display().to_string())?
-        }
+    let inline = var("PALETTE_OPERATOR_CEILING_JSON").filter(|s| !s.trim().is_empty());
+    let mut parsed = match &inline {
+        Some(text) => serde_json::from_str(text).map_err(|e| format!("invalid JSON in PALETTE_OPERATOR_CEILING_JSON: {e}"))?,
+        None => match var("PALETTE_CAPABILITY_CEILING").filter(|s| !s.trim().is_empty()) {
+            None => json!({}),
+            Some(selected) => {
+                let path = util::expand_user(&selected);
+                read_json(&path, "PALETTE_CAPABILITY_CEILING", &path.display().to_string())?
+            }
+        },
     };
     let object = parsed.as_object_mut().ok_or("capability ceiling must be a JSON object")?;
-    if let Some(legacy_path) = var("PALETTE_HOST_COMMANDS").filter(|s| !s.is_empty()) {
-        let legacy = read_json(&util::expand_user(&legacy_path), "PALETTE_HOST_COMMANDS", &legacy_path)?;
-        let legacy = legacy.as_object().ok_or("PALETTE_HOST_COMMANDS must contain an object")?;
-        let host = object.entry("host_command").or_insert_with(|| json!({}));
-        let host = host.as_object_mut().ok_or("host_command grant must be an object")?;
-        let commands = host.entry("commands").or_insert_with(|| json!({}));
-        let commands = commands.as_object_mut().ok_or("host_command.commands must be an object")?;
-        for (name, spec) in legacy {
-            if commands.get(name).is_some_and(|old| old != spec) {
-                return Err(format!("PALETTE_HOST_COMMANDS conflicts with host_command.commands entry {}", util::py_str(name)));
+    if inline.is_none() {
+        if let Some(legacy_path) = var("PALETTE_HOST_COMMANDS").filter(|s| !s.is_empty()) {
+            let legacy = read_json(&util::expand_user(&legacy_path), "PALETTE_HOST_COMMANDS", &legacy_path)?;
+            let legacy = legacy.as_object().ok_or("PALETTE_HOST_COMMANDS must contain an object")?;
+            let host = object.entry("host_command").or_insert_with(|| json!({}));
+            let host = host.as_object_mut().ok_or("host_command grant must be an object")?;
+            let commands = host.entry("commands").or_insert_with(|| json!({}));
+            let commands = commands.as_object_mut().ok_or("host_command.commands must be an object")?;
+            for (name, spec) in legacy {
+                if commands.get(name).is_some_and(|old| old != spec) {
+                    return Err(format!("PALETTE_HOST_COMMANDS conflicts with host_command.commands entry {}", util::py_str(name)));
+                }
+                commands.insert(name.clone(), spec.clone());
             }
-            commands.insert(name.clone(), spec.clone());
         }
     }
     validate_ceiling(&parsed)?;
@@ -338,6 +344,7 @@ pub(crate) fn palette_version(repo: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn ceiling_checks_read_as_the_python_host_wrote_them() {
@@ -449,6 +456,22 @@ mod tests {
         );
         let unknown = file("unknown.json", r#"{"zz": {}}"#);
         assert_eq!(operator_ceiling(vars(&[("PALETTE_CAPABILITY_CEILING", &unknown)])).unwrap_err(), "unknown capability categories: ['zz']");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inline_ceiling_is_a_captured_snapshot_and_does_not_merge_a_changed_file() {
+        let dir = util::mkdtemp("palette-ceiling-snapshot-").unwrap();
+        let commands = dir.join("commands.json");
+        fs::write(&commands, r#"{"new":{"argv":["/bin/echo"],"cwd":"/tmp"}}"#).unwrap();
+        let inline = r#"{"host_command":{"commands":{"captured":{"argv":["/bin/echo"],"cwd":"/tmp"}}}}"#;
+        let vars = HashMap::from([
+            ("PALETTE_OPERATOR_CEILING_JSON".to_string(), inline.to_string()),
+            ("PALETTE_HOST_COMMANDS".to_string(), commands.to_string_lossy().into_owned()),
+        ]);
+        let ceiling = operator_ceiling(|key| vars.get(key).cloned()).unwrap();
+        assert!(ceiling["host_command"]["commands"].get("captured").is_some());
+        assert!(ceiling["host_command"]["commands"].get("new").is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 
