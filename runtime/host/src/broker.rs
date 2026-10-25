@@ -795,10 +795,12 @@ impl Broker {
             let timeout_s = if action == "start" { HOST_COMMAND_MAX_TIMEOUT_S } else { 60.0 };
             (argv, cwd, timeout_s, None)
         };
+        let limit_owner = if registered.is_some() { "ceiling's" } else { "command's" };
+        let maximum_timeout_s = if registered.is_some() { default_timeout_s } else { HOST_COMMAND_MAX_TIMEOUT_S };
         let timeout_s = match p.get("timeout_s") {
             None | Some(Value::Null) => default_timeout_s,
-            Some(t) => t.as_f64().filter(|t| *t > 0.0 && *t <= default_timeout_s).ok_or_else(|| Denied(format!(
-                "host_command 'timeout_s' must be a number in (0, {default_timeout_s}], the command's limit for {}", q(name))))?,
+            Some(t) => t.as_f64().filter(|t| *t > 0.0 && *t <= maximum_timeout_s).ok_or_else(|| Denied(format!(
+                "host_command 'timeout_s' must be a number in (0, {maximum_timeout_s}], the {limit_owner} limit for {}", q(name))))?,
         };
         if let Some(lock) = &lock {
             let flock = ["/usr/bin/flock", "/bin/flock"].into_iter().find(|f| Path::new(f).is_file())
@@ -1090,10 +1092,10 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
             };
             let b = broker.clone();
             std::thread::spawn(move || {
-                let slot = slot;
+                let slot_guard = slot;
                 handle_conn(&mut conn, &b);
                 // Peer EOF acknowledges both the reply and released capacity.
-                drop(slot);
+                drop(slot_guard);
                 drop(conn);
             });
         }
@@ -1670,6 +1672,11 @@ mod tests {
         assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), session_cwd.to_string_lossy());
         let r = cmd(&b, json!({"name": "fixed", "cwd": request_cwd.to_string_lossy()}));
         assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), alias_cwd.to_string_lossy());
+        for timeout in [61, 14400] {
+            let r = cmd(&b, json!({"name": "pwd", "timeout_s": timeout}));
+            assert_eq!(r["approved"], true, "{r}");
+        }
+        assert_eq!(cmd(&b, json!({"name": "pwd", "timeout_s": 14401}))["approved"], false);
 
         let args: Vec<String> = (0..80).map(|n| format!("λ {n}")).collect();
         let expected = format!("{}\n", args.join(" "));
