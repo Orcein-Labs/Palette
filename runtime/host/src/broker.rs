@@ -1090,15 +1090,18 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
             };
             let b = broker.clone();
             std::thread::spawn(move || {
-                let _slot = slot;
-                handle_conn(conn, &b)
+                let slot = slot;
+                handle_conn(&mut conn, &b);
+                // Peer EOF acknowledges both the reply and released capacity.
+                drop(slot);
+                drop(conn);
             });
         }
     });
     Ok(BrokerServer { path: sock_path.to_path_buf(), stop, wake, thread: Some(thread) })
 }
 
-fn handle_conn(conn: UnixStream, broker: &Broker) {
+fn handle_conn(conn: &mut UnixStream, broker: &Broker) {
     let mut writer = match conn.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -1377,33 +1380,26 @@ mod tests {
         let sock = t.0.join("b.sock");
         let server = serve(&sock, Arc::new(broker(json!({}), &t.0.join("receipts.jsonl")))).unwrap();
         // Fill every slot with a connection that never sends a request.
-        let idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let busy = loop {
-            let mut extra = UnixStream::connect(&sock).unwrap();
-            extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let _ = writeln!(extra, "{}", json!({"id": "x", "category": "nope"}));
-            let mut reply = String::new();
-            let _ = BufReader::new(extra).read_line(&mut reply);
-            if reply.contains("broker busy") || std::time::Instant::now() > deadline {
-                break reply;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let mut idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+        let mut extra = UnixStream::connect(&sock).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut busy = String::new();
+        extra.read_to_string(&mut busy).unwrap();
         assert!(busy.contains("broker busy"), "connection past the cap was served: {busy:?}");
-        // Freeing a slot lets the next request through.
-        drop(idle);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let served = loop {
-            let mut c = UnixStream::connect(&sock).unwrap();
-            writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+        // Complete each request; EOF acknowledges its released slot.
+        for c in &mut idle {
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            writeln!(c, "{}", json!({"id": "idle", "category": "nope"})).unwrap();
             let mut reply = String::new();
-            BufReader::new(c).read_line(&mut reply).unwrap();
-            if reply.contains("unknown capability") || std::time::Instant::now() > deadline {
-                break reply;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+            c.read_to_string(&mut reply).unwrap();
+            assert!(reply.contains("unknown capability"), "{reply:?}");
+        }
+        drop(idle);
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+        let mut served = String::new();
+        c.read_to_string(&mut served).unwrap();
         assert!(served.contains("unknown capability"), "{served:?}");
         server.shutdown();
     }
