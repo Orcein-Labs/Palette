@@ -22,19 +22,29 @@ From Bash, `pal` sends code to the user's Palette daemon and prints the value:
 Flags: `-w WORKSPACE` and `-c CONTEXT` pick a workspace or context (defaults
 from PAL_WORKSPACE and PAL_CONTEXT). `-t SECONDS` sets the turn timeout.
 `--full` shows output that would otherwise be truncated. `--ephemeral` runs in a
-throwaway kernel. `--json` prints the raw tool result. `--tool NAME 'JSON'`
-calls another Palette tool, for example `pal --tool palette_workspace
-'{"action":"list"}'`. An error exits 1 with the message on stderr. A usage or
-connection problem exits 2.
+throwaway child with the session's mode and authority. `--json` prints the raw
+tool result. `--tool NAME 'JSON'` calls another Palette tool, for example
+`pal --tool palette_workspace '{"action":"list"}'`. An error exits 1 with the
+message on stderr. A usage or connection problem exits 2.
 
 The palette MCP tool reaches the same daemon and the same state as `pal`.
 
-The kernel runs in a sandbox. Inside it, `homedir()` is `/run/palette/home`,
-so do not write `~`. Use absolute paths under the read roots the user
-configured. Host programs run through the commands the operator allows:
-`Palette.host_commands()` lists them. `Palette.host_command(name, args...)`
-runs one and waits. With `wait=false` it returns a job id at once, for work
-longer than a turn. Then `Palette.host_command_poll(job)` returns the output
-since the previous poll and finally the result, and `Palette.host_jobs()`
-lists the jobs. The daemon has a private `/tmp`, so host commands do not see
-yours: have long jobs write their logs and outputs under a project directory.
+The kernel runs in `operator` mode by default: Julia has the user's normal
+filesystem, process, network, environment and toolchain access. Work directly
+in the configured project. For example, after `cd(repo)`,
+`Palette.host_command("git", ["status"])` runs Git from that directory with
+literal argv and no shell. `Palette.host_commands()` lists configured aliases;
+operator mode also accepts ordinary unregistered executable names or paths.
+
+`Palette.host_command(name, args...)` waits for a synchronous command. Use
+`wait=false` for long builds or other work that should outlive one turn; it
+returns a job id, `Palette.host_command_poll(job)` returns new output and the
+final result, and `Palette.host_jobs()` lists retained jobs. Direct operator
+commands start in Julia's current working directory, initially the session
+workspace. Configured aliases keep their fixed cwd and timeout.
+
+Use `pal --mode sandbox 'expression'` or set `PALETTE_MODE=sandbox` to enter
+the opt-in bubblewrap lab. There, `homedir()` is `/run/palette/home`, filesystem
+access follows the configured mounts and raw networking is disabled unless
+granted. Sandbox host commands must use an alias listed by
+`Palette.host_commands()`.
