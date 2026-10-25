@@ -1,7 +1,7 @@
 #!/usr/bin/env julia
 #=
-Palette persistent session loop. It runs inside the sandboxed worker and
-stays alive across many calls.
+Palette persistent session loop. It runs in an operator process by default or
+inside the sandboxed worker in sandbox mode, and stays alive across calls.
 
 Protocol: newline-delimited JSON on stdin/stdout, one request per line and
 one response per line, in order. The first line printed is HELLO. Its
@@ -30,9 +30,10 @@ after its reply (`kernel_exit`).
 EXECUTE evaluates into this session's persistent `eval_module`, kept for the
 life of the process.
 
-EPHEMERAL does not run in this process. It runs in a disposable,
-OS-sandboxed child started through `spawn_child_worker`. Code evaluated at
-runtime can change a foreign module's method table (for example
+EPHEMERAL does not run in this process. It runs in a disposable child started
+through `spawn_child_worker`. In sandbox mode, the child keeps the same OS
+boundary. In operator mode, it has the same normal host access as the session.
+Code evaluated at runtime can change a foreign module's method table (for example
 `Core.eval(Base, ...)`), which no parse-time check can see, so the boundary
 sits under the language: whatever the child changes dies with it. The
 call's optional `ceiling` (default `{}`) must lie within this session's own

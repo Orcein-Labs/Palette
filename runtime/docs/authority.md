@@ -1,19 +1,27 @@
 # Authority boundaries
 
-Palette workers run ordinary Julia with reflection, subprocesses, and native
-calls. The Linux supervisor places them in bubblewrap namespaces with a bounded
+Sessions use `operator` mode by default. The Julia worker runs as a normal host
+process with the user's filesystem, process, network, environment and toolchain
+access. Broker APIs still provide receipts and configured policy for mediated
+operations, but operator mode is not an OS containment boundary.
+
+Start a session with `--mode sandbox`, or set `PALETTE_MODE=sandbox`, to enter
+the opt-in lab. Sandbox workers run ordinary Julia with reflection,
+subprocesses, and native calls inside bubblewrap namespaces with a bounded
 filesystem view. Julia source checks are convenience checks, not an isolation
 boundary. The plain in-process package API does not establish this OS boundary.
 
-Workspace effects happen within configured mounts. Effects outside that envelope
-must be requested from the host broker, whose capability ceiling is configured
-before the session starts. A worker cannot grant itself a capability. Child
-ceilings must be subsets of the caller's ceiling. Requests outside the ceiling
-are denied, and broker receipts record decisions and outcomes.
+In sandbox mode, workspace effects happen within configured mounts. Effects
+outside that envelope must be requested from the host broker, whose capability
+ceiling is configured before the session starts. A worker cannot grant itself
+a capability. Child ceilings must be subsets of the caller's ceiling. Requests
+outside the ceiling are denied, and broker receipts record decisions and
+outcomes.
 
 A network capability grants broker-mediated access, not unrestricted raw worker
-networking. Read-only runtime mounts remain read-only even when Julia can run
-arbitrary code. Credentials belong to host services rather than worker bindings.
+networking in sandbox mode. Read-only runtime mounts remain read-only there even
+when Julia can run arbitrary code. Credentials belong to host services rather
+than worker bindings.
 
 `package_management.allowed_packages` is an explicit operator allowlist. The
 broker installs approved packages into the durable host package store, while
@@ -29,13 +37,13 @@ source, saved worlds, credentials, or broker configuration. It receives private
 scratch space and the managed package directories; prepared dependencies remain
 read-only. Offline installation also disables network access at the OS boundary.
 
-Writable workspace and saved-state mounts must be disjoint from protected
+In sandbox mode, writable workspace and saved-state mounts must be disjoint from protected
 runtime, project, toolchain, shared depot, OS and broker-socket paths. Canonical
 path checks reject parent, child, equal and symlink overlaps before launch.
 The routed workspace must also exclude the host registry, grants, ownership
 metadata and scratch area. Keep generated client configuration outside it.
 
-`PALETTE_READ_ROOTS` names host directories (`:`-separated absolute paths)
+The following mount and read-root rules apply to sandbox mode. `PALETTE_READ_ROOTS` names host directories (`:`-separated absolute paths)
 bound read-only into every worker at their own paths, so a path the kernel
 reads is the path on the host. A read root may not contain any other mount
 (OS roots, toolchain, depots, runtime, project, broker socket, workspace or
@@ -43,7 +51,7 @@ saved state) and may not lie inside a writable one, so `/` and a home
 directory holding the depot are refused at launch. Name the narrowest
 directories the work needs: everything under a root is readable.
 
-`PALETTE_TRUSTED_TOOLS` names the directory of trusted kernel tools. A
+In sandbox mode, `PALETTE_TRUSTED_TOOLS` names the directory of trusted kernel tools. A
 helper becomes a project tool in the workspace's `.palette/tools` once it has
 succeeded in 3 calls (`Api.promote`); the kernel can write that. It becomes
 trusted only through a `palette_patch` request to the reserved
@@ -53,9 +61,8 @@ may not overlap the workspace, and holds only `<name>.jl` and `<name>.json`.
 Each listing re-hashes the source, so a trusted tool whose source no longer
 matches its approved hash is not offered as trusted.
 
-`PALETTE_HOST_COMMANDS` names a JSON file of host commands that becomes the
-session's `host_command` ceiling, for work the sandbox cannot do itself (a
-GPU, a renderer, a build):
+`PALETTE_HOST_COMMANDS` names a JSON file of fixed host-command aliases for
+operations that need stable argv, cwd, timeout or lock settings:
 
 ```json
 {"render": {"argv": ["/usr/bin/julia", "--project=/abs/proj", "/abs/proj/render.jl"],
@@ -63,38 +70,53 @@ GPU, a renderer, a build):
             "lock": "/tmp/gpu.lock", "description": "render a frame on the GPU"}}
 ```
 
-Turn code runs one by name with `Palette.host_command("render", args...)`,
-and `Palette.host_commands()` lists the commands the session may run, with
-their descriptions.
-The program is an absolute path and never a shell; arguments reach only a
-command whose entry sets `extra_args`. Each command runs in its own process
-group, killed whole at `timeout_s` (at most 4 hours; a call's own
-`timeout_s` may shorten it, never extend it). `wait=false` returns a job id:
+In sandbox mode, turn code may run only a named alias with
+`Palette.host_command("render", args...)`; `Palette.host_commands()` lists the
+aliases available in the session. The program is an absolute path and never a
+shell; arguments reach only a command whose entry sets `extra_args`.
+
+In operator mode, `Palette.host_command(name, args...)` also accepts an
+unregistered executable name or path. Names resolve through the host `PATH`,
+arguments are passed literally without a shell, and the command starts in the
+Julia process's current working directory (the session workspace initially)
+with the host environment. Synchronous commands default to 60 seconds; a
+background job defaults to the 4-hour global limit so long builds can finish.
+An explicit timeout can select a value up to 4 hours. Configured aliases keep
+their fixed argv, cwd, timeout ceiling and optional lock in both modes. `host_commands()`
+lists aliases, not arbitrary executables. Operator commands run with the host
+process's privileges and are not contained by the sandbox mount rules.
+
+Each command runs in its own process group, killed whole at its timeout.
+`wait=false` returns a job id:
 `Palette.host_command_poll(job)` returns the output written since the last
 poll, then the result; `Palette.host_command_cancel(job)` kills the group;
 `Palette.host_jobs()` lists the jobs held, and the turn's jobs line names the
 ones still running. Jobs still running when the session ends are killed.
 A command with a `lock` file runs under an exclusive `flock(1)` on it, the
-same lock other GPU work on the machine takes, so two renders never share
-the GPU; waiting for the lock counts against `timeout_s`. A command's cwd,
-lock and the absolute paths in its argv are protected like the mounts above:
+same lock other GPU work on the machine takes, so two renders never share the
+GPU; waiting for the lock counts against `timeout_s`. In sandbox mode, an
+alias's cwd, lock and absolute argv paths are protected like the mounts above:
 no writable root or package store may lie inside, equal or contain one, nor
 equal or contain its parent directory (which could rename it). A sibling in
 the same parent is fine, so a store under `~/.local` sits beside a command
 that runs in `~/project`.
-Commands run with the host process's privilege and environment, outside every
-mount rule above: list only commands you would let the model run unattended.
+
+Host commands run with the host process's privileges and environment, outside
+the worker's mount rules. In operator mode, the kernel already has the user's
+ordinary host access; the broker command API adds argv execution, job control,
+and receipts. In sandbox mode, use aliases only for commands safe to run with
+those host privileges.
 
 The `teamlab` category is the shop of Julia tools and the mailbox that one
 user's agents share (`runtime/integrations/teamlab`). The ceiling grants it
 as `{"teamlab": {"dir": "/abs/shop"}}`; the operator adds that grant itself
 unless the ceiling names one, using `PALETTE_TEAMLAB_DIR`, else
 `$XDG_DATA_HOME/palette/teamlab` (`~/.local/share/palette/teamlab`), and
-`PALETTE_TEAMLAB_DIR=off` leaves it out. The directory is protected like the
-mounts above, and no read root may contain it or lie inside it: no kernel can
-read or write it, and the host does every read
-and write there, under a lock, with the size limits in
-`runtime/host/src/teamlab.rs`. Each request acts as the agent the session
+`PALETTE_TEAMLAB_DIR=off` leaves it out. Sandbox mode protects the directory
+like the mounts above and forbids read roots that contain it or lie inside it;
+the host serves every TeamLab request under a lock and size limits from
+`runtime/host/src/teamlab.rs`. Operator mode gives Julia the user's normal
+filesystem access, including direct access to that directory. Each request acts as the agent the session
 was started for: the MCP client's `clientInfo.name` (`claude-code` is
 `claude`), else `PALETTE_AGENT`, else `local`. That name is cooperative. It
 records who published, approved or sent something; it does not authenticate
@@ -114,8 +136,10 @@ revived. The MCP adapters pass `PALETTE_TURN_TIMEOUT` (default 60) and
 sets them with `turn_timeout` and `max_turn_timeout`. The limit covers one
 call; work longer than any call runs as a host command job. A scratch
 (`ephemeral`) call runs in a broker child bounded by the session's default
-limit less 10 s, so it takes no `timeout_s`: the host refuses one. A spawned
-child has the same bound, whatever limit its parent call runs under.
+limit less 10 s, so it takes no `timeout_s`: the host refuses one. The child
+keeps the session mode: operator children have the user's normal host access;
+sandbox children keep the OS boundary. A spawned child has the same time bound,
+whatever limit its parent call runs under.
 
 The routed MCP adapter can apply exact reviewed patches to trusted configured
 source roots. Approval binds a digest and world to one expiring attempt. It

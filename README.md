@@ -6,7 +6,11 @@ Note: Developed on CachyOS, tested on Windows 11 via QEMU. Xeon 2699 v3, RTX 506
 
 ChatGPT, Claude, Grok, and Gemini talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
 
-Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives, and host-side effects go through a capability broker and leave a receipt.
+Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives. Broker-mediated host effects leave a receipt; operator mode also has the user's normal host access.
+
+The supervised Julia session defaults to `operator` mode. Choose `--mode sandbox`
+to enter the opt-in bubblewrap lab, where filesystem and network access follow
+the configured boundaries.
 
 ## ChatGPT Chat, October 2026
 
@@ -27,8 +31,9 @@ Clients attach over MCP, or over the host session (newline-delimited JSON on std
 
 ## Install
 
-Linux, or WSL2 on Windows. One command installs Julia if needed, the sandbox
-host and its packages, and [TeamLab](runtime/integrations/teamlab/README.md),
+Linux, or WSL2 on Windows. One command installs Julia if needed, the Palette
+host and its packages, and
+[TeamLab](runtime/integrations/teamlab/README.md),
 the shop of tools and the mailbox your agents share. It connects the Claude
 Code, Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
 Claude Code, and checks the installation before switching to it.
@@ -44,9 +49,13 @@ you have none, installs Palette inside it, and also connects Claude Desktop:
 powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
 ```
 
-The installer asks for your password once, to install bubblewrap and Python 3
-from your distribution; on Windows it needs none. The first run takes several
-minutes while it prepares the sandbox. Everything else lives in
+To install Bubblewrap support and start in the opt-in sandbox, pipe the installer
+to `sh` with `PALETTE_MODE=sandbox`, or pass `--mode sandbox` to a downloaded
+installer. Otherwise Palette runs in operator mode. On Linux, the installer asks
+for your password to install Python 3 if needed and sandbox packages when you
+select sandbox mode; on Windows it needs none.
+The first run takes several
+minutes while it prepares Julia's packages and caches. Everything else lives in
 `~/.local/share/palette`, runs locally, and needs no account. Run the command
 again to update, or accept the daily update it offers.
 
@@ -66,16 +75,17 @@ state on that server.
 
 ## Use the Julia package
 
-`using Palette` works without the sandbox:
+`using Palette` works in a normal Julia process:
 
 ```sh
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=. -e 'using Palette; execute(ExecuteCode("x = 41")); println(execute(ExecuteCode("x + 1")).result.data)'
 ```
 
-The plain Julia API does not create an OS sandbox; the supervised host does.
-The [installation guide](runtime/docs/install.md) shows how to run the host
-session directly, which speaks newline-delimited JSON on stdio.
+The plain Julia API does not create an OS sandbox, and the supervised host also
+defaults to ordinary host access. Use `--mode sandbox` for the bounded OS
+environment. The [installation guide](runtime/docs/install.md) shows how to run
+the host session directly, which speaks newline-delimited JSON on stdio.
 
 ## Talking to the kernel
 
@@ -174,7 +184,7 @@ The package manifest declares Julia 1.10+; supervised development and CI are tes
 
 ## Explanation for why not just IPython or IJulia or Jupyter
 
-The reason I developed this and didn't simply wrap one of these three, is that Jupyter and IJulia were engineered as chronological presentation layers for human eyes. They treat code execution as a linear notebook, forcing the runtime to store a historical text stream of every cell input and output. If you force an AI agent to use a Jupyter wrapper, it rapidly suffocates its own context window with its own debugging history. Palette.jl is not a notebook UI wrapper; it is a non-linear state architecture built natively for LLM runtimes. Paired with Pharos.jl, it separates code execution logs from semantic working memory. It allows an autonomous agent to spawn sandboxed sub-scopes, programmatically inspect the project's AST graph, and prune its variable footprint dynamically. I didn't build on Jupyter because you can't solve a non-linear, token-constrained machine-learning problem using a linear, human-centric logging protocol. Also, IPython is a scratchpad meant for humans to type lines sequentially. If you give an LLM an IPython cell, it kinda behaves like an automated chatbot trying to navigate a dark room by feeling the walls and there's a rake in the walkway for some reason. Prime-Agent does exceptionally well with IPython, but it showed where the operator surface friction still lives. 
+The reason I developed this and didn't simply wrap one of these three, is that Jupyter and IJulia were engineered as chronological presentation layers for human eyes. They treat code execution as a linear notebook, forcing the runtime to store a historical text stream of every cell input and output. If you force an AI agent to use a Jupyter wrapper, it rapidly suffocates its own context window with its own debugging history. Palette.jl is not a notebook UI wrapper; it is a non-linear state architecture built natively for LLM runtimes. Paired with Pharos.jl, it separates code execution logs from semantic working memory. It allows an autonomous agent to spawn disposable Julia sub-scopes, programmatically inspect the project's AST graph, and prune its variable footprint dynamically. These child scopes keep the selected operator or sandbox mode. I didn't build on Jupyter because you can't solve a non-linear, token-constrained machine-learning problem using a linear, human-centric logging protocol. Also, IPython is a scratchpad meant for humans to type lines sequentially. If you give an LLM an IPython cell, it kinda behaves like an automated chatbot trying to navigate a dark room by feeling the walls and there's a rake in the walkway for some reason. Prime-Agent does exceptionally well with IPython, but it showed where the operator surface friction still lives.
 
 
 ## License
