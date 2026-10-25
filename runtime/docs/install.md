@@ -14,6 +14,12 @@ On Windows (PowerShell or a command prompt):
 powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
 ```
 
+Operator setup preserves the installer's `PATH` for user toolchains, with the
+selected Julia directory first. It drops empty, relative, missing and `/tmp`
+directories (including symlink targets there), and deduplicates in order.
+Sandbox setup keeps its minimal system path. Rerun setup to capture changed
+toolchain locations.
+
 `install.sh` does the following, and running it again updates the install:
 
 1. Downloads the release archive, which holds the source and a prebuilt

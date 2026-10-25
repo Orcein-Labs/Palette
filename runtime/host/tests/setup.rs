@@ -206,13 +206,15 @@ fn setup_defaults_to_operator_and_requires_bwrap_only_for_sandbox() {
     let repo = f.make_repo("sdk-1");
     let base = ["--repo-dir", repo.to_str().unwrap(), "--no-register", "--no-check"];
 
-    let no_bwrap_path = f.bin().to_string_lossy().into_owned();
+    let no_bwrap_path = format!("{}:/usr", f.bin().display());
     let out = f.setup(&base, &[("PATH", &no_bwrap_path)]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("Preparing the operator runtime"));
     let operator_launcher = fs::read_to_string(f.launcher()).unwrap();
     assert!(operator_launcher.contains("PALETTE_MODE=operator"));
     assert!(!operator_launcher.contains("JULIA_PKG_OFFLINE="), "operator mode should keep Julia's normal package network default");
+    assert_eq!(json(&f.client_dir().join("palette-launch.json"))["env"]["PATH"], "/usr",
+        "operator setup must preserve durable installer PATH entries instead of replacing them with SYSTEM_PATH");
 
     let mut sandbox = base.to_vec();
     sandbox.extend(["--mode", "sandbox"]);
