@@ -875,8 +875,14 @@ fn add_skipped(v: &mut Value, skipped: [u64; 2]) {
 
 fn host_job_json(job: Option<&str>, r: &sandbox::HostJobResult) -> Value {
     let mut v = json!({"returncode": r.returncode, "timed_out": r.timed_out, "cancelled": r.cancelled,
-                       "seconds": round_ms(r.seconds), "stdout": r.stdout, "stderr": r.stderr, "running": false});
+                       "seconds": round_ms(r.seconds), "stdout": r.stdout, "stderr": r.stderr,
+                       "stdout_tail": r.stdout_tail, "stderr_tail": r.stderr_tail, "running": false});
     add_skipped(&mut v, r.skipped);
+    for (key, n) in [("stdout_tail_skipped_bytes", r.tail_skipped[0]), ("stderr_tail_skipped_bytes", r.tail_skipped[1])] {
+        if n > 0 {
+            v[key] = json!(n);
+        }
+    }
     if let Some(id) = job {
         v["job"] = json!(id);
     }
@@ -1749,6 +1755,7 @@ mod tests {
         assert_eq!(r["result"]["running"], json!(false), "{r}");
         assert_eq!(rest, "two\n", "the final result repeated output a poll had returned");
         assert_eq!(err, "err\n");
+        assert_eq!((r["result"]["stdout_tail"].clone(), r["result"]["stderr_tail"].clone()), (json!("one\ntwo\n"), json!("err\n")));
         assert_eq!(r["result"]["cancelled"], json!(false));
     }
 
@@ -1770,7 +1777,7 @@ mod tests {
         assert_eq!(r["result"]["cancelled"], json!(true), "{r}");
         assert_eq!(r["result"]["running"], json!(false));
         assert_eq!(r["result"]["timed_out"], json!(false));
-        assert_eq!(r["result"]["stdout"], json!("started\n"));
+        assert_eq!((r["result"]["stdout"].clone(), r["result"]["stdout_tail"].clone()), (json!("started\n"), json!("started\n")));
         assert!(pid_dead(&helper), "a cancelled job's helper survived");
         assert_eq!(cmd(&b, json!({"action": "list"}))["result"]["jobs"], json!([]));
         assert!(cmd(&b, json!({"action": "cancel", "job": id}))["reason"].as_str().unwrap().contains("no running"));
@@ -1788,13 +1795,27 @@ mod tests {
     fn host_command_reports_output_the_tail_dropped() {
         let d = tmpdir("hostcmd-skip");
         let dir = d.0.to_string_lossy().into_owned();
+        let output = format!("{}界{}尾", "x".repeat(23_616), "x".repeat(16_379));
+        assert_eq!(output.len(), 40_001);
+        fs::write(d.0.join("output"), output).unwrap();
+        fs::write(d.0.join("invalid"), [0x80]).unwrap();
         let b = cmd_broker(&d.0, json!({
-            "loud": {"argv": ["/bin/sh", "-c", "head -c 40000 /dev/zero | tr '\\0' x; echo"], "cwd": dir},
+            "loud": {"argv": ["/bin/sh", "-c", "cat output; printf err >&2"], "cwd": dir},
+            "invalid": {"argv": ["/bin/cat", "invalid"], "cwd": dir},
         }));
         let r = cmd(&b, json!({"name": "loud"}));
-        assert_eq!(r["result"]["stdout"].as_str().unwrap().len(), HOST_COMMAND_OUTPUT, "{}", r["result"]["returncode"]);
-        assert_eq!(r["result"]["stdout_skipped_bytes"], json!(40001 - HOST_COMMAND_OUTPUT));
-        assert!(r["result"].get("stderr_skipped_bytes").is_none());
+        let tail = format!("{}尾", "x".repeat(16_379));
+        let skipped = json!(40_001 - HOST_COMMAND_OUTPUT + 2);
+        assert_eq!((r["result"]["stdout"].clone(), r["result"]["stdout_tail"].clone()), (json!(tail.as_str()), json!(tail.as_str())), "{}", r["result"]["returncode"]);
+        assert_eq!((r["result"]["stdout_skipped_bytes"].clone(), r["result"]["stdout_tail_skipped_bytes"].clone()), (skipped.clone(), skipped.clone()));
+        assert_eq!((r["result"]["stderr_tail"].clone(), r["result"].get("stderr_skipped_bytes").is_none()), (json!("err"), true));
+        let invalid = cmd(&b, json!({"name": "invalid"}));
+        assert_eq!((invalid["result"]["stdout_tail"].clone(), invalid["result"].get("stdout_tail_skipped_bytes").is_none()), (json!("\u{FFFD}"), true));
+
+        let id = cmd(&b, json!({"name": "loud", "action": "start"}))["result"]["job"].as_str().unwrap().to_string();
+        let r = poll_until(&b, &id, |r| r["result"]["running"] == json!(true));
+        assert_eq!(r["result"]["running"], json!(false));
+        assert_eq!((r["result"]["stdout_tail"].clone(), r["result"]["stdout_tail_skipped_bytes"].clone(), r["result"]["stderr_tail"].clone()), (json!(tail.as_str()), skipped, json!("err")));
     }
 
     #[test]
