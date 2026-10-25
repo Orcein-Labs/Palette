@@ -4,6 +4,11 @@ Sessions use `operator` mode by default. The Julia worker runs as a normal host
 process with the user's filesystem, process, network, environment and toolchain
 access. Broker APIs still provide receipts and configured policy for mediated
 operations, but operator mode is not an OS containment boundary.
+The managed daemon shares the host's `/tmp`. Its systemd unit retains
+`NoNewPrivileges=yes`, so workers and broker commands cannot gain privileges
+through setuid helpers such as `sudo`. Operator mode therefore provides the
+user's existing access, not privilege elevation. The separate Chat tunnel
+service retains its private temporary directory and service hardening.
 
 Start a session with `--mode sandbox`, or set `PALETTE_MODE=sandbox`, to enter
 the opt-in lab. Sandbox workers run ordinary Julia with reflection,
