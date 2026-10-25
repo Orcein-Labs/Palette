@@ -73,9 +73,16 @@ impl Gates {
     }
 
     fn run(&self, argv: Vec<OsString>, host: Option<&Path>) -> Result<(), Fail> {
+        self.run_with_mode(argv, host, None)
+    }
+
+    fn run_with_mode(&self, argv: Vec<OsString>, host: Option<&Path>, mode: Option<&str>) -> Result<(), Fail> {
         let shown = argv.iter().map(|w| w.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        let shown = mode.map_or_else(|| shown.clone(), |mode| format!("PALETTE_MODE={mode} {shown}"));
         println!("\nverification: {shown}");
-        let status = self.command(&argv, host).status().map_err(|e| format!("{shown}: {e}"))?;
+        let mut command = self.command(&argv, host);
+        if let Some(mode) = mode { command.env("PALETTE_MODE", mode); }
+        let status = command.status().map_err(|e| format!("{shown}: {e}"))?;
         if !status.success() {
             return Err(Fail::Failed(format!("verification failed ({status}): {shown}")));
         }
@@ -216,10 +223,13 @@ pub fn main(args: &[String]) -> Result<(), Fail> {
     }
     gates.run(argv!["cargo", "build", "--release", "--manifest-path", &host_manifest], None)?;
     // Through cargo, which has just built it, so the stubbed tests run no real host.
-    gates.run(
+    // The raw kernel/authority fixtures explicitly select the sandbox. Its
+    // prepared depot snapshot is distinct from normal operator preparation.
+    gates.run_with_mode(
         argv!["cargo", "run", "--release", "--quiet", "--manifest-path", &host_manifest, "--bin", "palette-host", "--",
               "prepare", "--project-dir", &project, "--repo-dir", &root],
         None,
+        Some("sandbox"),
     )?;
     let host = root.join("runtime/host/target/release/palette-host");
     let mut runs: Vec<Run> = SHARED_SUITES.iter().map(|s| Run { suite: Suite::Python(root.join(s)), host: None }).collect();

@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Logs `name|cwd|PALETTE_HOST_BIN|args`. As python3, `-c` lists three cases
+/// Logs `name|cwd|PALETTE_HOST_BIN|PALETTE_MODE|args`. As python3, `-c` lists three cases
 /// for the suite named by the code's argument, and fails a suite named in
 /// FAIL_SUITE; as cargo, `--list` lists three cases of the `--test` target.
 /// Any other stub named in FAIL_TOOL fails.
 const STUB: &str = r#"#!/bin/sh
 name=${0##*/}
 if [ "$name" = python3 ] && [ "$1" = -c ]; then
-  echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|list $3" >> "$STUB_LOG"
+  echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|${PALETTE_MODE-unset}|list $3" >> "$STUB_LOG"
   echo '["Case.test_one", "Case.test_two", "Case.test_three"]'
   exit 0
 fi
@@ -24,11 +24,11 @@ case " $* " in *" --list "*)
   all="$*"
   target=${all#* --test }
   target=${target%% *}
-  echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|list $target" >> "$STUB_LOG"
+  echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|${PALETTE_MODE-unset}|list $target" >> "$STUB_LOG"
   printf 'one: test\ntwo: test\nthree: test\n'
   exit 0
 esac
-echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|$*" >> "$STUB_LOG"
+echo "$name|$PWD|${PALETTE_HOST_BIN-unset}|${PALETTE_MODE-unset}|$*" >> "$STUB_LOG"
 [ "$name" = "$FAIL_TOOL" ] && exit 1
 case "$1" in */"$FAIL_SUITE".py) exit 1 ;; esac
 exit 0
@@ -50,6 +50,7 @@ struct Call {
     tool: String,
     cwd: String,
     host: String,
+    mode: String,
     args: String,
 }
 
@@ -80,6 +81,7 @@ impl Fixture {
             .env("STUB_LOG", self.dir.join("calls.log"))
             // An inherited host must never reach a gate that should not see it.
             .env("PALETTE_HOST_BIN", "/inherited/palette-host")
+            .env("PALETTE_MODE", "operator")
             .env_remove("FAIL_TOOL")
             .env_remove("FAIL_SUITE");
         c.envs(env.iter().copied()).output().unwrap()
@@ -90,8 +92,8 @@ impl Fixture {
         fs::remove_file(self.dir.join("calls.log")).ok();
         log.lines()
             .map(|l| {
-                let mut f = l.splitn(4, '|').map(str::to_string);
-                Call { tool: f.next().unwrap(), cwd: f.next().unwrap(), host: f.next().unwrap(), args: f.next().unwrap() }
+                let mut f = l.splitn(5, '|').map(str::to_string);
+                Call { tool: f.next().unwrap(), cwd: f.next().unwrap(), host: f.next().unwrap(), mode: f.next().unwrap(), args: f.next().unwrap() }
             })
             .collect()
     }
@@ -154,6 +156,8 @@ fn runs_every_gate_then_each_suite_whole_against_the_host() {
         ]
     );
     assert!(calls.iter().take(9).all(|c| c.host == "unset"));
+    assert_eq!(calls[8].mode, "sandbox");
+    assert!(calls.iter().enumerate().filter(|(i, _)| *i != 8).all(|(_, c)| c.mode == "operator"));
     let suites: Vec<(&str, &str)> = calls[9..].iter().map(|c| (suite(c).unwrap(), c.host.as_str())).collect();
     let hosted = ["test_authority", "test_session", "test_session_cli", "test_revival"];
     let expected: Vec<(&str, &str)> = [("test_workspace_router", "unset")]
