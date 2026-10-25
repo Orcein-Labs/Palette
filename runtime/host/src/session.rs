@@ -174,11 +174,13 @@ fn dead(msg: impl Into<String>) -> SessionError {
     SessionError::Dead(msg.into())
 }
 
-fn check_scratch_cleanup_root(root: &Path, protected: &[(&str, &Path)]) -> Result<(), String> {
-    for (name, path) in protected {
-        if path.starts_with(root) {
-            return Err(format!("session scratch root {} overlaps protected {name} {}",
-                               root.display(), path.display()));
+fn check_scratch_cleanup_root(root: &Path, projects: &[(&str, &Path)], durable: &[(&str, &Path)]) -> Result<(), String> {
+    for (paths, bidirectional) in [(projects, false), (durable, true)] {
+        for (name, path) in paths {
+            if path.starts_with(root) || (bidirectional && root.starts_with(path)) {
+                return Err(format!("session scratch root {} overlaps protected {name} {}",
+                                   root.display(), path.display()));
+            }
         }
     }
     Ok(())
@@ -253,9 +255,8 @@ impl PaletteSession {
         let repo_layout = util::resolve(Path::new(&o.repo_dir));
         let receipts_layout = o.receipts_dir.as_deref().map(|path| util::resolve(Path::new(path)))
             .or_else(|| default_receipts.as_ref().map(|(root, _)| root.clone()));
+        let projects = [("project directory", project_layout.as_path()), ("repository directory", repo_layout.as_path())];
         let mut protected_layout = Vec::new();
-        protected_layout.push(("project directory", project_layout.as_path()));
-        protected_layout.push(("repository directory", repo_layout.as_path()));
         if let Some(tw) = task_workspace.as_deref() { protected_layout.push(("task workspace", tw)); }
         if let Some(state) = state_dir.as_deref() { protected_layout.push(("persistent state directory", state)); }
         if let Some(package_store) = package_store.as_ref() {
@@ -269,9 +270,7 @@ impl PaletteSession {
         // Resolve the future scratch path before creating it so rejecting a
         // caller-owned workspace or durable state cannot transfer it to recursive cleanup.
         let planned_root = util::resolve(&tmp_root);
-        if !protected_layout.is_empty() {
-            check_scratch_cleanup_root(planned_root.as_path(), &protected_layout).map_err(err)?;
-        }
+        check_scratch_cleanup_root(planned_root.as_path(), &projects, &protected_layout).map_err(err)?;
         if o.scratch_root.is_none() {
             // Default session roots of hosts that were killed before their teardown ran.
             sandbox::sweep_orphaned_dirs(&sessions_root, "palette-", Duration::ZERO);
@@ -288,7 +287,7 @@ impl PaletteSession {
                     return Err(err(e.to_string()));
                 }
             };
-            if let Err(e) = check_scratch_cleanup_root(root.as_path(), &protected_layout) {
+            if let Err(e) = check_scratch_cleanup_root(root.as_path(), &projects, &protected_layout) {
                 // Only remove a new, still-empty directory at the path we
                 // resolved before creation; never recurse into caller data.
                 if !tmp_root_existed && root == util::resolve(&tmp_root) {
@@ -726,5 +725,26 @@ impl PaletteSession {
 impl Drop for PaletteSession {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op008_scratch_can_be_inside_project_but_never_durable_data() {
+        let project = Path::new("/home/operator");
+        let scratch = project.join("scratch");
+        let projects = [("project", project)];
+        assert!(check_scratch_cleanup_root(&scratch, &projects, &[]).is_ok());
+        assert!(check_scratch_cleanup_root(project, &projects, &[]).is_err());
+        let child = scratch.join("child");
+        for name in ["state", "task workspace", "package store", "receipts", "team lab"] {
+            let durable = [(name, scratch.as_path())];
+            for root in [scratch.as_path(), child.as_path(), project] {
+                assert!(check_scratch_cleanup_root(root, &projects, &durable).unwrap_err().contains("overlap"));
+            }
+        }
     }
 }

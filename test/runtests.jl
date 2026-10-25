@@ -779,6 +779,22 @@ VERSION >= v"1.12" && @testset "A struct that changes layout names what still us
     @test printed("struct Lone; x::Int; end; struct Lone; x::Float64; end") == ""
 end
 
+@testset "OP006 operator job notices contain only owned children" begin
+    withenv("PALETTE_MODE" => "operator") do
+        child = open(`cat`, "w")
+        try
+            jobs = Palette.background_processes()
+            @test getpid(child) in first.(jobs)
+            @test all(jobs) do (pid, _, _)
+                stat = read("/proc/$pid/stat", String)
+                parse(Int, split(stat[findlast(')', stat)+2:end])[2]) == getpid()
+            end
+        finally
+            close(child.in); wait(child)
+        end
+    end
+end
+
 # The code graph Palette.codegraph() serves, tested on its own.
 const Pharos = Palette.Pharos
 include("pharos.jl")

@@ -7,6 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+
+// These fixtures compile real Julia into private depots. Running their cold
+// compilers together on a small CI runner tests CPU contention, not mode routing.
+static JULIA_FIXTURE: Mutex<()> = Mutex::new(());
 
 struct Temp(PathBuf);
 
@@ -180,6 +185,7 @@ fn bwrap_trap(root: &Path) -> (PathBuf, PathBuf) {
 
 #[test]
 fn case_operator_cli_001_defaults_to_host_mode_and_kills_its_child_group_on_close() {
+    let _fixture = JULIA_FIXTURE.lock().unwrap();
     let tmp = Temp::new("close");
     let (bin, bwrap_called) = bwrap_trap(&tmp.0);
     let path = format!("{}:/usr/bin:/bin", bin.display());
@@ -238,6 +244,7 @@ fn case_operator_cli_001_defaults_to_host_mode_and_kills_its_child_group_on_clos
 
 #[test]
 fn case_operator_cli_002_candidate_checkout_precedes_an_unrelated_global_palette() {
+    let _fixture = JULIA_FIXTURE.lock().unwrap();
     let tmp = Temp::new("load-path");
     let project = tmp.0.join("empty-project");
     fs::create_dir_all(&project).unwrap();
@@ -382,6 +389,7 @@ fn case_operator_cli_004_session_mode_environment_is_resolved_before_startup() {
 
 #[test]
 fn case_operator_cli_005_project_can_contain_its_owned_scratch_directory() {
+    let _fixture = JULIA_FIXTURE.lock().unwrap();
     let tmp = Temp::new("project-scratch");
     let repo = checkout();
     let julia = julia();

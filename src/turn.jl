@@ -409,14 +409,16 @@ end
 """
     background_processes() -> Vector{Tuple{Int, String, Float64}}
 
-Processes earlier calls left running in the sandbox, as (pid, command line,
-seconds running): the kernel's children, and daemons the sandbox's init
-adopted (a server started with `&`, a database started with pg_ctl).
+Processes earlier calls left running, as (pid, command line, seconds running).
+Report the kernel's children. In sandbox mode, also report daemons adopted by
+the private init (a server started with `&`, a database started with pg_ctl).
+The host's init owns unrelated system services, so operator mode excludes them.
 """
 function background_processes()
     out = Tuple{Int, String, Float64}[]
     isfile("/proc/uptime") || return out
     me = getpid()
+    sandbox = get(ENV, "PALETTE_MODE", "operator") == "sandbox"
     uptime = parse(Float64, split(read("/proc/uptime", String))[1])
     hz = ccall(:sysconf, Clong, (Cint,), 2)   # _SC_CLK_TCK
     for p in readdir("/proc")
@@ -425,7 +427,7 @@ function background_processes()
         stat = try read("/proc/$pid/stat", String) catch; continue end
         rest = split(stat[findlast(')', stat)+2:end])
         ppid = parse(Int, rest[2])
-        (ppid == me || ppid == 1) || continue
+        (ppid == me || (sandbox && ppid == 1)) || continue
         cmd = strip(replace(try read("/proc/$pid/cmdline", String) catch; "" end, '\0' => ' '))
         (isempty(cmd) || occursin("session_loop.jl", cmd)) && continue
         push!(out, (pid, cmd, max(0.0, uptime - parse(Float64, rest[20]) / hz)))
