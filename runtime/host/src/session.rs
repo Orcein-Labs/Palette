@@ -1,5 +1,6 @@
-//! One persistent sandboxed worker (runtime/scripts/session_loop.jl) with its own
-//! broker, ceiling and depot clone, kept alive across calls. Its epoch comes
+//! One persistent Julia worker (runtime/scripts/session_loop.jl) with its own
+//! broker, kept alive across calls. Operator mode runs directly on the host;
+//! sandbox mode adds the existing bwrap boundary. Its epoch comes
 //! from the worker's own first line and dies with it: a dead worker is
 //! reported, never silently replaced, because a new process is a different
 //! session.
@@ -11,7 +12,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,35 @@ use std::time::{Duration, Instant};
 /// gets here.
 const HARD_TIMEOUT_MARGIN_S: f64 = 12.0;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionMode {
+    Operator,
+    Sandbox,
+}
+
+impl SessionMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "operator" => Ok(Self::Operator),
+            "sandbox" => Ok(Self::Sandbox),
+            other => Err(format!("mode must be 'operator' or 'sandbox', not {other:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Sandbox => "sandbox",
+        }
+    }
+}
+
+impl Default for SessionMode {
+    fn default() -> Self {
+        Self::Operator
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     /// The worker is gone; nothing after this can be served.
@@ -30,6 +60,8 @@ pub enum SessionError {
 }
 
 pub struct SessionOptions {
+    pub mode: SessionMode,
+    pub config_revision: Option<String>,
     pub project_dir: String,
     pub repo_dir: String,
     pub ceiling: Value,
@@ -72,6 +104,8 @@ pub struct Turn<'a> {
 pub struct PaletteSession {
     pub session_id: String,
     pub epoch: String,
+    pub mode: SessionMode,
+    pub config_revision: Option<String>,
     pub capabilities: Value,
     pub broker: Arc<Broker>,
     turn_timeout: f64,
@@ -87,6 +121,9 @@ pub struct PaletteSession {
     closed: bool,
     /// Set from outside (a signal) to give up waiting on the worker.
     pub stop: Arc<AtomicBool>,
+    /// Operator kernels own a host process group so ordinary Julia children
+    /// cannot outlive a closed or timed-out session.
+    worker_pgid: Option<i32>,
 }
 
 /// Scrubs a session's per-run residue (depot clone, tmp root, socket dir)
@@ -137,6 +174,16 @@ fn dead(msg: impl Into<String>) -> SessionError {
     SessionError::Dead(msg.into())
 }
 
+fn check_scratch_cleanup_root(root: &Path, protected: &[(&str, &Path)]) -> Result<(), String> {
+    for (name, path) in protected {
+        if path.starts_with(root) {
+            return Err(format!("session scratch root {} contains protected {name} {}",
+                               root.display(), path.display()));
+        }
+    }
+    Ok(())
+}
+
 /// What a stopped kernel leaves for the next call; the worker says the same when it stops itself.
 fn after_kernel_stop(revives: bool) -> &'static str {
     if revives {
@@ -181,36 +228,49 @@ impl PaletteSession {
             None => None,
         };
         let state_dir = o.state_dir.as_deref().map(|p| fs::canonicalize(p).map_err(|e| err(e.to_string()))).transpose()?;
-        let mut package_protection = vec![
-            PathBuf::from(&o.project_dir), PathBuf::from(&o.repo_dir), tmp_root.clone(),
-        ];
-        for path in [o.state_dir.as_deref(), o.task_workspace_dir.as_deref(), o.receipts_dir.as_deref()].into_iter().flatten() {
-            package_protection.push(PathBuf::from(path));
-        }
-        if let Some((root, _)) = &default_receipts {
-            package_protection.push(root.clone());
-            package_protection.push(crate::receipt_archive::archive_dir(root));
-        }
-        let package_store = sandbox::package_store_paths(&package_protection, Some(&o.ceiling)).map_err(err)?;
+        let package_store = if o.mode == SessionMode::Sandbox || o.ceiling.get("package_management").is_some() {
+            let mut package_protection = vec![
+                PathBuf::from(&o.project_dir), PathBuf::from(&o.repo_dir), tmp_root.clone(),
+            ];
+            for path in [o.state_dir.as_deref(), o.receipts_dir.as_deref()].into_iter().flatten() {
+                package_protection.push(PathBuf::from(path));
+            }
+            package_protection.extend(o.task_workspace_dir.as_deref().map(PathBuf::from));
+            if let Some((root, _)) = &default_receipts {
+                package_protection.push(root.clone());
+                package_protection.push(crate::receipt_archive::archive_dir(root));
+            }
+            Some(sandbox::package_store_paths(&package_protection, Some(&o.ceiling)).map_err(err)?)
+        } else {
+            None
+        };
         if let Some(state) = state_dir.as_deref() {
             if !state.is_dir() {
                 return Err(err(format!("state directory is not a directory: {}", state.display())));
             }
         }
+        let project_layout = util::resolve(Path::new(&o.project_dir));
+        let repo_layout = util::resolve(Path::new(&o.repo_dir));
+        let receipts_layout = o.receipts_dir.as_deref().map(|path| util::resolve(Path::new(path)))
+            .or_else(|| default_receipts.as_ref().map(|(root, _)| root.clone()));
         let mut protected_layout = Vec::new();
+        protected_layout.push(("project directory", project_layout.as_path()));
+        protected_layout.push(("repository directory", repo_layout.as_path()));
         if let Some(tw) = task_workspace.as_deref() { protected_layout.push(("task workspace", tw)); }
         if let Some(state) = state_dir.as_deref() { protected_layout.push(("persistent state directory", state)); }
-        protected_layout.push(("persistent package store", package_store.root.as_path()));
+        if let Some(package_store) = package_store.as_ref() {
+            protected_layout.push(("persistent package store", package_store.root.as_path()));
+        }
+        if let Some(receipts) = receipts_layout.as_deref() {
+            protected_layout.push(("receipts directory", receipts));
+        }
         let team_lab = crate::teamlab::ceiling_dir(&o.ceiling);
         if let Some(lab) = team_lab.as_deref() { protected_layout.push(("team lab", lab)); }
         // Resolve the future scratch path before creating it so rejecting a
         // caller-owned workspace or durable state cannot transfer it to recursive cleanup.
         let planned_root = util::resolve(&tmp_root);
         if !protected_layout.is_empty() {
-            sandbox::check_writable_mounts_disjoint(
-                &[("session scratch root", planned_root.as_path())],
-                &protected_layout,
-            ).map_err(err)?;
+            check_scratch_cleanup_root(planned_root.as_path(), &protected_layout).map_err(err)?;
         }
         if o.scratch_root.is_none() {
             // Default session roots of hosts that were killed before their teardown ran.
@@ -228,10 +288,7 @@ impl PaletteSession {
                     return Err(err(e.to_string()));
                 }
             };
-            if let Err(e) = sandbox::check_writable_mounts_disjoint(
-                &[("session scratch root", root.as_path())],
-                &protected_layout,
-            ) {
+            if let Err(e) = check_scratch_cleanup_root(root.as_path(), &protected_layout) {
                 // Only remove a new, still-empty directory at the path we
                 // resolved before creation; never recurse into caller data.
                 if !tmp_root_existed && root == util::resolve(&tmp_root) {
@@ -257,8 +314,13 @@ impl PaletteSession {
         };
         let workspace = workspace.to_string_lossy().into_owned();
 
-        let depot_clone = sandbox::create_session_depot(None).map_err(err)?;
-        cleanser.depot_clone = Some(depot_clone.clone());
+        let depot_clone = if o.mode == SessionMode::Sandbox {
+            let depot = sandbox::create_session_depot(None).map_err(err)?;
+            cleanser.depot_clone = Some(depot.clone());
+            Some(depot)
+        } else {
+            None
+        };
 
         // The socket accepts any local user, so its directory is private.
         // A Unix socket path is limited to 108 bytes; under a long HOME the
@@ -284,72 +346,118 @@ impl PaletteSession {
         let writable_state = state_dir;
         let mut writable = vec![("workspace", writable_workspace.as_path())];
         if let Some(state) = writable_state.as_deref() { writable.push(("state directory", state)); }
-        let mut protected = vec![("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path()),
-                                 ("persistent package store", package_store.root.as_path())];
-        if let Some(lab) = team_lab.as_deref() {
-            protected.push(("team lab", lab));
-            sandbox::check_hidden_from_read_roots("team lab", lab).map_err(err)?;
-        }
-        sandbox::check_writable_mounts_disjoint(&writable, &protected).map_err(err)?;
-        let commands = sandbox::protected_command_paths(&o.ceiling);
-        for (name, path) in &writable {
-            if let Some(hit) = sandbox::command_overlap(path, &commands) {
-                return Err(err(format!("writable {name} mount {} overlaps the protected host-command path {}", path.display(), hit.display())));
+        if o.mode == SessionMode::Sandbox {
+            let package_store = package_store.as_ref().ok_or_else(|| err("sandbox mode requires a package store".into()))?;
+            let mut protected = vec![("private broker", private_broker.as_path()), ("broker receipts", private_receipts.as_path()),
+                                     ("persistent package store", package_store.root.as_path())];
+            if let Some(lab) = team_lab.as_deref() {
+                protected.push(("team lab", lab));
+                sandbox::check_hidden_from_read_roots("team lab", lab).map_err(err)?;
+            }
+            sandbox::check_writable_mounts_disjoint(&writable, &protected).map_err(err)?;
+            let commands = sandbox::protected_command_paths(&o.ceiling);
+            for (name, path) in &writable {
+                if let Some(hit) = sandbox::command_overlap(path, &commands) {
+                    return Err(err(format!("writable {name} mount {} overlaps the protected host-command path {}", path.display(), hit.display())));
+                }
             }
         }
         let receipts = receipts_root.join("receipts.jsonl");
-        let broker = Arc::new(Broker::new(BrokerConfig {
+        let mut broker = Broker::new(BrokerConfig {
             ceiling: o.ceiling.clone(),
             receipt_log_path: receipts,
             session_id: session_id.to_string(),
-            package_depot_dir: Some(package_store.depot.to_string_lossy().into_owned()),
-            package_environment_dir: Some(package_store.environment.to_string_lossy().into_owned()),
+            package_depot_dir: package_store.as_ref().map(|p| p.depot.to_string_lossy().into_owned()),
+            package_environment_dir: package_store.as_ref().map(|p| p.environment.to_string_lossy().into_owned()),
             project_dir: Some(o.project_dir.clone()),
             repo_dir: Some(o.repo_dir.clone()),
             trusted_files: o.ceiling_file.iter().cloned().collect(),
             // Leaves the child's own shutdown and the reply time to land inside the call.
             child_timeout: Duration::from_secs_f64((o.turn_timeout - 10.0).max(5.0)),
-        }).map_err(err)?);
+        }).map_err(err)?;
+        broker.set_session_context(o.mode, PathBuf::from(&workspace), o.config_revision.clone());
+        let broker = Arc::new(broker);
         let server = broker::serve(&sock_dir.join("broker.sock"), broker.clone()).map_err(err)?;
 
         let julia = sandbox::resolve_julia().map_err(err)?;
-        let depot = sandbox::default_depot();
-        let sock_dir_s = sock_dir.to_string_lossy().into_owned();
-        let depot_clone_s = depot_clone.to_string_lossy().into_owned();
-        let mut argv = sandbox::build_bwrap_argv(&SandboxSpec {
-            workspace_dir: &workspace,
-            broker_socket_dir: Some(&sock_dir_s),
-            project_dir: &o.project_dir,
-            repo_dir: &o.repo_dir,
-            julia_bin: &julia,
-            julia_depot: &depot,
-            network_enabled: o.network_enabled,
-            depot_clone_dir: Some(&depot_clone_s),
-            package_store_root: Some(package_store.root.to_str().ok_or_else(|| err("package store path is not valid UTF-8".into()))?),
-            package_depot_dir: Some(package_store.depot.to_str().ok_or_else(|| err("package depot path is not valid UTF-8".into()))?),
-            package_environment_dir: Some(package_store.environment.to_str().ok_or_else(|| err("package environment path is not valid UTF-8".into()))?),
-            state_dir: o.state_dir.as_deref(),
-        }).map_err(err)?;
-        let mut setenv = |k: &str, v: String| argv.extend(["--setenv".to_string(), k.to_string(), v]);
-        setenv("PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette".into());
-        setenv("PALETTE_TURN_TIMEOUT", util::fmt_g(o.turn_timeout));
-        setenv("PALETTE_MAX_TURN_TIMEOUT", util::fmt_g(o.max_turn_timeout));
-        for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS"] {
-            if let Ok(v) = std::env::var(name) {
-                setenv(name, v);
-            }
-        }
         let loop_script = Path::new(&o.repo_dir).join("runtime/scripts").join("session_loop.jl");
-        argv.extend(["--".into(), julia, "--startup-file=no".into(), loop_script.to_string_lossy().into_owned()]);
-
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut command = match o.mode {
+            SessionMode::Sandbox => {
+                let package_store = package_store.as_ref().ok_or_else(|| err("sandbox mode requires a package store".into()))?;
+                let depot = sandbox::default_depot();
+                let sock_dir_s = sock_dir.to_string_lossy().into_owned();
+                let depot_clone_s = depot_clone.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let mut argv = sandbox::build_bwrap_argv(&SandboxSpec {
+                    workspace_dir: &workspace,
+                    broker_socket_dir: Some(&sock_dir_s),
+                    project_dir: &o.project_dir,
+                    repo_dir: &o.repo_dir,
+                    julia_bin: &julia,
+                    julia_depot: &depot,
+                    network_enabled: o.network_enabled,
+                    depot_clone_dir: depot_clone_s.as_deref(),
+                    package_store_root: Some(package_store.root.to_str().ok_or_else(|| err("package store path is not valid UTF-8".into()))?),
+                    package_depot_dir: Some(package_store.depot.to_str().ok_or_else(|| err("package depot path is not valid UTF-8".into()))?),
+                    package_environment_dir: Some(package_store.environment.to_str().ok_or_else(|| err("package environment path is not valid UTF-8".into()))?),
+                    state_dir: o.state_dir.as_deref(),
+                }).map_err(err)?;
+                let mut setenv = |k: &str, v: String| argv.extend(["--setenv".to_string(), k.to_string(), v]);
+                setenv("PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette".into());
+                setenv("PALETTE_MODE", o.mode.as_str().into());
+                setenv("PALETTE_TURN_TIMEOUT", util::fmt_g(o.turn_timeout));
+                setenv("PALETTE_MAX_TURN_TIMEOUT", util::fmt_g(o.max_turn_timeout));
+                if let Some(revision) = &o.config_revision {
+                    setenv("PALETTE_CONFIG_REVISION", revision.clone());
+                }
+                for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS"] {
+                    if let Ok(v) = std::env::var(name) {
+                        setenv(name, v);
+                    }
+                }
+                argv.extend(["--".into(), julia.clone(), "--startup-file=no".into(), loop_script.to_string_lossy().into_owned()]);
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                command
+            }
+            SessionMode::Operator => {
+                let package_environment = package_store.as_ref().map(|store| store.environment.to_string_lossy().into_owned());
+                let package_depot = package_store.as_ref().map(|store| store.depot.to_string_lossy().into_owned());
+                let operator_env = sandbox::operator_julia_env(
+                    &o.repo_dir, &o.project_dir, package_depot.as_deref(), package_environment.as_deref());
+                let provenance = std::env::var_os("PALETTE_PROVENANCE_DIR").map(PathBuf::from)
+                    .unwrap_or_else(|| tmp_root.join("home").join(".palette"));
+                let mut command = Command::new(&julia);
+                command.args(["--startup-file=no"]).arg(&loop_script)
+                    .current_dir(&workspace)
+                    .env("PALETTE_BROKER_SOCKET", sock_dir.join("broker.sock"))
+                    .env("PALETTE_PROVENANCE_DIR", provenance)
+                    .env("PALETTE_TURN_TIMEOUT", util::fmt_g(o.turn_timeout))
+                    .env("PALETTE_MAX_TURN_TIMEOUT", util::fmt_g(o.max_turn_timeout))
+                    .env_remove("PALETTE_STATE_DIR")
+                    .env_remove("PALETTE_PACKAGE_ENVIRONMENT")
+                    .env_remove("PALETTE_CONFIG_REVISION");
+                command.envs(&operator_env);
+                if let Some(state) = &o.state_dir {
+                    command.env("PALETTE_STATE_DIR", state);
+                }
+                if let Some(revision) = &o.config_revision {
+                    command.env("PALETTE_CONFIG_REVISION", revision);
+                }
+                command
+            }
+        };
+        if o.mode == SessionMode::Operator {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| err(format!("starting the worker: {e}")))?;
         let stdin = child.stdin.take();
+        let worker_pgid = (o.mode == SessionMode::Operator).then_some(child.id() as i32);
         // Nothing else reads the worker's stderr; left undrained, 64 KiB of
         // warnings fills the pipe and blocks the worker mid-call.
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -395,6 +503,8 @@ impl PaletteSession {
         let mut s = PaletteSession {
             session_id: session_id.to_string(),
             epoch: String::new(),
+            mode: o.mode,
+            config_revision: o.config_revision.clone(),
             capabilities: json!({}),
             broker,
             turn_timeout: o.turn_timeout,
@@ -408,19 +518,19 @@ impl PaletteSession {
             cleanser: std::mem::take(cleanser),
             closed: false,
             stop,
+            worker_pgid,
         };
         let hello = match s.read_line(Duration::from_secs_f64(o.startup_timeout)) {
             Ok(Some(l)) => l,
             Ok(None) => {
-                let _ = s.child.wait();
+                let _ = s.stop_worker();
                 std::thread::sleep(Duration::from_millis(200));
                 let tail = util::tail(&s.stderr_tail.lock().unwrap(), 2000);
                 s.teardown();
                 return Err(dead(format!("worker exited before HELLO: {tail}")));
             }
             Err(_) => {
-                let _ = s.child.kill();
-                let _ = s.child.wait();
+                s.stop_worker();
                 s.teardown();
                 return Err(dead(format!("worker did not produce HELLO within {}s", util::fmt_g(o.startup_timeout))));
             }
@@ -461,9 +571,10 @@ impl PaletteSession {
         if self.closed {
             return Err(dead(format!("session {} was explicitly closed", self.session_id)));
         }
-        if let Ok(Some(st)) = self.child.try_wait() {
+        if !self.worker_running() {
+            let st = self.stop_worker();
             return Err(dead(format!("session {} worker process exited (code {}) since epoch {} was issued",
-                                    self.session_id, st.code().unwrap_or(-1), self.epoch)));
+                                    self.session_id, st.and_then(|s| s.code()).unwrap_or(-1), self.epoch)));
         }
         // A scratch call's broker child is bounded by the session default, so
         // it never runs under a different limit.
@@ -511,15 +622,14 @@ impl PaletteSession {
             Err(Wait::TimedOut) => {
                 // Killed, not left pending: its eventual answer would be read
                 // as the next call's.
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.stop_worker();
                 return Err(dead(format!(
                     "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. {}",
                     util::fmt_g(limit), after_kernel_stop(self.revives))));
             }
         };
         let Some(line) = line else {
-            let st = self.child.wait().ok();
+            let st = self.stop_worker();
             std::thread::sleep(Duration::from_millis(200));
             let tail = util::tail(&self.stderr_tail.lock().unwrap(), 2000).trim().to_string();
             let code = st.and_then(|s| s.code()).map(|c| c.to_string()).unwrap_or_else(|| "None".into());
@@ -530,8 +640,7 @@ impl PaletteSession {
             Ok(v) => v,
             Err(_) => {
                 // The channel is out of sync; nothing after this can be trusted.
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.stop_worker();
                 return Err(dead(format!("session {} sent a non-JSON protocol line: {:?}", self.session_id, util::head(&line, 200))));
             }
         };
@@ -546,6 +655,7 @@ impl PaletteSession {
         // the call caused reaches it through session_request.
         if let Err(e) = self.broker.record_call(json!({
             "session_id": self.session_id, "epoch": self.epoch, "session_request": session_request, "kind": kind,
+            "mode": self.mode.as_str(), "config_revision": self.config_revision.clone(),
             "call": resp.get("call").cloned().unwrap_or(Value::Null), "started": started, "finished": util::now_secs(),
             "success": resp.get("success").and_then(Value::as_bool).unwrap_or(false),
             "context": resp.pointer("/costs/context").cloned().unwrap_or(Value::Null),
@@ -556,28 +666,48 @@ impl PaletteSession {
             // The worker answered and then exited on purpose; waiting here
             // means the next call cannot race that exit.
             let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+            while Instant::now() < deadline && self.worker_running() {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            self.stop_worker();
             return Err(dead(resp.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()).unwrap_or("the kernel stopped").to_string()));
         }
         Ok(resp)
     }
 
+    fn worker_running(&mut self) -> bool {
+        if self.worker_pgid.is_some() {
+            !sandbox::exited_unreaped(self.child.id() as i32, false).unwrap_or(true)
+        } else {
+            matches!(self.child.try_wait(), Ok(None))
+        }
+    }
+
+    fn stop_worker(&mut self) -> Option<ExitStatus> {
+        if let Some(pgid) = self.worker_pgid.take() {
+            sandbox::kill_process_group(pgid);
+        }
+        let _ = self.child.kill();
+        self.child.wait().ok()
+    }
+
     fn teardown(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
+        let mut running = self.worker_running();
+        if running {
             // EOF lets the kernel finish saving the last call's state, which
             // for a new data type means compiling its serializer.
             drop(self.stdin.take());
             let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+            while Instant::now() < deadline && running {
                 std::thread::sleep(Duration::from_millis(50));
+                running = self.worker_running();
             }
-            let _ = self.child.kill();
         }
-        let _ = self.child.wait();
+        if running || self.worker_pgid.is_some() {
+            self.stop_worker();
+        } else {
+            let _ = self.child.wait();
+        }
         drop(self.stdin.take());
         if let Some(s) = self.server.take() {
             s.shutdown();

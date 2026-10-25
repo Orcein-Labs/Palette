@@ -1,10 +1,9 @@
-//! The first trust domain: a bubblewrap sandbox around an unrestricted
-//! `julia`. Full language power inside, bounded by the OS outside it. Paths
-//! are bound at the same guest path as on the host, because Julia's manifests
-//! and precompile caches embed absolute paths. Each worker gets its own
-//! reflink clone of the prepared depot as its first writable entry. A later
-//! read-only operator package depot exposes broker-installed packages; the
-//! full prepared clone remains first so Julia's cached stdlib build ids match.
+//! OS-contained worker helpers for explicit sandbox mode. Julia keeps full
+//! language power inside bubblewrap while the OS bounds its view. Paths are
+//! bound at the same guest path as on the host, because Julia's manifests and
+//! precompile caches embed absolute paths. Each sandbox worker gets its own
+//! reflink clone of the prepared depot as its first writable entry. Operator
+//! workers use the host environment and are launched directly by `session.rs`.
 
 use crate::receipt_archive;
 use crate::util;
@@ -19,7 +18,7 @@ pub const SANDBOX_USER: &str = "palette";
 /// The sandbox sets these itself; a task environment cannot move them.
 const SANDBOX_OWNED_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "JULIA_DEPOT_PATH", "JULIA_PROJECT", "JULIA_LOAD_PATH",
-    "JULIA_PKG_OFFLINE", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
+    "JULIA_PKG_OFFLINE", "PALETTE_MODE", "PALETTE_CONFIG_REVISION", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
     "PALETTE_TRUSTED_TOOLS",
 ];
 
@@ -56,9 +55,64 @@ fn primary_depot(value: Option<&str>, fallback: &Path) -> String {
         .unwrap_or_else(|| fallback.to_string_lossy().into_owned())
 }
 
+fn operator_load_path(configured: Option<&str>, repo_dir: &str, package_environment: Option<&str>) -> Vec<String> {
+    let defaults = ["@", "@v#.#", "@stdlib"];
+    let configured = configured.filter(|p| !p.is_empty()).unwrap_or("@:@v#.#:@stdlib");
+    let mut load_path = Vec::new();
+    for entry in configured.split(':') {
+        if entry.is_empty() {
+            load_path.extend(defaults.iter().map(|entry| (*entry).to_string()));
+        } else {
+            load_path.push(entry.to_string());
+        }
+    }
+    if !load_path.iter().any(|p| p == "@") {
+        let at = load_path.iter().position(|p| p == "@v#.#" || p == "@stdlib").unwrap_or(load_path.len());
+        load_path.insert(at, "@".into());
+    }
+    if !load_path.iter().any(|p| p == repo_dir) {
+        let at = load_path.iter().position(|p| p == "@v#.#" || p == "@stdlib").unwrap_or(load_path.len());
+        load_path.insert(at, repo_dir.to_string());
+    }
+    if let Some(package_environment) = package_environment.filter(|p| !load_path.iter().any(|entry| entry == *p)) {
+        let at = load_path.iter().position(|p| p == "@stdlib").unwrap_or(load_path.len());
+        load_path.insert(at, package_environment.to_string());
+    }
+    load_path
+}
+
 pub fn default_depot() -> String {
     let configured = std::env::var("JULIA_DEPOT_PATH").ok();
     primary_depot(configured.as_deref(), &util::home().join(".julia"))
+}
+
+/// Julia's operator environment keeps the user's configured paths first and
+/// adds the active Palette checkout before Julia's global environment, so an
+/// unrelated installed Palette cannot shadow the checkout serving the call.
+pub fn operator_julia_env(
+    repo_dir: &str,
+    project_dir: &str,
+    package_depot: Option<&str>,
+    package_environment: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut depots = std::env::var("JULIA_DEPOT_PATH").ok().filter(|p| !p.is_empty()).unwrap_or_else(default_depot);
+    if let Some(package_depot) = package_depot.filter(|p| !depots.split(':').any(|d| d == *p)) {
+        depots.push(':');
+        depots.push_str(package_depot);
+    }
+
+    let load_path = operator_load_path(std::env::var("JULIA_LOAD_PATH").ok().as_deref(), repo_dir, package_environment);
+
+    let mut env = BTreeMap::new();
+    env.insert("JULIA_PROJECT".into(), project_dir.to_string());
+    env.insert("JULIA_DEPOT_PATH".into(), depots);
+    env.insert("JULIA_LOAD_PATH".into(), load_path.join(":"));
+    env.insert("PALETTE_MODE".into(), "operator".into());
+    env.insert("PALETTE_REPO_DIR".into(), repo_dir.to_string());
+    if let Some(package_environment) = package_environment {
+        env.insert("PALETTE_PACKAGE_ENVIRONMENT".into(), package_environment.to_string());
+    }
+    env
 }
 
 /// Build the isolated command for a broker-owned Pkg operation. Julia package
@@ -1368,6 +1422,41 @@ mod tests {
     }
 
     #[test]
+    fn case_operator_003_empty_load_path_entries_expand_defaults_before_global_packages() {
+        let load_path = operator_load_path(Some("/custom:"), "/palette-checkout", Some("/package-env"));
+        assert_eq!(load_path, ["/custom", "@", "/palette-checkout", "@v#.#", "/package-env", "@stdlib"]);
+        let load_path = operator_load_path(Some(":"), "/palette-checkout", None);
+        let repo = load_path.iter().position(|entry| entry == "/palette-checkout").unwrap();
+        let global = load_path.iter().position(|entry| entry == "@v#.#").unwrap();
+        assert!(repo < global);
+        let load_path = operator_load_path(Some("/custom"), "/palette-checkout", None);
+        assert_eq!(load_path, ["/custom", "@", "/palette-checkout"]);
+    }
+
+    #[test]
+    fn case_operator_004_selected_project_wins_over_inherited_project() {
+        let env = operator_julia_env("/palette-checkout", "/selected-project", None, None);
+        assert_eq!(env["JULIA_PROJECT"], "/selected-project");
+    }
+
+    #[test]
+    fn case_operator_002_captured_worker_reaps_helpers_after_its_leader_exits() {
+        let argv = vec!["/bin/sh".into(), "-c".into(), "sleep 300 & echo $!".into()];
+        let result = run_captured(&argv, None, Duration::from_secs(5)).unwrap();
+        assert_eq!(result.returncode, 0, "{}", result.stderr);
+        let pid = result.stdout.trim();
+        assert!(pid.bytes().all(|byte| byte.is_ascii_digit()), "helper pid: {pid:?}");
+        let exited = || fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z')
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(exited(), "captured worker helper {pid} outlived its leader");
+    }
+
+    #[test]
     fn case_boundary_native_001_rejects_nested_and_symlink_overlaps() {
         let root = util::mkdtemp("palette-mount-boundary-").unwrap();
         let repo = dir(&root, "repo");
@@ -2257,18 +2346,24 @@ pub struct WorkerResult {
 /// (invalid UTF-8 replaced). A timed-out child is killed.
 pub fn run_captured(argv: &[String], env: Option<&BTreeMap<String, Option<String>>>, timeout: Duration)
     -> Result<WorkerResult, String> {
-    run_captured_with_env(argv, env, timeout, false)
+    run_captured_with_env_at(argv, env, timeout, false, None)
 }
 
 pub fn run_captured_clean(argv: &[String], env: &BTreeMap<String, Option<String>>, timeout: Duration)
     -> Result<WorkerResult, String> {
-    run_captured_with_env(argv, Some(env), timeout, true)
+    run_captured_with_env_at(argv, Some(env), timeout, true, None)
 }
 
-fn run_captured_with_env(argv: &[String], env: Option<&BTreeMap<String, Option<String>>>, timeout: Duration, clear_env: bool)
+fn run_captured_with_env_at(argv: &[String], env: Option<&BTreeMap<String, Option<String>>>, timeout: Duration,
+    clear_env: bool, cwd: Option<&Path>)
     -> Result<WorkerResult, String> {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(&argv[1..]).process_group(0)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     if clear_env {
         cmd.env_clear();
     }
@@ -2293,18 +2388,29 @@ fn run_captured_with_env(argv: &[String], env: Option<&BTreeMap<String, Option<S
         let _ = err.read_to_end(&mut b);
         b
     });
+    let pid = child.id() as i32;
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
-        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
-            break st;
+        match exited_unreaped(pid, false) {
+            Ok(true) => {
+                // Keep the group leader unreaped until its helpers are gone,
+                // so its pid cannot be reused as an unrelated process group.
+                kill_group(pid);
+                break child.wait().map_err(|e| e.to_string())?;
+            }
+            Ok(false) if Instant::now() >= deadline => {
+                timed_out = true;
+                kill_group(pid);
+                break child.wait().map_err(|e| e.to_string())?;
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                kill_group(pid);
+                let _ = child.wait();
+                return Err(error);
+            }
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            break child.wait().map_err(|e| e.to_string())?;
-        }
-        std::thread::sleep(Duration::from_millis(20));
     };
     let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
@@ -2434,8 +2540,12 @@ fn kill_group(pgid: i32) {
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
+pub fn kill_process_group(pgid: i32) {
+    kill_group(pgid);
+}
+
 /// Whether `pid` has exited, without reaping it (WNOWAIT).
-fn exited_unreaped(pid: i32, block: bool) -> Result<bool, String> {
+pub(crate) fn exited_unreaped(pid: i32, block: bool) -> Result<bool, String> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let flags = libc::WEXITED | libc::WNOWAIT | if block { 0 } else { libc::WNOHANG };
     loop {
@@ -2594,6 +2704,12 @@ pub fn run_worker(r: &RunWorker) -> Result<WorkerResult, String> {
             package_environment_dir: Some(package_store.environment.to_str().ok_or("package environment path is not valid UTF-8")?),
             state_dir: None,
         })?;
+        argv.extend(["--setenv".into(), "PALETTE_MODE".into(), "sandbox".into()]);
+        if let Ok(revision) = std::env::var("PALETTE_CONFIG_REVISION") {
+            if !revision.is_empty() {
+                argv.extend(["--setenv".into(), "PALETTE_CONFIG_REVISION".into(), revision]);
+            }
+        }
         argv.extend(["--".into(), julia.clone(), "--startup-file=no".into(), "-e".into(), r.script.into()]);
         run_captured(&argv, None, r.timeout)
     })();
@@ -2601,4 +2717,36 @@ pub fn run_worker(r: &RunWorker) -> Result<WorkerResult, String> {
         remove_session_depot(&p);
     }
     result
+}
+
+/// A disposable Julia worker in operator mode. It inherits the host
+/// environment and runs in its temporary workspace without bwrap; callers
+/// choose this only when the enclosing session was explicitly started as an
+/// operator session.
+pub fn run_operator_worker(
+    r: &RunWorker,
+    package_depot: Option<&str>,
+    package_environment: Option<&str>,
+    config_revision: Option<&str>,
+) -> Result<WorkerResult, String> {
+    let julia = resolve_julia()?;
+    fs::create_dir_all(r.workspace_dir).map_err(|e| e.to_string())?;
+    let argv = vec![julia, "--startup-file=no".into(), "-e".into(), r.script.into()];
+    let mut env: BTreeMap<String, Option<String>> = operator_julia_env(
+        r.repo_dir, r.project_dir, package_depot, package_environment)
+        .into_iter().map(|(key, value)| (key, Some(value))).collect();
+    env.insert("PALETTE_CONFIG_REVISION".into(), config_revision.map(str::to_string));
+    env.insert("PALETTE_STATE_DIR".into(), None);
+    if package_environment.is_none() {
+        env.insert("PALETTE_PACKAGE_ENVIRONMENT".into(), None);
+    }
+    if let Some(socket_dir) = r.broker_socket_dir {
+        env.insert("PALETTE_BROKER_SOCKET".into(), Some(format!("{socket_dir}/broker.sock")));
+    } else {
+        env.insert("PALETTE_BROKER_SOCKET".into(), None);
+    }
+    let provenance = std::env::var_os("PALETTE_PROVENANCE_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(r.workspace_dir).join(".palette"));
+    env.insert("PALETTE_PROVENANCE_DIR".into(), Some(provenance.to_string_lossy().into_owned()));
+    run_captured_with_env_at(&argv, Some(&env), r.timeout, false, Some(Path::new(r.workspace_dir)))
 }
