@@ -38,8 +38,9 @@ Prepare Palette on Linux, register it with local clients, and check it works.
                            (default: $PALETTE_HOME/config/ceiling.json)
   --host-commands FILE     host commands file (PALETTE_HOST_COMMANDS), used when it exists; empty for none
                            (default: ~/.config/palette/host-commands.json)
-  --read-roots FILE        host directories the kernel may read (PALETTE_READ_ROOTS), one absolute path
-                           a line, used when it exists; empty for none (default: ~/.config/palette/read-roots)
+  --read-roots FILE        host directories the kernel may read, one absolute path a line; empty disables
+                           (default: ~/.config/palette/read-roots, reread on daemon reload; PALETTE_READ_ROOTS overrides)
+  --mode MODE              default execution mode: operator (default) or sandbox; PALETTE_MODE is used when omitted
   --connect-only           use a runtime already built and prewarmed; do not prepare again
   --wsl-distribution NAME  generate Windows client configuration targeting this WSL distribution
   --no-register            do not add the server to local agent clients
@@ -52,7 +53,7 @@ $PALETTE_HOME defaults to $XDG_DATA_HOME/palette, or ~/.local/share/palette.
 ";
 
 const VALUE_FLAGS: &[&str] = &[
-    "repo-dir", "output-dir", "data-dir", "depot-dir", "runtime-root", "ceiling", "host-commands", "read-roots", "wsl-distribution",
+    "repo-dir", "output-dir", "data-dir", "depot-dir", "runtime-root", "ceiling", "host-commands", "read-roots", "wsl-distribution", "mode",
 ];
 const BOOLEAN_FLAGS: &[&str] = &["help", "connect-only", "no-register", "replace", "no-check", "no-service"];
 
@@ -66,6 +67,14 @@ fn palette_home() -> PathBuf {
 
 fn config_dir() -> PathBuf {
     env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| util::home().join(".config")).join("palette")
+}
+
+fn operator_file(selection: Option<&str>, config: &Path, default: &str) -> Option<PathBuf> {
+    match selection {
+        Some("") => None,
+        Some(path) => Some(util::expand_user(path)),
+        None => Some(config.join(default)),
+    }
 }
 
 fn text(p: &Path) -> String {
@@ -512,7 +521,7 @@ fn check(launcher: &Path) -> Result<(), String> {
 
 /// The directories in a read-roots file: one absolute path a line, blank
 /// lines and lines starting with # skipped.
-fn read_roots_list(path: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn read_roots_list(path: &Path) -> Result<Vec<String>, String> {
     let mut roots = Vec::new();
     for line in fs::read_to_string(path).map_err(at(path))?.lines() {
         let entry = line.trim();
@@ -528,6 +537,23 @@ fn read_roots_list(path: &Path) -> Result<Vec<String>, String> {
         roots.push(text(&util::resolve(Path::new(entry))));
     }
     Ok(roots)
+}
+
+fn read_roots_launch_overrides(
+    requested: Option<&str>,
+    selected_file: Option<&Path>,
+    environment: Option<std::ffi::OsString>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    if let Some(value) = environment {
+        out.push(("PALETTE_READ_ROOTS".into(), value.into_string()
+            .map_err(|_| "PALETTE_READ_ROOTS must be valid UTF-8".to_string())?));
+    }
+    if let Some(requested) = requested {
+        let path = if requested.is_empty() { None } else { selected_file };
+        out.push(("PALETTE_READ_ROOTS_FILE".into(), path.map(text).unwrap_or_default()));
+    }
+    Ok(out)
 }
 
 /// The portable plugin folder a client loads: its manifest, the server entry,
@@ -648,6 +674,10 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     }
     let home = palette_home();
     let config = config_dir();
+    let mode = f.get("mode").cloned().or_else(|| std::env::var("PALETTE_MODE").ok()).unwrap_or_else(|| "operator".into());
+    if !["operator", "sandbox"].contains(&mode.as_str()) {
+        return Err("setup: --mode must be operator or sandbox".into());
+    }
     let dir = |key: &str, default: PathBuf| util::resolve(&f.get(key).map_or(default, PathBuf::from));
     let repo = util::resolve(Path::new(&f.get("repo-dir").cloned().map_or_else(cli::default_repo_dir, Ok)?));
     let output = dir("output-dir", home.join("client"));
@@ -656,21 +686,17 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     let runtime_root = dir("runtime-root", home.join("capabilities"));
     let ceiling = dir("ceiling", home.join("config/ceiling.json"));
     // An operator file, used when it exists; an empty value means none.
-    let operator_file = |key: &str, default: &str| match f.get(key) {
-        Some(s) if s.is_empty() => None,
-        Some(s) => Some(util::expand_user(s)),
-        None => Some(config.join(default)),
-    };
-    let host_commands = operator_file("host-commands", "host-commands.json").map(|p| util::resolve(&p)).filter(|p| p.is_file());
-    let read_roots = match operator_file("read-roots", "read-roots").filter(|p| p.is_file()) {
+    let selected_file = |key: &str, default: &str| operator_file(f.get(key).map(String::as_str), &config, default);
+    let host_commands = selected_file("host-commands", "host-commands.json").map(|p| util::resolve(&p)).filter(|p| p.is_file());
+    let read_roots_file = selected_file("read-roots", "read-roots").map(|p| util::resolve(&p));
+    let read_roots = match read_roots_file.as_ref().filter(|p| p.is_file()) {
         Some(p) => read_roots_list(&p)?,
         None => Vec::new(),
     };
-    let mut tools = Vec::new();
-    for name in ["julia", "bwrap"] {
-        tools.push(util::which(name).ok_or_else(|| format!("missing prerequisite on PATH: {name}"))?);
+    let julia = util::which("julia").ok_or_else(|| "missing prerequisite on PATH: julia".to_string())?;
+    if mode == "sandbox" && util::which("bwrap").is_none() {
+        return Err("missing prerequisite on PATH: bwrap (needed for sandbox mode)".into());
     }
-    let julia = &tools[0];
     if !repo.join("Project.toml").is_file() {
         return Err(format!("not a Palette SDK: {}", repo.display()));
     }
@@ -698,6 +724,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
         ("PALETTE_PACKAGE_DEPOT", text(&data.join("packages"))),
         ("PALETTE_RUNTIME_ROOT", text(&runtime_root)),
         ("PALETTE_CAPABILITY_CEILING", text(&ceiling)),
+        ("PALETTE_MODE", mode.clone()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -705,11 +732,14 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
     if let Some(p) = &host_commands {
         launch_env.push(("PALETTE_HOST_COMMANDS".into(), text(p)));
     }
-    if !read_roots.is_empty() {
-        launch_env.push(("PALETTE_READ_ROOTS".into(), read_roots.join(":")));
-    }
+    launch_env.extend(read_roots_launch_overrides(f.get("read-roots").map(String::as_str),
+        read_roots_file.as_deref(), std::env::var_os("PALETTE_READ_ROOTS"))?);
     launch_env.push(("JULIA_DEPOT_PATH".into(), text(&depot)));
-    launch_env.push(("JULIA_PKG_OFFLINE".into(), "true".into()));
+    if let Some(offline) = std::env::var("JULIA_PKG_OFFLINE").ok()
+        .or_else(|| (mode == "sandbox").then(|| "true".into()))
+    {
+        launch_env.push(("JULIA_PKG_OFFLINE".into(), offline));
+    }
     // The kernel is a numeric workbench: all cores unless the operator says otherwise.
     launch_env.push(("JULIA_NUM_THREADS".into(), std::env::var("JULIA_NUM_THREADS").ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "auto".into())));
     launch_env.push(("PATH".into(), format!("{}:{SYSTEM_PATH}", text(julia.parent().expect("a file on PATH")))));
@@ -736,12 +766,12 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
                     return Err("This source has no prebuilt host: install Rust (https://rustup.rs) or use the release installer".into());
                 }
                 let manifest = text(&repo.join("runtime/host/Cargo.toml"));
-                step("Building the sandbox host", &args(&["cargo", "build", "--manifest-path", &manifest, "--release", "--locked"]), &env, false)?;
+                step("Building the Palette host", &args(&["cargo", "build", "--manifest-path", &manifest, "--release", "--locked"]), &env, false)?;
             }
             let mut offline = env.clone();
             offline.push(("JULIA_PKG_OFFLINE".into(), "true".into()));
             step(
-                "Preparing the sandbox (the first run takes several minutes)",
+                if mode == "sandbox" { "Preparing the sandbox (the first run takes several minutes)" } else { "Preparing the operator runtime (the first run takes several minutes)" },
                 &args(&[&text(&host), "prepare", "--project-dir", &text(&repo)]),
                 &offline,
                 true,
@@ -849,6 +879,49 @@ mod tests {
         for bad in ["it's", "a\\b", "a\nb"] {
             assert!(env(&[("PALETTE_READ_ROOTS", bad)]).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn canonical_read_roots_are_parsed_without_becoming_an_environment_override() {
+        let root = tmp();
+        let one = root.join("one");
+        let two = root.join("two");
+        fs::create_dir_all(&one).unwrap();
+        fs::create_dir_all(&two).unwrap();
+        let file = root.join("read-roots");
+        fs::write(&file, format!("# comment\n{}\n\n{}\n", one.display(), two.display())).unwrap();
+        assert_eq!(read_roots_list(&file).unwrap(), vec![text(&util::resolve(&one)), text(&util::resolve(&two))]);
+
+        // An explicit process environment value is the only read-roots value
+        // the setup launcher persists; the canonical file stays live config.
+        let canonical = read_roots_launch_overrides(None, Some(&file), None).unwrap();
+        assert!(canonical.is_empty());
+        let custom = read_roots_launch_overrides(Some(file.to_str().unwrap()), Some(&file), None).unwrap();
+        assert_eq!(custom, [("PALETTE_READ_ROOTS_FILE".into(), file.to_string_lossy().into_owned())]);
+        let absent = root.join("created-later");
+        let selected = read_roots_launch_overrides(Some(absent.to_str().unwrap()), Some(&absent), None).unwrap();
+        assert_eq!(selected, [("PALETTE_READ_ROOTS_FILE".into(), absent.to_string_lossy().into_owned())]);
+        let disabled = read_roots_launch_overrides(Some(""), None, None).unwrap();
+        assert_eq!(disabled, [("PALETTE_READ_ROOTS_FILE".into(), String::new())]);
+        let override_env = read_roots_launch_overrides(None, Some(&file), Some("/explicit".into())).unwrap();
+        assert_eq!(override_env, [("PALETTE_READ_ROOTS".into(), "/explicit".into())]);
+
+        // Exercise the same selection helper used by setup's --read-roots
+        // option: an explicit empty value cannot fall back to the canonical
+        // file, and an explicit custom path stays the selected source.
+        let options = root.join("options");
+        fs::create_dir_all(&options).unwrap();
+        fs::write(options.join("read-roots"), format!("{}\n", one.display())).unwrap();
+        let parsed = |value: &str| {
+            let argv = ["--read-roots".to_string(), value.to_string()];
+            crate::flags(&argv, BOOLEAN_FLAGS).unwrap()
+        };
+        assert_eq!(operator_file(None, &options, "read-roots"), Some(options.join("read-roots")));
+        let none = parsed("");
+        assert_eq!(operator_file(none.get("read-roots").map(String::as_str), &options, "read-roots"), None);
+        let custom = parsed(file.to_str().unwrap());
+        assert_eq!(operator_file(custom.get("read-roots").map(String::as_str), &options, "read-roots"), Some(file.clone()));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

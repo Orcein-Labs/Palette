@@ -30,12 +30,13 @@ usage: palette-host serve init|inspect|prepare|launch|client --profile P [option
   --depot D         prepared Julia depot (init; default /var/cache/palette/depot)
   --ceiling C       host-owned ceiling file (init; default /etc/palette/ceiling.json)
   --runtime-root R  installed capability manifests (init; default /opt/palette-capabilities)
+  --mode M          default execution mode: operator (default) or sandbox
   --ssh-target T    user@host the client connects to (client)
 ";
 
-const VALUE_FLAGS: &[&str] = &["profile", "repo", "data", "depot", "ceiling", "runtime-root", "ssh-target"];
+const VALUE_FLAGS: &[&str] = &["profile", "repo", "data", "depot", "ceiling", "runtime-root", "ssh-target", "mode"];
 const FIELDS: &[&str] = &[
-    "format", "repo", "data", "depot", "ceiling", "runtime_root", "host_commands", "read_roots", "repair_config",
+    "format", "repo", "data", "depot", "ceiling", "runtime_root", "mode", "host_commands", "read_roots", "repair_config",
     "patch_roots", "turn_timeout", "max_turn_timeout",
 ];
 const HOST: &str = "runtime/host/target/release/palette-host";
@@ -48,6 +49,7 @@ struct Profile {
     depot: PathBuf,
     ceiling: PathBuf,
     runtime_root: PathBuf,
+    mode: String,
     host_commands: Option<PathBuf>,
     repair_config: Option<PathBuf>,
     patch_roots: Map<String, Value>,
@@ -112,6 +114,13 @@ fn load_profile(path: &Path) -> Result<Profile, String> {
     };
     let field = |key: &str| absolute(profile.get(key), key);
     let (repo, data, depot, ceiling, runtime_root) = (field("repo")?, field("data")?, field("depot")?, field("ceiling")?, field("runtime_root")?);
+    let mode = match profile.get("mode") {
+        None => "operator",
+        Some(Value::String(mode)) if mode == "operator" => "operator",
+        Some(Value::String(mode)) if mode == "sandbox" => "sandbox",
+        _ => return Err("mode must be operator or sandbox".into()),
+    }
+    .to_string();
     // Configuration, source, packages and saved worlds cannot enter a worker's
     // writable workspace. These checks happen before creating any directories.
     disjoint(
@@ -152,7 +161,7 @@ fn load_profile(path: &Path) -> Result<Profile, String> {
         Some(_) => return Err("read_roots must be a list".into()),
     };
     let turn_limits = turn_limits(&profile)?;
-    Ok(Profile { profile: profile_path, repo, data, depot, ceiling, runtime_root, host_commands, repair_config, patch_roots, read_roots, turn_limits })
+    Ok(Profile { profile: profile_path, repo, data, depot, ceiling, runtime_root, mode, host_commands, repair_config, patch_roots, read_roots, turn_limits })
 }
 
 /// The runtime's whole environment. Transport and model credentials, and any
@@ -175,6 +184,7 @@ fn environment(p: &Profile) -> Result<Vec<(String, String)>, String> {
     set("PALETTE_PACKAGE_DEPOT", &d.join("packages"))?;
     set("PALETTE_CAPABILITY_CEILING", &p.ceiling)?;
     set("PALETTE_RUNTIME_ROOT", &p.runtime_root)?;
+    set("PALETTE_MODE", Path::new(&p.mode))?;
     set("JULIA_DEPOT_PATH", &p.depot)?;
     if let Some(h) = &p.host_commands {
         set("PALETTE_HOST_COMMANDS", h)?;
@@ -189,18 +199,27 @@ fn environment(p: &Profile) -> Result<Vec<(String, String)>, String> {
     if !p.patch_roots.is_empty() {
         env.push(("PALETTE_PATCH_ROOTS".into(), Value::Object(p.patch_roots.clone()).to_string()));
     }
-    env.push(("JULIA_PKG_OFFLINE".into(), "true".into()));
+    if let Some(offline) = std::env::var("JULIA_PKG_OFFLINE")
+        .ok()
+        .or_else(|| (p.mode == "sandbox").then(|| "true".into()))
+    {
+        env.push(("JULIA_PKG_OFFLINE".into(), offline));
+    }
     env.push(("PALETTE_TURN_TIMEOUT".into(), util::fmt_g(p.turn_limits.0)));
     env.push(("PALETTE_MAX_TURN_TIMEOUT".into(), util::fmt_g(p.turn_limits.1)));
     Ok(env)
 }
 
 /// First-time provisioning is an administrator action, before the sandbox
-/// opens. Interactive workers keep offline package networking afterwards.
+/// opens. Sandbox workers stay offline afterwards; operator workers use the
+/// user's Julia package setting or Julia's default.
 fn prepare(p: &Profile) -> Result<(), String> {
     let mut tools = HashMap::new();
-    for name in ["julia", "cargo", "bwrap"] {
+    for name in ["julia", "cargo"] {
         tools.insert(name, util::which(name).ok_or_else(|| format!("Missing server prerequisite: {name}"))?);
+    }
+    if p.mode == "sandbox" {
+        tools.insert("bwrap", util::which("bwrap").ok_or_else(|| "Missing server prerequisite: bwrap (needed for sandbox mode)".to_string())?);
     }
     for dir in [&p.data, &p.depot, &p.runtime_root] {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -236,10 +255,15 @@ fn init(path: &Path, f: &HashMap<String, String>) -> Result<(), String> {
         ("ceiling", get("ceiling", "/etc/palette/ceiling.json")),
         ("runtime_root", get("runtime-root", "/opt/palette-capabilities")),
     ];
+    let mode = f.get("mode").map(String::as_str).unwrap_or("operator");
+    if !["operator", "sandbox"].contains(&mode) {
+        return Err("mode must be operator or sandbox".into());
+    }
     let mut body = String::from("{\n  \"format\": 1,\n");
     for (k, v) in &fields {
         body += &format!("  \"{k}\": {},\n", Value::from(v.as_str()));
     }
+    body += &format!("  \"mode\": {},\n", Value::from(mode));
     body += "  \"read_roots\": []\n}\n";
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -286,7 +310,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
         "init" | "inspect" => println!(
             "{}",
             json!({"profile": text(&p.profile)?, "repo": text(&p.repo)?, "workspace": text(&p.data.join("workspace"))?,
-                   "state": text(&p.data.join("state"))?, "compute": "server", "edge_required": false})
+                   "state": text(&p.data.join("state"))?, "compute": "server", "edge_required": false, "default_mode": p.mode})
         ),
         "prepare" => prepare(&p)?,
         "client" => {
@@ -365,6 +389,9 @@ mod tests {
         assert!(f.load(json!({"repo": "opt/palette"})).unwrap_err().contains("repo must be an absolute server path"));
         assert_eq!(f.load(json!({"extra": 1})).err().unwrap(), "Unsupported server profile");
         assert_eq!(f.load(json!({"format": 2})).err().unwrap(), "Unsupported server profile");
+        for invalid_mode in [json!(null), json!(1), json!("unexpected")] {
+            assert_eq!(f.load(json!({"mode": invalid_mode})).unwrap_err(), "mode must be operator or sandbox");
+        }
         let mut no_repo = f.base();
         no_repo.remove("repo");
         fs::write(f.root.join("p.json"), Value::Object(no_repo).to_string()).unwrap();
