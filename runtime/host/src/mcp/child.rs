@@ -197,7 +197,8 @@ fn receive(frames: &Frames, deadline: Instant) -> Result<Value, Fault> {
     let wait = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
     match frames.recv_timeout(wait) {
         Ok(item) => item,
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(Fault::new("Empty", "")),
+        Err(RecvTimeoutError::Timeout) => Err(Fault::new("Timeout", "Timed out waiting for a Julia worker response.")),
+        Err(RecvTimeoutError::Disconnected) => Err(Fault::new("EOFError", "Julia worker closed stdout before replying.")),
     }
 }
 
@@ -275,7 +276,7 @@ pub(crate) fn project_result(event: &Map<String, Value>, full: bool, ephemeral: 
     result
 }
 
-pub(crate) const PALETTE_DESCRIPTION: &str = "Persistent Julia Palette through the Rust sandbox. Payload carries text verbatim. \
+pub(crate) const PALETTE_DESCRIPTION: &str = "Persistent Julia Palette in the selected operator or sandbox mode (operator is the default). Payload carries text verbatim. \
 Scratch runs in a disposable process. Replies default to quiet; view=full retains response metadata. Inspect varinfo(), \
 Api.provenance(:name), Api.changes(), Api.jobs(), and Api.costs() on demand. Offline preparation and existing state revival \
 are wired; inspect restoration evidence after any epoch change. ";
@@ -322,6 +323,8 @@ struct Adapter {
     ceiling: Value,
     limits: (f64, f64),
     workspace_id: String,
+    mode: String,
+    configured_revision: Option<String>,
     registry: Registry,
     repair: Arc<RepairBroker>,
 
@@ -404,6 +407,11 @@ impl Adapter {
         let (repo, host) = repo_and_host()?;
         let workspace = env("OPERATOR_WORKSPACE").ok_or("KeyError: 'OPERATOR_WORKSPACE'")?;
         let workspace = util::absolute(Path::new(&workspace)).to_string_lossy().into_owned();
+        let mode = env("PALETTE_MODE").unwrap_or_else(|| "operator".into());
+        if !matches!(mode.as_str(), "operator" | "sandbox") {
+            return Err("ValueError: PALETTE_MODE must be operator or sandbox".into());
+        }
+        let configured_revision = env("PALETTE_CONFIG_REVISION");
         let state_dir = util::absolute(&env("PALETTE_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| default_state_dir(&workspace)));
         let receipts_dir = receipts_dir(&state_dir);
         let ceiling = provisioning::with_teamlab(provisioning::operator_ceiling(env)?, env)?;
@@ -434,6 +442,8 @@ impl Adapter {
             ceiling,
             limits,
             workspace_id: env("PALETTE_WORKSPACE_ID").unwrap_or_else(|| "default".into()),
+            mode,
+            configured_revision,
             registry,
             repair: Arc::new(repair),
             proc: None,
@@ -453,6 +463,16 @@ impl Adapter {
         self.hello.as_ref().map(|h| get(h, "epoch").clone()).unwrap_or(Value::Null)
     }
 
+    fn effective_mode(&self) -> String {
+        self.hello.as_ref().and_then(|hello| hello.get("mode")).and_then(Value::as_str)
+            .unwrap_or(&self.mode).to_string()
+    }
+
+    fn effective_config_revision(&self) -> Option<String> {
+        self.hello.as_ref().and_then(|hello| hello.get("config_revision")).and_then(Value::as_str)
+            .map(str::to_string).or_else(|| self.configured_revision.clone())
+    }
+
     fn send(&self, message: &Value) -> Result<(), Fault> {
         let mut live = self.live.lock().unwrap();
         let stdin = live.stdin.as_mut().ok_or_else(|| Fault::value("I/O operation on closed file."))?;
@@ -463,7 +483,7 @@ impl Adapter {
     fn receive(&self, deadline: Instant) -> Result<Value, Fault> {
         match &self.frames {
             Some(frames) => receive(frames, deadline),
-            None => Err(Fault::new("Empty", "")),
+            None => Err(Fault::new("EOFError", "Julia worker has no response stream.")),
         }
     }
 
@@ -486,7 +506,8 @@ impl Adapter {
     fn prepare_session(&mut self) -> Result<Value, Fault> {
         eprintln!("{}", r#"{"phase": "preparation", "state": "preparing"}"#);
         let started = Instant::now();
-        let record = preparation::prepare(Path::new(&self.repo), Path::new(&self.repo), None, Path::new(&self.host), false, None)?;
+        let record = preparation::prepare(Path::new(&self.repo), Path::new(&self.repo), None, Path::new(&self.host), false,
+                                          Some(transport::PREPARATION_TIMEOUT_SECS as f64))?;
         let mut prep = Map::new();
         for key in ["state", "reused", "previous_state"] {
             if let Some(v) = record.get(key) {
@@ -551,7 +572,7 @@ impl Adapter {
         self.frames = Some(pump(child.stdout.take().expect("piped stdout")));
         *self.live.lock().unwrap() = Live { stdin: child.stdin.take(), pid: Some(child.id() as libc::pid_t) };
         self.proc = Some(child);
-        let hello = self.receive(started + Duration::from_secs(180)).and_then(|hello| {
+        let hello = self.receive(started + Duration::from_secs(transport::WORKER_STARTUP_TIMEOUT_SECS)).and_then(|hello| {
             if get(&hello, "kind") != "HELLO" {
                 return Err(Fault::new("RuntimeError", format!("operator startup failed: {}", util::py_dumps(&hello, None))));
             }
@@ -601,7 +622,12 @@ impl Adapter {
                     // the next independent call starts a session from the saved state.
                     self.stop();
                 }
-                Ok(project_result(&event, full, ephemeral, &mut self.bindings))
+                let mut result = project_result(&event, full, ephemeral, &mut self.bindings);
+                result.insert("mode".into(), json!(self.effective_mode()));
+                if let Some(revision) = self.effective_config_revision() {
+                    result.insert("config_revision".into(), json!(revision));
+                }
+                Ok(result)
             }
             Err(e) => {
                 self.connection_failure = Some(json!({"epoch": self.epoch(), "error": e.message, "completion": "unknown"}));
@@ -881,6 +907,7 @@ impl Adapter {
                 }
                 let connected = self.alive();
                 Ok(json!({"connected": connected, "epoch": self.epoch(), "state_dir": self.state_dir.to_string_lossy(),
+                          "mode": self.effective_mode(), "config_revision": self.effective_config_revision(),
                           "preparation": preparation, "costs": self.cost_status()}))
             }
             Some("prepare") => self.prepare_session(),
@@ -1034,6 +1061,20 @@ mod tests {
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn worker_receive_names_timeout_and_disconnect() {
+        let (_tx, timeout_frames) = mpsc::channel::<Result<Value, Fault>>();
+        let timeout = receive(&timeout_frames, Instant::now()).unwrap_err();
+        assert_eq!(timeout.kind, "Timeout");
+        assert!(timeout.message.contains("Julia worker response"));
+
+        let (tx, closed_frames) = mpsc::channel::<Result<Value, Fault>>();
+        drop(tx);
+        let closed = receive(&closed_frames, Instant::now() + Duration::from_secs(1)).unwrap_err();
+        assert_eq!(closed.kind, "EOFError");
+        assert!(closed.message.contains("closed stdout"));
     }
 
     #[test]

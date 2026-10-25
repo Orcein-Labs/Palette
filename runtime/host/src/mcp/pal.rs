@@ -12,7 +12,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
 
-const USAGE: &str = "usage: pal [-w WORKSPACE] [-c CONTEXT] [-t SECONDS] [--full] [--json] [--ephemeral] (CODE... | -f FILE | -)
+const USAGE: &str = "usage: pal [-w WORKSPACE] [-c CONTEXT] [--mode operator|sandbox] [-t SECONDS] [--full] [--json] [--ephemeral] (CODE... | -f FILE | -)
+       pal [--json] [--mode operator|sandbox] --status|--reload
        pal [--json] --tool NAME [ARGUMENTS_JSON]
 
 Evaluates Julia in the persistent Palette workspace and prints its output and
@@ -31,6 +32,8 @@ struct Request {
 fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> Result<Option<Request>, String> {
     let mut args = Map::new();
     let mut tool: Option<String> = None;
+    let mut mode: Option<String> = None;
+    let mut special_action: Option<&str> = None;
     let mut json = false;
     let mut code: Vec<String> = Vec::new();
     let mut file: Option<String> = None;
@@ -49,6 +52,19 @@ fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> 
                 args.insert("timeout_s".into(), json!(secs));
             }
             "-f" | "--file" => file = Some(value(&mut it, a)?),
+            "--mode" => {
+                let selected = value(&mut it, a)?;
+                if !matches!(selected.as_str(), "operator" | "sandbox") {
+                    return Err("--mode must be operator or sandbox".into());
+                }
+                mode = Some(selected);
+            }
+            "--status" => {
+                if special_action.replace("status").is_some() { return Err("--status and --reload are mutually exclusive".into()); }
+            }
+            "--reload" => {
+                if special_action.replace("reload_config").is_some() { return Err("--status and --reload are mutually exclusive".into()); }
+            }
             "--full" => { args.insert("view".into(), "full".into()); }
             "--ephemeral" => { args.insert("ephemeral".into(), true.into()); }
             "--json" => json = true,
@@ -65,6 +81,19 @@ fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> 
             }
         }
     }
+    if let Some(action) = special_action {
+        if tool.is_some() || file.is_some() || !code.is_empty() {
+            return Err("--status and --reload cannot be combined with a tool, file, or Julia code".into());
+        }
+        let mut arguments = json!({"action": action});
+        if let Some(mode) = mode {
+            arguments["mode"] = json!(mode);
+        }
+        for (key, value) in &args {
+            arguments.as_object_mut().expect("object").entry(key.clone()).or_insert(value.clone());
+        }
+        return Ok(Some(Request { tool: "palette_control".into(), arguments, json }));
+    }
     if let Some(name) = tool {
         let mut arguments = match code.join(" ").trim() {
             "" => Value::Object(Map::new()),
@@ -75,6 +104,9 @@ fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> 
             if k == "workspace_id" || k == "context_id" {
                 obj.entry(k).or_insert(v);
             }
+        }
+        if let Some(mode) = mode {
+            obj.insert("mode".into(), json!(mode));
         }
         return Ok(Some(Request { tool: name, arguments, json }));
     }
@@ -91,6 +123,9 @@ fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> 
         return Ok(None);
     }
     args.insert("code".into(), source.into());
+    if let Some(mode) = mode {
+        args.insert("mode".into(), json!(mode));
+    }
     Ok(Some(Request { tool: "palette".into(), arguments: Value::Object(args), json }))
 }
 
@@ -210,6 +245,20 @@ mod tests {
         assert!(parse(&args(&["--tool", "palette_workspace", "[1]"]), &mut || Ok(String::new())).is_err());
         // Code may itself start with a dash once code has begun, or after --.
         assert_eq!(parsed(&["--", "-x"]).arguments["code"], "-x");
+    }
+
+    #[test]
+    fn parses_mode_status_and_reload_without_stealing_julia_words() {
+        assert_eq!(parsed(&["--mode", "sandbox", "x = 1"]).arguments["mode"], "sandbox");
+        assert_eq!(parsed(&["--status"]).arguments["action"], "status");
+        assert_eq!(parsed(&["--reload", "--mode", "operator"]).arguments["action"], "reload_config");
+        assert_eq!(parsed(&["--reload", "--mode", "operator"]).arguments["mode"], "operator");
+        assert_eq!(parsed(&["--tool", "palette", r#"{"code":"1 + 1","mode":"operator"}"#, "--mode", "sandbox"])
+            .arguments["mode"], "sandbox");
+        assert!(parse(&args(&["--mode", "unsafe", "x"]), &mut || Ok(String::new())).is_err());
+        assert!(parse(&args(&["--status", "x"]), &mut || Ok(String::new())).is_err());
+        assert_eq!(parsed(&["--status"]).tool, "palette_control");
+        assert_eq!(parsed(&["--reload"]).tool, "palette_control");
     }
 
     #[test]

@@ -988,6 +988,21 @@ impl PatchBroker {
     /// client to confirm a pending request when it can).
     pub fn call(&self, args: &Map<String, Value>, workspace: &str, capabilities: &Map<String, Value>,
                 client: &mut dyn Client) -> Result<Value, Fault> {
+        self.call_with_apply(args, workspace, capabilities, client, |identifier, workspace| {
+            self.apply(identifier, workspace)
+        })
+    }
+
+    /// Like `call`, but lets the owner refresh and synchronize policy at the
+    /// final write boundary after any user approval has arrived.
+    pub fn call_with_apply(
+        &self,
+        args: &Map<String, Value>,
+        workspace: &str,
+        capabilities: &Map<String, Value>,
+        client: &mut dyn Client,
+        apply: impl Fn(&Value, &str) -> Result<Map<String, Value>, Fault>,
+    ) -> Result<Value, Fault> {
         let action = field(args, "action")?;
         if action == "read" {
             let target = args.get("target").unwrap_or(&Value::Null);
@@ -1015,7 +1030,7 @@ impl PatchBroker {
         }
         let request_id = field(&record, "request_id")?.clone();
         if field(&record, "status")? != "pending" {
-            return self.apply(&request_id, workspace).map(Value::Object);
+            return apply(&request_id, workspace).map(Value::Object);
         }
         self.reject_forbidden_changes(&record)?;
         let declined = |reason: &str| {
@@ -1051,7 +1066,7 @@ impl PatchBroker {
                 if accepted {
                     let sha = field(&record, "patch_sha256")?.as_str().unwrap_or_default();
                     self.approve(&request_id, sha, "mcp_client_confirmed_user")?;
-                    return self.apply(&request_id, workspace).map(Value::Object);
+                    return apply(&request_id, workspace).map(Value::Object);
                 }
                 let _lock = self.locked()?;
                 let mut outcome = record.clone();

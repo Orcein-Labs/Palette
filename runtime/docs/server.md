@@ -7,12 +7,23 @@ local model, file mount or toolchain. Neither CyanTunnel nor a developer checkou
 is needed to start the production adapter. CyanTunnel remains FreeBuff
 compatibility/testing machinery.
 
-Install Julia 1.12, Python 3.11 or newer, bubblewrap and Rust on the server. Deploy a Palette
+Both local and server profiles default to operator mode, which runs Julia
+directly and does not require bubblewrap. Set `mode` to `sandbox` in a server
+profile (or pass `--mode sandbox` to `serve init`) to make sandbox the default;
+that mode requires bubblewrap. For local calls, `pal --mode sandbox 'code'`
+selects the separate sandbox world for one call. From `pal`, `--status` reports
+effective mode, the running session's config revision, and the pending daemon
+config. `--reload` validates and publishes configuration for new sessions. A
+config reload leaves an already-running session on its captured mode and config
+revision.
+
+Install Julia 1.12, Python 3.11 or newer, and Rust on the server. Install
+bubblewrap only if the profile selects sandbox mode. Deploy a Palette
 checkout or release SDK at a stable server path. Configure a service account's
 directories so the source, capability configuration and registry are outside
 worker-writable workspace and state mounts. The server account must be able to
 write the data and depot directories and read its deployed source/configuration.
-The operating system must support Bubblewrap namespaces and Landlock for patches.
+Sandbox mode needs Bubblewrap namespaces; repair patches also need Landlock.
 
 Create a host-owned ceiling file, for example `/etc/palette/ceiling.json`:
 
@@ -27,7 +38,7 @@ The runtime request exposes discovery, sandboxed capabilities, refresh and the
 configured repair workflow. It does not authorize network access, arbitrary
 host commands or file writes. Package requests remain subject to the named
 allowlist. Leave `package_management` out when installations are not authorized.
-Worker networking stays disabled; the broker performs an approved installation.
+Sandbox worker networking stays disabled; the broker performs an approved installation.
 
 Build the host once, generate a profile on the server, then prepare it as an
 administrator action:
@@ -40,7 +51,9 @@ cargo build --release --locked --manifest-path /opt/palette/runtime/host/Cargo.t
   --profile /etc/palette/runtime.json
 ```
 
-`prepare` needs `julia`, `cargo` and `bwrap` on `PATH`.
+`prepare` needs `julia` and `cargo` on `PATH`; it also needs `bwrap` when the
+profile's default mode is `sandbox`. Older profiles without a `mode` field
+default to `operator`.
 
 Defaults are `/opt/palette` for source, `/var/lib/palette` for data,
 `/var/cache/palette/depot` for prepared dependencies, and
@@ -68,6 +81,14 @@ commands, put an absolute `host_commands` configuration path in the profile.
 `turn_timeout` (default 60) and `max_turn_timeout` (default 1800) set a call's
 default time limit and the longest one it may ask for in seconds. Ambient
 client environment variables do not become configuration or additional grants.
+
+For the local daemon operator desk, `~/.config/palette/read-roots` is the live
+default roots file; `PALETTE_READ_ROOTS` explicitly overrides it.
+`PALETTE_HOST_COMMANDS` likewise overrides the canonical host-commands file.
+Older installs may have `PALETTE_READ_ROOTS` in `config/daemon.env` because
+setup copied the roots file into that variable. It now acts as an explicit
+override. Review and remove the line only when returning to the canonical live
+file; setup preserves it because its original intent cannot be recovered.
 
 For staged repair, add `patch_roots` (target names mapped to source directories)
 and a `repair_config` file path to the profile. The host configuration contains

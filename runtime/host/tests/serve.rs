@@ -150,12 +150,14 @@ fn init_inspect_and_client_report_the_profile() {
     let s = |p: PathBuf| p.to_string_lossy().into_owned();
     let report = f.init();
     assert_eq!(report, json!({"profile": s(f.profile()), "repo": s(f.repo()), "workspace": s(f.root.join("data/workspace")),
-                              "state": s(f.root.join("data/state")), "compute": "server", "edge_required": false}));
+                              "state": s(f.root.join("data/state")), "compute": "server", "edge_required": false, "default_mode": "operator"}));
     assert_eq!(fs::metadata(f.profile()).unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(fs::metadata(f.root.join("config")).unwrap().permissions().mode() & 0o777, 0o700);
     let written: Value = serde_json::from_str(&fs::read_to_string(f.profile()).unwrap()).unwrap();
     assert_eq!(written["format"], 1);
+    assert_eq!(written["mode"], "operator");
     assert_eq!(written["read_roots"], json!([]));
+    assert_eq!(report["default_mode"], "operator");
     let inspect: Value = serde_json::from_str(&f.ok(&["inspect", "--profile", &s(f.profile())])).unwrap();
     assert_eq!(inspect, report);
 
@@ -222,8 +224,26 @@ fn launch_passes_only_the_profile_environment() {
     assert_eq!(env["PATH"], path);
     assert_eq!(env["PALETTE_PACKAGE_DEPOT"], f.root.join("data/packages").to_string_lossy());
     assert_eq!(env["JULIA_DEPOT_PATH"], f.root.join("depot").to_string_lossy());
-    assert_eq!(env["JULIA_PKG_OFFLINE"], "true");
+    assert!(!env.contains_key("JULIA_PKG_OFFLINE"), "operator mode keeps the user's Julia package network setting");
+    assert_eq!(env["PALETTE_MODE"], "operator");
     assert_eq!((env["PALETTE_TURN_TIMEOUT"].as_str(), env["PALETTE_MAX_TURN_TIMEOUT"].as_str()), ("60", "1800"));
+
+    let mut profile: Value = serde_json::from_str(&fs::read_to_string(f.profile()).unwrap()).unwrap();
+    profile["mode"] = json!("sandbox");
+    fs::write(f.profile(), profile.to_string()).unwrap();
+    fs::write(f.record(), "").unwrap();
+    let out = f.command(&["launch", "--profile", &f.profile().to_string_lossy()], &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(f.calls()[0].1["PALETTE_MODE"], "sandbox");
+    assert_eq!(f.calls()[0].1["JULIA_PKG_OFFLINE"], "true");
+
+    profile["mode"] = json!("operator");
+    fs::write(f.profile(), profile.to_string()).unwrap();
+    fs::write(f.record(), "").unwrap();
+    let out = f.command(&["launch", "--profile", &f.profile().to_string_lossy()], &path)
+        .env("JULIA_PKG_OFFLINE", "false").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(f.calls()[0].1["JULIA_PKG_OFFLINE"], "false");
 }
 
 #[test]
@@ -255,7 +275,7 @@ fn prepare_provisions_with_package_networking_on() {
     let f = Fixture::new();
     f.init();
     fs::create_dir_all(f.repo()).unwrap();
-    for tool in ["julia", "cargo", "bwrap"] {
+    for tool in ["julia", "cargo"] {
         f.recorder(tool);
     }
     f.recorder_at(&f.repo().join(HOST));
@@ -278,13 +298,30 @@ fn prepare_provisions_with_package_networking_on() {
     for (_, env) in &calls {
         assert_eq!(env["JULIA_PKG_OFFLINE"], "false");
         assert_eq!(env["PWD"].as_str(), repo);
+        assert_eq!(env["PALETTE_MODE"], "operator");
     }
 
-    // A missing prerequisite stops before anything runs.
-    fs::remove_file(f.bin().join("bwrap")).unwrap();
+    // The default operator profile prepares without Bubblewrap.
     fs::remove_file(f.record()).unwrap();
     let out = f.command(&["prepare", "--profile", &profile], &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // Sandbox profiles still require Bubblewrap before running any step.
+    let sandbox_profile = f.root.join("config/sandbox-profile.json");
+    let sandbox_init = [
+        "init".to_string(), "--profile".into(), sandbox_profile.to_string_lossy().into_owned(), "--repo".into(), repo.clone(),
+        "--data".into(), f.root.join("sandbox-data").to_string_lossy().into_owned(), "--depot".into(),
+        f.root.join("sandbox-depot").to_string_lossy().into_owned(), "--ceiling".into(),
+        f.root.join("config/sandbox-ceiling.json").to_string_lossy().into_owned(), "--runtime-root".into(),
+        f.root.join("sandbox-capabilities").to_string_lossy().into_owned(), "--mode".into(), "sandbox".into(),
+    ];
+    f.ok(&args(&sandbox_init));
+    let sandbox_config: Value = serde_json::from_str(&fs::read_to_string(&sandbox_profile).unwrap()).unwrap();
+    assert_eq!(sandbox_config["mode"], "sandbox");
+    fs::remove_file(f.record()).unwrap();
+    let sandbox_path = f.bin().to_string_lossy().into_owned();
+    let out = f.command(&["prepare", "--profile", sandbox_profile.to_str().unwrap()], &sandbox_path).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Missing server prerequisite: bwrap"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Missing server prerequisite: bwrap (needed for sandbox mode)"));
     assert!(f.calls().is_empty());
 }
