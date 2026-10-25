@@ -1407,6 +1407,7 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn empty_config_overrides_disable_ceiling_files() {
@@ -1419,8 +1420,6 @@ mod tests {
             assert!(configured.is_none());
         }
     }
-    use std::os::unix::fs::symlink;
-
     fn dir(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);
         fs::create_dir_all(&path).unwrap();

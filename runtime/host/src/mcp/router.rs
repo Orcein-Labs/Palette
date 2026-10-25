@@ -72,6 +72,17 @@ struct ConfigSnapshot {
 }
 
 impl ConfigSnapshot {
+    fn session_mode(&self, requested: Option<&str>) -> Result<String, Fault> {
+        let mode = requested.unwrap_or(&self.default_mode);
+        if !matches!(mode, "operator" | "sandbox") {
+            return Err(Fault::value("mode must be operator or sandbox"));
+        }
+        if self.default_mode == "sandbox" && mode == "operator" {
+            return Err(Fault::permission("PALETTE_MODE=sandbox requires sandbox sessions; a tool call cannot select operator mode"));
+        }
+        Ok(mode.into())
+    }
+
     fn load(revision: u64, var: impl Fn(&str) -> Option<String>) -> Result<ConfigSnapshot, Fault> {
         if var("PALETTE_OPERATOR_CEILING_JSON").is_some() {
             return Err(Fault::value("PALETTE_OPERATOR_CEILING_JSON is reserved for the internal workspace snapshot handoff and cannot be set on the daemon"));
@@ -947,6 +958,7 @@ impl Worker {
     }
 
     fn start_with_snapshot(&self, r: &Router, frames: &mut Option<Frames>, config: &ConfigSnapshot) -> Result<(), Fault> {
+        config.session_mode(Some(&self.mode))?;
         let state = util::resolve(&self.state_dir);
         let workspace = util::resolve(Path::new(text(&self.entry, "workspace_dir")));
         let generation = r.generations.resolve(None)?;
@@ -1114,9 +1126,9 @@ fn patch_schema() -> Value {
 fn tools(limits: (f64, f64)) -> Value {
     let mut palette = child::palette_schema(limits);
     palette["required"] = json!([]);
-    palette["properties"]["mode"] = json!({"enum": ["operator", "sandbox"]});
+    palette["properties"]["mode"] = json!({"enum": ["operator", "sandbox"], "description": "Omitted mode uses the active config default. A configured sandbox default cannot be loosened to operator."});
     let mut control = child::control_schema(&CONTROL_ACTIONS);
-    control["properties"]["mode"] = json!({"enum": ["operator", "sandbox"]});
+    control["properties"]["mode"] = palette["properties"]["mode"].clone();
     control["properties"]["generation_id"] = json!({"type": "string", "maxLength": 64});
     let workspace = json!({"type": "object", "properties": {
         "action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]},
@@ -1291,11 +1303,8 @@ impl Session<'_> {
             return Ok(child::text_result(&result, failed));
         }
         let config = r.config_snapshot();
-        let mode = args.remove("mode").and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| config.default_mode.clone());
-        if !matches!(mode.as_str(), "operator" | "sandbox") {
-            return Err(Fault::value("mode must be operator or sandbox"));
-        }
+        let requested_mode = args.remove("mode");
+        let mode = config.session_mode(requested_mode.as_ref().and_then(Value::as_str))?;
         let entry = r.resolve(&args)?;
         if name == "palette_patch" {
             let broker = self.patch_broker()?;
@@ -1623,6 +1632,25 @@ mod tests {
 
     fn err(args: Value, name: &str) -> String {
         validate(&args, &schema(name)).unwrap_err().message
+    }
+
+    #[test]
+    fn op007_configured_sandbox_is_a_mode_floor() {
+        let (_tmp, r) = router(4);
+        let mut config = (*r.config_snapshot()).clone();
+        for default in ["operator", "sandbox"] {
+            config.default_mode = default.into();
+            assert_eq!(config.session_mode(None).unwrap(), default);
+            assert_eq!(config.session_mode(Some("sandbox")).unwrap(), "sandbox");
+            let result = config.session_mode(Some("operator"));
+            if default == "sandbox" {
+                let fault = result.unwrap_err();
+                assert_eq!(fault.kind, "PermissionError");
+                assert!(fault.message.contains("PALETTE_MODE=sandbox"));
+            } else {
+                assert_eq!(result.unwrap(), "operator");
+            }
+        }
     }
 
     #[test]

@@ -10,6 +10,9 @@ the opt-in lab. Sandbox workers run ordinary Julia with reflection,
 subprocesses, and native calls inside bubblewrap namespaces with a bounded
 filesystem view. Julia source checks are convenience checks, not an isolation
 boundary. The plain in-process package API does not establish this OS boundary.
+For an MCP daemon configured with `PALETTE_MODE=sandbox`, sandbox mode is a
+floor: tool calls cannot select operator mode. With an operator default, a
+caller may select sandbox mode for an individual world.
 
 In sandbox mode, workspace effects happen within configured mounts. Effects
 outside that envelope must be requested from the host broker, whose capability
