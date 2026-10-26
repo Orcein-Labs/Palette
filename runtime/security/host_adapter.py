@@ -61,8 +61,8 @@ def scratch_root() -> str:
 
 
 def session_cmd(root: str | None = None) -> list[str]:
-    """The command that starts the session bridge (its arguments follow)."""
-    return [HOST_BIN, "session", "--scratch-root", root or scratch_root()]
+    """Security fixtures explicitly enter sandbox mode."""
+    return [HOST_BIN, "session", "--mode", "sandbox", "--scratch-root", root or scratch_root()]
 
 
 def control(action, directory, **args):

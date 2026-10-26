@@ -14,12 +14,19 @@ On Windows (PowerShell or a command prompt):
 powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
 ```
 
+Operator setup preserves the installer's `PATH` for user toolchains, with the
+selected Julia directory first. It drops empty, relative, missing and `/tmp`
+directories (including symlink targets there), and deduplicates in order.
+Sandbox setup keeps its minimal system path. Rerun setup to capture changed
+toolchain locations.
+
 `install.sh` does the following, and running it again updates the install:
 
 1. Downloads the release archive, which holds the source and a prebuilt
    x86_64 host (glibc 2.35 or newer), and checks it against `SHA256SUMS.txt`.
    Where the prebuilt host does not run, the installer builds it with Rust.
-2. Installs bubblewrap if it is missing and, where AppArmor
+2. Installs bubblewrap only when `PALETTE_MODE=sandbox` (or `--mode sandbox` is
+   passed to the installer), if it is missing and, where AppArmor
    restricts user namespaces (Ubuntu 23.10 and newer), Ubuntu's recommended
    upstream bubblewrap profile, pinned by revision and checksum. This is the
    only step that needs root (`runtime/scripts/setup-sandbox-host.sh`); global
@@ -27,10 +34,12 @@ powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.co
 3. Installs Julia with [juliaup](https://github.com/JuliaLang/juliaup) unless
    Julia 1.10 or newer is on `PATH`.
 4. Runs `palette-host setup`, which instantiates the Julia project,
-   prepares the sandbox depot, deploys [TeamLab](../integrations/teamlab/README.md)
+   prepares the selected mode's Julia depot, deploys [TeamLab](../integrations/teamlab/README.md)
    into the capability registry, grants `palette.runtime` in the capability
    ceiling (creating it, or adding to the one there), and writes the client
-   configuration and the `palette-mcp` stdio launcher. It checks the new
+   configuration and the `palette-mcp` stdio launcher. Operator-mode
+   preparation runs Julia directly and does not require bubblewrap; sandbox
+   mode uses bubblewrap. It checks the new
    launcher (`x = 41`, then `x + 1`, then TeamLab's status) before it replaces
    the old one, so a failed update leaves the working installation in use.
    Where a user systemd session is available (not with `--no-service` or
@@ -72,10 +81,25 @@ environment moves it, and `off` leaves TeamLab out.
 When `~/.config/palette/host-commands.json` exists, the launcher passes it as
 `PALETTE_HOST_COMMANDS` (see [authority](authority.md)); create it and run the
 installer again to enable host commands.
-Likewise, when `~/.config/palette/read-roots` exists, the launcher passes its
-directories as `PALETTE_READ_ROOTS`: one absolute path a line, with blank
-lines and lines starting with `#` skipped. Setup refuses a relative path or a
-missing directory.
+Likewise, when `~/.config/palette/read-roots` exists, the daemon reads it as
+live configuration: one absolute path a line, with blank lines and lines
+starting with `#` skipped. `PALETTE_READ_ROOTS` is an explicit environment
+override and takes precedence over that file. `pal --reload` validates and
+publishes config for new sessions; existing sessions keep their captured
+revision. A custom `--read-roots FILE` selection is retained as its file source.
+
+Older installs may have a generated `config/daemon.env` containing
+`PALETTE_READ_ROOTS` copied from the then-current file. That value is now an
+explicit override, and setup preserves it because it cannot tell a copied
+value from an intentional one. To return to the live canonical file, review
+and remove that line from `config/daemon.env`, then restart the daemon. Setup
+does not edit the running service or its environment in place.
+
+The default install runs in operator mode and needs no bubblewrap. The `pal`
+command reports mode and session/config snapshots with `pal --status`. Use
+`pal --mode sandbox 'your Julia expression'` for a sandboxed call. To install
+with sandbox as the default, run `PALETTE_MODE=sandbox sh install.sh` or pass
+`--mode sandbox` to the installer. Omitted mode uses the current config default.
 
 `install.sh --update` installs a newer release only and leaves registrations
 as they are. It does nothing for a source checkout, and from a
@@ -119,11 +143,11 @@ shop). Julia stays installed
 
 ## Manual installation
 
-The Linux supervised runtime requires Julia, bubblewrap, and a built
-Rust host. Julia dependencies are defined by `Project.toml`; Rust dependencies
+The Linux operator runtime requires Julia and a built Rust host. Bubblewrap is
+required only when selecting sandbox mode. Julia dependencies are defined by `Project.toml`; Rust dependencies
 are locked in `runtime/host/Cargo.lock`. Instantiate the Julia project and build the host
-before installing the adapter. Additional packages must be provisioned by the
-host, not silently downloaded inside an offline worker.
+before installing the adapter. Additional packages for sandbox workers must be
+provisioned by the host, not silently downloaded inside an offline worker.
 
 See the [portable plugin setup](../plugins/palette/README.md) for Agent Plugins manifests, a repository marketplace, and a generic MCP launcher.
 
@@ -140,8 +164,9 @@ the workspace.
 
 ### Prepare before interactive use
 
-Cold preparation compiles standard libraries and project dependencies in the
-actual sandbox, with the same paths later sessions use. On a fresh depot this
+Cold preparation compiles standard libraries and project dependencies using
+the selected mode and the same Julia project/depot paths later sessions use.
+Operator mode runs directly; sandbox mode runs in bubblewrap. On a fresh depot this
 can take several minutes and exceed a client's interactive request deadline.
 Run it before connecting an interactive client, and after runtime or source
 updates:
@@ -150,17 +175,23 @@ updates:
 runtime/host/target/release/palette-host prepare --project-dir "$PWD"
 ```
 
+To prepare sandbox mode, use
+`PALETTE_MODE=sandbox palette-host prepare --project-dir "$PWD"`. Preparation
+records are mode-specific. Operator preparation does not publish or copy a
+sandbox depot snapshot; sandbox preparation publishes the read-only snapshot
+used by sandbox sessions.
+
 A successful command records `state: prepared`; sessions validate its source,
 runtime, and loaded-cache identity before reusing it. `--status` inspects the
 record without starting preparation. Preparation failures remain failures;
 raising a client's call timeout is not a substitute for a prepared installation.
 
-A successful preparation also publishes a snapshot of the depot in
+A successful sandbox preparation also publishes a snapshot of the depot in
 `<depot parent>/.palette-depot-snapshots/<depot name>/`. Each session mounts an
 overlay of it: the snapshot is the read-only lower layer and the session writes
 to a private upper layer, so starting a session copies nothing and a Julia
 process that shares the live depot cannot break a session's depot. A reused
-preparation publishes a snapshot when none exists. Sessions copy the snapshot
+reused sandbox preparation publishes a snapshot when none exists. Sessions copy the snapshot
 instead when bwrap is older than 0.8 or the kernel refuses unprivileged overlay
 mounts, and copy the live depot until a snapshot exists. On a filesystem
 without reflinks the snapshot is a full copy of the depot.
@@ -265,7 +296,7 @@ for the `palette.service` daemon. It exposes
 | `PALETTE_PACKAGE_DEPOT` | Durable broker-managed package store. The installers and `palette-host mcp start` set it to `packages` under the instance's data directory (`PALETTE_DATA_HOME`), so a private instance never shares another's store; a host started without it uses `~/.palette/packages` |
 | `PALETTE_RECEIPT_RETENTION_DAYS` | Days a session's default receipts directory is kept after its last write, before a later session archives it into `~/.palette/docs/receipts/<YYYY-MM>.zip`. Defaults to 30. `0` deletes it when the session closes. See [capabilities](capabilities.md) |
 | `JULIA_DEPOT_PATH` | Provisioned Julia depot |
-| `JULIA_PKG_OFFLINE` | Julia's offline package policy |
+| `JULIA_PKG_OFFLINE` | Optional Julia package policy; sandbox defaults to offline, while operator mode follows Julia's default unless this is set |
 
 Restart the adapter to load updated runtime code. Refresh client tool discovery
 when the tool schema changes. Reusing a connection does not require creating a

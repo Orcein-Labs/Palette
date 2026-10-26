@@ -6,7 +6,12 @@ Palette ships these reusable MCP adapters for independent execution worlds and e
 
 Call `palette_workspace` with action=create, workspace_id=your-lab, context_id=a-stable-unique-key, scope=thread. Include workspace_id and context_id on subsequent palette and palette_control calls. To select a host-configured project directory, also pass its `project_root_id`; omitting it selects the legacy workspace. Context-active routing also works, and attachment persists across router restart. Explicit workspace_id wins. Missing both fields uses the visibly identified shared legacy world; it does not automatically create an isolated thread.
 
-The operator configures `PALETTE_PROJECT_ROOTS` as a JSON object mapping stable IDs to absolute directories. `palette_workspace` list returns those IDs. Tool arguments select an ID and never supply a path. The configured directory is mounted writable as the worker's workspace at its host path. Keep each root narrow and disjoint from the legacy workspace, runtime, registry, saved state, scratch, toolchains, package stores, and read-only roots. Do not also configure a writable project root under `PALETTE_READ_ROOTS`.
+Workspace routing selects Julia state and a project directory; it does not add
+OS containment. Calls use operator mode by default. Explicit sandbox calls run
+with the bounded filesystem view described in [authority](authority.md) and do
+not replace or mutate the attached operator world.
+
+The operator configures `PALETTE_PROJECT_ROOTS` as a JSON object mapping stable IDs to absolute directories. `palette_workspace` list returns those IDs. Tool arguments select an ID and never supply a path. The configured directory is used as the worker's project and workspace path; sandbox calls mount it writable at its host path. Keep each root narrow and disjoint from the legacy workspace, runtime, registry, saved state, scratch, toolchains, package stores, and read-only roots. Do not also configure a writable project root under `PALETTE_READ_ROOTS`.
 
 Scope thread compares caller-supplied keys. It prevents accidental collisions, not impersonation by a caller who knows the key. A list shows another context's thread workspaces only as a count, `other_thread_workspaces`, with a `note` saying to list again with the context_id that created one. Project scope makes a workspace visible across contexts for its configured root; contexts share a Julia world by attaching to the same workspace ID. Open is an explicit cross-context sharing choice. Multiple workspaces can select the same root: their Julia state is independent while their project files are shared.
 

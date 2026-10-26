@@ -20,6 +20,27 @@ versions=$home/versions
 update=
 if [ "${1:-}" = --update ]; then update=1; shift; fi
 
+mode=${PALETTE_MODE:-}
+mode_arg=
+want_mode=
+for arg do
+    if [ -n "$want_mode" ]; then mode=$arg; mode_arg=1; want_mode=; continue; fi
+    [ "$arg" = --mode ] && want_mode=1
+done
+if [ -n "$want_mode" ]; then
+    printf 'Palette install stopped: --mode needs operator or sandbox\n' >&2
+    exit 2
+fi
+if [ -z "$mode_arg" ] && [ -z "${PALETTE_MODE:-}" ]; then
+    saved_mode=$(sed -n "s/^PALETTE_MODE='\\(operator\\|sandbox\\)'$/\\1/p" "$home/config/daemon.env" 2>/dev/null | tail -n 1)
+    case $saved_mode in operator|sandbox) mode=$saved_mode ;; esac
+fi
+[ -n "$mode" ] || mode=operator
+case $mode in
+    operator|sandbox) ;;
+    *) printf 'Palette install stopped: mode must be operator or sandbox\n' >&2; exit 1 ;;
+esac
+
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'Palette install stopped: %s\n' "$*" >&2; exit 1; }
 interactive() { [ -z "$update" ] && (: </dev/tty) 2>/dev/null; }
@@ -49,7 +70,7 @@ if [ -f "$0" ] && [ -f "$here/install.sh" ] && [ -e "$here/../../.git" ]; then
         git -C "$src" archive HEAD | tar -x -C "$stage"
         # The checkout's resolved packages, when it has them, are the ones it was tested with.
         [ -f "$src/Manifest.toml" ] && cp "$src/Manifest.toml" "$stage/"
-        say "Building the sandbox host"
+        say "Building the Palette host"
         # One target directory for every commit, so a rebuild is incremental.
         CARGO_TARGET_DIR=$home/build cargo build --manifest-path "$stage/runtime/host/Cargo.toml" --release --locked
         mkdir -p "$stage/runtime/host/target/release"
@@ -105,7 +126,7 @@ else
         if [ "$(uname -m)" != x86_64 ] || ! "$host" 2>&1 | grep -q 'usage: palette-host'; then
             rm -f "$host"
             command -v cargo >/dev/null || die "the prebuilt host does not run on this system; install Rust (https://rustup.rs) and run this again"
-            say "Building the sandbox host"
+            say "Building the Palette host"
             CARGO_TARGET_DIR=$home/build cargo build --manifest-path "$stage/runtime/host/Cargo.toml" --release --locked
             cp "$home/build/release/palette-host" "$host"
         fi
@@ -117,19 +138,21 @@ else
 fi
 sdk=$versions/$id
 
-# The sandbox needs bubblewrap, and on some distributions an
-# AppArmor profile; installing those is the one step that needs root.
-sandbox="$sdk/runtime/scripts/setup-sandbox-host.sh"
-if ! sh "$sandbox" check 2>/dev/null; then
-    if [ "$(id -u)" = 0 ]; then
-        sh "$sandbox" install
-    elif command -v sudo >/dev/null && interactive; then
-        say "Installing the sandbox's system packages (needs your password once)"
-        sudo sh "$sandbox" install </dev/tty
-    else
-        die "run this once as root, then run the installer again: sudo sh $sandbox install"
+# Sandbox is opt-in. Only that mode needs bubblewrap and, on some
+# distributions, its AppArmor profile.
+if [ "$mode" = sandbox ]; then
+    sandbox="$sdk/runtime/scripts/setup-sandbox-host.sh"
+    if ! sh "$sandbox" check 2>/dev/null; then
+        if [ "$(id -u)" = 0 ]; then
+            sh "$sandbox" install
+        elif command -v sudo >/dev/null && interactive; then
+            say "Installing the sandbox's system packages (needs your password once)"
+            sudo sh "$sandbox" install </dev/tty
+        else
+            die "run this once as root, then run the installer again: sudo sh $sandbox install"
+        fi
+        sh "$sandbox" check || die "the sandbox cannot start on this system; see $sdk/runtime/docs/install.md"
     fi
-    sh "$sandbox" check || die "the sandbox cannot start on this system; see $sdk/runtime/docs/install.md"
 fi
 
 julia_ok() {
@@ -148,6 +171,7 @@ export PATH
 # client launcher at it, so a failed update leaves the working installation in use.
 set -- --repo-dir "$sdk" --output-dir "$home/client" --data-dir "$home/data" --depot-dir "$home/depot" \
     --runtime-root "$home/capabilities" --ceiling "$home/config/ceiling.json" "$@"
+[ -n "$mode_arg" ] || set -- --mode "$mode" "$@"
 [ -n "${PALETTE_WSL_DISTRIBUTION:-}" ] && set -- "$@" --wsl-distribution "$PALETTE_WSL_DISTRIBUTION"
 # An update leaves the clients' registrations as they are: the launcher path does not change.
 [ -n "$update" ] && set -- "$@" --no-register
