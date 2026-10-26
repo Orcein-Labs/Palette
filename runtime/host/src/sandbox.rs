@@ -1468,7 +1468,7 @@ mod tests {
         while !exited() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(exited(), "captured worker helper {pid} outlived its leader");
+        assert!(exited(), "captured worker helper {pid} outlived its leader: {:?}", fs::read_to_string(format!("/proc/{pid}/stat")));
     }
 
     #[test]
