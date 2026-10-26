@@ -131,10 +131,9 @@ fn subset(argv: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Precompile every stdlib and project dependency into the real depot, in the
-/// worker's own sandbox so the caches record the paths a worker sees. Run once
-/// per depot, and again after Palette or the project changes. A successful
-/// run publishes a snapshot of the depot for session clones.
+/// Precompile every stdlib and project dependency into the selected depot. A
+/// sandbox preparation publishes a snapshot for session clones; operator
+/// preparation uses Julia's normal host environment and keeps the live depot.
 pub(crate) const PREWARM: &str = include_str!("../../security/prewarm_workload.jl");
 
 fn prewarm(argv: &[String]) -> Result<i32, String> {
@@ -146,27 +145,55 @@ fn prewarm(argv: &[String]) -> Result<i32, String> {
     let depot = sandbox::default_depot();
     let packages = sandbox::package_store_paths(&[project.clone(), repo.clone(), workspace.clone()], None)?;
     // No depot clone: the real depot is bound writable at its own path.
-    let mut argv = sandbox::build_bwrap_argv(&sandbox::SandboxSpec {
-        workspace_dir: &workspace.to_string_lossy(),
-        broker_socket_dir: None,
-        project_dir: &project.to_string_lossy(),
-        repo_dir: &repo.to_string_lossy(),
-        julia_bin: &julia,
-        julia_depot: &depot,
-        network_enabled: false,
-        depot_clone_dir: None,
-        package_store_root: Some(packages.root.to_str().ok_or("package store path is not UTF-8")?),
-        package_depot_dir: Some(packages.depot.to_str().ok_or("package depot path is not UTF-8")?),
-        package_environment_dir: Some(packages.environment.to_str().ok_or("package environment path is not UTF-8")?),
-        state_dir: None,
-    })?;
-    argv.extend(["--".into(), julia, "--startup-file=no".into(), "-e".into(), PREWARM.into()]);
-    let status = std::process::Command::new(&argv[0]).args(&argv[1..]).stdin(std::process::Stdio::null()).status();
+    let mode = std::env::var("PALETTE_MODE").unwrap_or_else(|_| "operator".into());
+    if !matches!(mode.as_str(), "operator" | "sandbox") {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return Err("PALETTE_MODE must be operator or sandbox".into());
+    }
+    let status = if mode == "sandbox" {
+        let mut argv = sandbox::build_bwrap_argv(&sandbox::SandboxSpec {
+            workspace_dir: &workspace.to_string_lossy(),
+            broker_socket_dir: None,
+            project_dir: &project.to_string_lossy(),
+            repo_dir: &repo.to_string_lossy(),
+            julia_bin: &julia,
+            julia_depot: &depot,
+            network_enabled: false,
+            depot_clone_dir: None,
+            package_store_root: Some(packages.root.to_str().ok_or("package store path is not UTF-8")?),
+            package_depot_dir: Some(packages.depot.to_str().ok_or("package depot path is not UTF-8")?),
+            package_environment_dir: Some(packages.environment.to_str().ok_or("package environment path is not UTF-8")?),
+            state_dir: None,
+        })?;
+        argv.extend(["--".into(), julia.clone(), "--startup-file=no".into(), "-e".into(), PREWARM.into()]);
+        std::process::Command::new(&argv[0]).args(&argv[1..])
+            .stdin(std::process::Stdio::null()).status()
+    } else {
+        // Operator mode keeps the same Julia workload and persistent cache
+        // destinations, while running it directly under the host environment.
+        let repo_text = repo.to_string_lossy();
+        let project_text = project.to_string_lossy();
+        let package_depot = packages.depot.to_string_lossy();
+        let package_environment = packages.environment.to_string_lossy();
+        let mut julia_env = sandbox::operator_julia_env(
+            &repo_text,
+            &project_text,
+            Some(&package_depot),
+            Some(&package_environment),
+        );
+        julia_env.insert("PALETTE_PACKAGE_DEPOT".into(), packages.root.to_string_lossy().into_owned());
+        std::process::Command::new(&julia)
+            .arg("--startup-file=no")
+            .arg("-e").arg(PREWARM)
+            .current_dir(&workspace)
+            .envs(&julia_env)
+            .stdin(std::process::Stdio::null()).status()
+    };
     let _ = std::fs::remove_dir_all(&workspace);
     let code = status.map_err(|e| e.to_string())?.code().unwrap_or(1);
-    // Sessions clone the snapshot, which no Julia process writes, instead of
-    // the live depot. Without one they fall back to the live depot.
-    if code == 0 {
+    // Sandbox sessions clone the immutable snapshot instead of the live depot.
+    // Operator sessions use their normal live depot and do not publish one.
+    if code == 0 && mode == "sandbox" {
         if let Err(e) = sandbox::publish_depot_snapshot(std::path::Path::new(&depot)) {
             eprintln!("palette-host: the depot snapshot was not published: {e}");
         }
@@ -201,6 +228,7 @@ fn main() {
         Some("prewarm") => prewarm(rest),
         Some("prepare") => flags(rest, &["status", "force"]).and_then(|f| mcp::preparation::main(&f)),
         Some("teamlab-news") => teamlab_news(rest),
+        Some("reload") if rest.is_empty() => Ok(mcp::pal::main(&["--reload".into()])),
         Some("setup") => setup::main(rest),
         Some("install-plugin") => install_plugin::main(rest),
         Some("service") => service::main(rest),
@@ -215,7 +243,7 @@ fn main() {
             Some("start") if rest.len() == 1 => mcp::router::start(),
             _ => mcp::router::main(rest),
         },
-        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|setup|install-plugin|service|serve|patch|control|toolchain|pal|mcp ...".into()),
+        _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|reload|setup|install-plugin|service|serve|patch|control|toolchain|pal|mcp ...".into()),
     };
     std::process::exit(match code {
         Ok(c) => c,

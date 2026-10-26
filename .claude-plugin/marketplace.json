@@ -4,13 +4,13 @@
     "name": "Matt C"
   },
   "metadata": {
-    "description": "Palette: a persistent, sandboxed Julia world for coding agents"
+    "description": "Palette: a persistent Julia operator surface with an opt-in sandbox lab for coding agents"
   },
   "plugins": [
     {
       "name": "palette",
       "source": "./runtime/plugins/palette",
-      "description": "Skills for Palette's persistent Julia world, and a session-start line saying which Palette is installed.",
+      "description": "Skills for Palette's persistent operator-mode Julia world and opt-in sandbox, plus a session-start line naming the installed version.",
       "author": {
         "name": "Matt C"
       },

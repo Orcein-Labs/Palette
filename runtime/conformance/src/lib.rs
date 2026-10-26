@@ -143,6 +143,9 @@ pub fn control(action: &str, directory: &Path, args: Value) -> Result<Value, Con
 
 /// How a kernel is started: the defaults are a 20 s turn timeout, no ceiling and no extra arguments.
 pub struct KernelOptions {
+    /// Session mode. Existing conformance kernels explicitly opt into the
+    /// sandbox so their authority assertions keep their original boundary.
+    pub mode: String,
     pub timeout: f64,
     pub env: Vec<(String, String)>,
     pub extra_args: Vec<String>,
@@ -151,7 +154,7 @@ pub struct KernelOptions {
 
 impl Default for KernelOptions {
     fn default() -> Self {
-        KernelOptions { timeout: 20.0, env: Vec::new(), extra_args: Vec::new(), ceiling: json!({}) }
+        KernelOptions { mode: "sandbox".into(), timeout: 20.0, env: Vec::new(), extra_args: Vec::new(), ceiling: json!({}) }
     }
 }
 
@@ -175,6 +178,8 @@ impl Kernel {
         let scratch = TempDir::new("palette-adapter-");
         let mut child = Command::new(host_bin())
             .arg("session")
+            .arg("--mode")
+            .arg(&options.mode)
             .arg("--scratch-root")
             .arg(scratch.join("root"))
             .arg("--repo-dir")

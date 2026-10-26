@@ -1,12 +1,12 @@
-//! The second trust domain: the capability broker. It runs outside the
-//! sandbox; the worker reaches it only through one Unix socket bound into the
-//! sandbox. One JSON request per connection, one JSON response:
+//! The host capability broker. Sandbox workers reach it through a Unix socket
+//! bound into their namespace. One JSON request per connection, one JSON response:
 //!     {"id", "category", "params"}  ->  {"id", "approved", "result" | "reason"}
 //! Authorize against the session's fixed ceiling, perform the effect here with
 //! host privilege (the worker has no code path to it), and write a receipt
 //! for every request, approved or not.
 
 use crate::sandbox::{self, RunWorker};
+use crate::session::SessionMode;
 use crate::teamlab;
 use crate::util;
 use serde_json::{json, Map, Value};
@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -140,6 +141,9 @@ pub fn ceiling_is_subset(requested: &Value, parent: &Value) -> (bool, String) {
 
 pub struct Broker {
     ceiling: Value,
+    mode: SessionMode,
+    command_cwd: PathBuf,
+    config_revision: Option<String>,
     receipt_log_path: PathBuf,
     session_id: String,
     // external_fs_write's allowed_dirs, resolved once when the broker starts.
@@ -298,8 +302,14 @@ impl Broker {
         OpenOptions::new().create(true).append(true).open(&c.receipt_log_path)
             .map_err(|e| format!("cannot open the receipt log {}: {e}", c.receipt_log_path.display()))?;
         let write_roots = write_roots(&c)?;
+        let command_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         Ok(Broker {
             ceiling: c.ceiling,
+            // Standalone broker users retain the historical ceiling-bound
+            // contract. Sessions set their resolved mode before serving.
+            mode: SessionMode::Sandbox,
+            command_cwd,
+            config_revision: None,
             receipt_log_path: c.receipt_log_path,
             session_id: c.session_id,
             write_roots,
@@ -320,6 +330,12 @@ impl Broker {
 
     pub fn set_host_bridge(&self, bridge: HostBridge) {
         *self.host_bridge.lock().unwrap() = Some(bridge);
+    }
+
+    pub fn set_session_context(&mut self, mode: SessionMode, command_cwd: PathBuf, config_revision: Option<String>) {
+        self.mode = mode;
+        self.command_cwd = command_cwd;
+        self.config_revision = config_revision;
     }
 
     pub fn set_in_flight(&self, r: Option<String>) {
@@ -480,8 +496,8 @@ impl Broker {
 
     /// C_child ⊆ C_caller, enforced here. A request chooses which capabilities
     /// the child gets, never where its filesystem view points. A child's
-    /// network namespace is always unshared: network_access for a child means
-    /// asking its own broker, which enforces its already-validated ceiling.
+    /// In sandbox mode a child's network namespace is unshared: network_access
+    /// means asking its own broker, which enforces its validated ceiling.
     fn spawn_child_worker(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
         let requested = p.get("ceiling").cloned().unwrap_or_else(|| json!({}));
         if !requested.is_object() {
@@ -504,14 +520,14 @@ impl Broker {
             return Err(Denied("spawn_child_worker requires a string 'script'".into()));
         };
         let ws = util::mkdtemp("palette-child-ws-").map_err(|e| Internal(e.to_string()))?;
-        let child_depot = if requested.get("package_management").is_some() {
+        let child_depot = if self.mode == SessionMode::Sandbox && requested.get("package_management").is_some() {
             Some(sandbox::create_session_depot(None).map_err(Internal)?)
         } else {
             None
         };
         let sock_dir = util::mkdtemp("palette-child-broker-").map_err(|e| Internal(e.to_string()))?;
         let result = (|| {
-            let child = Arc::new(Broker::new(BrokerConfig {
+            let mut child_broker = Broker::new(BrokerConfig {
                 ceiling: requested.clone(),
                 receipt_log_path: sock_dir.join("receipts.jsonl"),
                 session_id: format!("{}/child", self.session_id),
@@ -521,10 +537,12 @@ impl Broker {
                 repo_dir: Some(repo.clone()),
                 trusted_files: self.trusted_files.clone(),
                 child_timeout: Duration::from_secs(90),
-            }).map_err(Internal)?);
+            }).map_err(Internal)?;
+            child_broker.set_session_context(self.mode, PathBuf::from(&ws), self.config_revision.clone());
+            let child = Arc::new(child_broker);
             child.set_caller(self.caller.lock().unwrap().clone());
             let server = serve(&sock_dir.join("broker.sock"), child).map_err(Internal)?;
-            let r = sandbox::run_worker(&RunWorker {
+            let worker = RunWorker {
                 workspace_dir: &ws.to_string_lossy(),
                 project_dir: project,
                 repo_dir: repo,
@@ -533,7 +551,13 @@ impl Broker {
                 network_enabled: false,
                 depot_clone_dir: child_depot.as_ref().map(|d| d.to_str().unwrap_or_default()),
                 timeout: self.child_timeout,
-            });
+            };
+            let r = match self.mode {
+                SessionMode::Sandbox => sandbox::run_worker(&worker),
+                SessionMode::Operator => sandbox::run_operator_worker(
+                    &worker, self.package_depot_dir.as_deref(), self.package_environment_dir.as_deref(),
+                    self.config_revision.as_deref()),
+            };
             server.shutdown();
             let r = r.map_err(Internal)?;
             if r.timed_out {
@@ -637,27 +661,29 @@ impl Broker {
         Ok(json!({"digests": digests, "observer": "host", "algorithm": "sha256"}))
     }
 
-    /// Run a command the operator named in the ceiling, on the host, outside
-    /// the sandbox: the way a kernel reaches a GPU, a renderer or a build it
-    /// cannot run itself. The ceiling fixes each command's argv (absolute
-    /// program), cwd and timeout; a request only picks a command by name,
-    /// may shorten (never extend) its timeout with `timeout_s`, and passes
-    /// arguments only to a command that allows them. Never a shell.
+    /// Run an argv command on the host. Operator mode accepts an executable
+    /// name or path and literal arguments; registered aliases keep their
+    /// configured argv, cwd, timeout and optional lock. Sandbox mode is
+    /// limited to registered aliases. Never a shell.
     /// Actions: "run" (default) waits for the result; "start" returns a job
     /// id at once, for commands longer than a turn; "poll" with that id
     /// returns {"running": true} and the output since the last poll, or the
     /// result; "list" names the jobs still held; "commands" names the
     /// commands the ceiling allows. A command with a "lock" file runs under
     /// an exclusive flock on it, shared with work outside Palette (a GPU
-    /// lock); waiting for the lock counts against its timeout.
+    /// lock); waiting for the lock counts against its timeout. Unregistered
+    /// operator commands default to 60 s for `run` and four hours for `start`.
     /// Ceiling: {"host_command": {"commands": {"<name>": {"argv": [...],
     ///   "cwd": "/abs", "timeout_s": 600, "extra_args": false,
     ///   "lock": "/abs/file", "description": "..."}}}}
     fn host_command(&self, p: &Map<String, Value>) -> Result<Value, Fail> {
-        let cap = self.cap("host_command").ok_or_else(|| Denied("host_command not in this session's ceiling".into()))?;
+        let cap = self.cap("host_command");
+        if self.mode == SessionMode::Sandbox && cap.is_none() {
+            return Err(Denied("host_command not in this session's ceiling".into()));
+        }
+        let commands = cap.as_ref().map(|grant| obj(grant.get("commands").unwrap_or(&Value::Null))).unwrap_or_default();
         let action = p.get("action").and_then(Value::as_str).unwrap_or("run");
         if action == "commands" {
-            let commands = obj(cap.get("commands").unwrap_or(&Value::Null));
             let listed: Vec<Value> = commands.iter().map(|(name, spec)| {
                 let mut v = json!({"name": name, "argv": spec.get("argv"), "cwd": spec.get("cwd"),
                                    "timeout_s": spec.get("timeout_s").cloned().unwrap_or(json!(60.0)),
@@ -707,23 +733,16 @@ impl Broker {
         }
         let name = p.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())
             .ok_or_else(|| Denied("host_command requires a non-empty string 'name'".into()))?;
-        let commands = obj(cap.get("commands").unwrap_or(&Value::Null));
-        let spec = obj(commands.get(name).ok_or_else(|| Denied(format!("host command {} is not in this session's ceiling", q(name))))?);
-        let misconfigured = |why: &str| Denied(format!("host command {} is misconfigured in the ceiling: {why}", q(name)));
-        let mut argv = str_list(spec.get("argv")).filter(|a| !a.is_empty() && spec["argv"].as_array().is_some_and(|x| x.len() == a.len()))
-            .ok_or_else(|| misconfigured("'argv' must be a non-empty list of strings"))?;
-        if !Path::new(&argv[0]).is_absolute() || !Path::new(&argv[0]).is_file() {
-            return Err(misconfigured("argv[0] must be an absolute path to a program"));
+        if name.contains('\0') {
+            return Err(Denied("host_command 'name' must not contain NUL".into()));
         }
-        let cwd = spec.get("cwd").and_then(Value::as_str).map(PathBuf::from)
-            .filter(|c| c.is_absolute() && c.is_dir()).ok_or_else(|| misconfigured("'cwd' must be an absolute directory"))?;
-        let timeout_s = spec.get("timeout_s").map(|t| t.as_f64().filter(|t| *t > 0.0 && *t <= HOST_COMMAND_MAX_TIMEOUT_S))
-            .unwrap_or(Some(60.0)).ok_or_else(|| misconfigured("'timeout_s' must be a number in (0, 14400]"))?;
-        let timeout_s = match p.get("timeout_s") {
-            None | Some(Value::Null) => timeout_s,
-            Some(t) => t.as_f64().filter(|t| *t > 0.0 && *t <= timeout_s).ok_or_else(|| Denied(format!(
-                "host_command 'timeout_s' must be a number in (0, {timeout_s}], the ceiling's limit for {}", q(name))))?,
-        };
+        let registered = commands.get(name);
+        if self.mode == SessionMode::Sandbox && registered.is_none() {
+            return Err(Denied(format!("host command {} is not in this session's ceiling", q(name))));
+        }
+        let spec = registered.map(obj).unwrap_or_default();
+        let alias = registered.is_some();
+        let misconfigured = |why: &str| Denied(format!("host command {} is misconfigured in the ceiling: {why}", q(name)));
         let args = match p.get("args") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(a)) => {
@@ -735,18 +754,53 @@ impl Broker {
             }
             Some(_) => return Err(Denied("host_command 'args' must be a list of strings".into())),
         };
-        if !args.is_empty() && spec.get("extra_args").and_then(Value::as_bool) != Some(true) {
-            return Err(Denied(format!("host command {} takes no arguments (its ceiling entry does not set extra_args)", q(name))));
+        if args.iter().any(|a| a.contains('\0')) {
+            return Err(Denied("host_command arguments must not contain NUL".into()));
         }
-        if args.len() > 64 || args.iter().any(|a| a.contains('\0') || a.len() > 4096) {
+        if (self.mode == SessionMode::Sandbox || alias)
+            && (args.len() > 64 || args.iter().any(|a| a.len() > 4096)) {
             return Err(Denied("host_command accepts at most 64 arguments of at most 4096 bytes, without NUL".into()));
         }
-        argv.extend(args);
-        let lock = match spec.get("lock") {
-            None | Some(Value::Null) => None,
-            Some(l) => Some(l.as_str().map(PathBuf::from)
-                .filter(|l| l.is_absolute() && l.parent().is_some_and(Path::is_dir) && !l.is_dir())
-                .ok_or_else(|| misconfigured("'lock' must be an absolute file path in an existing directory"))?),
+        let (mut argv, cwd, default_timeout_s, lock) = if alias {
+            let mut argv = str_list(spec.get("argv")).filter(|a| !a.is_empty() && spec["argv"].as_array().is_some_and(|x| x.len() == a.len()))
+                .ok_or_else(|| misconfigured("'argv' must be a non-empty list of strings"))?;
+            if !Path::new(&argv[0]).is_absolute() || !Path::new(&argv[0]).is_file() {
+                return Err(misconfigured("argv[0] must be an absolute path to a program"));
+            }
+            if !args.is_empty() && spec.get("extra_args").and_then(Value::as_bool) != Some(true) {
+                return Err(Denied(format!("host command {} takes no arguments (its ceiling entry does not set extra_args)", q(name))));
+            }
+            let cwd = spec.get("cwd").and_then(Value::as_str).map(PathBuf::from)
+                .filter(|c| c.is_absolute() && c.is_dir()).ok_or_else(|| misconfigured("'cwd' must be an absolute directory"))?;
+            let timeout_s = spec.get("timeout_s").map(|t| t.as_f64().filter(|t| *t > 0.0 && *t <= HOST_COMMAND_MAX_TIMEOUT_S))
+                .unwrap_or(Some(60.0)).ok_or_else(|| misconfigured("'timeout_s' must be a number in (0, 14400]"))?;
+            let lock = match spec.get("lock") {
+                None | Some(Value::Null) => None,
+                Some(l) => Some(l.as_str().map(PathBuf::from)
+                    .filter(|l| l.is_absolute() && l.parent().is_some_and(Path::is_dir) && !l.is_dir())
+                    .ok_or_else(|| misconfigured("'lock' must be an absolute file path in an existing directory"))?),
+            };
+            argv.extend(args);
+            (argv, cwd, timeout_s, lock)
+        } else {
+            let cwd = match p.get("cwd").and_then(Value::as_str) {
+                Some(cwd) => PathBuf::from(cwd),
+                None => self.command_cwd.clone(),
+            };
+            if !cwd.is_absolute() || !cwd.is_dir() {
+                return Err(Denied("host_command 'cwd' must be an absolute existing directory".into()));
+            }
+            let mut argv = vec![name.to_string()];
+            argv.extend(args);
+            let timeout_s = if action == "start" { HOST_COMMAND_MAX_TIMEOUT_S } else { 60.0 };
+            (argv, cwd, timeout_s, None)
+        };
+        let limit_owner = if registered.is_some() { "ceiling's" } else { "command's" };
+        let maximum_timeout_s = if registered.is_some() { default_timeout_s } else { HOST_COMMAND_MAX_TIMEOUT_S };
+        let timeout_s = match p.get("timeout_s") {
+            None | Some(Value::Null) => default_timeout_s,
+            Some(t) => t.as_f64().filter(|t| *t > 0.0 && *t <= maximum_timeout_s).ok_or_else(|| Denied(format!(
+                "host_command 'timeout_s' must be a number in (0, {maximum_timeout_s}], the {limit_owner} limit for {}", q(name))))?,
         };
         if let Some(lock) = &lock {
             let flock = ["/usr/bin/flock", "/bin/flock"].into_iter().find(|f| Path::new(f).is_file())
@@ -835,6 +889,7 @@ impl Broker {
         let session_request = self.in_flight.lock().unwrap().clone();
         let receipt = json!({
             "receipt_id": util::uuid4(), "request_id": req_id, "session_id": self.session_id,
+            "mode": self.mode.as_str(), "config_revision": self.config_revision.clone(),
             "session_request": session_request,
             "timestamp": util::now_secs(), "category": category, "params": params,
             "approved": approved, "result": result, "reason": reason,
@@ -875,8 +930,14 @@ fn add_skipped(v: &mut Value, skipped: [u64; 2]) {
 
 fn host_job_json(job: Option<&str>, r: &sandbox::HostJobResult) -> Value {
     let mut v = json!({"returncode": r.returncode, "timed_out": r.timed_out, "cancelled": r.cancelled,
-                       "seconds": round_ms(r.seconds), "stdout": r.stdout, "stderr": r.stderr, "running": false});
+                       "seconds": round_ms(r.seconds), "stdout": r.stdout, "stderr": r.stderr,
+                       "stdout_tail": r.stdout_tail, "stderr_tail": r.stderr_tail, "running": false});
     add_skipped(&mut v, r.skipped);
+    for (key, n) in [("stdout_tail_skipped_bytes", r.tail_skipped[0]), ("stderr_tail_skipped_bytes", r.tail_skipped[1])] {
+        if n > 0 {
+            v[key] = json!(n);
+        }
+    }
     if let Some(id) = job {
         v["job"] = json!(id);
     }
@@ -961,6 +1022,7 @@ impl Drop for ConnSlot {
 pub struct BrokerServer {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    wake: UnixStream,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -971,7 +1033,9 @@ impl BrokerServer {
 
     fn stop_now(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.path); // wake the accept loop
+        // Wake the accept loop independently of the socket pathname. Scratch
+        // cleanup may already have unlinked that path during error handling.
+        let _ = self.wake.write_all(&[1]);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -994,13 +1058,32 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
     fs::set_permissions(sock_path, fs::Permissions::from_mode(0o666)).map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let (wake_reader, wake) = UnixStream::pair().map_err(|e| format!("creating broker wake pair: {e}"))?;
     let active = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            if stop2.load(Ordering::SeqCst) {
+        let listener_fd = listener.as_raw_fd();
+        let wake_fd = wake_reader.as_raw_fd();
+        loop {
+            let mut fds = [
+                libc::pollfd { fd: listener_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+            ];
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                    continue;
+                }
                 break;
             }
-            let Ok(mut conn) = conn else { continue };
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                || stop2.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            if fds[0].revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let Ok((mut conn, _)) = listener.accept() else { continue };
             let _ = conn.set_read_timeout(Some(CONN_IO_TIMEOUT));
             let _ = conn.set_write_timeout(Some(CONN_IO_TIMEOUT));
             let Some(slot) = ConnSlot::take(&active) else {
@@ -1009,15 +1092,18 @@ pub fn serve(sock_path: &Path, broker: Arc<Broker>) -> Result<BrokerServer, Stri
             };
             let b = broker.clone();
             std::thread::spawn(move || {
-                let _slot = slot;
-                handle_conn(conn, &b)
+                let slot_guard = slot;
+                handle_conn(&mut conn, &b);
+                // Peer EOF acknowledges both the reply and released capacity.
+                drop(slot_guard);
+                drop(conn);
             });
         }
     });
-    Ok(BrokerServer { path: sock_path.to_path_buf(), stop, thread: Some(thread) })
+    Ok(BrokerServer { path: sock_path.to_path_buf(), stop, wake, thread: Some(thread) })
 }
 
-fn handle_conn(conn: UnixStream, broker: &Broker) {
+fn handle_conn(conn: &mut UnixStream, broker: &Broker) {
     let mut writer = match conn.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -1296,34 +1382,36 @@ mod tests {
         let sock = t.0.join("b.sock");
         let server = serve(&sock, Arc::new(broker(json!({}), &t.0.join("receipts.jsonl")))).unwrap();
         // Fill every slot with a connection that never sends a request.
-        let idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let busy = loop {
-            let mut extra = UnixStream::connect(&sock).unwrap();
-            extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let _ = writeln!(extra, "{}", json!({"id": "x", "category": "nope"}));
-            let mut reply = String::new();
-            let _ = BufReader::new(extra).read_line(&mut reply);
-            if reply.contains("broker busy") || std::time::Instant::now() > deadline {
-                break reply;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let mut idle: Vec<UnixStream> = (0..MAX_CONNECTIONS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+        let mut extra = UnixStream::connect(&sock).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut busy = String::new();
+        extra.read_to_string(&mut busy).unwrap();
         assert!(busy.contains("broker busy"), "connection past the cap was served: {busy:?}");
-        // Freeing a slot lets the next request through.
-        drop(idle);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let served = loop {
-            let mut c = UnixStream::connect(&sock).unwrap();
-            writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+        // Complete each request; EOF acknowledges its released slot.
+        for c in &mut idle {
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            writeln!(c, "{}", json!({"id": "idle", "category": "nope"})).unwrap();
             let mut reply = String::new();
-            BufReader::new(c).read_line(&mut reply).unwrap();
-            if reply.contains("unknown capability") || std::time::Instant::now() > deadline {
-                break reply;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+            c.read_to_string(&mut reply).unwrap();
+            assert!(reply.contains("unknown capability"), "{reply:?}");
+        }
+        drop(idle);
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        writeln!(c, "{}", json!({"id": "y", "category": "nope"})).unwrap();
+        let mut served = String::new();
+        c.read_to_string(&mut served).unwrap();
         assert!(served.contains("unknown capability"), "{served:?}");
+        server.shutdown();
+    }
+
+    #[test]
+    fn shutdown_does_not_depend_on_socket_path() {
+        let t = tmpdir("unlinked-socket");
+        let sock = t.0.join("b.sock");
+        let server = serve(&sock, Arc::new(broker(json!({}), &t.0.join("receipts.jsonl")))).unwrap();
+        fs::remove_file(&sock).unwrap();
         server.shutdown();
     }
 
@@ -1565,6 +1653,50 @@ mod tests {
     }
 
     #[test]
+    fn case_operator_001_runs_literal_argv_without_a_ceiling_and_keeps_alias_cwd() {
+        let d = tmpdir("operator-hostcmd");
+        let session_cwd = d.0.join("session-cwd");
+        let request_cwd = d.0.join("request-cwd");
+        let alias_cwd = d.0.join("alias-cwd");
+        for path in [&session_cwd, &request_cwd, &alias_cwd] { fs::create_dir_all(path).unwrap(); }
+        let receipts = d.0.join("receipts.jsonl");
+        let mut b = broker(json!({"host_command": {"commands": {
+            "fixed": {"argv": ["/bin/pwd"], "cwd": alias_cwd.to_string_lossy()}
+        }}}), &receipts);
+        b.set_session_context(SessionMode::Operator, session_cwd.clone(), Some("config-r7".into()));
+
+        let r = cmd(&b, json!({"name": "pwd", "cwd": request_cwd.to_string_lossy()}));
+        assert_eq!(r["approved"], true, "{r}");
+        assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), request_cwd.to_string_lossy());
+        let r = cmd(&b, json!({"name": "pwd"}));
+        assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), session_cwd.to_string_lossy());
+        let r = cmd(&b, json!({"name": "fixed", "cwd": request_cwd.to_string_lossy()}));
+        assert_eq!(r["result"]["stdout"].as_str().unwrap().trim(), alias_cwd.to_string_lossy());
+        for timeout in [61, 14400] {
+            let r = cmd(&b, json!({"name": "pwd", "timeout_s": timeout}));
+            assert_eq!(r["approved"], true, "{r}");
+        }
+        assert_eq!(cmd(&b, json!({"name": "pwd", "timeout_s": 14401}))["approved"], false);
+
+        let args: Vec<String> = (0..80).map(|n| format!("λ {n}")).collect();
+        let expected = format!("{}\n", args.join(" "));
+        let r = cmd(&b, json!({"name": "echo", "args": args, "cwd": request_cwd.to_string_lossy()}));
+        assert_eq!(r["approved"], true, "{r}");
+        assert_eq!(r["result"]["stdout"], expected);
+        let long = "λ".repeat(3000);
+        let r = cmd(&b, json!({"name": "echo", "args": [long], "cwd": request_cwd.to_string_lossy()}));
+        assert_eq!(r["approved"], true, "{r}");
+        assert_eq!(r["result"]["stdout"], format!("{long}\n"));
+        let r = cmd(&b, json!({"name": "echo", "args": ["bad\u{0000}arg"]}));
+        assert_eq!(r["approved"], false);
+
+        let rows: Vec<Value> = fs::read_to_string(receipts).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(rows.len() >= 6);
+        assert!(rows.iter().all(|row| row["mode"] == "operator" && row["config_revision"] == "config-r7"));
+    }
+
+    #[test]
     fn host_command_refuses_unnamed_commands_unasked_args_and_bad_specs() {
         let d = tmpdir("hostcmd-deny");
         let dir = d.0.to_string_lossy().into_owned();
@@ -1749,6 +1881,7 @@ mod tests {
         assert_eq!(r["result"]["running"], json!(false), "{r}");
         assert_eq!(rest, "two\n", "the final result repeated output a poll had returned");
         assert_eq!(err, "err\n");
+        assert_eq!((r["result"]["stdout_tail"].clone(), r["result"]["stderr_tail"].clone()), (json!("one\ntwo\n"), json!("err\n")));
         assert_eq!(r["result"]["cancelled"], json!(false));
     }
 
@@ -1770,7 +1903,7 @@ mod tests {
         assert_eq!(r["result"]["cancelled"], json!(true), "{r}");
         assert_eq!(r["result"]["running"], json!(false));
         assert_eq!(r["result"]["timed_out"], json!(false));
-        assert_eq!(r["result"]["stdout"], json!("started\n"));
+        assert_eq!((r["result"]["stdout"].clone(), r["result"]["stdout_tail"].clone()), (json!("started\n"), json!("started\n")));
         assert!(pid_dead(&helper), "a cancelled job's helper survived");
         assert_eq!(cmd(&b, json!({"action": "list"}))["result"]["jobs"], json!([]));
         assert!(cmd(&b, json!({"action": "cancel", "job": id}))["reason"].as_str().unwrap().contains("no running"));
@@ -1788,13 +1921,27 @@ mod tests {
     fn host_command_reports_output_the_tail_dropped() {
         let d = tmpdir("hostcmd-skip");
         let dir = d.0.to_string_lossy().into_owned();
+        let output = format!("{}界{}尾", "x".repeat(23_616), "x".repeat(16_379));
+        assert_eq!(output.len(), 40_001);
+        fs::write(d.0.join("output"), output).unwrap();
+        fs::write(d.0.join("invalid"), [0x80]).unwrap();
         let b = cmd_broker(&d.0, json!({
-            "loud": {"argv": ["/bin/sh", "-c", "head -c 40000 /dev/zero | tr '\\0' x; echo"], "cwd": dir},
+            "loud": {"argv": ["/bin/sh", "-c", "cat output; printf err >&2"], "cwd": dir},
+            "invalid": {"argv": ["/bin/cat", "invalid"], "cwd": dir},
         }));
         let r = cmd(&b, json!({"name": "loud"}));
-        assert_eq!(r["result"]["stdout"].as_str().unwrap().len(), HOST_COMMAND_OUTPUT, "{}", r["result"]["returncode"]);
-        assert_eq!(r["result"]["stdout_skipped_bytes"], json!(40001 - HOST_COMMAND_OUTPUT));
-        assert!(r["result"].get("stderr_skipped_bytes").is_none());
+        let tail = format!("{}尾", "x".repeat(16_379));
+        let skipped = json!(40_001 - HOST_COMMAND_OUTPUT + 2);
+        assert_eq!((r["result"]["stdout"].clone(), r["result"]["stdout_tail"].clone()), (json!(tail.as_str()), json!(tail.as_str())), "{}", r["result"]["returncode"]);
+        assert_eq!((r["result"]["stdout_skipped_bytes"].clone(), r["result"]["stdout_tail_skipped_bytes"].clone()), (skipped.clone(), skipped.clone()));
+        assert_eq!((r["result"]["stderr_tail"].clone(), r["result"].get("stderr_skipped_bytes").is_none()), (json!("err"), true));
+        let invalid = cmd(&b, json!({"name": "invalid"}));
+        assert_eq!((invalid["result"]["stdout_tail"].clone(), invalid["result"].get("stdout_tail_skipped_bytes").is_none()), (json!("\u{FFFD}"), true));
+
+        let id = cmd(&b, json!({"name": "loud", "action": "start"}))["result"]["job"].as_str().unwrap().to_string();
+        let r = poll_until(&b, &id, |r| r["result"]["running"] == json!(true));
+        assert_eq!(r["result"]["running"], json!(false));
+        assert_eq!((r["result"]["stdout_tail"].clone(), r["result"]["stdout_tail_skipped_bytes"].clone(), r["result"]["stderr_tail"].clone()), (json!(tail.as_str()), skipped, json!("err")));
     }
 
     #[test]

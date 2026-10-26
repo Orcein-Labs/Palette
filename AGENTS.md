@@ -10,8 +10,10 @@ stage internal research or credentials into the public release.
 ## Implementation
 
 - Read owning files before broad changes. Preserve documented behavior.
-- Competence is not authorization. Host effects require the configured broker
-  ceiling; workers must not mint grants or weaken OS isolation.
+- Session mode defines the host boundary. `operator` mode runs with the user's
+  normal authority; configured broker aliases retain their declared policy.
+  `sandbox` mode is opt-in and keeps host effects ceiling-bound inside the OS
+  boundary. Workers must not mint grants or weaken that sandbox isolation.
 - Prefer Julia-native APIs. Keep process entrypoints and durable formats explicit.
 - Routine dependency updates require a minimum release age of seven days.
   Urgent patches require an explicitly justified exception.
