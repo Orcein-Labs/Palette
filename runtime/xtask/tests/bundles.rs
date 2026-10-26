@@ -73,6 +73,8 @@ fn builds_the_same_three_bundles_from_a_revision_every_time() {
     find(&desktop, "server/index.cjs");
     assert!(chatgpt.iter().all(|(n, _)| n.starts_with("palette/")), "the ChatGPT plugin has one root");
     find(&chatgpt, "palette/plugin.json");
+    find(&claude, "hooks/hooks.json");
+    find(&claude, "hooks/session-start.sh");
 
     let manifest: serde_json::Map<String, Value> = serde_json::from_slice(find(&claude, ".claude-plugin/plugin.json")).unwrap();
     assert_eq!(manifest.keys().collect::<Vec<_>>(), ["name", "version", "description", "author", "license", "repository", "mcpServers", "skills"]);

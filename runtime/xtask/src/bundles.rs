@@ -123,7 +123,7 @@ fn build(source: &Files, revision: &str) -> Result<Vec<(&'static str, Vec<u8>)>,
     claude_manifest.insert("mcpServers".into(), "./.mcp.json".into());
     claude_manifest.insert("skills".into(), "./skills/".into());
     let mut claude = shared.clone();
-    claude.extend(portable.iter().filter(|(n, _)| n.starts_with("skills/") || n.starts_with("assets/")).map(|(n, d)| (n.clone(), d.clone())));
+    claude.extend(portable.iter().filter(|(n, _)| n.starts_with("skills/") || n.starts_with("assets/") || n.starts_with("hooks/")).map(|(n, d)| (n.clone(), d.clone())));
     claude.insert(".claude-plugin/plugin.json".into(), json_bytes(&claude_manifest.into()));
     claude.insert(".mcp.json".into(), json_bytes(&json!({"mcpServers": {"palette": {"command": "palette-mcp"}}})));
 
