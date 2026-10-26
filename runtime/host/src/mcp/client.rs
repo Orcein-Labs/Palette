@@ -26,8 +26,21 @@ pub(crate) fn socket_path() -> Result<PathBuf, String> {
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| login_runtime_dir(&PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))))
         .ok_or("PALETTE_SOCKET is unset and XDG_RUNTIME_DIR is unavailable")?;
-    Ok(PathBuf::from(runtime).join("palette/daemon.sock"))
+    Ok(runtime.join("palette/daemon.sock"))
+}
+
+/// MCP clients such as Codex start servers with a filtered environment that
+/// drops `XDG_RUNTIME_DIR`. The login manager's per-user directory is used in
+/// its place only when it is a real directory this user owns and nobody else
+/// can enter.
+fn login_runtime_dir(dir: &PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    let private = meta.is_dir() && meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o077 == 0;
+    private.then(|| dir.clone())
 }
 
 /// A connected stream whose server runs as this user. `Err(Err(_))` is a
@@ -673,6 +686,23 @@ mod tests {
         assert!(matches!(connect(&path), Err(Err(_))));
         let _listener = UnixListener::bind(&path).unwrap();
         assert!(connect(&path).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn login_runtime_dir_must_be_private_and_real() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = util::mkdtemp("palette-client-test-").unwrap();
+        let runtime = dir.join("runtime");
+        assert_eq!(login_runtime_dir(&runtime), None);
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(login_runtime_dir(&runtime), Some(runtime.clone()));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&runtime, &link).unwrap();
+        assert_eq!(login_runtime_dir(&link), None);
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(login_runtime_dir(&runtime), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
