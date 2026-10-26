@@ -10,7 +10,7 @@
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/latentcollapse/Palette"
+    "url": "https://github.com/Orcein-Labs/Palette"
   },
   "server": {
     "type": "node",

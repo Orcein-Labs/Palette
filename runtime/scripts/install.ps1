@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Install Palette on Windows. Palette runs in WSL2; this sets WSL2 up, installs
 # Palette inside it, and connects Claude Desktop, Claude Code and Codex:
-#   powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
+#   powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/Orcein-Labs/Palette/releases/latest/download/install.ps1'))"
 # Run again to update. Settings, all optional:
 #   PALETTE_WSL_DISTRIBUTION  WSL distribution to use (default: the default one, or a new Ubuntu)
 #   PALETTE_VERSION           release tag to install (default: the latest release)
@@ -21,8 +21,8 @@ if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
 }
 $release = $env:PALETTE_RELEASE_URL
 if (-not $release) {
-    $release = if ($env:PALETTE_VERSION) { "https://github.com/latentcollapse/Palette/releases/download/$env:PALETTE_VERSION" }
-               else { 'https://github.com/latentcollapse/Palette/releases/latest/download' }
+    $release = if ($env:PALETTE_VERSION) { "https://github.com/Orcein-Labs/Palette/releases/download/$env:PALETTE_VERSION" }
+               else { 'https://github.com/Orcein-Labs/Palette/releases/latest/download' }
 }
 
 # Linux commands; their output is UTF-8 and wsl.exe's own messages are too.

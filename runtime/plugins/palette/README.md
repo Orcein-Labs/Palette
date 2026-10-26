@@ -6,7 +6,7 @@ Claude Code. To add the plugin to Claude Code by hand, after the runtime is
 installed:
 
 ```sh
-claude plugin marketplace add latentcollapse/Palette
+claude plugin marketplace add Orcein-Labs/Palette
 claude plugin install palette@palette
 ```
 

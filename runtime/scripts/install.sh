@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 # Install Palette on Linux (or inside WSL2) and connect it to local clients:
-#   curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/Orcein-Labs/Palette/releases/latest/download/install.sh | sh
 # Run again to update; `install.sh --update` installs a newer release only.
 # Arguments after the options below go to `palette-host setup` (for example --replace,
 # to take over a client's existing palette server). Settings, all optional:
@@ -13,7 +13,7 @@
 #   PALETTE_WSL_DISTRIBUTION  set by install.ps1 so Windows clients launch through WSL
 set -eu
 
-repo=latentcollapse/Palette
+repo=Orcein-Labs/Palette
 home=${PALETTE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/palette}
 asset=palette-linux-x86_64.tar.gz
 versions=$home/versions
