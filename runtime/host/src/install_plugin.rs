@@ -20,6 +20,23 @@ Wire a local Palette plugin directly to the repository-owned MCP consumer.
 const LAUNCHER_HEADER: &str = "#!/bin/sh\n# Palette-managed launcher\n";
 const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
+/// Keep generated plugins on the same instructions as their installed runtime.
+pub(crate) fn copy_instructions(repo: &Path, plugin: &Path) -> Result<(), String> {
+    let instructions = repo.join("runtime/plugins/palette");
+    for relative in ["skills/palette/SKILL.md", "skills/palette-setup/SKILL.md", "hooks/hooks.json", "hooks/session-start.sh"] {
+        let source = instructions.join(relative);
+        let target = plugin.join(relative);
+        if util::resolve(&source) == util::resolve(&target) {
+            continue;
+        }
+        let text = fs::read_to_string(&source).map_err(|e| format!("{}: {e}", source.display()))?;
+        let parent = target.parent().expect("instruction files have a parent");
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        util::write_atomic(&target, &text, if relative.ends_with(".sh") { 0o755 } else { 0o644 })?;
+    }
+    Ok(())
+}
+
 fn read_json(p: &Path) -> Result<Value, String> {
     let text = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", p.display()))
@@ -163,6 +180,7 @@ pub fn main(argv: &[String]) -> Result<i32, String> {
             fs::copy(&icon, assets.join("palette.svg")).map_err(|e| format!("{}: {e}", icon.display()))?;
         }
     }
+    copy_instructions(&repo, &plugin)?;
     write_json(&config_path, &config)?;
     write_json(&manifest_path, &manifest)?;
 
