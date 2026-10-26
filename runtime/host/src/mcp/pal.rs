@@ -90,7 +90,11 @@ fn parse(argv: &[String], stdin: &mut dyn FnMut() -> Result<String, String>) -> 
             arguments["mode"] = json!(mode);
         }
         for (key, value) in &args {
-            arguments.as_object_mut().expect("object").entry(key.clone()).or_insert(value.clone());
+            // Like --tool, control shortcuts accept routing options; execution
+            // flags belong to Julia calls and are absent from the control schema.
+            if key == "workspace_id" || key == "context_id" {
+                arguments.as_object_mut().expect("object").entry(key.clone()).or_insert(value.clone());
+            }
         }
         return Ok(Some(Request { tool: "palette_control".into(), arguments, json }));
     }
@@ -259,6 +263,8 @@ mod tests {
         assert!(parse(&args(&["--status", "x"]), &mut || Ok(String::new())).is_err());
         assert_eq!(parsed(&["--status"]).tool, "palette_control");
         assert_eq!(parsed(&["--reload"]).tool, "palette_control");
+        assert_eq!(parsed(&["-w", "ws", "-c", "ctx", "-t", "30", "--full", "--ephemeral", "--status"]).arguments, json!({"action":"status", "workspace_id":"ws", "context_id":"ctx"}));
+        assert_eq!(parsed(&["--reload", "-w", "ws", "-c", "ctx", "-t", "30"]).arguments, json!({"action":"reload_config", "workspace_id":"ws", "context_id":"ctx"}));
     }
 
     #[test]
