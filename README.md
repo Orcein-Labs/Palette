@@ -4,7 +4,7 @@ Palette gives any harness that accepts plugins, a Julia computer on your machine
 
 Note: Developed on CachyOS, tested on Windows 11 via QEMU. Xeon 2699 v3, RTX 5060 8GB, 32GB DDR4
 
-ChatGPT, Claude, Grok, and Gemini talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
+ChatGPT, Claude, Grok, and Gemini talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. You can kill Palette on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. 
 
 Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives. Broker-mediated host effects leave a receipt; operator mode also has the user's normal host access.
 
