@@ -100,7 +100,7 @@ fn build(source: &Files, revision: &str) -> Result<Vec<(&'static str, Vec<u8>)>,
         (
             "SOURCE.json".into(),
             json_bytes(&json!({
-                "repository": "https://github.com/latentcollapse/Palette",
+                "repository": "https://github.com/Orcein-Labs/Palette",
                 "revision": revision,
                 "plugin_version": field("version")?,
                 "runtime": "source; prepare on Linux or WSL2",
