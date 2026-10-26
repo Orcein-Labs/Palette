@@ -110,9 +110,7 @@ impl Fixture {
         for name in CLIENTS {
             write(&f.bin().join(name), CLIENT_STUB, 0o755);
         }
-        for name in ["julia", "bwrap"] {
-            write(&f.bin().join(name), "#!/bin/sh\nexit 0\n", 0o755);
-        }
+        write(&f.bin().join("julia"), "#!/bin/sh\nexit 0\n", 0o755);
         fs::create_dir_all(f.state()).unwrap();
         fs::create_dir_all(f.home()).unwrap();
         f
@@ -202,6 +200,69 @@ fn names(dir: &Path) -> Vec<String> {
     n
 }
 
+#[test]
+fn setup_defaults_to_operator_and_requires_bwrap_only_for_sandbox() {
+    let f = Fixture::new();
+    let repo = f.make_repo("sdk-1");
+    let base = ["--repo-dir", repo.to_str().unwrap(), "--no-register", "--no-check"];
+
+    let no_bwrap_path = format!("{}:/usr", f.bin().display());
+    let out = f.setup(&base, &[("PATH", &no_bwrap_path)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Preparing the operator runtime"));
+    let operator_launcher = fs::read_to_string(f.launcher()).unwrap();
+    assert!(operator_launcher.contains("PALETTE_MODE=operator"));
+    assert!(!operator_launcher.contains("JULIA_PKG_OFFLINE="), "operator mode should keep Julia's normal package network default");
+    assert_eq!(json(&f.client_dir().join("palette-launch.json"))["env"]["PATH"], "/usr",
+        "operator setup must preserve durable installer PATH entries instead of replacing them with SYSTEM_PATH");
+
+    let mut sandbox = base.to_vec();
+    sandbox.extend(["--mode", "sandbox"]);
+    let out = f.setup(&sandbox, &[("PATH", &no_bwrap_path)]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing prerequisite on PATH: bwrap (needed for sandbox mode)"));
+
+    let out = f.setup(&base, &[("PATH", &no_bwrap_path), ("PALETTE_MODE", "sandbox")]);
+    assert!(!out.status.success(), "PALETTE_MODE should select sandbox when setup has no explicit mode");
+    let mut explicit_operator = base.to_vec();
+    explicit_operator.extend(["--mode", "operator"]);
+    let out = f.setup(&explicit_operator, &[("PATH", &no_bwrap_path), ("PALETTE_MODE", "sandbox")]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(fs::read_to_string(f.launcher()).unwrap().contains("PALETTE_MODE=operator"));
+
+    let out = f.setup(&explicit_operator, &[("PATH", &no_bwrap_path), ("JULIA_PKG_OFFLINE", "false")]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(fs::read_to_string(f.launcher()).unwrap().contains("JULIA_PKG_OFFLINE=false"));
+
+    write(&f.bin().join("bwrap"), "#!/bin/sh\nexit 0\n", 0o755);
+    let out = f.setup(&sandbox, &[("PATH", &no_bwrap_path)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Preparing the sandbox"));
+    let sandbox_launcher = fs::read_to_string(f.launcher()).unwrap();
+    assert!(sandbox_launcher.contains("PALETTE_MODE=sandbox"));
+    assert!(sandbox_launcher.contains("JULIA_PKG_OFFLINE=true"));
+}
+
+#[test]
+fn installer_rejects_a_missing_mode_before_install_side_effects() {
+    let f = Fixture::new();
+    let invoked = f.root.join("curl-invoked");
+    write(&f.bin().join("curl"), &format!("#!/bin/sh\ntouch '{}'\n", invoked.display()), 0o755);
+    let script = source().join("runtime/scripts/install.sh");
+    let out = Command::new("/bin/sh")
+        .arg(script)
+        .arg("--mode")
+        .env_clear()
+        .env("HOME", f.home())
+        .env("PATH", format!("{}:/usr/bin:/bin", f.bin().display()))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--mode needs operator or sandbox"));
+    assert!(!invoked.exists());
+    assert!(!f.home().join(".local/share/palette/versions").exists());
+}
+
 fn json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -252,7 +313,7 @@ fn installs_checks_and_keeps_the_working_installation_when_a_check_fails() {
     let f = Fixture::new();
     let sdk1 = f.make_repo("sdk-1");
     let out = f.ok(&["--repo-dir", sdk1.to_str().unwrap()]);
-    assert!(out.contains("Preparing the sandbox"), "{out}");
+    assert!(out.contains("Preparing the operator runtime"), "{out}");
     assert!(out.contains("x + 1 = 42"), "{out}");
     assert!(out.contains("TeamLab: 0 listings in the shop at /shop."), "{out}");
     for client in CLIENTS {
@@ -273,7 +334,7 @@ fn installs_checks_and_keeps_the_working_installation_when_a_check_fails() {
     let env = read_env(&f.server_env());
     assert_eq!(env["PALETTE_RUNTIME_ROOT"], capabilities.to_string_lossy());
     assert_eq!(env["PALETTE_CAPABILITY_CEILING"], ceiling.to_string_lossy());
-    assert_eq!(env["JULIA_PKG_OFFLINE"], "true");
+    assert!(!env.contains_key("JULIA_PKG_OFFLINE"), "operator mode should not force Julia offline");
     for absent in ["TEAMLAB_DIR", "PALETTE_HOST_COMMANDS", "PALETTE_READ_ROOTS"] {
         assert!(!env.contains_key(absent), "{absent} is set");
     }
@@ -332,9 +393,8 @@ fn operator_files_are_passed_to_the_server() {
     fs::create_dir_all(&two).unwrap();
     write(&roots, &format!("# read roots\n\n  {}\n{}\n", one.display(), two.display()), 0o644);
     let out = f.ok(&["--repo-dir", repo.to_str().unwrap(), "--no-register"]);
-    let joined = format!("{}:{}", one.display(), two.display());
     assert!(out.contains(&format!("Read roots: {}, {}", one.display(), two.display())), "{out}");
-    assert_eq!(read_env(&f.server_env())["PALETTE_READ_ROOTS"], joined);
-    assert!(fs::read_to_string(f.launcher()).unwrap().contains(&format!("'PALETTE_READ_ROOTS={joined}'")));
+    assert!(!read_env(&f.server_env()).contains_key("PALETTE_READ_ROOTS"), "canonical roots file should remain live config");
+    assert!(!fs::read_to_string(f.launcher()).unwrap().contains("PALETTE_READ_ROOTS="));
     assert!(names(&f.client_dir()).iter().all(|n| !n.starts_with('.')));
 }

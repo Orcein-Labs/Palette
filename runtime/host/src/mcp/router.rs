@@ -17,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -26,17 +26,25 @@ use super::child::{self, env, get, no_get};
 use super::generation::GenerationStore;
 use super::patch::{self, PatchBroker};
 use super::{atomic_json, lineage, py_json_loads, transport, valid_id, Fault};
-use crate::{provisioning, util};
+use crate::{provisioning, sandbox, util};
 
 const FRAME_LIMIT: usize = 1048576;
-const CONTROL_ACTIONS: [&str; 8] =
-    ["status", "prepare", "restart", "checkpoints", "restore", "receipts", "generation_status", "activate_generation"];
+const CONTROL_ACTIONS: [&str; 9] =
+    ["status", "prepare", "restart", "checkpoints", "restore", "receipts", "generation_status", "activate_generation", "reload_config"];
 const INSTRUCTIONS: &str = "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities.";
 const ROUTING: [&str; 2] = ["workspace_id", "context_id"];
 
 /// A mutex lock that outlives a panicked holder, as Python's locks do.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read_lock<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_lock<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn mkdir_private(path: &Path) -> Result<(), Fault> {
@@ -49,8 +57,98 @@ fn disjoint<W: AsRef<Path>, P: AsRef<Path>, Q: AsRef<Path>>(writable: &[W], prot
 
 const NONE: &[PathBuf] = &[];
 
-fn ceiling() -> Result<Value, Fault> {
-    provisioning::with_teamlab(provisioning::operator_ceiling(env).map_err(Fault::value)?, env).map_err(Fault::value)
+#[derive(Clone)]
+struct ConfigSnapshot {
+    revision: u64,
+    default_mode: String,
+    read_roots: Vec<PathBuf>,
+    read_roots_source: &'static str,
+    read_roots_spec: String,
+    read_roots_file: Option<PathBuf>,
+    host_commands: Option<String>,
+    host_commands_source: &'static str,
+    ceiling: Value,
+    command_parents: Vec<PathBuf>,
+}
+
+impl ConfigSnapshot {
+    fn session_mode(&self, requested: Option<&str>) -> Result<String, Fault> {
+        let mode = requested.unwrap_or(&self.default_mode);
+        if !matches!(mode, "operator" | "sandbox") {
+            return Err(Fault::value("mode must be operator or sandbox"));
+        }
+        if self.default_mode == "sandbox" && mode == "operator" {
+            return Err(Fault::permission("PALETTE_MODE=sandbox requires sandbox sessions; a tool call cannot select operator mode"));
+        }
+        Ok(mode.into())
+    }
+
+    fn load(revision: u64, var: impl Fn(&str) -> Option<String>) -> Result<ConfigSnapshot, Fault> {
+        if var("PALETTE_OPERATOR_CEILING_JSON").is_some() {
+            return Err(Fault::value("PALETTE_OPERATOR_CEILING_JSON is reserved for the internal workspace snapshot handoff and cannot be set on the daemon"));
+        }
+        let config_dir = var("XDG_CONFIG_HOME").map(PathBuf::from)
+            .unwrap_or_else(|| util::home().join(".config")).join("palette");
+        let roots_path = util::expand_user(&config_dir.join("read-roots").to_string_lossy());
+        let read_roots_override = var("PALETTE_READ_ROOTS");
+        let read_roots_file_override = var("PALETTE_READ_ROOTS_FILE");
+        let read_roots_file = match &read_roots_override {
+            Some(_) => None,
+            None => match read_roots_file_override.as_deref() {
+                Some("") => None,
+                Some(path) => Some(util::resolve(&util::expand_user(path))),
+                None if roots_path.is_file() => Some(roots_path),
+                None => None,
+            },
+        };
+        let (read_roots_spec, read_roots_source) = match read_roots_override {
+            Some(spec) => (spec, "environment"),
+            None if read_roots_file_override.as_deref() == Some("") => (String::new(), "disabled"),
+            None => match read_roots_file.as_ref() {
+                Some(path) => {
+                    let roots = crate::setup::read_roots_list(path).map_err(Fault::value)?;
+                    (roots.join(":"), "file")
+                }
+                None => (String::new(), "none"),
+            },
+        };
+        let read_roots = sandbox::parse_read_roots(Some(&read_roots_spec)).map_err(Fault::value)?;
+        let commands_path = util::expand_user(&config_dir.join("host-commands.json").to_string_lossy());
+        let (host_commands, host_commands_source) = match var("PALETTE_HOST_COMMANDS") {
+            Some(path) if path.is_empty() => (None, "environment"),
+            Some(path) => (Some(path), "environment"),
+            None if commands_path.is_file() => (Some(commands_path.to_string_lossy().into_owned()), "file"),
+            None => (None, "none"),
+        };
+        let config_var = |key: &str| match key {
+            "PALETTE_READ_ROOTS" => Some(read_roots_spec.clone()),
+            "PALETTE_HOST_COMMANDS" => host_commands.clone(),
+            "PALETTE_OPERATOR_CEILING_JSON" => None,
+            _ => var(key),
+        };
+        let ceiling = provisioning::with_teamlab(provisioning::operator_ceiling(&config_var).map_err(Fault::value)?, &config_var)
+            .map_err(Fault::value)?;
+        let command_parents = provisioning::command_parents(&ceiling).map_err(Fault::value)?;
+        let default_mode = var("PALETTE_MODE").unwrap_or_else(|| "operator".into());
+        if !matches!(default_mode.as_str(), "operator" | "sandbox") {
+            return Err(Fault::value("PALETTE_MODE must be operator or sandbox"));
+        }
+        Ok(ConfigSnapshot { revision, default_mode, read_roots, read_roots_source,
+                            read_roots_spec, read_roots_file, host_commands, host_commands_source, ceiling, command_parents })
+    }
+
+    fn env(&self, key: &str) -> Option<String> {
+        match key {
+            "PALETTE_READ_ROOTS" => Some(self.read_roots_spec.clone()),
+            "PALETTE_HOST_COMMANDS" => self.host_commands.clone(),
+            _ => env(key),
+        }
+    }
+
+    fn sources(&self) -> Value {
+        json!({"read_roots": self.read_roots_source, "host_commands": self.host_commands_source})
+    }
+
 }
 
 fn version(repo: &Path) -> Result<String, Fault> {
@@ -145,7 +243,8 @@ fn receive(frames: &Frames, deadline: Instant) -> Result<Value, Fault> {
     let wait = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
     match frames.recv_timeout(wait) {
         Ok(item) => item,
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(Fault::new("Empty", "")),
+        Err(RecvTimeoutError::Timeout) => Err(Fault::new("Timeout", "Timed out waiting for a Palette child response.")),
+        Err(RecvTimeoutError::Disconnected) => Err(Fault::new("EOFError", "Palette child closed stdout before replying.")),
     }
 }
 
@@ -156,6 +255,8 @@ struct Proc {
     /// The flock on the state directory's owner lock; the child holds it too.
     lease: Option<File>,
     generation_id: Option<String>,
+    config_revision: Option<String>,
+    config_snapshot: Option<Arc<ConfigSnapshot>>,
 }
 
 /// One workspace's adapter (Python's `Child`). `call` is held for a whole
@@ -163,6 +264,9 @@ struct Proc {
 /// `children`, then `proc`.
 struct Worker {
     entry: Map<String, Value>,
+    workspace_state_dir: PathBuf,
+    state_dir: PathBuf,
+    mode: String,
     key: String,
     call: Mutex<Option<Frames>>,
     proc: Mutex<Proc>,
@@ -187,14 +291,35 @@ pub(crate) struct Router {
     max_live: usize,
     idle: Duration,
     limits: (f64, f64),
-    command_parents: Vec<PathBuf>,
     project_roots: BTreeMap<String, PathBuf>,
     tools: Value,
     children: Mutex<Children>,
+    config: RwLock<Arc<ConfigSnapshot>>,
+    reload_lock: Mutex<()>,
 }
 
 fn scratch_root(root: &Path) -> PathBuf {
     env("PALETTE_SCRATCH_ROOT").map(PathBuf::from).unwrap_or_else(|| root.join("scratch"))
+}
+
+fn sandbox_state_dir(workspace_state_dir: &Path) -> PathBuf {
+    workspace_state_dir.parent().unwrap_or(workspace_state_dir)
+        .join(".sandbox")
+        .join(workspace_state_dir.file_name().unwrap_or_default())
+}
+
+fn state_artifacts(state_dir: &Path) -> Vec<PathBuf> {
+    vec![state_dir.to_path_buf(), child::receipts_dir(state_dir), lineage::owner_lock_path(state_dir)]
+}
+
+fn legacy_state_protected_paths(r: &Router) -> Vec<PathBuf> {
+    let mut protected = vec![r.root.clone(), r.legacy.clone(), r.legacy_receipts.clone(), lineage::owner_lock_path(&r.legacy)];
+    protected.extend(state_artifacts(&sandbox_state_dir(&r.legacy)));
+    protected
+}
+
+fn patch_roots_disjoint_from_state(state_dir: &Path, patch_roots: &[PathBuf]) -> Result<(), Fault> {
+    disjoint(patch_roots, &state_artifacts(state_dir), NONE)
 }
 
 impl Router {
@@ -213,42 +338,81 @@ impl Router {
         let idle = env("PALETTE_WORKSPACE_IDLE_SECONDS").unwrap_or_else(|| "900".into());
         let idle: f64 = idle.trim().parse().map_err(|_| Fault::value(format!(
             "could not convert string to float: {}", util::py_repr(&Value::String(idle.clone())))))?;
-        let limits = transport::turn_limits(env).map_err(Fault::value)?;
+        let limits = transport::turn_limits(&env).map_err(Fault::value)?;
         if max_live < 1 || idle <= 0.0 {
             return Err(Fault::value("Workspace limits must be positive"));
         }
+        let config = Arc::new(ConfigSnapshot::load(1, &env)?);
         disjoint(&[&base], &[&repo, &root, &legacy, &legacy_receipts, &scratch_root(&root)], NONE)?;
         disjoint(&[&root, &legacy, &legacy_receipts], &[&repo], NONE)?;
         disjoint(&[&legacy, &legacy_receipts], &[&root], NONE)?;
         // A missing default workspace failed the first call, not start-up.
         mkdir_private(&base)?;
-        let command_parents = provisioning::command_parents(&provisioning::operator_ceiling(env).map_err(Fault::value)?)
-            .map_err(Fault::value)?;
         let mut router = Router {
             repo, base, legacy, legacy_receipts, root, generations,
             generation_lock: Mutex::new(()),
             max_live: max_live as usize,
             idle: Duration::try_from_secs_f64(idle).unwrap_or(Duration::MAX),
             limits,
-            command_parents,
             project_roots: BTreeMap::new(),
             tools: Value::Null,
             children: Mutex::new(Children::default()),
+            config: RwLock::new(config),
+            reload_lock: Mutex::new(()),
         };
-        router.project_roots = router.configured_project_roots()?;
+        let config = router.config_snapshot();
+        router.project_roots = router.configured_project_roots(&config, &env)?;
         router.tools = tools(limits);
         Ok(router)
+    }
+
+    fn config_snapshot(&self) -> Arc<ConfigSnapshot> {
+        Arc::clone(&read_lock(&self.config))
+    }
+
+    fn reload_config(&self) -> Value {
+        self.reload_config_with(env)
+    }
+
+    fn reload_config_with(&self, var: impl Fn(&str) -> Option<String>) -> Value {
+        let _reload = lock(&self.reload_lock);
+        let current = self.config_snapshot();
+        eprintln!("palette: config reload requested from revision {}", current.revision);
+        let loaded = ConfigSnapshot::load(current.revision + 1, &var)
+            .and_then(|next| self.configured_project_roots(&next, &var).map(|_| next));
+        match loaded {
+            Ok(next) => {
+                let result_revision = next.revision.to_string();
+                let result_mode = next.default_mode.clone();
+                let sources = next.sources();
+                *write_lock(&self.config) = Arc::new(next);
+                eprintln!("palette: config reload published revision {result_revision}");
+                json!({"success": true, "reloaded": true, "default_mode": result_mode,
+                       "effective_config_revision": current.revision.to_string(),
+                       "pending_config_revision": result_revision, "config_sources": sources,
+                       "active_sessions": self.active_sessions()})
+            }
+            Err(error) => {
+                eprintln!("palette: config reload rejected at revision {}: {}", current.revision, error.message);
+                json!({"success": false, "reloaded": false, "default_mode": current.default_mode,
+                       "effective_config_revision": current.revision.to_string(),
+                       "pending_config_revision": current.revision.to_string(),
+                       "config_sources": current.sources(), "active_sessions": self.active_sessions(),
+                       "error": error.message})
+            }
+        }
     }
 
     /// What a workspace may not overlap: Palette's own state and install,
     /// the read roots, the host-command paths, the Julia install and depots,
     /// the configured host files and the patch targets.
-    fn workspace_protected_paths(&self) -> Result<Vec<PathBuf>, Fault> {
-        let mut protected = vec![self.base.clone(), self.repo.clone(), self.root.clone(), self.legacy.clone(),
-                                 self.legacy_receipts.clone(), scratch_root(&self.root)];
+    fn workspace_protected_paths(&self, config: &ConfigSnapshot) -> Result<Vec<PathBuf>, Fault> {
+        let mut protected = vec![self.base.clone(), self.repo.clone(), scratch_root(&self.root)];
+        protected.extend(legacy_state_protected_paths(self));
         let split = |key: &str| env(key).unwrap_or_default().split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect::<Vec<_>>();
-        protected.extend(split("PALETTE_READ_ROOTS"));
-        protected.extend(provisioning::protected_host_paths(&ceiling()?, true, true, env).map_err(Fault::value)?);
+        protected.extend(config.read_roots.iter().cloned());
+        protected.extend(config.read_roots_file.iter().cloned());
+        protected.extend(provisioning::protected_host_paths(&config.ceiling, true, true, |key| config.env(key)).map_err(Fault::value)?);
         // The default depot stays protected even when JULIA_DEPOT_PATH points
         // elsewhere: it holds juliaup toolchains and config/startup.jl, which a
         // host started without the override would still run.
@@ -276,15 +440,46 @@ impl Router {
         Ok(protected)
     }
 
+    /// Patch decisions follow the latest validated config while retaining
+    /// protections captured by any still-running workspace adapter.
+    fn patch_protected_paths(&self, current: &Arc<ConfigSnapshot>) -> Result<Vec<PathBuf>, Fault> {
+        let workers = lock(&self.children).map.values().cloned().collect::<Vec<_>>();
+        let mut snapshots = vec![Arc::clone(current)];
+        for worker in &workers {
+            if let Some(snapshot) = worker.live_config_snapshot() {
+                if !snapshots.iter().any(|known| known.revision == snapshot.revision) {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+        let mut protected = legacy_state_protected_paths(self);
+        for worker in workers {
+            protected.extend(state_artifacts(&worker.state_dir));
+        }
+        for snapshot in snapshots {
+            protected.extend(provisioning::protected_host_paths(
+                &snapshot.ceiling,
+                true,
+                false,
+                |key| snapshot.env(key),
+            ).map_err(Fault::value)?);
+        }
+        Ok(protected)
+    }
+
     /// PALETTE_PROJECT_ROOTS: id -> an existing directory a workspace may
     /// write, disjoint from everything protected and from each other.
-    fn configured_project_roots(&self) -> Result<BTreeMap<String, PathBuf>, Fault> {
-        let text = env("PALETTE_PROJECT_ROOTS").unwrap_or_else(|| "{}".into());
+    fn configured_project_roots(
+        &self,
+        config: &ConfigSnapshot,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<BTreeMap<String, PathBuf>, Fault> {
+        let text = var("PALETTE_PROJECT_ROOTS").unwrap_or_else(|| "{}".into());
         let Ok(Value::Object(configured)) = serde_json::from_str::<Value>(&text) else {
             return Err(Fault::value("PALETTE_PROJECT_ROOTS must be a JSON object"));
         };
         let mut roots = BTreeMap::from([("default".to_string(), self.base.clone())]);
-        let protected = self.workspace_protected_paths()?;
+        let protected = self.workspace_protected_paths(config)?;
         for (id, raw) in &configured {
             if !valid_id(id) || id == "default" {
                 return Err(Fault::value("PALETTE_PROJECT_ROOTS keys must be valid non-default project root IDs"));
@@ -297,7 +492,7 @@ impl Router {
                 return Err(Fault::value(format!("Project root {id} is not a directory")));
             }
             let others: Vec<&PathBuf> = protected.iter().chain(roots.values()).collect();
-            if let Err(e) = provisioning::require_disjoint(&[&path], &others, &self.command_parents) {
+            if let Err(e) = provisioning::require_disjoint(&[&path], &others, &config.command_parents) {
                 return Err(Fault::permission(format!(
                     "Project root {id}: {e}. Host-command directories and binaries, their parents, \
                      and Palette's own install and config are protected, because a kernel that could write \
@@ -420,15 +615,37 @@ impl Router {
     // -- Workers --------------------------------------------------------------
 
     fn child_for(&self, entry: &Map<String, Value>) -> Arc<Worker> {
-        let key = text(entry, "state_dir").to_string();
+        self.child_for_mode(entry, self.config_snapshot().default_mode.clone())
+    }
+
+    fn child_for_mode(&self, entry: &Map<String, Value>, mode: String) -> Arc<Worker> {
+        let workspace_state_dir = PathBuf::from(text(entry, "state_dir"));
+        let state_dir = if mode == "sandbox" {
+            sandbox_state_dir(&workspace_state_dir)
+        } else {
+            workspace_state_dir.clone()
+        };
+        let key = format!("{}\0{mode}", workspace_state_dir.to_string_lossy());
         let mut children = lock(&self.children);
         Arc::clone(children.map.entry(key.clone()).or_insert_with(|| Arc::new(Worker {
             entry: entry.clone(),
+            workspace_state_dir,
+            state_dir,
+            mode,
             key,
             call: Mutex::new(None),
             proc: Mutex::new(Proc::default()),
             last_used: Mutex::new(Instant::now()),
         })))
+    }
+
+    fn active_sessions(&self) -> Vec<Value> {
+        let workers: Vec<Arc<Worker>> = lock(&self.children).map.values().cloned().collect();
+        workers.into_iter().filter_map(|worker| {
+            let (running, _) = worker.pid();
+            running.then(|| json!({"workspace_id": worker.entry.get("workspace_id"), "mode": worker.mode,
+                                  "config_revision": worker.config_revision()}))
+        }).collect()
     }
 
     fn stop_idle(&self, except: Option<&Arc<Worker>>) {
@@ -556,13 +773,14 @@ impl Router {
             })?;
             return Ok(json!({"active_workspace_id": entry["workspace_id"]}));
         }
-        let state_dir = text(&entry, "state_dir").to_string();
-        let worker = lock(&self.children).map.get(&state_dir).cloned();
-        let current = |w: &Arc<Worker>| lock(&self.children).map.get(&state_dir).is_some_and(|c| Arc::ptr_eq(c, w));
+        let state_dir = PathBuf::from(text(&entry, "state_dir"));
+        let workers: Vec<Arc<Worker>> = lock(&self.children).map.values()
+            .filter(|w| w.workspace_state_dir == state_dir).cloned().collect();
+        let current = |w: &Arc<Worker>| lock(&self.children).map.get(&w.key).is_some_and(|c| Arc::ptr_eq(c, w));
         if action == "close" {
             // close is linearized against starts and waits for any in-flight call
             // to finish before stopping the worker. A later call may start it again.
-            if let Some(w) = worker {
+            for w in workers {
                 let _call = lock(&w.call);
                 let has_proc = lock(&w.proc).child.is_some();
                 if current(&w) && has_proc {
@@ -571,16 +789,25 @@ impl Router {
             }
             return Ok(json!({"workspace_id": entry["workspace_id"], "closed": true, "state_retained": true}));
         }
-        let (running, pid) = match worker {
-            Some(w) => {
-                let _call = lock(&w.call);
-                if current(&w) { w.pid() } else { (false, None) }
+        let mut sessions = Vec::new();
+        let mut pids = Vec::new();
+        for w in workers {
+            let _call = lock(&w.call);
+            if current(&w) {
+                let (running, pid) = w.pid();
+                if running {
+                    sessions.push(json!({"workspace_id": entry["workspace_id"], "mode": w.mode,
+                                         "config_revision": w.config_revision()}));
+                    if let Some(pid) = pid { pids.push(pid); }
+                }
             }
-            None => (false, None),
-        };
+        }
+        let running = !sessions.is_empty();
+        let pid = pids.first().copied();
         let mut status = entry;
         status.insert("running".into(), json!(running));
         status.insert("local_adapter_pid".into(), json!(pid));
+        status.insert("active_sessions".into(), Value::Array(sessions));
         status.insert("observation".into(), json!("running describes this router; another router may hold ownership"));
         Ok(Value::Object(status))
     }
@@ -663,6 +890,14 @@ impl Worker {
         }
     }
 
+    fn config_revision(&self) -> Option<String> {
+        lock(&self.proc).config_revision.clone()
+    }
+
+    fn live_config_snapshot(&self) -> Option<Arc<ConfigSnapshot>> {
+        lock(&self.proc).config_snapshot.clone()
+    }
+
     fn call(self: &Arc<Self>, r: &Router, name: &str, args: Map<String, Value>) -> Result<Value, Fault> {
         r.stop_idle(Some(self));
         let mut frames = lock(&self.call);
@@ -706,7 +941,25 @@ impl Worker {
             return Ok(());
         }
         self.stop_proc(r);
-        let state = util::resolve(Path::new(text(&self.entry, "state_dir")));
+        // Publish the starting snapshot while reload is excluded. A patch
+        // apply that begins after a new config publishes must also see any
+        // worker that captured the prior config and is still starting.
+        let config = {
+            let _reload = lock(&r.reload_lock);
+            let config = r.config_snapshot();
+            lock(&self.proc).config_snapshot = Some(Arc::clone(&config));
+            config
+        };
+        let started = self.start_with_snapshot(r, frames, &config);
+        if started.is_err() {
+            self.stop_proc(r);
+        }
+        started
+    }
+
+    fn start_with_snapshot(&self, r: &Router, frames: &mut Option<Frames>, config: &ConfigSnapshot) -> Result<(), Fault> {
+        config.session_mode(Some(&self.mode))?;
+        let state = util::resolve(&self.state_dir);
         let workspace = util::resolve(Path::new(text(&self.entry, "workspace_dir")));
         let generation = r.generations.resolve(None)?;
         let generation_repo = util::resolve(&generation.repo);
@@ -714,18 +967,20 @@ impl Worker {
         // The builtin generation's adapter is this binary; another
         // generation's is its own host.
         let launcher = if generation.id == "builtin" { PathBuf::from(child::current_exe()) } else { generation_host.clone() };
-        let mut protected = r.workspace_protected_paths()?;
+        let mut protected = r.workspace_protected_paths(&config)?;
         protected.extend([generation_repo.clone(), generation_host.clone(), util::resolve(&launcher)]);
         if workspace == r.base {
             protected.retain(|p| *p != r.base);
         } else {
             protected.push(r.base.clone());
         }
-        disjoint(&[&workspace], &protected, &r.command_parents)?;
+        disjoint(&[&workspace], &protected, &config.command_parents)?;
         let mut state_protected = vec![r.repo.clone(), generation_repo.clone()];
         state_protected.extend(["patches", "registry.json", "registry.lock", "client-capabilities.json", "scratch", "runtime-generations"]
             .map(|name| r.root.join(name)));
         disjoint(&[&state], &state_protected, NONE)?;
+        let patch_roots = patch::patch_roots_from_env(env)?.values().map(path_value).collect::<Result<Vec<_>, _>>()?;
+        patch_roots_disjoint_from_state(&state, &patch_roots)?;
         if let Some(parent) = state.parent() {
             mkdir_private(parent)?;
         }
@@ -752,8 +1007,17 @@ impl Worker {
             .env("PALETTE_WORKSPACE_ID", lineage_or_id(&self.entry))
             .env("PALETTE_REPO", &generation_repo)
             .env("PALETTE_HOST", &generation_host)
+            .env("PALETTE_READ_ROOTS", &config.read_roots_spec)
+            .env("PALETTE_MODE", &self.mode)
+            .env("PALETTE_CONFIG_REVISION", config.revision.to_string())
+            .env("PALETTE_OPERATOR_CEILING_JSON", config.ceiling.to_string())
             .env("PALETTE_SCRATCH_ROOT", &scratch)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        if let Some(path) = &config.host_commands {
+            command.env("PALETTE_HOST_COMMANDS", path);
+        } else {
+            command.env_remove("PALETTE_HOST_COMMANDS");
+        }
         unsafe {
             command.pre_exec(move || {
                 // The child inherits the lease, and none of the signals this
@@ -782,6 +1046,7 @@ impl Worker {
             proc.stdin = spawned.stdin.take();
             proc.child = Some(spawned);
             proc.generation_id = Some(generation.id.clone());
+            proc.config_revision = Some(config.revision.to_string());
         }
         *frames = Some(pump(stdout));
         let initialized = version(&r.repo).and_then(|v| self.exchange(r, frames, "initialize", json!({
@@ -802,9 +1067,10 @@ impl Worker {
             stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()).map_err(|e| patch::bare_os(&e))?;
         }
         // A start, its preparation and the call, whose own limit the child enforces.
-        let arguments = params.get("arguments").and_then(Value::as_object).cloned().unwrap_or_default();
-        let deadline = Instant::now() + Duration::from_secs_f64(150.0 + transport::call_limit(&arguments, r.limits));
-        let Some(frames) = frames.as_ref() else { return Err(Fault::new("Empty", "")) };
+        let deadline = Instant::now() + transport::response_timeout(method, &params, r.limits);
+        let Some(frames) = frames.as_ref() else {
+            return Err(Fault::new("EOFError", "Palette child has no response stream."));
+        };
         loop {
             let frame = receive(frames, deadline)?;
             if frame.get("id") != Some(&json!(rid)) {
@@ -838,6 +1104,7 @@ impl Worker {
             child::retire(&mut child, Duration::from_secs(40));
         }
         drop(lease);
+        lock(&self.proc).config_snapshot = None;
         if stopped {
             lock(&r.children).stopping.remove(&self.key);
         }
@@ -859,15 +1126,17 @@ fn patch_schema() -> Value {
 fn tools(limits: (f64, f64)) -> Value {
     let mut palette = child::palette_schema(limits);
     palette["required"] = json!([]);
+    palette["properties"]["mode"] = json!({"enum": ["operator", "sandbox"], "description": "Omitted mode uses the active config default. A configured sandbox default cannot be loosened to operator."});
     let mut control = child::control_schema(&CONTROL_ACTIONS);
+    control["properties"]["mode"] = palette["properties"]["mode"].clone();
     control["properties"]["generation_id"] = json!({"type": "string", "maxLength": 64});
     let workspace = json!({"type": "object", "properties": {
         "action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]},
         "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}},
         "required": ["action"], "additionalProperties": false});
     let tools = [
-        ("palette", format!("Persistent Julia world. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. {}", transport::PALETTE_GUIDE), palette),
-        ("palette_control", format!("Status, offline preparation or restart of exactly the selected workspace. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot and keeps its checkpoints. {}", transport::CONTROL_GUIDE), control),
+        ("palette", format!("Persistent Julia world. mode selects operator or sandbox for this workspace; omitted mode uses the active config default. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. {}", transport::PALETTE_GUIDE), palette),
+        ("palette_control", format!("Status, offline preparation, config reload or restart of exactly the selected workspace. Status distinguishes the running session snapshot from pending config. Reload keeps live sessions on their captured config; new sessions use the published revision. Missing routing fields select the shared legacy world. restore=false retires that world's snapshot and keeps its checkpoints. {}", transport::CONTROL_GUIDE), control),
         ("palette_workspace", "Create/attach/list/status/close thread, project or explicitly open worlds. On create, project_root_id selects a host-configured project directory; omit it for the legacy workspace. Paths are never accepted from tool arguments. Project-scoped aliases selecting the same root share one durable Julia lineage; thread/open worlds remain independent. Thread scope compares supplied context IDs; it does not authenticate callers. Close retains snapshots. Live worlds are limited; idle ones are stopped on subsequent calls.".into(), workspace),
         ("palette_patch", "Read bounded target files, prepare, inspect or apply exact file replacements in a host-configured target. Application requires explicit user approval through supported client elicitation or the local administrator CLI. No argument grants authority. Before hashes and expiry are rechecked. Multi-file application is not atomic; use a quiescent target.".into(), patch_schema()),
     ];
@@ -939,12 +1208,20 @@ impl patch::Client for StreamClient<'_> {
 
 struct Session<'a> {
     r: &'a Router,
-    broker: PatchBroker,
     capabilities: Map<String, Value>,
     caller: Option<String>,
 }
 
 impl Session<'_> {
+    fn patch_broker(&self) -> Result<PatchBroker, Fault> {
+        let config = self.r.config_snapshot();
+        let protected = self.r.patch_protected_paths(&config)?;
+        let repair = child::repair_config()?;
+        let runtime_root = util::resolve(&util::expand_user(&env("PALETTE_RUNTIME_ROOT")
+            .unwrap_or_else(|| self.r.repo.join("runtime/capabilities").to_string_lossy().into_owned())));
+        child::patch_broker(&self.r.root.join("patches"), &repair, &protected, &runtime_root)
+    }
+
     /// One message's result, or None for a notification.
     fn handle(&mut self, raw: &str, mid: &mut Value, input: &Lines, out: &mut dyn Write) -> Result<Option<Value>, Fault> {
         let msg = py_json_loads(raw)?;
@@ -1011,7 +1288,8 @@ impl Session<'_> {
         let name = name.as_str().unwrap_or_default();
         let Value::Object(mut args) = args else { unreachable!("validated") };
         if name == "palette" {
-            let (routing, routed): (Map<String, Value>, Map<String, Value>) = args.into_iter().partition(|(k, _)| ROUTING.contains(&k.as_str()));
+            let (routing, routed): (Map<String, Value>, Map<String, Value>) = args.into_iter().partition(|(k, _)|
+                ROUTING.contains(&k.as_str()) || k == "mode");
             let normalized = transport::normalize_palette_call(&Value::Object(routed)).map_err(|e| Fault::new("SourceTransportError", e))?;
             args = routing;
             args.extend(normalized);
@@ -1019,21 +1297,50 @@ impl Session<'_> {
         if name == "palette_workspace" {
             return Ok(child::text_result(&r.workspace_control(&args)?, false));
         }
+        if name == "palette_control" && args.get("action").and_then(Value::as_str) == Some("reload_config") {
+            let result = r.reload_config();
+            let failed = result.get("success") == Some(&json!(false));
+            return Ok(child::text_result(&result, failed));
+        }
+        let config = r.config_snapshot();
+        let requested_mode = args.remove("mode");
+        let mode = config.session_mode(requested_mode.as_ref().and_then(Value::as_str))?;
         let entry = r.resolve(&args)?;
         if name == "palette_patch" {
+            let broker = self.patch_broker()?;
             let mut client = StreamClient { input, out };
-            return Ok(child::text_result(&self.broker.call(&args, &lineage_or_id(&entry), &self.capabilities, &mut client)?, false));
+            let workspace = lineage_or_id(&entry);
+            return Ok(child::text_result(&broker.call_with_apply(
+                &args,
+                &workspace,
+                &self.capabilities,
+                &mut client,
+                |identifier, workspace| {
+                    let _reload = lock(&r.reload_lock);
+                    let current = self.patch_broker()?;
+                    current.apply(identifier, workspace)
+                },
+            )?, false));
         }
         if name == "palette_control" && matches!(args["action"].as_str(), Some("generation_status" | "activate_generation")) {
             return Ok(child::text_result(&r.generation_control(&args, &entry)?, false));
         }
+        let control_action = args.get("action").and_then(Value::as_str).map(str::to_string);
         let mut forwarded: Map<String, Value> = args.into_iter().filter(|(k, _)| !ROUTING.contains(&k.as_str())).collect();
         if name == "palette" {
             if let Some(caller) = &self.caller {
                 forwarded.insert("caller".into(), json!(caller));
             }
         }
-        let worker = r.child_for(&entry);
+        let worker = r.child_for_mode(&entry, mode.clone());
+        if name == "palette_control"
+            && matches!(control_action.as_deref(), Some("restart" | "restore"))
+            && worker.config_revision().is_some_and(|revision| revision != config.revision.to_string())
+        {
+            // An explicit restart after reload is the point where this
+            // durable world's adapter adopts the new validated snapshot.
+            worker.stop_proc(r);
+        }
         let mut result = worker.call(r, name, forwarded)?;
         let mut value = py_json_loads(content_text(&result)?)?;
         let Some(fields) = value.as_object_mut() else { return Err(patch::no_attribute(&value, "update")) };
@@ -1048,6 +1355,24 @@ impl Session<'_> {
         fields.insert("generation_id".into(), json!(generation_id));
         fields.insert("workspace_dir".into(), entry["workspace_dir"].clone());
         fields.insert("legacy_shared".into(), entry.get("legacy").cloned().unwrap_or(json!(false)));
+        fields.insert("mode".into(), json!(worker.mode));
+        if name == "palette_control" && control_action.as_deref() == Some("status") {
+            let active_config = r.config_snapshot();
+            let effective_revision = worker.config_revision().unwrap_or_else(|| active_config.revision.to_string());
+            let connected = fields.get("connected").cloned().unwrap_or(Value::Bool(false));
+            let epoch = fields.get("epoch").cloned().unwrap_or(Value::Null);
+            fields.insert("effective_mode".into(), json!(worker.mode));
+            fields.insert("default_mode".into(), json!(active_config.default_mode));
+            fields.insert("effective_config_revision".into(), json!(effective_revision));
+            fields.insert("pending_config_revision".into(), json!(active_config.revision.to_string()));
+            fields.insert("config_pending".into(), json!(effective_revision != active_config.revision.to_string()));
+            fields.insert("config_sources".into(), active_config.sources());
+            fields.insert("config_snapshot".into(), json!({"revision": active_config.revision.to_string(),
+                "default_mode": active_config.default_mode, "sources": active_config.sources()}));
+            fields.insert("session_snapshot".into(), json!({"mode": worker.mode,
+                "config_revision": effective_revision, "connected": connected, "epoch": epoch}));
+            fields.insert("active_sessions".into(), Value::Array(r.active_sessions()));
+        }
         result["content"][0]["text"] = json!(value.to_string());
         Ok(result)
     }
@@ -1056,15 +1381,9 @@ impl Session<'_> {
 /// Serves MCP frames from `input` to `out` until the input ends.
 fn serve_stream(r: &Router, input: &Lines, out: &mut dyn Write) -> Result<(), Fault> {
     let roots: Vec<PathBuf> = patch::patch_roots_from_env(env)?.values().map(path_value).collect::<Result<_, _>>()?;
-    disjoint(&roots, &[&r.root, &r.legacy, &r.legacy_receipts], NONE)?;
-    let ceiling = ceiling()?;
-    let config = child::repair_config()?;
-    let runtime_root = util::resolve(&util::expand_user(&env("PALETTE_RUNTIME_ROOT")
-        .unwrap_or_else(|| r.repo.join("runtime/capabilities").to_string_lossy().into_owned())));
-    let mut protected = provisioning::protected_host_paths(&ceiling, true, false, env).map_err(Fault::value)?;
-    protected.extend([r.root.clone(), r.legacy.clone(), r.legacy_receipts.clone()]);
-    let broker = child::patch_broker(&r.root.join("patches"), &config, &protected, &runtime_root)?;
-    let mut session = Session { r, broker, capabilities: Map::new(), caller: None };
+    let protected = legacy_state_protected_paths(r);
+    disjoint(&roots, &protected, NONE)?;
+    let mut session = Session { r, capabilities: Map::new(), caller: None };
     loop {
         let raw = match input.recv() {
             Ok(Ok(line)) => line,
@@ -1297,8 +1616,41 @@ mod tests {
         tools((60.0, 1800.0)).as_array().unwrap().iter().find(|t| t["name"] == name).unwrap()["inputSchema"].clone()
     }
 
+    #[test]
+    fn child_receive_names_timeout_and_disconnect() {
+        let (_tx, timeout_frames) = mpsc::channel::<Result<Value, Fault>>();
+        let timeout = receive(&timeout_frames, Instant::now()).unwrap_err();
+        assert_eq!(timeout.kind, "Timeout");
+        assert!(timeout.message.contains("Palette child response"));
+
+        let (tx, closed_frames) = mpsc::channel::<Result<Value, Fault>>();
+        drop(tx);
+        let closed = receive(&closed_frames, Instant::now() + Duration::from_secs(1)).unwrap_err();
+        assert_eq!(closed.kind, "EOFError");
+        assert!(closed.message.contains("closed stdout"));
+    }
+
     fn err(args: Value, name: &str) -> String {
         validate(&args, &schema(name)).unwrap_err().message
+    }
+
+    #[test]
+    fn op007_configured_sandbox_is_a_mode_floor() {
+        let (_tmp, r) = router(4);
+        let mut config = (*r.config_snapshot()).clone();
+        for default in ["operator", "sandbox"] {
+            config.default_mode = default.into();
+            assert_eq!(config.session_mode(None).unwrap(), default);
+            assert_eq!(config.session_mode(Some("sandbox")).unwrap(), "sandbox");
+            let result = config.session_mode(Some("operator"));
+            if default == "sandbox" {
+                let fault = result.unwrap_err();
+                assert_eq!(fault.kind, "PermissionError");
+                assert!(fault.message.contains("PALETTE_MODE=sandbox"));
+            } else {
+                assert_eq!(result.unwrap(), "operator");
+            }
+        }
     }
 
     #[test]
@@ -1313,9 +1665,149 @@ mod tests {
             assert_eq!(tool["annotations"]["destructiveHint"], json!(true));
         }
         assert_eq!(schema("palette")["required"], json!([]));
-        assert_eq!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().len(), 8);
+        assert_eq!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().len(), 9);
+        assert_eq!(schema("palette")["properties"]["mode"]["enum"], json!(["operator", "sandbox"]));
+        assert_eq!(schema("palette_control")["properties"]["mode"]["enum"], json!(["operator", "sandbox"]));
         assert_eq!(schema("palette_control")["properties"]["generation_id"]["maxLength"], json!(64));
         assert!(tools[0]["description"].as_str().unwrap().ends_with(transport::PALETTE_GUIDE));
+    }
+
+    #[test]
+    fn config_reload_keeps_existing_snapshots_and_rejects_invalid_files_atomically() {
+        let (_tmp, r) = router(4);
+        let config_home = util::resolve(&util::mkdtemp("palette-config-reload-").unwrap());
+        let config_dir = config_home.join("palette");
+        fs::create_dir_all(&config_dir).unwrap();
+        let first_root = util::resolve(&util::mkdtemp("palette-read-root-a-").unwrap());
+        let second_root = util::resolve(&util::mkdtemp("palette-read-root-b-").unwrap());
+        let roots_file = config_dir.join("read-roots");
+        fs::write(&roots_file, format!("{}\n", first_root.display())).unwrap();
+        let commands_file = config_dir.join("host-commands.json");
+        fs::write(&commands_file, r#"{"first":{"argv":["/bin/true"],"cwd":"/var/tmp"}}"#).unwrap();
+        let vars = |extra: &[(&str, &str)]| {
+            let mut values = HashMap::from([("XDG_CONFIG_HOME".to_string(), config_home.to_string_lossy().into_owned())]);
+            values.extend(extra.iter().map(|(key, value)| (key.to_string(), value.to_string())));
+            move |key: &str| values.get(key).cloned()
+        };
+
+        let original = Arc::new(ConfigSnapshot::load(1, vars(&[])).unwrap());
+        *write_lock(&r.config) = original.clone();
+        fs::write(&roots_file, format!("{}\n", second_root.display())).unwrap();
+        fs::write(&commands_file, r#"{"second":{"argv":["/bin/false"],"cwd":"/var/tmp"}}"#).unwrap();
+        assert_eq!(original.read_roots, vec![first_root.clone()], "a live session keeps its captured config");
+        assert!(original.ceiling["host_command"]["commands"].get("first").is_some());
+        assert!(original.ceiling["host_command"]["commands"].get("second").is_none());
+        let reloaded = r.reload_config_with(vars(&[]));
+        assert_eq!(reloaded["success"], true, "{reloaded}");
+        assert_eq!(reloaded["pending_config_revision"], "2");
+        assert!(!Arc::ptr_eq(&r.config_snapshot(), &original));
+        assert_eq!(r.config_snapshot().read_roots, vec![second_root.clone()]);
+        assert!(r.config_snapshot().ceiling["host_command"]["commands"].get("second").is_some());
+        assert_eq!(original.read_roots, vec![first_root.clone()]);
+
+        let first_root_text = first_root.to_string_lossy().into_owned();
+        let overridden = ConfigSnapshot::load(3, vars(&[("PALETTE_READ_ROOTS", &first_root_text)])).unwrap();
+        assert_eq!(overridden.read_roots_source, "environment");
+        assert_eq!(overridden.read_roots, vec![first_root.clone()], "explicit env wins over a changed file");
+        let internal_ceiling = ConfigSnapshot::load(3, vars(&[("PALETTE_OPERATOR_CEILING_JSON", "{}")])).err().unwrap();
+        assert!(internal_ceiling.message.contains("reserved for the internal workspace snapshot handoff"));
+
+        let custom_file = config_dir.join("custom-roots");
+        fs::write(&custom_file, format!("{}\n", first_root.display())).unwrap();
+        let custom_path = custom_file.to_string_lossy().into_owned();
+        let custom = ConfigSnapshot::load(3, vars(&[("PALETTE_READ_ROOTS_FILE", &custom_path)])).unwrap();
+        assert_eq!(custom.read_roots_source, "file");
+        assert_eq!(custom.read_roots, vec![first_root.clone()]);
+        let disabled = ConfigSnapshot::load(3, vars(&[("PALETTE_READ_ROOTS_FILE", "")])).unwrap();
+        assert!(disabled.read_roots.is_empty(), "explicit empty file selection disables the canonical file");
+
+        fs::write(&roots_file, "relative/path\n").unwrap();
+        let before_rejection = r.config_snapshot();
+        let rejected = r.reload_config_with(vars(&[]));
+        assert_eq!(rejected["success"], false);
+        assert_eq!(rejected["reloaded"], false);
+        assert_eq!(rejected["pending_config_revision"], "2");
+        assert!(Arc::ptr_eq(&r.config_snapshot(), &before_rejection));
+        assert_eq!(r.config_snapshot().revision, 2, "invalid config must not advance revision");
+        assert_eq!(r.config_snapshot().read_roots, vec![second_root.clone()]);
+        fs::remove_dir_all(config_home).unwrap();
+        fs::remove_dir_all(first_root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn config_reload_rechecks_protected_layout_against_project_roots() {
+        let (_tmp, mut r) = router(4);
+        let config_home = util::resolve(&util::mkdtemp("palette-config-layout-").unwrap());
+        let config_dir = config_home.join("palette");
+        fs::create_dir_all(&config_dir).unwrap();
+        let project_root = util::resolve(&util::mkdtemp("palette-project-layout-").unwrap());
+        let roots_file = config_dir.join("read-roots");
+        fs::write(&roots_file, "").unwrap();
+        let config_home = config_home.to_string_lossy().into_owned();
+        let project_roots = json!({"project": project_root.to_string_lossy()}).to_string();
+        let vars = |key: &str| match key {
+            "XDG_CONFIG_HOME" => Some(config_home.clone()),
+            "PALETTE_PROJECT_ROOTS" => Some(project_roots.clone()),
+            "PALETTE_MODE" => Some("sandbox".into()),
+            _ => None,
+        };
+        let original = Arc::new(ConfigSnapshot::load(1, &vars).unwrap());
+        r.project_roots = r.configured_project_roots(&original, &vars).unwrap();
+        *write_lock(&r.config) = original;
+
+        fs::write(&roots_file, format!("{}\n", project_root.display())).unwrap();
+        let rejected = r.reload_config_with(&vars);
+        assert_eq!(rejected["success"], false, "read roots cannot overlap a sandbox workspace root");
+        assert_eq!(r.config_snapshot().revision, 1, "failed layout validation is atomic");
+        fs::remove_dir_all(config_home).unwrap();
+        fs::remove_dir_all(project_root).unwrap();
+    }
+
+    #[test]
+    fn patch_protections_refresh_after_reload_and_retain_live_session_paths() {
+        let (_tmp, r) = router(4);
+        let config_home = util::resolve(&util::mkdtemp("palette-patch-reload-").unwrap());
+        let config_dir = config_home.join("palette");
+        fs::create_dir_all(&config_dir).unwrap();
+        let commands_file = config_dir.join("host-commands.json");
+        let old_command = config_home.join("bin/old-command");
+        let new_command = config_home.join("bin/new-command");
+        let command = |path: &Path| json!({"argv": [path.to_string_lossy().into_owned()], "cwd": "/var/tmp"});
+        fs::write(&commands_file, json!({"old": command(&old_command)}).to_string()).unwrap();
+        let vars = |key: &str| match key {
+            "XDG_CONFIG_HOME" => Some(config_home.to_string_lossy().into_owned()),
+            "PALETTE_MODE" => Some("operator".into()),
+            _ => None,
+        };
+        let original = Arc::new(ConfigSnapshot::load(1, &vars).unwrap());
+        *write_lock(&r.config) = original.clone();
+        let entry = r.workspace_control(json!({"action": "create", "workspace_id": "patch-world", "scope": "open"})
+            .as_object().unwrap()).unwrap();
+        let worker = r.child_for_mode(entry.as_object().unwrap(), "operator".into());
+        make_live(&worker);
+        lock(&worker.proc).config_snapshot = Some(Arc::clone(&original));
+
+        // This Session stands for one MCP connection spanning a reload.
+        let session = Session { r: &r, capabilities: Map::new(), caller: None };
+        let first = session.patch_broker().unwrap();
+        assert!(first.protected_paths.contains(&util::resolve(&old_command)));
+        assert!(!first.protected_paths.contains(&util::resolve(&new_command)));
+
+        fs::write(&commands_file, json!({"new": command(&new_command)}).to_string()).unwrap();
+        assert_eq!(r.reload_config_with(&vars)["success"], true);
+        let after = session.patch_broker().unwrap();
+        assert!(after.protected_paths.contains(&util::resolve(&new_command)), "new command path was not protected after reload");
+        assert!(after.protected_paths.contains(&util::resolve(&old_command)), "live adapter's captured command path lost protection");
+        let roots = [("target".into(), json!(config_home.to_string_lossy().into_owned()))].into_iter().collect::<Map<_, _>>();
+        let classify = PatchBroker::new(
+            &r.root.join("patch-test-storage"),
+            &roots,
+            patch::Options { protected_paths: after.protected_paths.clone(), ..patch::Options::default() },
+        ).unwrap();
+        assert_eq!(classify.classify(&json!("target"), &json!("bin/new-command")).unwrap().class, "protected");
+        worker.stop_proc(&r);
+        fs::remove_dir_all(config_home).unwrap();
     }
 
     #[test]
@@ -1451,9 +1943,21 @@ mod tests {
             max_live,
             idle: Duration::from_secs(900),
             limits: (60.0, 1800.0),
-            command_parents: Vec::new(),
             tools: Value::Null,
             children: Mutex::new(Children::default()),
+            config: RwLock::new(Arc::new(ConfigSnapshot {
+                revision: 1,
+                default_mode: "operator".into(),
+                read_roots: Vec::new(),
+                read_roots_source: "none",
+                read_roots_spec: String::new(),
+                read_roots_file: None,
+                host_commands: None,
+                host_commands_source: "none",
+                ceiling: json!({}),
+                command_parents: Vec::new(),
+            })),
+            reload_lock: Mutex::new(()),
         };
         (tmp, r)
     }
@@ -1461,6 +1965,72 @@ mod tests {
     fn open_worker(r: &Router, id: &str) -> Arc<Worker> {
         let entry = r.workspace_control(json!({"action": "create", "workspace_id": id, "scope": "open"}).as_object().unwrap()).unwrap();
         r.child_for(entry.as_object().unwrap())
+    }
+
+    #[test]
+    fn sandbox_worker_uses_a_separate_state_dir_and_key() {
+        let (_tmp, r) = router(4);
+        let entry = r.workspace_control(json!({"action": "create", "workspace_id": "mode-world", "scope": "open"})
+            .as_object().unwrap()).unwrap();
+        let operator = r.child_for_mode(entry.as_object().unwrap(), "operator".into());
+        let sandbox = r.child_for_mode(entry.as_object().unwrap(), "sandbox".into());
+        assert_eq!(operator.workspace_state_dir, sandbox.workspace_state_dir);
+        assert_ne!(operator.state_dir, sandbox.state_dir);
+        assert_ne!(operator.key, sandbox.key);
+        assert_eq!(operator.state_dir, operator.workspace_state_dir);
+        assert_eq!(sandbox.state_dir, operator.workspace_state_dir.parent().unwrap().join(".sandbox").join("mode-world"));
+
+        let lookalike = r.workspace_control(json!({"action": "create", "workspace_id": "mode-world.sandbox", "scope": "open"})
+            .as_object().unwrap()).unwrap();
+        let lookalike = r.child_for_mode(lookalike.as_object().unwrap(), "operator".into());
+        assert_ne!(sandbox.state_dir, lookalike.state_dir, "sandbox state collided with a valid operator workspace ID");
+        assert_ne!(lineage::owner_lock_path(&sandbox.state_dir), lineage::owner_lock_path(&lookalike.state_dir));
+        fs::create_dir_all(&operator.state_dir).unwrap();
+        fs::create_dir_all(&sandbox.state_dir).unwrap();
+        fs::create_dir_all(&lookalike.state_dir).unwrap();
+        fs::write(operator.state_dir.join("marker"), "operator").unwrap();
+        fs::write(sandbox.state_dir.join("marker"), "sandbox").unwrap();
+        fs::write(lookalike.state_dir.join("marker"), "lookalike").unwrap();
+        assert_eq!(fs::read_to_string(operator.state_dir.join("marker")).unwrap(), "operator");
+        assert_eq!(fs::read_to_string(sandbox.state_dir.join("marker")).unwrap(), "sandbox");
+        assert_eq!(fs::read_to_string(lookalike.state_dir.join("marker")).unwrap(), "lookalike");
+    }
+
+    #[test]
+    fn failed_worker_start_releases_its_provisional_config_snapshot() {
+        let (_tmp, r) = router(4);
+        let entry = r.workspace_control(json!({"action": "create", "workspace_id": "failed-start", "scope": "open"})
+            .as_object().unwrap()).unwrap();
+        let mut entry = entry.as_object().unwrap().clone();
+        entry.insert("workspace_dir".into(), json!(r.repo.to_string_lossy()));
+        let worker = r.child_for_mode(&entry, "operator".into());
+        let mut frames = None;
+        assert!(worker.start(&r, &mut frames).is_err());
+        assert!(worker.live_config_snapshot().is_none(), "failed startup must not retain a stale protection snapshot");
+    }
+
+    #[test]
+    fn patch_roots_exclude_legacy_and_active_sandbox_state_artifacts() {
+        let (_tmp, r) = router(4);
+        let legacy_lab = sandbox_state_dir(&r.legacy);
+        let legacy_artifacts = state_artifacts(&legacy_lab);
+        let legacy_protected = legacy_state_protected_paths(&r);
+        for artifact in &legacy_artifacts {
+            assert!(legacy_protected.contains(artifact), "missing legacy sandbox artifact: {}", artifact.display());
+        }
+        assert!(disjoint(&[&legacy_lab], &legacy_protected, NONE).is_err(), "stream patch-root check must reject the legacy lab state");
+
+        let entry = r.default_entry();
+        let worker = r.child_for_mode(&entry, "sandbox".into());
+        make_live(&worker);
+        lock(&worker.proc).config_snapshot = Some(r.config_snapshot());
+        let protected = r.patch_protected_paths(&r.config_snapshot()).unwrap();
+        for artifact in state_artifacts(&worker.state_dir) {
+            assert!(protected.contains(&artifact), "dynamic patch protection omitted {}", artifact.display());
+            assert!(patch_roots_disjoint_from_state(&worker.state_dir, &[artifact]).is_err(),
+                "worker state must reject overlapping patch roots");
+        }
+        worker.stop_proc(&r);
     }
 
     /// Gives `w` a live adapter: `cat` exits when its stdin closes.

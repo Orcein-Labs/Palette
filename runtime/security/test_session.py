@@ -175,7 +175,7 @@ class TestSessionScratchOwnership(SessionTestCase):
     them. Receipts written without a receipts directory outlive the session."""
 
     def _bridge(self):
-        proc = subprocess.Popen([HOST_BIN, "session", "--project-dir", PROJECT_DIR, "--ceiling", "{}"],
+        proc = subprocess.Popen([HOST_BIN, "session", "--mode", "sandbox", "--project-dir", PROJECT_DIR, "--ceiling", "{}"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdin.close(), proc.stdout.close()))
         hello = json.loads(proc.stdout.readline() or "{}")

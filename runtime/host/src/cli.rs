@@ -15,8 +15,10 @@
 //! reply for an unknown or finished request is dropped, and stdin closing fails
 //! every waiting request. This process exits when stdin closes, when the kernel
 //! dies, or on SIGTERM/SIGHUP/SIGINT (after tearing the session down).
+//! Mode is `operator` by default; `--mode operator|sandbox` overrides
+//! `PALETTE_MODE` for this session.
 
-use crate::session::{PaletteSession, SessionError, SessionOptions, Turn};
+use crate::session::{PaletteSession, SessionError, SessionMode, SessionOptions, Turn};
 use crate::util;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -95,6 +97,8 @@ enum Incoming {
 }
 
 struct Args {
+    mode: SessionMode,
+    config_revision: Option<String>,
     project_dir: String,
     repo_dir: Option<String>,
     ceiling: String,
@@ -109,8 +113,10 @@ struct Args {
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let mut a = Args { project_dir: String::new(), repo_dir: None, ceiling: "{}".into(), network: false,
+    let mut a = Args { mode: SessionMode::default(), config_revision: None,
+                       project_dir: String::new(), repo_dir: None, ceiling: "{}".into(), network: false,
                        turn_timeout: 60.0, max_turn_timeout: None, startup_timeout: 180.0, workspace_dir: None, state_dir: None, receipts_dir: None, scratch_root: None };
+    let mut explicit_mode = None;
     let mut i = 0;
     let val = |i: &mut usize| -> Result<String, String> {
         *i += 1;
@@ -118,6 +124,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     };
     while i < argv.len() {
         match argv[i].as_str() {
+            "--mode" => explicit_mode = Some(SessionMode::parse(&val(&mut i)?)?),
             "--project-dir" => a.project_dir = val(&mut i)?,
             "--repo-dir" => a.repo_dir = Some(val(&mut i)?),
             "--ceiling" => a.ceiling = val(&mut i)?,
@@ -136,6 +143,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if a.project_dir.is_empty() {
         return Err("--project-dir is required".into());
     }
+    a.mode = match explicit_mode {
+        Some(mode) => mode,
+        None => std::env::var("PALETTE_MODE").ok().filter(|value| !value.is_empty())
+            .map(|value| SessionMode::parse(&value)).transpose()?.unwrap_or_default(),
+    };
+    a.config_revision = std::env::var("PALETTE_CONFIG_REVISION").ok().filter(|value| !value.is_empty());
     let max_turn_timeout = a.max_turn_timeout.unwrap_or(a.turn_timeout);
     if !(a.turn_timeout > 0.0 && a.turn_timeout <= max_turn_timeout && max_turn_timeout <= LONGEST_TURN_TIMEOUT) {
         return Err(format!("--turn-timeout must be positive and no more than --max-turn-timeout, \
@@ -241,6 +254,8 @@ pub fn main(argv: &[String]) -> i32 {
     let turn_timeout = args.turn_timeout;
     let max_turn_timeout = args.max_turn_timeout.unwrap_or(turn_timeout);
     let session = PaletteSession::start(SessionOptions {
+        mode: args.mode,
+        config_revision: args.config_revision,
         project_dir: args.project_dir.clone(),
         repo_dir: args.repo_dir.clone().unwrap_or_default(),
         ceiling,
@@ -303,6 +318,7 @@ pub fn main(argv: &[String]) -> i32 {
     }
 
     respond(&json!({"kind": "HELLO", "epoch": session.epoch, "session_id": session.session_id, "revival": revival,
+                   "mode": session.mode.as_str(), "config_revision": session.config_revision.clone(),
                    "capabilities": session.capabilities}));
 
     loop {

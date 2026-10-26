@@ -109,9 +109,14 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
         Ok(p) if !p.is_empty() => Value::String(file_digest(Path::new(&p)).map_err(|e| Fault::os(&e, Path::new(&p)))?),
         _ => Value::Null,
     };
+    let mode = std::env::var("PALETTE_MODE").unwrap_or_else(|_| "operator".into());
+    if !matches!(mode.as_str(), "operator" | "sandbox") {
+        return Err(Fault::value("PALETTE_MODE must be operator or sandbox"));
+    }
     Ok(json!({
         "project": project.to_string_lossy(),
         "repo": repo.to_string_lossy(),
+        "mode": mode,
         "source": digests(sources)?,
         "workload": util::sha256_hex(PREWARM.as_bytes()),
         "runtime": {"binary": julia_bin, "version": String::from_utf8_lossy(&out.stdout).trim(),
@@ -126,7 +131,13 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
 /// records already on disk are found.
 pub(crate) fn record_path(identity: &Value, state_dir: Option<&Path>) -> PathBuf {
     let field = |k: &str| util::py_json_str(identity[k].as_str().unwrap_or(""));
-    let key = util::sha256_hex(format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")).as_bytes());
+    let identity_fields = match identity.get("mode").and_then(Value::as_str) {
+        Some(mode) => format!("[{}, {}, {}, {}]", field("project"), field("repo"), field("depot"), util::py_json_str(mode)),
+        // Records without a mode are from the pre-mode sandbox format. Keep
+        // their paths readable for callers that still inspect those records.
+        None => format!("[{}, {}, {}]", field("project"), field("repo"), field("depot")),
+    };
+    let key = util::sha256_hex(identity_fields.as_bytes());
     let dir = match state_dir {
         Some(dir) => dir.to_path_buf(),
         None => Path::new(identity["depot"].as_str().unwrap_or("")).join(".palette-preparation"),
@@ -234,7 +245,8 @@ pub(crate) fn prepare(project_dir: &Path, repo_dir: &Path, state_dir: Option<&Pa
     let previous_state = previous["state"].as_str().unwrap_or("").to_string();
     if previous_state == "prepared" && !force {
         let depot = Path::new(identity["depot"].as_str().unwrap_or(""));
-        if !sandbox::has_depot_snapshot(depot) {
+        let mode = identity.get("mode").and_then(Value::as_str).unwrap_or("sandbox");
+        if mode == "sandbox" && !sandbox::has_depot_snapshot(depot) {
             if let Err(e) = sandbox::publish_depot_snapshot(depot) {
                 eprintln!("palette-host: the depot snapshot was not published: {e}");
             }
@@ -351,6 +363,18 @@ mod tests {
         assert_eq!(record_path(&identity, Some(Path::new("/s"))),
                    Path::new("/s/e867693d64c661e80e711d5167eab68536a50b4360d1761d8e282da977f17ecf.json"));
         assert_eq!(record_path(&json!({"project": "/p", "repo": "/r", "depot": "/d"}), None).parent().unwrap(), Path::new("/d/.palette-preparation"));
+    }
+
+    #[test]
+    fn operator_and_sandbox_preparation_records_do_not_alias() {
+        let legacy = json!({"project": "/p", "repo": "/r é", "depot": "/d\"\n"});
+        let mut operator = legacy.clone();
+        operator["mode"] = json!("operator");
+        let mut sandbox = legacy.clone();
+        sandbox["mode"] = json!("sandbox");
+        assert_ne!(record_path(&operator, Some(Path::new("/s"))), record_path(&sandbox, Some(Path::new("/s"))));
+        assert_eq!(record_path(&legacy, Some(Path::new("/s"))),
+                   Path::new("/s/e867693d64c661e80e711d5167eab68536a50b4360d1761d8e282da977f17ecf.json"));
     }
 
     fn write_record(root: &Path, identity: &Value, fields: Value) {

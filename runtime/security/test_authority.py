@@ -437,7 +437,7 @@ class TestCeilingFileProtected(unittest.TestCase):
                                  "--receipts", str(self.base / "receipts" / "receipts.jsonl")], 60, subprocess.PIPE)
 
     def test_a_session_started_from_a_ceiling_file_refuses_a_dir_holding_it(self):
-        self._refused([HOST_BIN, "session", "--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
+        self._refused([HOST_BIN, "session", "--mode", "sandbox", "--project-dir", PROJECT_DIR, "--ceiling", str(self.ceiling),
                                  "--scratch-root", str(self.base / "scratch"),
                                  "--receipts-dir", str(self.base / "receipts")], 300, subprocess.DEVNULL)
 
