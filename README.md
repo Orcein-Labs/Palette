@@ -1,6 +1,6 @@
 # Palette
 
-Palette gives any harness that accepts plugins, a Julia computer on your machine, and that computer is still running when the next message arrives.
+Palette gives any harness that accepts plugins a Julia computer on your machine, and that computer is still running when the next message arrives.
 
 Note: Developed on CachyOS, tested on Windows 11 via QEMU. Xeon 2699 v3, RTX 5060 8GB, 32GB DDR4
 
