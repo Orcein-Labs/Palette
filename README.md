@@ -12,23 +12,6 @@ The supervised Julia session defaults to `operator` mode. Choose `--mode sandbox
 to enter the opt-in bubblewrap lab, where filesystem and network access follow
 the configured boundaries.
 
-## ChatGPT Chat, October 2026
-
-This is the default ChatGPT chat product. The UI labels it Chat.
-
-<p align="center">
-  <img src="runtime/docs/images/chatgpt-chat-mode.png" alt="ChatGPT Chat mode, confirmed in the UI, driving Palette" width="48%" />
-  <img src="runtime/docs/images/chatgpt-os-lab.png" alt="ChatGPT Chat installing Metatheory.jl through Palette in real time" width="48%" />
-</p>
-
-The right-hand capture is ChatGPT Chat installing Metatheory.jl through Palette while the kernel stays up. Isolated research environment, Gesso's dependencies left alone.
-
-The workspace is a separate research world, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
-
-We've run long-horizon R&D spirals on this desk. Bugs showed up and they were able to be fixed from the inside. The World was still on disk after the kernel came back.
-
-Clients attach over MCP, or over the host session (newline-delimited JSON on stdio). The kernel is local. Talk to whichever model you already use.
-
 ## Install
 
 Linux, or WSL2 on Windows. One command installs Julia if needed, the Palette
