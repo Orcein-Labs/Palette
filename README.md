@@ -39,14 +39,14 @@ Code, Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
 Claude Code, and checks the installation before switching to it.
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Orcein-Labs/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows, in PowerShell or a command prompt. It sets up WSL2 with Ubuntu if
 you have none, installs Palette inside it, and also connects Claude Desktop:
 
 ```powershell
-powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/Orcein-Labs/Palette/releases/latest/download/install.ps1'))"
 ```
 
 To install Bubblewrap support and start in the opt-in sandbox, pipe the installer
