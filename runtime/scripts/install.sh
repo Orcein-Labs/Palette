@@ -156,14 +156,14 @@ if [ "$mode" = sandbox ]; then
 fi
 
 julia_ok() {
-    command -v julia >/dev/null && julia --startup-file=no -e 'exit(VERSION >= v"1.10" ? 0 : 1)' </dev/null
+    command -v julia >/dev/null && julia --startup-file=no -e 'exit(VERSION >= v"1.11" ? 0 : 1)' </dev/null
 }
 [ -x "$HOME/.juliaup/bin/julia" ] && PATH=$HOME/.juliaup/bin:$PATH
 if ! julia_ok; then
     say "Installing Julia with juliaup"
     curl -fsSL https://install.julialang.org | sh -s -- --yes
     PATH=$HOME/.juliaup/bin:$PATH
-    julia_ok || die "Julia 1.10 or newer is needed; juliaup did not provide it"
+    julia_ok || die "Julia 1.11 or newer is needed; juliaup did not provide it"
 fi
 export PATH
 

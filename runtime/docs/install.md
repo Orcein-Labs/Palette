@@ -32,7 +32,7 @@ toolchain locations.
    only step that needs root (`runtime/scripts/setup-sandbox-host.sh`); global
    AppArmor and user-namespace policy is left as it is.
 3. Installs Julia with [juliaup](https://github.com/JuliaLang/juliaup) unless
-   Julia 1.10 or newer is on `PATH`.
+   Julia 1.11 or newer is on `PATH`.
 4. Runs `palette-host setup`, which instantiates the Julia project,
    prepares the selected mode's Julia depot, deploys [TeamLab](../integrations/teamlab/README.md)
    into the capability registry, grants `palette.runtime` in the capability

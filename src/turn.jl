@@ -780,11 +780,16 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
     call = next_call()
     CURRENT_CALL[] = call
     CALL_CONTEXT[] = context
+    TURN_TASK[] = current_task()
+    done = Base.Event()
+    TURN_DONE[] = done
     try
         return run_execute_turn(code, timeout_s, call, context, session_request)
     finally
+        TURN_TASK[] = nothing
         CURRENT_CALL[] = 0
         CALL_CONTEXT[] = nothing
+        notify(done)
     end
 end
 
@@ -814,6 +819,9 @@ function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call
         costs["maintenance_seconds"] = (time_ns() - maintained) / 1e9
         costs["phase"] = "execution"
         turn = run_turn(() -> with_context(ctx) do
+            # User eval runs on this task, not execute_turn's caller. Sync bash
+            # on this task keeps the ShellResult; @async bash rings the doorbell.
+            TURN_TASK[] = current_task()
             # Compile timing nests (it counts enables), so user code may still use @time.
             Base.cumulative_compile_timing(true)
             compiled = first(Base.cumulative_compile_time_ns())

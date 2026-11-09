@@ -44,7 +44,7 @@ using Palette
 # Palette's own UUIDs binding: a project that lists only Palette cannot
 # `using UUIDs` itself.
 const UUIDs = Palette.UUIDs
-using Palette: safe_json, execute_turn, bounded_data, text_display, scrub, with_hint
+using Palette: safe_json
 
 const EPOCH = string(UUIDs.uuid4())
 Palette.TASK_EPOCH[] = EPOCH
@@ -128,19 +128,13 @@ let name = Palette.revival_module_name()
     Core.eval(Main, Expr(:(=), nameof(mod), mod))
 end
 
-# Finish runtime compilation and revival before advertising readiness.
-# Otherwise the host charges this preparation against the first turn's limit.
-# Warm-up calls leave no user history, receipt, binding or phase observations.
+# Revival, tool stubs and the pre-HELLO snapshot have to finish before we
+# advertise readiness: a first-turn kill used to leave started_call with no
+# manifest. Dummy execute_turn warm-ups are already in the package image
+# (`precompile_workload.jl`); running them here charged HELLO for compile
+# the first real call can pay under the turn limit.
 let state = Palette.get_kernel_state()
     Core.eval(state.eval_module, Expr(:global, Expr(:(=), :PAYLOAD, nothing)))
-    (r, _, _), out = execute_turn("print(\"\"); [1 2]", 60.0)
-    # An undefined name is the error models make most, and its message runs
-    # the REPL's hint handlers, which the package image cannot hold.
-    (e, _, _), _ = execute_turn("warm_up_undefined_name", 60.0)
-    with_hint(e.result.error, "")
-    text_display(r.result.data); bounded_data(r.result.data); bounded_data(Dict("a" => [1]))
-    scrub(out); with_hint("x", "y"); safe_json(Dict{String,Any}("a" => 1))
-    Palette.reset_kernel_state!()
     Core.eval(state.eval_module, Expr(:global, Expr(:(=), :ans, nothing)))
     Palette.REVIVAL_REPORT[] = try
         Base.invokelatest(Palette.revive_state!)
@@ -156,6 +150,12 @@ let state = Palette.get_kernel_state()
     catch e
         Palette.REVIVAL_REPORT[] = join(filter(!isempty, [Palette.REVIVAL_REPORT[],
             "[tools] Listing project and trusted tools failed ($(first(sprint(showerror, e), 200))); none are bound."]), "\n")
+    end
+    # First-turn kills used to leave started_call with no manifest ("No complete
+    # snapshot remains"). Snapshot the revived or empty world before HELLO.
+    try
+        Base.invokelatest(Palette.ensure_pre_hello_snapshot!)
+    catch
     end
 end
 

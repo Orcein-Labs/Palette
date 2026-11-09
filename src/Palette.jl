@@ -26,9 +26,29 @@ using UUIDs
 using Sockets
 using JSON
 using SHA
+using Joovy
 using PrecompileTools: @compile_workload
 using Base.CoreLogging: AbstractLogger, with_logger, current_logger
 using Statistics: mean as stdlib_mean
+
+"""
+    bind_joovy!(mod)
+
+Put Joovy's TTFX helpers on the session module. `joovy_use` / `joovy_compile_tiered`
+must compile into `mod`, not host `Main`.
+"""
+function bind_joovy!(mod::Module)
+    Core.eval(mod, :(const Joovy = $(Joovy)))
+    Core.eval(mod, :(joovy_compile_tiered(code::AbstractString; kwargs...) =
+        $(Joovy.joovy_compile_tiered)(String(code); mod=@__MODULE__, kwargs...)))
+    Core.eval(mod, :(joovy_use(path::AbstractString; kwargs...) =
+        $(Joovy.joovy_use)(String(path); mod=@__MODULE__, kwargs...)))
+    Core.eval(mod, :(joovy_warm(packages; kwargs...) = $(Joovy.joovy_warm)(packages; kwargs...)))
+    Core.eval(mod, :(prepare_cold_load!(args...; kwargs...) = $(Joovy.prepare_cold_load!)(args...; kwargs...)))
+    Core.eval(mod, :(finish_cold_load!() = $(Joovy.finish_cold_load!)()))
+    Core.eval(mod, :(compile_report() = $(Joovy.compile_report)()))
+    return nothing
+end
 
 #==============================================================================
 PHASE 2: Operator Types & Vocabulary (leaf types first)
@@ -235,6 +255,9 @@ mutable struct KernelState
         # loaded here at all; this one lists the session's own bindings.
         Core.eval(state.eval_module, :(varinfo() = $(varinfo)(@__MODULE__)))
         Core.eval(state.eval_module, :(kernelinfo() = $(kernelinfo)()))
+        # Models type `ls`; Julia Base only has readdir. Bind both names.
+        Core.eval(state.eval_module, :(ls(path::AbstractString=".") = readdir(path)))
+        bind_joovy!(state.eval_module)
         state.variables = Dict{String, Any}()
         state.execution_history = ExecutionRecord[]
         state.operator_registry = Dict{String, Function}()
@@ -491,11 +514,19 @@ the command's stdout and then its stderr, and returns them with the exit code
 instead of throwing on a nonzero one. Turn code reaches it as `bash(script)`,
 or as `sh"..."`, which passes `\$` to the shell instead of interpolating it.
 """
+const TURN_TASK = Ref{Union{Task, Nothing}}(nothing)
+const TURN_DONE = Ref{Union{Base.Event, Nothing}}(nothing)
+
 function run_bash(script::AbstractString)
     # Files, not pipes: a command that puts a job in the background (`job &`)
     # hands it the pipe, and reading a pipe to its end waited for the job,
     # up to the call's time limit, which then killed it. Only bash is waited
     # for; what the job writes later is reported at the start of a later call.
+    done = TURN_DONE[]
+    # Background `@async bash(...)` (the turn task is someone else, or the turn
+    # already returned). Synchronous bash on the turn task keeps the ShellResult
+    # in that call and does not ring the host doorbell.
+    notify_when_done = current_task() !== TURN_TASK[]
     out, err = tempname(), tempname()
     # Append mode, so the files can be truncated safely once reported (turn.jl).
     p = open(out, "a") do o
@@ -508,7 +539,53 @@ function run_bash(script::AbstractString)
     keep_for_late_output!(err, ncodeunits(e))
     print(stdout, o)
     print(stderr, e)
-    return ShellResult(p.termsignal > 0 ? 128 + p.termsignal : p.exitcode, o, e)
+    exitcode = p.termsignal > 0 ? 128 + p.termsignal : p.exitcode
+    notify_when_done && maybe_notify_bash_completed(bash_completion_id(p), script, exitcode, done)
+    return ShellResult(exitcode, o, e)
+end
+
+const BASH_COMPLETED_COMMAND_CAP = 2000
+const BASH_COMPLETION_SEQ = Threads.Atomic{Int}(0)
+
+# Julia 1.12 Process drops its OS pid once reaped (`getpid` → ESRCH). Long
+# jobs can still report the real pid; instant ones get a positive job id.
+function bash_completion_id(p)
+    try
+        pid = Int(getpid(p))
+        pid > 0 && return pid
+    catch
+    end
+    return Threads.atomic_add!(BASH_COMPLETION_SEQ, 1) + 1
+end
+
+# Independent `@async bash(...)` work: after the creating turn returns, ask the
+# agent host to start a follow-up, the same class as IPython `[bash-done …]`.
+# Synchronous bash during a turn already returns the ShellResult in that call.
+function maybe_notify_bash_completed(pid, command::AbstractString, exitcode::Integer, done)
+    try
+        pid = Int(pid)
+        pid > 0 || return nothing
+        cmd = String(command)
+        if ncodeunits(cmd) > BASH_COMPLETED_COMMAND_CAP
+            cmd = cmd[1:prevind(cmd, BASH_COMPLETED_COMMAND_CAP + 1)] * "\n... [command truncated]"
+        end
+        payload = Dict{String, Any}("pid" => pid, "command" => cmd, "exitCode" => Int(exitcode))
+        @async begin
+            try
+                done !== nothing && wait(done)
+            catch e
+                e isa InterruptException && rethrow()
+            end
+            try
+                host_request("bash.completed", payload)
+            catch e
+                e isa InterruptException && rethrow()
+            end
+        end
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return nothing
 end
 
 function sh_suffix_error(suffix::AbstractString)
@@ -850,7 +927,9 @@ end
 # Bindings the kernel creates in every session module. They are not the
 # model's own variables, so GetState and varinfo() leave them out.
 const KERNEL_BINDINGS = (:eval, :include, :bash, Symbol("@sh_str"), :Palette, :Api, :ShellResult,
-                         :varinfo, :kernelinfo, :ans, :PAYLOAD, :Main)
+                         :varinfo, :kernelinfo, :ls, :Joovy, :joovy_compile_tiered, :joovy_use,
+                         :joovy_warm, :prepare_cold_load!, :finish_cold_load!, :compile_report,
+                         :ans, :PAYLOAD, :Main)
 
 """
     VarInfo
@@ -934,7 +1013,9 @@ function kernelinfo()
                    loaded: $(isempty(loaded) ? "none" : join(loaded, ", "))
         helpers    bash("cmd") or sh"cmd" -> ShellResult(exitcode, stdout, stderr); sh"..." keeps \$ for the shell
                    PAYLOAD: this call's payload text, raw; write(path, PAYLOAD) writes a file with no Julia quoting
-                   ans: the last call's value.  varinfo(): your bindings.  include("file.jl") loads a workspace file
+                   ans: the last call's value.  varinfo(): your bindings.  ls(path="."): directory listing (readdir)
+                   include("file.jl") loads a workspace file.  joovy_use("file.jl") lazy-loads it (tier 1, promotes when hot)
+                   joovy_compile_tiered("f(x)=..."); prepare_cold_load!(0); finish_cold_load!(); compile_report()
                    Palette.output(n): everything call n printed, in full, when the result you saw was elided
         reloading  a package loaded from the workspace is reloaded when its source changes, before the next
                    call or include runs, so `using` it again is not needed. When the workspace is itself a

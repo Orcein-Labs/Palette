@@ -728,6 +728,20 @@ calls_text(a::Int, b::Int) = a == b ? "call $(a)" : "calls $(a)–$(b)"
 calls_pronoun(a::Int, b::Int) = a == b ? "it" : "they"
 
 """
+    ensure_pre_hello_snapshot!()
+
+When `STATE_DIR` is set and has no complete snapshot (`manifest.json`), write
+call 0 of the current world. The session loop runs this after revival and
+before HELLO so a later kernel does not report that no complete snapshot remains.
+"""
+function ensure_pre_hello_snapshot!()
+    dir = STATE_DIR[]
+    isempty(dir) && return nothing
+    isfile(joinpath(dir, "manifest.json")) && return nothing
+    return snapshot_state!(0)
+end
+
+"""
     snapshot_state!(call; waiting = () -> false)
 
 Writes the state at the end of `call` to STATE_DIR, replacing the last

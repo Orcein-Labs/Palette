@@ -15,8 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 1.10 is the [compat] lower bound; 1.12 is the release in use.
-        julia: ['1.10', '1.12']
+        # 1.11 is the [compat] lower bound ([sources] needs it); 1.12 is the release in use.
+        julia: ['1.11', '1.12']
 
     steps:
     - uses: actions/checkout@v7

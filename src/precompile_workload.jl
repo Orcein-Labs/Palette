@@ -27,7 +27,9 @@ end
                      "for i in 1:3\n    s = i\nend\nprintln(\"done\")",
                      "d = Dict(\"a\" => 1); (d, :b, 1.5, \"s\", nothing)",
                      "error(\"workload\")", "undefined_name + 1", "g(x::Int) = x\ng(\"s\")", "s = \"\$(1",
-                     "\"ok\"", "readdir(tempdir())[1:0]", "Dict(:a => 1)", "rand(3)", "1.5")
+                     "\"ok\"", "readdir(tempdir())[1:0]", "ls(tempdir())[1:0]",
+                     "joovy_compile_tiered(\"joovy_workload(x)=x\"; tier=1, name=:joovy_workload)",
+                     "Dict(:a => 1)", "rand(3)", "1.5")
             for (i, code) in enumerate(codes)
                 request = Dict{String,Any}("request_id" => string(i), "kind" => "EXECUTE", "code" => code)
                 i == 1 && (request["timeout_s"] = 60)
@@ -75,16 +77,12 @@ end
         empty!(DEFINITION_LOG)
         snapshot_state!(6; waiting = () -> false)
         revive_state!()
-        # A code graph's first build and queries, and the tool index, stubs and
-        # lookup a session starts with: cold, these took about 3.4 s.
+        # Tool index, stubs and lookup a session starts with. Pharos
+        # codegraph/definitions/callers compile on first use so HELLO and
+        # `using Palette` do not pay for a lighthouse the turn never asked for.
         let root = mktempdir(), previous = WORKSPACE_ROOT[]
             try
                 WORKSPACE_ROOT[] = root
-                write(joinpath(root, "lib.jl"), "\"Doc.\"\nfunction g(x::Int)\n    x\nend\nf(x) = g(x)\nmacro m(e) e end\n")
-                write(joinpath(root, "lib.rs"), "fn a() { b(); }\n")
-                Pharos.digest(codegraph(root))
-                Api.definitions("g")
-                Api.callers("g")
                 dir = mkpath(joinpath(root, ".palette", "tools"))
                 code = "workload_tool(x) = x + 1\n"
                 write(joinpath(dir, "workload_tool.jl"), code)

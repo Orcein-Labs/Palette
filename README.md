@@ -138,6 +138,9 @@ with exact and IVF search and a code-symbol indexer, and
 [jrir](runtime/integrations/jrir/README.md), which normalizes Rust/C LLVM IR for
 inlining into Julia through `Base.llvmcall`.
 
+Palette depends on [Joovy](runtime/integrations/joovy/README.md) for tiered
+compilation of session code; its helpers are available in every session.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for scope, verification, and research archival.
@@ -163,7 +166,7 @@ and deals the test cases across the shards by their recorded seconds
 CI runs package, host, Jupyter integration, workspace/patch, and process gates.
 Pull requests run the process gates against the Rust host; both hosts run nightly.
 The Python host is scheduled for removal ([authority](runtime/docs/authority.md)).
-The package manifest declares Julia 1.10+; supervised development and CI are tested on Julia 1.12.
+The package manifest declares Julia 1.11+; supervised development and CI are tested on Julia 1.12.
 
 ## Explanation for why not just IPython or IJulia or Jupyter
 

@@ -598,6 +598,9 @@ end
     rows = run("varinfo()").data.rows
     @test "r" in first.(rows)
     @test isempty(intersect(first.(rows), string.(collect(Palette.KERNEL_BINDINGS))))
+    @test run("ls isa Function").data
+    @test run("Joovy isa Module").data
+    @test run("joovy_compile_tiered(\"joovy_t(x)=x+1\"; tier=1, name=:joovy_t)(1)").data == 2
 
     # turn code reaches authority through Palette, and nothing else of the package
     @test run("Palette.request_capability isa Function").data
@@ -606,6 +609,38 @@ end
     # the receipt log keeps outcomes, not values
     run("zeros(10^6)")
     @test get_kernel_state().receipt_log[end].result.data === nothing
+end
+
+@testset "independent @async bash notifies bash.completed after the turn" begin
+    reset_kernel_state()
+    # Match this testset's own command: bash that earlier testsets ran outside a
+    # turn (execute without execute_turn) can ring the doorbell late.
+    is_bash_done(s) = get(get(s, "params", Dict()), "type", nothing) == "bash.completed" &&
+        get(get(s["params"], "payload", Dict()), "command", nothing) == "true"
+    with_fake_broker((t, p) -> t == "bash.completed" ? ok(Dict()) :
+                               Dict("approved" => false, "reason" => "not allowed")) do seen
+        (receipt, _, _), _ = Palette.execute_turn("job = @async bash(\"true\")", nothing)
+        @test receipt.result.success
+        t0 = time()
+        while time() - t0 < 5 && !any(is_bash_done, seen)
+            sleep(0.05)
+        end
+        @test any(is_bash_done, seen)
+        req = seen[findfirst(is_bash_done, seen)]
+        @test req["params"]["payload"]["command"] == "true"
+        @test req["params"]["payload"]["exitCode"] == 0
+        @test req["params"]["payload"]["pid"] isa Integer && req["params"]["payload"]["pid"] > 0
+    end
+    with_fake_broker((t, p) -> t == "bash.completed" ? ok(Dict()) :
+                               Dict("approved" => false, "reason" => "not allowed")) do seen
+        (receipt, _, _), _ = Palette.execute_turn("bash(\"true\")", nothing)
+        @test receipt.result.success
+        t0 = time()
+        while time() - t0 < 0.5
+            sleep(0.05)
+        end
+        @test !any(is_bash_done, seen)
+    end
 end
 
 @testset "execute_turn names its call while it runs" begin
@@ -692,6 +727,29 @@ end
     """
     cmd = `$(Base.julia_cmd()) --startup-file=no --depwarn=error --project=$(dirname(@__DIR__)) -e $script`
     @test readchomp(pipeline(cmd; stderr=stderr)) == "ok"
+end
+
+@testset "Pre-HELLO snapshot after started_call without manifest keeps ls" begin
+    reset_kernel_state()
+    old_root, old_state = Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[]
+    Palette.WORKSPACE_ROOT[] = mktempdir()
+    Palette.STATE_DIR[] = mktempdir()
+    try
+        Palette.note_started_call!(1, "sleep(999)")
+        @test isfile(joinpath(Palette.STATE_DIR[], "started_call"))
+        @test !isfile(joinpath(Palette.STATE_DIR[], "manifest.json"))
+        Palette.ensure_pre_hello_snapshot!()
+        @test isfile(joinpath(Palette.STATE_DIR[], "manifest.json"))
+        Palette.reset_kernel_state()
+        report = Palette.revive_state!()
+        @test !occursin("No complete snapshot remains", report)
+        mod = Palette.get_kernel_state().eval_module
+        @test isdefined(mod, :ls)
+        @test Core.eval(mod, :ls) isa Function
+        @test :ls in Palette.KERNEL_BINDINGS
+    finally
+        Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[] = old_root, old_state
+    end
 end
 
 @testset "Snapshot of a large value stays fast (seam S-2)" begin
