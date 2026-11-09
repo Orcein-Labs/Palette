@@ -41,11 +41,10 @@ mutable struct CodeGraph
     dirs::Dict{String,Float64}
     git_head::String
     untracked::Set{String}
-    fs_type::Symbol
 end
 
 CodeGraph(root::String, files::Dict{String,FileEntry}, last::Dict{String,Any}) =
-    CodeGraph(root, files, last, Dict{String,Float64}(), "", Set{String}(), :unknown)
+    CodeGraph(root, files, last, Dict{String,Float64}(), "", Set{String}())
 
 _language(path::AbstractString) =
     endswith(path, ".jl") ? :julia : endswith(path, ".py") ? :python : endswith(path, ".rs") ? :rust : nothing
@@ -67,29 +66,6 @@ end
 end
 @inline _sha256_hex(s::AbstractString) = _sha256_hex(String(s))
 @inline _sha256_hex(b::AbstractVector{UInt8}) = bytes2hex(sha256(b))
-
-function _detect_fs_type(path::AbstractString)
-    try
-        target = abspath(path)
-        best_mount = ""
-        best_fs = :generic
-        if isfile("/proc/mounts")
-            for line in eachline("/proc/mounts")
-                parts = split(line)
-                length(parts) >= 3 || continue
-                mountpoint = parts[2]
-                fstype = parts[3]
-                if (target == mountpoint || startswith(target, mountpoint * "/")) && length(mountpoint) > length(best_mount)
-                    best_mount = mountpoint
-                    best_fs = Symbol(fstype)
-                end
-            end
-        end
-        return best_fs
-    catch
-        return :generic
-    end
-end
 
 function _git_head(root::AbstractString)
     Sys.which("git") === nothing && return ""
@@ -205,7 +181,7 @@ _restamp(e::FileEntry, s::NTuple{3,Float64}) =
 "Build a graph over the source files under root (or the given relative `files`)."
 function CodeGraph(root::AbstractString; files=nothing)
     norm_root = String(_normroot(root))
-    g = CodeGraph(norm_root, Dict{String,FileEntry}(), Dict{String,Any}(), Dict{String,Float64}(), "", Set{String}(), _detect_fs_type(norm_root))
+    g = CodeGraph(norm_root, Dict{String,FileEntry}(), Dict{String,Any}(), Dict{String,Float64}(), "", Set{String}())
     return refresh!(g; files=files)
 end
 
