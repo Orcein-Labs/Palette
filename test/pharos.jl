@@ -345,6 +345,25 @@ _calls(e) = [(c.caller, c.callee) for c in e.calls]
             @test g.last["strategy"] == :full
             @test digest(g) == digest(g_fresh)
         end
+
+        @testset "Incremental refresh of a subdirectory root" begin
+            d = mktempdir()
+            run(pipeline(`git -C $d init -q`, stdout=devnull, stderr=devnull))
+            run(`git -C $d config user.name "Test"`)
+            run(`git -C $d config user.email "test@example.com"`)
+            _write(joinpath(d, "src", "sub", "a.jl"), "f(x) = x + 1\n")
+            _write(joinpath(d, "src", "b.py"), "def run(): pass\n")
+            run(`git -C $d add .`)
+            run(`git -C $d commit -q -m "init"`)
+
+            sub = joinpath(d, "src")
+            g = CodeGraph(sub)
+            _write(joinpath(sub, "sub", "a.jl"), "f(x) = x + 100\n")
+            refresh!(g)
+            # Porcelain paths are repo-root relative; the graph must still match a fresh scan.
+            @test digest(g) == digest(CodeGraph(sub))
+            @test g.files["sub/a.jl"].sha256 == Pharos._sha256_hex("f(x) = x + 100\n")
+        end
     end
 
     if Sys.which("python3") !== nothing

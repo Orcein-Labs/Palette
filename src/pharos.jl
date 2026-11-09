@@ -110,6 +110,20 @@ function _git_status_uall(root::AbstractString)
     end
 end
 
+"""
+True when `root` is the top of its git work tree. Porcelain status paths are
+always relative to the work-tree top, so the incremental path is only valid
+there; a subdirectory root takes the full scan instead.
+"""
+function _git_at_top(root::AbstractString)
+    Sys.which("git") === nothing && return false
+    try
+        return isempty(strip(read(pipeline(`git -C $root rev-parse --show-prefix`, stderr=devnull), String)))
+    catch
+        return false
+    end
+end
+
 function _record_dirs(root::AbstractString, rel_files)
     dirs = Dict{String,Float64}()
     for f in rel_files
@@ -195,7 +209,7 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
                 # Check if .gitignore or exclude rules changed
                 status_lines = split(status_out, '\n'; keepempty=false)
                 ignore_changed = any(l -> occursin(".gitignore", l) || occursin(".git/info/exclude", l), status_lines)
-                if !ignore_changed
+                if !ignore_changed && _git_at_top(g.root)
                     current_untracked = Set{String}()
                     dirty_paths = String[]
                     removed_paths = String[]
