@@ -270,4 +270,140 @@ _calls(e) = [(c.caller, c.callee) for c in e.calls]
         g = CodeGraph(d; files=["keep.jl"])
         @test collect(keys(g.files)) == ["keep.jl"]
     end
+
+    @testset "SHA-256 Fast Path edge cases & parity" begin
+        cases = [
+            "",
+            "a",
+            "The quick brown fox jumps over the lazy dog",
+            "embedded\0nul\0bytes",
+            "Unicode αβγδε 你好 🚀🔥",
+            repeat("Z", 100_000)
+        ]
+        for c in cases
+            @test Pharos._sha256_hex(c) == bytes2hex(Pharos.SHA.sha256(c))
+        end
+    end
+
+    if Sys.which("git") !== nothing
+        @testset "Incremental Git refresh adversarial mutations" begin
+            d = mktempdir()
+            run(pipeline(`git -C $d init -q`, stdout=devnull, stderr=devnull))
+            run(`git -C $d config user.name "Test"`)
+            run(`git -C $d config user.email "test@example.com"`)
+
+            _write(joinpath(d, "src", "a.jl"), "f(x) = x + 1\n")
+            _write(joinpath(d, "src", "b.py"), "def run(): pass\n")
+            run(`git -C $d add .`)
+            run(`git -C $d commit -q -m "init"`)
+
+            g = CodeGraph(d)
+            @test length(g.files) == 2
+            @test g.last["strategy"] == :full
+
+            # 1. Zero change warm refresh
+            refresh!(g)
+            @test g.last["strategy"] == :git_clean
+            @test g.last["reparsed"] == 0
+            @test g.last["hashed"] == 0
+
+            # 2. In-place edit of tracked file
+            write(joinpath(d, "src", "a.jl"), "f(x) = x + 10\n")
+            refresh!(g)
+            @test g.last["strategy"] == :git_incremental
+            @test g.last["reparsed"] == 1
+            @test g.last["reparsed_paths"] == ["src/a.jl"]
+            run(`git -C $d commit -q -am "update a"`)
+            g.git_head = Pharos._git_head(d)
+
+            # 3. New untracked file
+            _write(joinpath(d, "src", "new.rs"), "fn foo() {}\n")
+            refresh!(g)
+            @test g.last["strategy"] == :git_incremental
+            @test haskey(g.files, "src/new.rs")
+            @test "src/new.rs" in g.last["reparsed_paths"]
+
+            # 4. Deletion of untracked file
+            rm(joinpath(d, "src", "new.rs"))
+            refresh!(g)
+            @test g.last["strategy"] == :git_incremental
+            @test !haskey(g.files, "src/new.rs")
+            @test g.last["removed"] == 1
+
+            # 5. Non-source change (e.g. documentation or config)
+            write(joinpath(d, "README.md"), "# Title\n")
+            refresh!(g)
+            @test g.last["strategy"] == :git_non_source
+            @test g.last["reparsed"] == 0
+
+            # 6. Digest parity with fresh full scan
+            g_fresh = CodeGraph(d)
+            @test digest(g) == digest(g_fresh)
+
+            # 7. Explicit full refresh fallback
+            refresh!(g; full=true)
+            @test g.last["strategy"] == :full
+            @test digest(g) == digest(g_fresh)
+        end
+    end
+
+    if Sys.which("python3") !== nothing
+        @testset "Python AST statement traversal & complex syntax" begin
+            d = mktempdir()
+            _write(joinpath(d, "complex.py"), """
+            import sys, os.path as osp
+            from math import sin, cos
+            from ..parent import helper
+
+            GLOBAL_CONST = 100
+
+            def outer_func(x):
+                def inner_func(y):
+                    return x + y
+                return inner_func
+
+            class OuterClass:
+                class NestedClass:
+                    def nested_method(self):
+                        pass
+                async def async_method(self):
+                    pass
+
+            if True:
+                def branch_func(): pass
+            else:
+                def other_branch(): pass
+
+            try:
+                def try_func(): pass
+            except Exception:
+                def except_func(): pass
+            finally:
+                def finally_func(): pass
+
+            with open(__file__) as f:
+                def with_func(): pass
+            """)
+            g = CodeGraph(d)
+            e = g.files["complex.py"]
+            @test e.error === nothing
+            defs = _defs(e)
+            @test defs["outer_func"] === :function
+            @test defs["outer_func.inner_func"] === :function
+            @test defs["OuterClass"] === :class
+            @test defs["OuterClass.NestedClass"] === :class
+            @test defs["OuterClass.NestedClass.nested_method"] === :function
+            @test defs["OuterClass.async_method"] === :function
+            @test defs["branch_func"] === :function
+            @test defs["other_branch"] === :function
+            @test defs["try_func"] === :function
+            @test defs["except_func"] === :function
+            @test defs["finally_func"] === :function
+            @test defs["with_func"] === :function
+            @test "sys" in e.imports
+            @test "os.path" in e.imports
+            @test "math" in e.imports
+            @test "..parent" in e.imports
+        end
+    end
 end

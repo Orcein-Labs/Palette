@@ -38,7 +38,14 @@ mutable struct CodeGraph
     root::String
     files::Dict{String,FileEntry}
     last::Dict{String,Any}
+    dirs::Dict{String,Float64}
+    git_head::String
+    untracked::Set{String}
+    fs_type::Symbol
 end
+
+CodeGraph(root::String, files::Dict{String,FileEntry}, last::Dict{String,Any}) =
+    CodeGraph(root, files, last, Dict{String,Float64}(), "", Set{String}(), :unknown)
 
 _language(path::AbstractString) =
     endswith(path, ".jl") ? :julia : endswith(path, ".py") ? :python : endswith(path, ".rs") ? :rust : nothing
@@ -46,6 +53,74 @@ _language(path::AbstractString) =
 function _normroot(root::AbstractString)
     r = rstrip(abspath(root), '/')
     isempty(r) ? "/" : r
+end
+
+# Fast pointer-wrapped SHA-256: avoids Julia SHA.jl scalar fallback on Base.CodeUnits{UInt8, String}.
+# Memory safety: GC.@preserve keeps `s` alive; own=false ensures Julia never frees the pointer.
+@inline function _sha256_hex(s::String)
+    n = sizeof(s)
+    n == 0 && return bytes2hex(sha256(UInt8[]))
+    GC.@preserve s begin
+        arr = unsafe_wrap(Array, pointer(s), n; own=false)
+        return bytes2hex(sha256(arr))
+    end
+end
+@inline _sha256_hex(s::AbstractString) = _sha256_hex(String(s))
+@inline _sha256_hex(b::AbstractVector{UInt8}) = bytes2hex(sha256(b))
+
+function _detect_fs_type(path::AbstractString)
+    try
+        target = abspath(path)
+        best_mount = ""
+        best_fs = :generic
+        if isfile("/proc/mounts")
+            for line in eachline("/proc/mounts")
+                parts = split(line)
+                length(parts) >= 3 || continue
+                mountpoint = parts[2]
+                fstype = parts[3]
+                if (target == mountpoint || startswith(target, mountpoint * "/")) && length(mountpoint) > length(best_mount)
+                    best_mount = mountpoint
+                    best_fs = Symbol(fstype)
+                end
+            end
+        end
+        return best_fs
+    catch
+        return :generic
+    end
+end
+
+function _git_head(root::AbstractString)
+    Sys.which("git") === nothing && return ""
+    try
+        s = read(pipeline(`git -C $root rev-parse HEAD`, stderr=devnull), String)
+        return strip(s)
+    catch
+        return ""
+    end
+end
+
+function _git_status_uall(root::AbstractString)
+    Sys.which("git") === nothing && return nothing
+    try
+        return read(pipeline(`git -C $root status --porcelain -uall`, stderr=devnull), String)
+    catch
+        return nothing
+    end
+end
+
+function _record_dirs(root::AbstractString, rel_files)
+    dirs = Dict{String,Float64}()
+    for f in rel_files
+        d = dirname(f)
+        if !haskey(dirs, d)
+            abs_d = isempty(d) ? root : joinpath(root, d)
+            st = lstat(abs_d)
+            (isfile(st) || isdir(st)) && (dirs[d] = Float64(st.mtime))
+        end
+    end
+    return dirs
 end
 
 """
@@ -91,13 +166,138 @@ _restamp(e::FileEntry, s::NTuple{3,Float64}) =
 
 "Build a graph over the source files under root (or the given relative `files`)."
 function CodeGraph(root::AbstractString; files=nothing)
-    g = CodeGraph(_normroot(root), Dict{String,FileEntry}(), Dict{String,Any}())
+    norm_root = String(_normroot(root))
+    g = CodeGraph(norm_root, Dict{String,FileEntry}(), Dict{String,Any}(), Dict{String,Float64}(), "", Set{String}(), _detect_fs_type(norm_root))
     return refresh!(g; files=files)
 end
 
 "Re-scan changed files. Unchanged stamps are skipped, touched files are re-hashed, and only changed bytes are parsed."
-function refresh!(g::CodeGraph; files=nothing)
+function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
     t0 = time()
+
+    # -------------------------------------------------------------
+    # Incremental Fast-Path (when no explicit files list requested)
+    # -------------------------------------------------------------
+    if files === nothing && !full && !isempty(g.files)
+        head = _git_head(g.root)
+        if !isempty(head) && head == g.git_head
+            status_out = _git_status_uall(g.root)
+            if status_out !== nothing
+                if isempty(status_out) && isempty(g.untracked)
+                    # Repository is 100% clean! Zero changes to tracked or untracked source files.
+                    g.last = Dict{String,Any}(
+                        "checked" => length(g.files), "hashed" => 0, "reparsed" => 0,
+                        "reparsed_paths" => String[], "removed" => 0, "seconds" => time() - t0,
+                        "files" => length(g.files), "strategy" => :git_clean)
+                    return g
+                end
+
+                # Check if .gitignore or exclude rules changed
+                status_lines = split(status_out, '\n'; keepempty=false)
+                ignore_changed = any(l -> occursin(".gitignore", l) || occursin(".git/info/exclude", l), status_lines)
+                if !ignore_changed
+                    current_untracked = Set{String}()
+                    dirty_paths = String[]
+                    removed_paths = String[]
+                    for line in status_lines
+                        length(line) >= 4 || continue
+                        code = line[1:2]
+                        raw_path = strip(line[3:end])
+                        if startswith(code, "??")
+                            if _language(raw_path) !== nothing
+                                push!(current_untracked, raw_path)
+                                push!(dirty_paths, raw_path)
+                            end
+                        elseif startswith(code, "R") && occursin(" -> ", raw_path)
+                            parts = split(raw_path, " -> ")
+                            old_p, new_p = strip(parts[1]), strip(parts[2])
+                            _language(old_p) !== nothing && push!(removed_paths, old_p)
+                            _language(new_p) !== nothing && push!(dirty_paths, new_p)
+                        elseif occursin('D', code)
+                            _language(raw_path) !== nothing && push!(removed_paths, raw_path)
+                        else
+                            _language(raw_path) !== nothing && push!(dirty_paths, raw_path)
+                        end
+                    end
+
+                    # Check for untracked files previously indexed that were deleted
+                    for old_u in g.untracked
+                        if !(old_u in current_untracked)
+                            push!(removed_paths, old_u)
+                        end
+                    end
+                    g.untracked = current_untracked
+
+                    if isempty(dirty_paths) && isempty(removed_paths)
+                        # Modified files exist, but none are source files!
+                        g.last = Dict{String,Any}(
+                            "checked" => length(g.files), "hashed" => 0, "reparsed" => 0,
+                            "reparsed_paths" => String[], "removed" => 0, "seconds" => time() - t0,
+                            "files" => length(g.files), "strategy" => :git_non_source)
+                        return g
+                    end
+
+                    # Apply removals
+                    removed_count = 0
+                    for rp in removed_paths
+                        if haskey(g.files, rp)
+                            delete!(g.files, rp)
+                            removed_count += 1
+                        end
+                    end
+
+                    # Reparse dirty paths
+                    reparsed_paths = String[]
+                    py_pending = Tuple{String,String,String,NTuple{3,Float64},String}[]
+                    hashed_count = 0
+
+                    for rel in unique(dirty_paths)
+                        lang = _language(rel)
+                        lang === nothing && continue
+                        abs = joinpath(g.root, rel)
+                        st = lstat(abs)
+                        isfile(st) || continue
+                        stamp = (Float64(st.mtime), Float64(st.size), Float64(st.inode))
+                        text = try read(abs, String) catch; continue end
+                        hashed_count += 1
+                        h = _sha256_hex(text)
+
+                        e = get(g.files, rel, nothing)
+                        if e !== nothing && e.sha256 == h
+                            g.files[rel] = _restamp(e, stamp)
+                            continue
+                        end
+                        push!(reparsed_paths, rel)
+                        if lang === :python
+                            push!(py_pending, (rel, abs, h, stamp, text))
+                        elseif lang === :julia
+                            g.files[rel] = _julia_entry(rel, text, h, stamp)
+                        else
+                            g.files[rel] = _rust_entry(rel, text, h, stamp)
+                        end
+                    end
+
+                    if !isempty(py_pending)
+                        filter!(p -> !occursin('\n', p[2]), py_pending)
+                        res = _python_extract([p[2] for p in py_pending])
+                        for (i, (rel, abs, h, stamp, text)) in enumerate(py_pending)
+                            g.files[rel] = res === nothing ? _python_regex_entry(rel, text, h, stamp) : _python_entry(rel, res[i], h, stamp)
+                        end
+                    end
+
+                    g.last = Dict{String,Any}(
+                        "checked" => length(g.files), "hashed" => hashed_count, "reparsed" => length(reparsed_paths),
+                        "reparsed_paths" => reparsed_paths, "removed" => removed_count, "seconds" => time() - t0,
+                        "files" => length(g.files), "strategy" => :git_incremental)
+                    return g
+                end
+            end
+        end
+    end
+
+    # -------------------------------------------------------------
+    # Full Refresh / Trusted Fallback Path
+    # -------------------------------------------------------------
     rels = files === nothing ? source_files(g.root) : sort!(unique(String.(files)))
     old = g.files
     new = Dict{String,FileEntry}()
@@ -109,8 +309,6 @@ function refresh!(g::CodeGraph; files=nothing)
         lang = _language(rel)
         lang === nothing && continue
         abs = joinpath(g.root, rel)
-        # lstat: a symlink is skipped, not followed out of the root. The inode
-        # catches a file replaced by rename with the same size and mtime.
         st = lstat(abs)
         isfile(st) || continue
         stamp = (Float64(st.mtime), Float64(st.size), Float64(st.inode))
@@ -126,7 +324,7 @@ function refresh!(g::CodeGraph; files=nothing)
             continue
         end
         hashed += 1
-        h = bytes2hex(sha256(text))
+        h = _sha256_hex(text)
         if e !== nothing && e.sha256 == h
             new[rel] = _restamp(e, stamp)
             continue
@@ -149,10 +347,18 @@ function refresh!(g::CodeGraph; files=nothing)
     end
     removed = count(k -> !haskey(new, k), keys(old))
     g.files = new
+    g.git_head = _git_head(g.root)
+    g.dirs = _record_dirs(g.root, keys(new))
+    st_out = _git_status_uall(g.root)
+    if st_out !== nothing
+        g.untracked = Set{String}(strip(line[3:end]) for line in split(st_out, '\n'; keepempty=false) if startswith(line, "??") && _language(strip(line[3:end])) !== nothing)
+    else
+        g.untracked = Set{String}()
+    end
     g.last = Dict{String,Any}(
         "checked" => checked, "hashed" => hashed, "reparsed" => length(reparsed),
         "reparsed_paths" => reparsed, "removed" => removed, "seconds" => time() - t0,
-        "files" => length(new))
+        "files" => length(new), "strategy" => :full)
     return g
 end
 
@@ -182,7 +388,7 @@ end
 "sha256 hex over the sorted \"path sha\" lines of every entry."
 function digest(g::CodeGraph)
     lines = sort!(["$(path) $(e.sha256)" for (path, e) in g.files])
-    return bytes2hex(sha256(join(lines, "\n")))
+    return _sha256_hex(join(lines, "\n"))
 end
 
 function Base.show(io::IO, ::MIME"text/plain", g::CodeGraph)
@@ -382,30 +588,55 @@ end
 # "<index>\tI\tmodule" or "<index>\tE\tmessage" lines.
 const _PY_SCRIPT = """
 import ast, sys
+
 paths = sys.stdin.read().split('\\n')
 w = sys.stdout.write
+fn_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+def scan_stmts(stmts, prefix, i, out):
+    for st in stmts:
+        t = type(st)
+        if t in fn_types:
+            name = prefix + st.name
+            out.append(f"{i}\\tD\\t{name}\\tfunction\\t{st.lineno}\\n")
+            scan_stmts(st.body, name + ".", i, out)
+        elif t is ast.ClassDef:
+            name = prefix + st.name
+            out.append(f"{i}\\tD\\t{name}\\tclass\\t{st.lineno}\\n")
+            scan_stmts(st.body, name + ".", i, out)
+        elif t is ast.Import:
+            for a in st.names:
+                out.append(f"{i}\\tI\\t{a.name}\\n")
+        elif t is ast.ImportFrom:
+            out.append(f"{i}\\tI\\t{'.' * st.level + (st.module or '')}\\n")
+        elif t is ast.If or t is ast.While or t is ast.For or t is ast.AsyncFor:
+            scan_stmts(st.body, prefix, i, out)
+            st.orelse and scan_stmts(st.orelse, prefix, i, out)
+        elif t is ast.Try or t is getattr(ast, 'TryStar', ast.Try):
+            scan_stmts(st.body, prefix, i, out)
+            for h in st.handlers:
+                scan_stmts(h.body, prefix, i, out)
+            st.orelse and scan_stmts(st.orelse, prefix, i, out)
+            st.finalbody and scan_stmts(st.finalbody, prefix, i, out)
+        elif t is ast.With or t is ast.AsyncWith:
+            scan_stmts(st.body, prefix, i, out)
+        elif hasattr(ast, 'Match') and t is ast.Match:
+            for c in st.cases:
+                scan_stmts(c.body, prefix, i, out)
+
 for i, p in enumerate(paths):
+    if not p:
+        continue
     try:
         with open(p, 'rb') as f:
             tree = ast.parse(f.read(), filename=p)
     except Exception as e:
         w('%d\\tE\\t%s\\n' % (i, ' '.join((type(e).__name__ + ': ' + str(e)).split())))
         continue
-    def visit(node, prefix):
-        for ch in ast.iter_child_nodes(node):
-            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                kind = 'class' if isinstance(ch, ast.ClassDef) else 'function'
-                w('%d\\tD\\t%s\\t%s\\t%d\\n' % (i, prefix + ch.name, kind, ch.lineno))
-                visit(ch, prefix + ch.name + '.')
-            else:
-                visit(ch, prefix)
-    visit(tree, '')
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for a in n.names:
-                w('%d\\tI\\t%s\\n' % (i, a.name))
-        elif isinstance(n, ast.ImportFrom):
-            w('%d\\tI\\t%s\\n' % (i, '.' * n.level + (n.module or '')))
+    out = []
+    if tree and hasattr(tree, 'body'):
+        scan_stmts(tree.body, '', i, out)
+    w(''.join(out))
 """
 
 # One record per path, or nothing when python3 is missing, fails or times out.
@@ -430,9 +661,17 @@ function _python_extract(abs_paths::Vector{String})
     recs = [(Definition[], String[], Ref{Union{Nothing,String}}(nothing)) for _ in abs_paths]
     for line in eachsplit(out, '\n'; keepempty=false)
         f = split(line, '\t')
-        defs, imports, err = recs[parse(Int, f[1]) + 1]
-        f[2] == "D" ? push!(defs, Definition(f[3], Symbol(f[4]), parse(Int, f[5]))) :
-        f[2] == "I" ? push!(imports, f[3]) : (err[] = f[3])
+        length(f) >= 3 || continue
+        idx = parse(Int, f[1]) + 1
+        1 <= idx <= length(recs) || continue
+        defs, imports, err = recs[idx]
+        if f[2] == "D" && length(f) >= 5
+            push!(defs, Definition(f[3], Symbol(f[4]), parse(Int, f[5])))
+        elseif f[2] == "I"
+            push!(imports, f[3])
+        elseif f[2] == "E"
+            err[] = f[3]
+        end
     end
     return recs
 end
