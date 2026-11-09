@@ -364,6 +364,39 @@ _calls(e) = [(c.caller, c.callee) for c in e.calls]
             @test digest(g) == digest(CodeGraph(sub))
             @test g.files["sub/a.jl"].sha256 == Pharos._sha256_hex("f(x) = x + 100\n")
         end
+
+        @testset "Incremental refresh of quoted and non-ASCII paths" begin
+            d = mktempdir()
+            run(pipeline(`git -C $d init -q`, stdout=devnull, stderr=devnull))
+            run(`git -C $d config user.name "Test"`)
+            run(`git -C $d config user.email "test@example.com"`)
+            _write(joinpath(d, "naïve café.jl"), "f(x) = x\n")
+            _write(joinpath(d, "my file.jl"), "h(x) = x\n")
+            _write(joinpath(d, "plain.jl"), "k(x) = x\n")
+            run(`git -C $d add .`)
+            run(`git -C $d commit -q -m "init"`)
+
+            g = CodeGraph(d)
+            @test length(g.files) == 3
+
+            # Tracked edits to paths git would C-quote in porcelain output
+            write(joinpath(d, "naïve café.jl"), "f(x) = x + 5\n")
+            write(joinpath(d, "my file.jl"), "h(x) = x + 5\n")
+            refresh!(g)
+            @test g.last["strategy"] == :git_incremental
+            @test Set(g.last["reparsed_paths"]) == Set(["naïve café.jl", "my file.jl"])
+            @test digest(g) == digest(CodeGraph(d))
+
+            # Untracked non-ASCII path appears, then disappears
+            _write(joinpath(d, "new ünï.py"), "def k(): pass\n")
+            refresh!(g)
+            @test haskey(g.files, "new ünï.py")
+            @test digest(g) == digest(CodeGraph(d))
+            rm(joinpath(d, "new ünï.py"))
+            refresh!(g)
+            @test !haskey(g.files, "new ünï.py")
+            @test digest(g) == digest(CodeGraph(d))
+        end
     end
 
     if Sys.which("python3") !== nothing

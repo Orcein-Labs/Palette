@@ -104,10 +104,34 @@ end
 function _git_status_uall(root::AbstractString)
     Sys.which("git") === nothing && return nothing
     try
-        return read(pipeline(`git -C $root status --porcelain -uall`, stderr=devnull), String)
+        return read(pipeline(`git -C $root status --porcelain -z -uall`, stderr=devnull), String)
     catch
         return nothing
     end
+end
+
+"""
+Entries of `git status --porcelain -z` as (code, path, origpath) triples.
+With -z git does not C-quote paths, and a rename or copy is followed by its
+original path as a second NUL-terminated field.
+"""
+function _parse_status_z(out::AbstractString)
+    entries = Tuple{String,String,Union{Nothing,String}}[]
+    fields = split(out, '\0'; keepempty=false)
+    i = 1
+    while i <= length(fields)
+        f = fields[i]
+        i += 1
+        length(f) >= 4 || continue
+        code = String(f[1:2])
+        orig = nothing
+        if occursin('R', code) || occursin('C', code)
+            i <= length(fields) && (orig = String(fields[i]))
+            i += 1
+        end
+        push!(entries, (code, String(f[4:end]), orig))
+    end
+    return entries
 end
 
 """
@@ -206,31 +230,26 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
                     return g
                 end
 
-                # Check if .gitignore or exclude rules changed
-                status_lines = split(status_out, '\n'; keepempty=false)
-                ignore_changed = any(l -> occursin(".gitignore", l) || occursin(".git/info/exclude", l), status_lines)
+                # Check if a .gitignore rule file changed (any nested one too)
+                entries = _parse_status_z(status_out)
+                ignore_changed = any(e -> endswith(e[2], ".gitignore"), entries)
                 if !ignore_changed && _git_at_top(g.root)
                     current_untracked = Set{String}()
                     dirty_paths = String[]
                     removed_paths = String[]
-                    for line in status_lines
-                        length(line) >= 4 || continue
-                        code = line[1:2]
-                        raw_path = strip(line[3:end])
-                        if startswith(code, "??")
-                            if _language(raw_path) !== nothing
-                                push!(current_untracked, raw_path)
-                                push!(dirty_paths, raw_path)
+                    for (code, path, orig) in entries
+                        if code == "??"
+                            if _language(path) !== nothing
+                                push!(current_untracked, path)
+                                push!(dirty_paths, path)
                             end
-                        elseif startswith(code, "R") && occursin(" -> ", raw_path)
-                            parts = split(raw_path, " -> ")
-                            old_p, new_p = strip(parts[1]), strip(parts[2])
-                            _language(old_p) !== nothing && push!(removed_paths, old_p)
-                            _language(new_p) !== nothing && push!(dirty_paths, new_p)
+                        elseif orig !== nothing
+                            _language(orig) !== nothing && push!(removed_paths, orig)
+                            _language(path) !== nothing && push!(dirty_paths, path)
                         elseif occursin('D', code)
-                            _language(raw_path) !== nothing && push!(removed_paths, raw_path)
+                            _language(path) !== nothing && push!(removed_paths, path)
                         else
-                            _language(raw_path) !== nothing && push!(dirty_paths, raw_path)
+                            _language(path) !== nothing && push!(dirty_paths, path)
                         end
                     end
 
@@ -365,7 +384,7 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
     g.dirs = _record_dirs(g.root, keys(new))
     st_out = _git_status_uall(g.root)
     if st_out !== nothing
-        g.untracked = Set{String}(strip(line[3:end]) for line in split(st_out, '\n'; keepempty=false) if startswith(line, "??") && _language(strip(line[3:end])) !== nothing)
+        g.untracked = Set{String}(path for (code, path, _) in _parse_status_z(st_out) if code == "??" && _language(path) !== nothing)
     else
         g.untracked = Set{String}()
     end
