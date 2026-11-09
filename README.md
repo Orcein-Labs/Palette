@@ -1,33 +1,16 @@
 # Palette
 
-Palette gives any harness that accepts plugins, a Julia computer on your machine, and that computer is still running when the next message arrives.
+Palette gives any harness that accepts plugins a Julia computer on your machine, and that computer is still running when the next message arrives.
 
 Note: Developed on CachyOS, tested on Windows 11 via QEMU. Xeon 2699 v3, RTX 5060 8GB, 32GB DDR4
 
-ChatGPT, Claude, Grok, and Gemini talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. Kill Julia on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. Trust that report. Re-derive anything it marks lost.
+ChatGPT, Claude, Grok, and Gemini talk. Palette holds the live world they work in: bindings, loaded packages, files you wrote, journals, isolated workspaces. You can kill Palette on purpose and the next process comes up from disk, with a host report of what came back restored, rebuilt, stale, or lost. 
 
 Every call is parsed whole before any of it runs. A call that never yields gets killed, then the kernel revives. Broker-mediated host effects leave a receipt; operator mode also has the user's normal host access.
 
 The supervised Julia session defaults to `operator` mode. Choose `--mode sandbox`
 to enter the opt-in bubblewrap lab, where filesystem and network access follow
 the configured boundaries.
-
-## ChatGPT Chat, October 2026
-
-This is the default ChatGPT chat product. The UI labels it Chat.
-
-<p align="center">
-  <img src="runtime/docs/images/chatgpt-chat-mode.png" alt="ChatGPT Chat mode, confirmed in the UI, driving Palette" width="48%" />
-  <img src="runtime/docs/images/chatgpt-os-lab.png" alt="ChatGPT Chat installing Metatheory.jl through Palette in real time" width="48%" />
-</p>
-
-The right-hand capture is ChatGPT Chat installing Metatheory.jl through Palette while the kernel stays up. Isolated research environment, Gesso's dependencies left alone.
-
-The workspace is a separate research world, kept off the default world, and Palette runs disposable Julia processes against that same tree. Process A writes a World and dies. Process B starts empty and reconstructs identity, authority, provenance, and the journal from disk, independent of Palette's in-memory revival.
-
-We've run long-horizon R&D spirals on this desk. Bugs showed up and they were able to be fixed from the inside. The World was still on disk after the kernel came back.
-
-Clients attach over MCP, or over the host session (newline-delimited JSON on stdio). The kernel is local. Talk to whichever model you already use.
 
 ## Install
 
@@ -39,14 +22,14 @@ Code, Codex, Grok and Antigravity installs it finds, adds the Palette plugin to
 Claude Code, and checks the installation before switching to it.
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Orcein-Labs/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows, in PowerShell or a command prompt. It sets up WSL2 with Ubuntu if
 you have none, installs Palette inside it, and also connects Claude Desktop:
 
 ```powershell
-powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/Orcein-Labs/Palette/releases/latest/download/install.ps1'))"
 ```
 
 To install Bubblewrap support and start in the opt-in sandbox, pipe the installer

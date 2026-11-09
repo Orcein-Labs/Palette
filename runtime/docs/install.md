@@ -5,13 +5,13 @@
 On Linux, or inside WSL2:
 
 ```sh
-curl -fsSL https://github.com/latentcollapse/Palette/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Orcein-Labs/Palette/releases/latest/download/install.sh | sh
 ```
 
 On Windows (PowerShell or a command prompt):
 
 ```powershell
-powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/latentcollapse/Palette/releases/latest/download/install.ps1'))"
+powershell -c "iex ((New-Object Net.WebClient).DownloadString('https://github.com/Orcein-Labs/Palette/releases/latest/download/install.ps1'))"
 ```
 
 Operator setup preserves the installer's `PATH` for user toolchains, with the
@@ -210,6 +210,9 @@ server runs `palette-host mcp connect`, a stdio client for the user service
 below. It checks the local build and preserves configuration when updating an
 existing Palette entry. The client must separately support and enable that plugin format.
 Installing these files does not register a remote ChatGPT connection.
+Generated plugins include the current Palette skills and startup hook.
+Reinstalling refreshes these shipped instructions while preserving other
+plugin files and the existing server configuration.
 
 ### User service lifecycle
 

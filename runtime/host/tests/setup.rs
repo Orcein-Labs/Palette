@@ -340,12 +340,31 @@ fn installs_checks_and_keeps_the_working_installation_when_a_check_fails() {
     }
     assert_eq!(names(&f.client_dir()), ["generic-mcp.json", "palette-launch.json", "palette-local-plugin", "palette-mcp"]);
     let plugin = f.client_dir().join("palette-local-plugin");
+    assert_eq!(names(&plugin.join("skills")), names(&sdk1.join("runtime/plugins/palette/skills")));
     assert_eq!(json(&plugin.join("plugin.json"))["license"], "AGPL-3.0-only");
     let entry = &json(&plugin.join("mcp.json"))["mcpServers"]["palette"];
     assert_eq!(entry["type"], "stdio");
     assert_eq!(entry["env"]["PALETTE_REPO"], sdk1.to_str().unwrap());
     for file in ["LICENSE", "NOTICE", "MIT-INHERITED.txt", "assets/palette.svg"] {
         assert!(plugin.join(file).is_file(), "{file}");
+    }
+    for file in ["skills/palette/SKILL.md", "skills/palette-setup/SKILL.md", "hooks/hooks.json", "hooks/session-start.sh"] {
+        assert_eq!(fs::read(plugin.join(file)).unwrap(), fs::read(sdk1.join("runtime/plugins/palette").join(file)).unwrap());
+    }
+    std::os::unix::fs::symlink(&sdk1, palette.join("current")).unwrap();
+    write(&f.bin().join("pal"), "#!/bin/sh\ncat > \"$STUB_STATE/pal-was-called\"\n", 0o755);
+    let hook = Command::new("sh").arg(plugin.join("hooks/session-start.sh"))
+        .env("PALETTE_HOME", &palette).env("STUB_STATE", f.state())
+        .env("PATH", format!("{}:/usr/bin:/bin", f.bin().display())).output().unwrap();
+    assert!(hook.status.success() && String::from_utf8_lossy(&hook.stdout).contains("the pal shell command"));
+    assert!(!f.state().join("pal-was-called").exists(), "startup guidance executed pal");
+    for format in ["portable", "codex"] {
+        let target = f.root.join(format);
+        let result = Command::new(env!("CARGO_BIN_EXE_palette-host")).args(["install-plugin", "--format", format, "--repo-dir", sdk1.to_str().unwrap(), "--workspace-dir", f.state().to_str().unwrap(), "--plugin-dir", target.to_str().unwrap()]).output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        for file in ["skills/palette/SKILL.md", "skills/palette-setup/SKILL.md", "hooks/hooks.json", "hooks/session-start.sh"] {
+            assert_eq!(fs::read(target.join(file)).unwrap(), fs::read(plugin.join(file)).unwrap());
+        }
     }
 
     // An update whose check fails leaves the installation that worked.

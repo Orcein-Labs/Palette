@@ -611,6 +611,7 @@ fn write_plugin(repo: &Path, plugin: &Path, entry: &Value) -> Result<(), String>
         fs::copy(repo.join(from), plugin.join(to)).map_err(at(&repo.join(from)))?;
     }
     fs::write(plugin.join("NOTICE"), NOTICE).map_err(at(&plugin.join("NOTICE")))?;
+    crate::install_plugin::copy_instructions(repo, plugin)?;
     manifest.as_object_mut().ok_or("plugin.json must be a JSON object")?.insert("license".into(), json!("AGPL-3.0-only"));
     fs::write(&manifest_path, pretty(&manifest)).map_err(at(&manifest_path))
 }
