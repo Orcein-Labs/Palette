@@ -1,7 +1,7 @@
 [package]
 license = "AGPL-3.0-only"
 name = "palette-host"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Palette host: the sandbox launcher, persistent session, and capability broker for the Palette kernel"
 
