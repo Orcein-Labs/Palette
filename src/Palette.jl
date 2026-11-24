@@ -316,6 +316,7 @@ Resets the kernel state (useful for testing or clean restarts).
 function reset_kernel_state()
     GLOBAL_STATE[] = nothing
     empty!(MMAP_BINDINGS)
+    empty!(PIN_REGISTRY)
     empty!(EPHEMERAL_BINDINGS)
     empty!(SANDBOX_MODULES)
     empty!(SANDBOX_MODULE_GENERATIONS)
@@ -348,6 +349,7 @@ function reset_kernel_state!(; process::Bool=false)
     empty!(CALL_FILES); empty!(USED_FILES)
     empty!(BINDING_SEEN); empty!(BINDING_ORIGINS); empty!(BINDING_IDENTITIES)
     empty!(MMAP_BINDINGS)
+    empty!(PIN_REGISTRY)
     empty!(EPHEMERAL_BINDINGS)
     empty!(SANDBOX_MODULES); empty!(SANDBOX_MODULE_GENERATIONS)
     empty!(OUTPUTS); empty!(XRAY)
@@ -930,12 +932,19 @@ definitions(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Noth
     Palette.definitions(name; graph, root, match, kwargs...)
 callers(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
     Palette.callers(name; graph, root, match, kwargs...)
-grep_defs(substring::AbstractString; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, kwargs...) =
-    Palette.grep_defs(substring; graph, path_prefix, root, kwargs...)
+grep_defs(pattern::Union{AbstractString, Regex}; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, exts=nothing, kwargs...) =
+    Palette.grep_defs(pattern; graph, path_prefix, root, exts, kwargs...)
 bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, dims::Tuple{Vararg{Integer}}; offset::Integer=0) where {T} =
     Palette.bind_mmap(name, path, T, dims; offset)
 bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, len::Integer; offset::Integer=0) where {T} =
     Palette.bind_mmap(name, path, T, len; offset)
+pin(fn::Function, name::Symbol; lazy::Bool=false) = Palette.pin(fn, name; lazy)
+pin(name::Symbol, fn::Function; lazy::Bool=false) = Palette.pin(fn, name; lazy)
+pin(name::Symbol) = Palette.pin(name)
+unpin(name::Symbol) = Palette.unpin(name)
+pinned() = Palette.pinned()
+map_budgeted(f, xs; budget_s::Real=20.0, chunk::Integer=16) =
+    Palette.map_budgeted(f, xs; budget_s, chunk)
 ephemeral!(sym::Symbol) = Palette.ephemeral!(sym)
 ephemeral!(syms::Symbol...) = Palette.ephemeral!(syms...)
 unephemeral!(sym::Symbol) = Palette.unephemeral!(sym)
@@ -1040,7 +1049,12 @@ function Base.show(io::IO, ::MIME"text/plain", v::VarInfo)
     end
 end
 
+struct PinnedRef
+    name::Symbol
+end
+
 function _summary(v)
+    v isa PinnedRef && return "pinned ref :$(v.name)"
     v isa Function && return "function, $(length(methods(v))) method(s)"
     v isa Type && return "type"
     v isa Module && return "module"
@@ -1890,6 +1904,64 @@ macro bench(ex, opts...)
     return _bench_macro_expand(ex, opts)
 end
 
+"""
+    map_budgeted(f, xs; budget_s=20.0, chunk=16)
+        -> NamedTuple{(:results, :completed, :total, :timed_out, :elapsed_s)}
+
+Evaluate `f(x)` across `xs` in chunks of `chunk` items, calling `GC.safepoint()`
+and `yield()` between chunks and stopping early once wall-clock time reaches
+`budget_s`. Returns `(results=..., completed=..., total=..., timed_out=..., elapsed_s=...)`
+so long sweeps return partial progress cleanly instead of hitting hard worker
+timeouts.
+"""
+function map_budgeted(f, xs; budget_s::Real=20.0, chunk::Integer=16)
+    (budget_s isa Bool || isnan(Float64(budget_s)) || Float64(budget_s) <= 0.0) &&
+        throw(ArgumentError("budget_s must be a positive real number, got $budget_s"))
+    (chunk isa Bool || chunk < 1) &&
+        throw(ArgumentError("chunk must be >= 1, got $chunk"))
+
+    budget = Float64(budget_s)
+    chunk_size = Int(chunk)
+    items = Base.IteratorSize(xs) isa Union{Base.HasLength, Base.HasShape} ? xs : collect(xs)
+    total = length(items)
+
+    if total == 0
+        return (results=Any[], completed=0, total=0, timed_out=false, elapsed_s=0.0)
+    end
+
+    t0 = time_ns()
+    raw = Vector{Any}()
+    sizehint!(raw, min(total, 1024))
+    completed = 0
+    in_chunk = 0
+    timed_out = false
+
+    for x in items
+        if (time_ns() - t0) / 1e9 >= budget
+            timed_out = true
+            break
+        end
+        push!(raw, f(x))
+        completed += 1
+        in_chunk += 1
+        if in_chunk >= chunk_size && completed < total
+            in_chunk = 0
+            GC.safepoint()
+            yield()
+        end
+    end
+
+    elapsed_s = (time_ns() - t0) / 1e9
+    results = isempty(raw) ? Any[] : [r for r in raw]
+    return (
+        results=results,
+        completed=completed,
+        total=total,
+        timed_out=timed_out,
+        elapsed_s=elapsed_s,
+    )
+end
+
 #==============================================================================
 Wave 4: @ephemeral RAM-Only Guard, Safe summarysize, Sandbox Modules & Warntype Summary
 ==============================================================================#
@@ -1991,6 +2063,7 @@ graph caches such as `Pharos.CodeGraph`. Returns `nothing` if the object exceeds
 function safe_summarysize(@nospecialize(x); max_depth::Int=32, max_nodes::Int=20_000)::Union{Int, Nothing}
     max_depth >= 0 || throw(ArgumentError("max_depth must be non-negative, got $max_depth"))
     max_nodes >= 1 || throw(ArgumentError("max_nodes must be positive, got $max_nodes"))
+    x isa PinnedRef && return 0
     isdefined(@__MODULE__, :Pharos) && x isa Pharos.CodeGraph && return nothing
 
     seen = IdDict{Any, Nothing}()
@@ -2004,6 +2077,7 @@ function safe_summarysize(@nospecialize(x); max_depth::Int=32, max_nodes::Int=20
         nodes += 1
         nodes > max_nodes && return nothing
 
+        cur isa PinnedRef && continue
         isdefined(@__MODULE__, :Pharos) && cur isa Pharos.CodeGraph && return nothing
         T = typeof(cur)
         if cur === nothing || cur === missing || cur isa Module || cur isa Type || cur isa Task ||
@@ -3740,6 +3814,7 @@ export host_request, runtime
 export Api, Pharos, codegraph, codegraph!, definitions, callers, grep_defs
 export bind_mmap, eval_isolated, depot_mode, enable_shared_depot!
 export reload_methods!, sync_kernel_modules_to_main!, pin_cache!, get_cache, cache_get!, clear_cache!, bench, @bench
+export pin, unpin, pinned, map_budgeted
 export set_blas_threads!, get_blas_threads, serve_unix_socket, stop!, UnixSocketServerHandle
 export private_lab_root, is_private_mode, check_private_isolation, configure_private_lab!
 export @ephemeral, ephemeral!, unephemeral!, ephemerals, safe_summarysize

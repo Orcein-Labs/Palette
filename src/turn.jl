@@ -928,10 +928,41 @@ function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]
         ex = log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module, eval_mod=state.eval_module)
+        _maybe_attach_world_age_hint!(costs, ex)
         ok && note_tool_uses!(ex, call, session_request)
         observe_tasks!(state.eval_module, call, code)
         turn
     end
+end
+
+const WORLD_AGE_HINT_TEXT =
+    "Call mixed module/include definitions with >1s execution; benchmark in a subsequent call to avoid world-age/first-call dispatch overhead."
+
+function _is_include_call_expr(ex::Expr)::Bool
+    ex.head === :call && !isempty(ex.args) || return false
+    callee = ex.args[1]
+    callee === :include && return true
+    if callee isa Expr && callee.head === :. && length(callee.args) == 2
+        rhs = callee.args[2]
+        return rhs === :include || (rhs isa QuoteNode && rhs.value === :include)
+    end
+    return false
+end
+
+function _has_module_or_include_def(ex)::Bool
+    ex isa Expr || return false
+    ex.head in (:quote, :inert) && return false
+    (ex.head === :module || _is_include_call_expr(ex)) && return true
+    return any(_has_module_or_include_def, ex.args)
+end
+
+function _maybe_attach_world_age_hint!(costs::Dict{String, Any}, ex)
+    ex === nothing && return nothing
+    exec_s = get(costs, "execution_seconds", nothing)
+    if exec_s isa Real && exec_s > 1.0 && _has_module_or_include_def(ex)
+        costs["world_age_hint"] = WORLD_AGE_HINT_TEXT
+    end
+    return nothing
 end
 
 """
@@ -955,6 +986,7 @@ function xray(n::Integer)
         "tools" => deepcopy(get(c, "tools", Dict{String, Any}[])),
         "codegraph" => deepcopy(get(c, "codegraph", Dict{String, Any}[])),
         "budget_exceeded" => get(c, "budget_exceeded", nothing),
+        "world_age_hint" => get(c, "world_age_hint", nothing),
         "receipts" => "palette_control {\"action\":\"receipts\",\"call\":$n} returns the host's receipts for this call",
         "limits" => "Compile time, GC time and allocation are process-wide: work other tasks did during the call is counted. run = execution - compile - GC. Dispatch is recorded only in the traced context, memo hits only in the memoized one, replaced methods only in the reference one; each covers the outermost call of every top-level statement (dispatch, memo) or the whole call (references).")
 end

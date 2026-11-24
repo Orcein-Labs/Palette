@@ -52,7 +52,10 @@ CodeGraph(root::String, files::Dict{String,FileEntry}, last::Dict{String,Any}) =
     CodeGraph(root, files, last, Dict{String,Float64}(), "", Set{String}(), :unknown)
 
 _language(path::AbstractString) =
-    endswith(path, ".jl") ? :julia : endswith(path, ".py") ? :python : endswith(path, ".rs") ? :rust : nothing
+    endswith(path, ".jl") ? :julia :
+    endswith(path, ".py") ? :python :
+    endswith(path, ".rs") ? :rust :
+    endswith(path, ".wgsl") ? :wgsl : nothing
 
 function _normroot(root::AbstractString)
     r = rstrip(abspath(root), '/')
@@ -128,7 +131,7 @@ function _record_dirs(root::AbstractString, rel_files)
 end
 
 """
-Relative paths of .jl, .py and .rs files under root, sorted: the files git
+Relative paths of .jl, .py, .rs and .wgsl files under root, sorted: the files git
 tracks or would track when root is in a work tree, else a walk that skips
 hidden and build directories. Symlinks are not followed.
 """
@@ -276,8 +279,10 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
                             push!(py_pending, (rel, abs, h, stamp, text))
                         elseif lang === :julia
                             g.files[rel] = _julia_entry(rel, text, h, stamp)
-                        else
+                        elseif lang === :rust
                             g.files[rel] = _rust_entry(rel, text, h, stamp)
+                        else
+                            g.files[rel] = _wgsl_entry(rel, text, h, stamp)
                         end
                     end
 
@@ -338,8 +343,10 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
             push!(pending, (rel, abs, h, stamp, text))
         elseif lang === :julia
             new[rel] = _julia_entry(rel, text, h, stamp)
-        else
+        elseif lang === :rust
             new[rel] = _rust_entry(rel, text, h, stamp)
+        else
+            new[rel] = _wgsl_entry(rel, text, h, stamp)
         end
     end
     if !isempty(pending)
@@ -435,31 +442,86 @@ function callers(g::CodeGraph, name::Union{AbstractString, Symbol}; path_prefix:
     return sort!(out; by=t -> (t[1], t[2].line))
 end
 
+function _norm_ext_token(x)
+    s = lowercase(strip(String(x)))
+    isempty(s) && return ""
+    s in ("julia", ".julia") && return ".jl"
+    s in ("python", ".python") && return ".py"
+    s in ("rust", ".rust") && return ".rs"
+    s == "wgsl" && return ".wgsl"
+    return startswith(s, '.') ? s : "." * s
+end
+
+function _normalize_exts(exts)
+    exts === nothing && return nothing
+    out = Set{String}()
+    if exts isa Union{AbstractString, Symbol}
+        t = _norm_ext_token(exts)
+        isempty(t) || push!(out, t)
+    else
+        for item in exts
+            t = _norm_ext_token(item)
+            isempty(t) || push!(out, t)
+        end
+    end
+    return out
+end
+
 """
-    grep_defs(g::CodeGraph, substring::AbstractString; path_prefix::AbstractString="", ignorecase::Bool=false)
+    grep_defs(g::CodeGraph, pattern; path_prefix="", exts=nothing, ignorecase=false, match=:substring)
+    grep_defs(pattern; root=nothing, path_prefix="", exts=nothing, ignorecase=false, match=:substring)
 
 Concise structured matches (`(file, line, kind, name)` NamedTuples) for definitions
-whose name contains `substring`, optionally filtered to relative paths matching
-`path_prefix` (with leading `./` normalized away).
+matching `pattern` (a substring `AbstractString` or `Regex`), optionally filtered
+to relative paths matching `path_prefix` (with leading `./` normalized away) and
+file extensions/languages `exts` (e.g. `(".rs", ".wgsl")` or `["jl", "wgsl"]`).
 """
-function grep_defs(g::CodeGraph, substring::AbstractString;
-                   path_prefix::AbstractString="", ignorecase::Bool=false)
+function grep_defs(g::CodeGraph, pattern::Union{AbstractString, Regex};
+                   path_prefix::AbstractString="", exts=nothing,
+                   ignorecase::Bool=false, match::Symbol=:substring)
     out = NamedTuple{(:file, :line, :kind, :name), Tuple{String, Int, Symbol, String}}[]
     prefix = _norm_relpath(path_prefix)
-    needle = ignorecase ? lowercase(String(substring)) : String(substring)
+    ext_set = _normalize_exts(exts)
+    pred = if pattern isa Regex
+        rx = ignorecase ? Regex(pattern.pattern, "i") : pattern
+        name -> occursin(rx, name)
+    elseif match === :substring
+        needle = ignorecase ? lowercase(String(pattern)) : String(pattern)
+        name -> occursin(needle, ignorecase ? lowercase(name) : name)
+    elseif match === :regex
+        rx = ignorecase ? Regex(String(pattern), "i") : Regex(String(pattern))
+        name -> occursin(rx, name)
+    elseif match in (:exact, :prefix)
+        if ignorecase
+            p = lowercase(String(pattern))
+            if match === :exact
+                suf = "." * p
+                name -> (ln = lowercase(name); ln == p || endswith(ln, suf))
+            else
+                name -> (ln = lowercase(name); startswith(ln, p) || startswith(_unqualified_tail(ln), p))
+            end
+        else
+            _matcher(String(pattern), match)
+        end
+    else
+        throw(ArgumentError("unsupported match mode :$match (expected :substring, :exact, :prefix, or :regex)"))
+    end
     for (path, e) in g.files
         _prefix_match(path, prefix) || continue
         norm_path = _norm_relpath(path)
+        if ext_set !== nothing
+            ext = lowercase(last(splitext(norm_path)))
+            ext in ext_set || continue
+        end
         for d in e.definitions
-            hay = ignorecase ? lowercase(d.name) : d.name
-            occursin(needle, hay) && push!(out, (file=norm_path, line=d.line, kind=d.kind, name=d.name))
+            pred(d.name) && push!(out, (file=norm_path, line=d.line, kind=d.kind, name=d.name))
         end
     end
     return sort!(out; by=t -> (t.file, t.line, t.name))
 end
 
 const _SUMMARY_MODULE_KINDS = (:module, :mod)
-const _SUMMARY_TYPE_KINDS = (:struct, :abstract, :primitive, :class, :enum, :trait, :type)
+const _SUMMARY_TYPE_KINDS = (:struct, :abstract, :primitive, :class, :enum, :trait, :type, :alias)
 const _SUMMARY_FUNCTION_KINDS = (:function, :fn, :macro)
 
 function _default_summary_root()
@@ -716,7 +778,7 @@ function load_or_build(
 end
 
 function Base.show(io::IO, ::MIME"text/plain", g::CodeGraph)
-    for lang in (:julia, :python, :rust)
+    for lang in (:julia, :python, :rust, :wgsl)
         fs = [e for e in values(g.files) if e.language === lang]
         nd = sum(e -> length(e.definitions), fs; init=0)
         println(io, rpad(string(lang), 8), length(fs), " files  ", nd, " definitions")
@@ -1021,10 +1083,177 @@ function _python_regex_entry(rel::String, text::String, h::String, stamp::NTuple
     return FileEntry(rel, :python, h, stamp, true, defs, Call[], String[], imports, nothing)
 end
 
-# Rust: line-based approximation.
+# Shared comment stripper (// and nested /* ... */) preserving line numbers 1-to-1.
+function _strip_c_comments(text::AbstractString; support_strings::Bool=false)::String
+    s = String(text)
+    buf = IOBuffer()
+    i = firstindex(s)
+    n = ncodeunits(s)
+    block_depth = 0
+    while i <= n
+        c = s[i]
+        nxt_i = nextind(s, i)
+        if block_depth > 0
+            if c == '*' && nxt_i <= n && s[nxt_i] == '/'
+                write(buf, "  ")
+                block_depth -= 1
+                i = nextind(s, nxt_i)
+            elseif c == '/' && nxt_i <= n && s[nxt_i] == '*'
+                write(buf, "  ")
+                block_depth += 1
+                i = nextind(s, nxt_i)
+            elseif c == '\n'
+                write(buf, '\n')
+                i = nxt_i
+            else
+                write(buf, ' ')
+                i = nxt_i
+            end
+            continue
+        end
+        if c == '/' && nxt_i <= n
+            c2 = s[nxt_i]
+            if c2 == '/'
+                while i <= n && s[i] != '\n'
+                    i = nextind(s, i)
+                end
+                continue
+            elseif c2 == '*'
+                write(buf, "  ")
+                block_depth = 1
+                i = nextind(s, nxt_i)
+                continue
+            end
+        end
+        if support_strings
+            if c == 'r' && (i == 1 || !(isletter(s[prevind(s, i)]) || isdigit(s[prevind(s, i)]) || s[prevind(s, i)] == '_'))
+                j = nxt_i
+                hashes = 0
+                while j <= n && s[j] == '#'
+                    hashes += 1
+                    j = nextind(s, j)
+                end
+                if j <= n && s[j] == '"'
+                    write(buf, SubString(s, i, j))
+                    i = nextind(s, j)
+                    while i <= n
+                        ch = s[i]
+                        write(buf, ch)
+                        if ch == '"'
+                            k = nextind(s, i)
+                            matched = 0
+                            while matched < hashes && k <= n && s[k] == '#'
+                                write(buf, '#')
+                                matched += 1
+                                k = nextind(s, k)
+                            end
+                            if matched == hashes
+                                i = k
+                                break
+                            end
+                        end
+                        i = nextind(s, i)
+                    end
+                    continue
+                end
+            elseif c == '"'
+                write(buf, '"')
+                i = nxt_i
+                escaped = false
+                while i <= n
+                    ch = s[i]
+                    write(buf, ch)
+                    i = nextind(s, i)
+                    if escaped
+                        escaped = false
+                    elseif ch == '\\'
+                        escaped = true
+                    elseif ch == '"'
+                        break
+                    end
+                end
+                continue
+            elseif c == '\'' && nxt_i <= n
+                if s[nxt_i] == '\\'
+                    k1 = nextind(s, nxt_i)
+                    k2 = k1 <= n ? nextind(s, k1) : n + 1
+                    if k2 <= n && s[k2] == '\''
+                        write(buf, SubString(s, i, k2))
+                        i = nextind(s, k2)
+                        continue
+                    end
+                else
+                    k1 = nextind(s, nxt_i)
+                    if k1 <= n && s[k1] == '\''
+                        write(buf, SubString(s, i, k1))
+                        i = nextind(s, k1)
+                        continue
+                    end
+                end
+            end
+        end
+        write(buf, c)
+        i = nxt_i
+    end
+    return String(take!(buf))
+end
 
-const _RS_ITEM = r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+\"[^\"]*\")?)\s+)*(fn|struct|enum|trait|mod|type|const|static|union)\s+([A-Za-z_][A-Za-z0-9_]*)"
-const _RS_IMPL = r"^\s*(?:unsafe\s+)?impl\b(?:<[^>]*>)?\s+([^{;]+?)\s*(?:\{.*)?$"
+function _skip_balanced(s::AbstractString, open_idx::Int, open_c::Char, close_c::Char; allow_strings::Bool=false)
+    i = nextind(s, open_idx)
+    n = ncodeunits(s)
+    depth = 1
+    in_str = false
+    escaped = false
+    while i <= n && depth > 0
+        c = s[i]
+        if allow_strings && in_str
+            if escaped
+                escaped = false
+            elseif c == '\\'
+                escaped = true
+            elseif c == '"'
+                in_str = false
+            end
+        elseif allow_strings && c == '"'
+            in_str = true
+        elseif c == open_c
+            depth += 1
+        elseif c == close_c
+            depth -= 1
+        end
+        i = nextind(s, i)
+    end
+    return depth == 0 ? i : nothing
+end
+
+function _strip_rust_attrs(line::AbstractString)
+    s = lstrip(line)
+    while startswith(s, "#[")
+        after = _skip_balanced(s, nextind(s, firstindex(s)), '[', ']'; allow_strings=true)
+        after === nothing && return s
+        s = lstrip(SubString(s, after))
+    end
+    return s
+end
+
+function _match_rust_impl(line::AbstractString)
+    m = match(r"^\s*(?:unsafe\s+)?impl\b(.*)$", line)
+    m === nothing && return nothing
+    rest = lstrip(m.captures[1])
+    if startswith(rest, "<")
+        after = _skip_balanced(rest, firstindex(rest), '<', '>')
+        after === nothing && return nothing
+        rest = lstrip(SubString(rest, after))
+    end
+    m2 = match(r"^([^{;]+?)(?:\s*\bwhere\b.*|\s*\{.*|\s*;.*)?$", rest)
+    m2 === nothing && return nothing
+    target = strip(String(m2.captures[1]))
+    return isempty(target) ? nothing : target
+end
+
+# Rust: line-based approximation with nested comment & attribute handling.
+
+const _RS_ITEM = r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+\"[^\"]*\")?)\s+)*(fn|struct|enum|trait|mod|type|const|static|union)\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)"
 const _RS_MACRO = r"^\s*macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)"
 const _RS_USE = r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);"
 const _RS_KIND = Dict("fn" => :fn, "struct" => :struct, "union" => :struct, "enum" => :enum,
@@ -1033,18 +1262,65 @@ const _RS_KIND = Dict("fn" => :fn, "struct" => :struct, "union" => :struct, "enu
 function _rust_entry(rel::String, text::String, h::String, stamp::NTuple{3,Float64})
     defs = Definition[]
     imports = String[]
-    for (i, line) in enumerate(split(text, '\n'))
-        startswith(lstrip(line), "//") && continue
+    cleaned = _strip_c_comments(text; support_strings=true)
+    for (i, raw_line) in enumerate(split(cleaned, '\n'))
+        line = _strip_rust_attrs(raw_line)
+        isempty(line) && continue
         if (m = match(_RS_ITEM, line)) !== nothing
             push!(defs, Definition(String(m.captures[2]), _RS_KIND[String(m.captures[1])], i))
-        elseif (m = match(_RS_IMPL, line)) !== nothing
-            push!(defs, Definition(strip(String(m.captures[1])), :impl, i))
+        elseif (impl_target = _match_rust_impl(line)) !== nothing
+            push!(defs, Definition(impl_target, :impl, i))
         elseif (m = match(_RS_MACRO, line)) !== nothing
             push!(defs, Definition(String(m.captures[1]), :macro, i))
         end
         (m = match(_RS_USE, line)) !== nothing && push!(imports, strip(String(m.captures[1])))
     end
     return FileEntry(rel, :rust, h, stamp, true, defs, Call[], String[], imports, nothing)
+end
+
+# WGSL: module-scope extraction with nested comment, attribute, and brace-depth tracking.
+
+function _strip_wgsl_attrs(line::AbstractString)
+    s = lstrip(line)
+    while startswith(s, "@")
+        m = match(r"^@[A-Za-z_][A-Za-z0-9_]*(.*)$", s)
+        m === nothing && break
+        rest = lstrip(m.captures[1])
+        if startswith(rest, "(")
+            after = _skip_balanced(rest, firstindex(rest), '(', ')')
+            after === nothing && return s
+            rest = lstrip(SubString(rest, after))
+        end
+        s = rest
+    end
+    return s
+end
+
+const _WGSL_DECL = r"^(fn|struct|var|const|override|alias)\b(?:\s*<[^>]*>)?\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+const _WGSL_KIND = Dict(
+    "fn" => :fn,
+    "struct" => :struct,
+    "var" => :var,
+    "const" => :const,
+    "override" => :override,
+    "alias" => :alias,
+)
+
+function _wgsl_entry(rel::String, text::String, h::String, stamp::NTuple{3,Float64})
+    defs = Definition[]
+    cleaned = _strip_c_comments(text; support_strings=false)
+    brace_depth = 0
+    for (i, raw_line) in enumerate(split(cleaned, '\n'))
+        start_depth = brace_depth
+        brace_depth = max(0, brace_depth + count(==('{'), raw_line) - count(==('}'), raw_line))
+        start_depth == 0 || continue
+        line = _strip_wgsl_attrs(raw_line)
+        isempty(line) && continue
+        if (m = match(_WGSL_DECL, line)) !== nothing
+            push!(defs, Definition(String(m.captures[2]), _WGSL_KIND[String(m.captures[1])], i))
+        end
+    end
+    return FileEntry(rel, :wgsl, h, stamp, true, defs, Call[], String[], String[], nothing)
 end
 
 end # module Pharos

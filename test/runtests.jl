@@ -969,6 +969,351 @@ end
     end
 end
 
+@testset "Api.pin: 0-byte snapshot, lazy reconstruction across revival, unpin, pinned" begin
+    Palette.reset_kernel_state!(; process=true)
+    old_ws, old_st = Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[]
+    ws, st, side_log = mktempdir(), mktempdir(), tempname()
+    try
+        Palette.WORKSPACE_ROOT[] = ws
+        Palette.STATE_DIR[] = st
+
+        # Direct in-process unit checks: caching, nothing value, lazy=true, unpin, pinned
+        calls = Ref(0)
+        acc = Api.pin(:local_small) do
+            calls[] += 1
+            [10, 20, 30]
+        end
+        @test acc isa Palette.PinnedRef
+        @test acc() == [10, 20, 30]
+        @test Api.pin(:local_small) === acc()
+        @test calls[] == 1
+        @test Palette.safe_summarysize(acc) == 0
+
+        nothing_calls = Ref(0)
+        n_acc = Api.pin(:nil_val) do
+            nothing_calls[] += 1
+            nothing
+        end
+        @test n_acc() === nothing
+        @test Api.pin(:nil_val) === nothing
+        @test nothing_calls[] == 1
+
+        # Pure lazy=true pin has has_recipe === true without capturing mutable locals
+        l_pure = Api.pin(:deferred_pure; lazy=true) do
+            "lazy-pure"
+        end
+        pinfo_pure = only(filter(p -> p.name === :deferred_pure, Api.pinned()))
+        @test pinfo_pure.loaded === false && pinfo_pure.bytes === nothing && pinfo_pure.has_recipe === true
+        @test l_pure() == "lazy-pure"
+        @test only(filter(p -> p.name === :deferred_pure, Api.pinned())).loaded === true
+
+        # Closure capturing a mutable Ref works in RAM with has_recipe === false
+        lazy_calls = Ref(0)
+        l_acc = Api.pin(:deferred; lazy=true) do
+            lazy_calls[] += 1
+            "lazy-built"
+        end
+        @test lazy_calls[] == 0
+        pinfo = only(filter(p -> p.name === :deferred, Api.pinned()))
+        @test pinfo.loaded === false && pinfo.bytes === nothing && pinfo.has_recipe === false
+        @test l_acc() == "lazy-built"
+        @test lazy_calls[] == 1
+        @test l_acc() == "lazy-built"
+        @test lazy_calls[] == 1
+
+        @test Api.unpin(:local_small) === true
+        @test Api.unpin(:local_small) === false
+        @test_throws ErrorException Api.pin(:local_small)
+        @test_throws ErrorException acc()
+        @test Set(p.name for p in Api.pinned()) == Set([:nil_val, :deferred_pure, :deferred])
+
+        # Turn-level + cold-subprocess revival test with >16 MiB payload & 0-byte snapshot
+        Palette.reset_kernel_state!(; process=true)
+        Palette.WORKSPACE_ROOT[] = ws
+        Palette.STATE_DIR[] = st
+        write(side_log, "")
+
+        withenv("PALETTE_STATE_MAX_BINDING_BYTES" => "4096", "PALETTE_STATE_MAX_SIDECAR_BYTES" => "0") do
+            t1, _ = Palette.execute_turn("""
+            module PinHelperMod
+                module Sub
+                    fill_val() = Float32(7.5)
+                end
+            end
+            const PIN_SUB = PinHelperMod.Sub
+            build_corpus(n) = (open($(repr(side_log)), "a") do io; println(io, "built:", n); end; fill(PIN_SUB.fill_val(), n))
+
+            # 20 MiB array pinned -> 0 bytes in snapshot bindings!
+            big_acc = Api.pin(:big_weights) do
+                build_corpus(5_000_000)
+            end
+            # Also an unnamed pin accessed via Api.pin(:named_only)
+            Api.pin(:named_only) do
+                open($(repr(side_log)), "a") do io; println(io, "named_only"); end
+                Dict("k" => 42)
+            end
+            # Unpinned ref should not resurrect
+            temp_acc = Api.pin(:ephemeral_pin) do
+                [1, 2, 3]
+            end
+            Api.unpin(:ephemeral_pin)
+            length(big_acc())
+            """, 30.0)
+            @test t1[1].result.success
+            @test t1[1].result.data == 5_000_000
+            @test read(side_log, String) == "built:5000000\nnamed_only\n"
+            @test [p.name for p in Api.pinned()] == [:big_weights, :named_only]
+
+            # varinfo reports 0 bytes for big_acc
+            vi = Palette.execute(Palette.ExecuteCode("varinfo()")).result.data
+            vi_map = Dict(row[1] => row[2] for row in vi.rows)
+            @test vi_map["big_acc"] == "0 bytes"
+
+            manifest = Palette.snapshot_state!(1)
+            @test manifest !== nothing
+            @test manifest["bytes"] == 0
+            @test manifest["sidecar_bytes"] == 0
+            @test isempty(manifest["data"])
+            b_big = only(filter(b -> b["name"] == "big_acc", manifest["bindings"]))
+            @test b_big["class"] == "pin"
+            @test b_big["pin_name"] == "big_weights"
+            b_tmp = only(filter(b -> b["name"] == "temp_acc", manifest["bindings"]))
+            @test b_tmp["class"] == "runtime" && occursin("unpinned", b_tmp["reason"])
+            @test sort!([p["name"] for p in manifest["pins"]]) == ["big_weights", "named_only"]
+        end
+
+        write(side_log, "")
+        verify_script = """
+        using Palette, Test
+        Palette.WORKSPACE_ROOT[] = $(repr(ws))
+        Palette.STATE_DIR[] = $(repr(st))
+        name = Palette.revival_module_name()
+        Palette.GLOBAL_STATE[] = Palette.KernelState(Module(Symbol(name)))
+        mod = Palette.get_kernel_state().eval_module
+        Core.eval(Main, Expr(:(=), nameof(mod), mod))
+        rep = Base.invokelatest(Palette.revive_state!)
+        @test occursin("restored exactly", rep)
+        @test occursin("big_acc", rep)
+        obs = Api.revival()
+        @test any(s -> startswith(s, "temp_acc "), obs["lost"])
+        @test !any(s -> startswith(s, "big_acc "), obs["lost"])
+        @test !any(s -> startswith(s, "big_weights"), obs["lost"])
+        # Constructor MUST NOT have run eagerly during revival!
+        @test read($(repr(side_log)), String) == ""
+
+        ps_before = Api.pinned()
+        @test [p.name for p in ps_before] == [:big_weights, :named_only]
+        @test all(p -> !p.loaded && p.bytes === nothing && p.has_recipe, ps_before)
+
+        # First access through returned accessor lazily reconstructs the 20 MiB vector
+        acc_rev = Base.invokelatest(getglobal, mod, :big_acc)
+        v1 = acc_rev()
+        @test length(v1) == 5_000_000 && v1[1] == Float32(7.5) && v1[end] == Float32(7.5)
+        @test read($(repr(side_log)), String) == "built:5000000\\n"
+
+        # Second access and Api.pin(:big_weights) reuse cached instance (no rebuild)
+        v2 = Api.pin(:big_weights)
+        @test v2 === v1
+        @test read($(repr(side_log)), String) == "built:5000000\\n"
+
+        # Access via Api.pin(:named_only) lazily reconstructs the unnamed pin too
+        @test Api.pin(:named_only) == Dict("k" => 42)
+        @test read($(repr(side_log)), String) == "built:5000000\\nnamed_only\\n"
+        @test Api.pin(:named_only) == Dict("k" => 42)
+        @test read($(repr(side_log)), String) == "built:5000000\\nnamed_only\\n"
+
+        ps_after = Api.pinned()
+        @test all(p -> p.loaded && p.bytes !== nothing, ps_after)
+        @test Api.unpin(:named_only) === true
+        @test [p.name for p in Api.pinned()] == [:big_weights]
+        """
+        run(`$(Base.julia_cmd()) -t1 --startup-file=no --project=$(dirname(@__DIR__)) -e $verify_script`)
+    finally
+        Palette.reset_kernel_state!(; process=true)
+        Palette.WORKSPACE_ROOT[] = old_ws; Palette.STATE_DIR[] = old_st
+        rm(ws; recursive=true, force=true); rm(st; recursive=true, force=true); rm(side_log; force=true)
+    end
+end
+
+@testset "Api.map_budgeted: chunked yield, soft budget_s cutoff, empty input" begin
+    reset_kernel_state()
+
+    # Empty inputs
+    e_vec = Api.map_budgeted(x -> x + 1, Int[])
+    @test e_vec.results == Any[] && e_vec.completed == 0 && e_vec.total == 0 && e_vec.timed_out === false && e_vec.elapsed_s >= 0.0
+    e_gen = Api.map_budgeted(x -> x * 2, (i for i in 1:0))
+    @test e_gen.completed == 0 && e_gen.total == 0 && e_gen.timed_out === false
+
+    # Full completion + type narrowing + cooperative yield at chunk boundaries
+    yielded = Ref(false)
+    bg = @async (yielded[] = true)
+    full = Api.map_budgeted(x -> x * x, 1:10; budget_s=10.0, chunk=3)
+    wait(bg)
+    @test yielded[] === true
+    @test full.results == [i * i for i in 1:10]
+    @test eltype(full.results) === Int
+    @test full.completed == 10
+    @test full.total == 10
+    @test full.timed_out === false
+    @test full.elapsed_s >= 0.0
+
+    # Soft budget_s early cutoff returns exact partial prefix
+    partial = Api.map_budgeted(1:20; budget_s=0.12, chunk=2) do i
+        sleep(0.03)
+        i * 10
+    end
+    @test partial.timed_out === true
+    @test 1 <= partial.completed < 20
+    @test partial.total == 20
+    @test partial.results == [i * 10 for i in 1:partial.completed]
+    @test partial.elapsed_s >= 0.12
+
+    # Validation errors
+    @test_throws ArgumentError Api.map_budgeted(identity, 1:3; budget_s=0.0)
+    @test_throws ArgumentError Api.map_budgeted(identity, 1:3; budget_s=-1.0)
+    @test_throws ArgumentError Api.map_budgeted(identity, 1:3; chunk=0)
+
+    # Inside Palette turn
+    r_turn = Palette.execute(Palette.ExecuteCode("Api.map_budgeted(x -> x + 5, [1, 2, 3]; budget_s=5.0, chunk=2)"))
+    @test r_turn.result.success
+    @test r_turn.result.data.results == [6, 7, 8]
+    @test r_turn.result.data.completed == 3 && !r_turn.result.data.timed_out
+end
+
+@testset "World-age benchmark hint on module/include turns >1s" begin
+    Palette.reset_kernel_state!(; process=true)
+    old_ws = Palette.WORKSPACE_ROOT[]
+    ws = mktempdir()
+    Palette.WORKSPACE_ROOT[] = ws
+    try
+        inc_file = joinpath(ws, "slow_mod.jl")
+        write(inc_file, "module SlowIncMod; f(x) = x + 1; end\n")
+
+        # 1. Fast include (<1s): MUST NOT attach world_age_hint
+        (r_fast_inc, _, _), _ = Palette.execute_turn("include($(repr(inc_file))); SlowIncMod.f(1)", 20.0)
+        @test r_fast_inc.result.success
+        c_fast_inc = Palette.Api.costs(1)
+        @test c_fast_inc["execution_seconds"] < 1.0
+        @test !haskey(c_fast_inc, "world_age_hint")
+
+        # 2. Slow pure compute (>1s) WITHOUT module/include: MUST NOT attach world_age_hint
+        (r_slow_pure, _, _), _ = Palette.execute_turn("sleep(1.05); 42", 20.0)
+        @test r_slow_pure.result.success
+        c_slow_pure = Palette.Api.costs(2)
+        @test c_slow_pure["execution_seconds"] > 1.0
+        @test !haskey(c_slow_pure, "world_age_hint")
+
+        # 3. Slow quoted AST literal :(module Fake; end) (>1s): MUST NOT attach world_age_hint
+        (r_quoted, _, _), _ = Palette.execute_turn("ex = :(module QuotedFake; end); sleep(1.05); ex.head", 20.0)
+        @test r_quoted.result.success
+        c_quoted = Palette.Api.costs(3)
+        @test c_quoted["execution_seconds"] > 1.0
+        @test !haskey(c_quoted, "world_age_hint")
+
+        # 4. include(...) + >1s execution: MUST attach world_age_hint
+        (r_slow_inc, _, _), _ = Palette.execute_turn("include($(repr(inc_file))); sleep(1.05); SlowIncMod.f(2)", 20.0)
+        @test r_slow_inc.result.success
+        c_slow_inc = Palette.Api.costs(4)
+        @test c_slow_inc["execution_seconds"] > 1.0
+        @test haskey(c_slow_inc, "world_age_hint")
+        @test occursin("world-age", lowercase(c_slow_inc["world_age_hint"]))
+        @test Palette.xray(4)["world_age_hint"] == c_slow_inc["world_age_hint"]
+
+        # 5. Inline module ... end + >1s execution: MUST attach world_age_hint
+        (r_slow_mod, _, _), _ = Palette.execute_turn("module InlineSlowMod; g(x) = x * 2; end; sleep(1.05); InlineSlowMod.g(3)", 20.0)
+        @test r_slow_mod.result.success
+        c_slow_mod = Palette.Api.costs(5)
+        @test c_slow_mod["execution_seconds"] > 1.0
+        @test haskey(c_slow_mod, "world_age_hint")
+    finally
+        Palette.reset_kernel_state!(; process=true)
+        Palette.WORKSPACE_ROOT[] = old_ws
+        rm(ws; recursive=true, force=true)
+    end
+end
+
+@testset "Api.grep_defs cross-language Rust + WGSL + Julia queries" begin
+    Palette.reset_kernel_state!(; process=true)
+    old_ws = Palette.WORKSPACE_ROOT[]
+    repo = mktempdir()
+    try
+        mkpath(joinpath(repo, "crates", "core"))
+        mkpath(joinpath(repo, "shaders"))
+        mkpath(joinpath(repo, "julia"))
+        write(joinpath(repo, "crates", "core", "lib.rs"), """
+        pub mod pipeline;
+        pub struct GpuPipeline { id: u32 }
+        pub enum ShaderStage { Vertex, Fragment }
+        pub trait KernelPass { fn run(&self); }
+        impl KernelPass for GpuPipeline {
+            fn run(&self) {}
+        }
+        pub const MAX_FRAMES: usize = 3;
+        pub type FrameIdx = u64;
+        macro_rules! gpu_assert { () => {}; }
+        pub fn build_pipeline() {}
+        """)
+        write(joinpath(repo, "shaders", "compute.wgsl"), """
+        alias Scalar = f32;
+        const TILE: u32 = 16u;
+        @id(0) override TILE_OVERRIDE: u32 = 16u;
+        struct PipelineParams { scale: Scalar };
+        @group(0) @binding(0) var<uniform> pipeline_params: PipelineParams;
+        @compute @workgroup_size(16, 1, 1)
+        fn run_pipeline(@builtin(global_invocation_id) id: vec3<u32>) {
+            var local_pipeline_val: Scalar = 0.0;
+        }
+        """)
+        write(joinpath(repo, "julia", "driver.jl"), """
+        struct PipelineHost
+            steps::Int
+        end
+        function run_pipeline_host(h::PipelineHost)
+            return h.steps
+        end
+        """)
+
+        Palette.WORKSPACE_ROOT[] = repo
+        Palette.codegraph!(nothing)
+
+        # Unified cross-language query via Api.grep_defs with root= and exts=
+        all_hits = Api.grep_defs("pipeline"; root=repo, ignorecase=true)
+        @test [(m.file, m.kind, m.name) for m in all_hits] == [
+            ("crates/core/lib.rs", :mod, "pipeline"),
+            ("crates/core/lib.rs", :struct, "GpuPipeline"),
+            ("crates/core/lib.rs", :impl, "KernelPass for GpuPipeline"),
+            ("crates/core/lib.rs", :fn, "build_pipeline"),
+            ("julia/driver.jl", :struct, "PipelineHost"),
+            ("julia/driver.jl", :function, "run_pipeline_host"),
+            ("shaders/compute.wgsl", :struct, "PipelineParams"),
+            ("shaders/compute.wgsl", :var, "pipeline_params"),
+            ("shaders/compute.wgsl", :fn, "run_pipeline"),
+        ]
+
+        wgsl_rs = Api.grep_defs(r"Pipeline|TILE"; root=repo, exts=(".rs", ".wgsl"))
+        @test [(m.file, m.kind, m.name) for m in wgsl_rs] == [
+            ("crates/core/lib.rs", :struct, "GpuPipeline"),
+            ("crates/core/lib.rs", :impl, "KernelPass for GpuPipeline"),
+            ("shaders/compute.wgsl", :const, "TILE"),
+            ("shaders/compute.wgsl", :override, "TILE_OVERRIDE"),
+            ("shaders/compute.wgsl", :struct, "PipelineParams"),
+        ]
+
+        # Works inside a persistent Palette turn via Api.grep_defs and Palette.grep_defs
+        r_turn = Palette.execute(Palette.ExecuteCode("Api.grep_defs(\"run_pipeline\"; root=$(repr(repo)), exts=(\".wgsl\", \".jl\"))"))
+        @test r_turn.result.success
+        @test [(m.file, m.name) for m in r_turn.result.data] == [
+            ("julia/driver.jl", "run_pipeline_host"),
+            ("shaders/compute.wgsl", "run_pipeline"),
+        ]
+    finally
+        Palette.codegraph!(nothing)
+        Palette.reset_kernel_state!(; process=true)
+        Palette.WORKSPACE_ROOT[] = old_ws
+        rm(repo; recursive=true, force=true)
+    end
+end
+
 # The code graph Palette.codegraph() serves, tested on its own.
 isdefined(@__MODULE__, :Pharos) || (const Pharos = Palette.Pharos)
 include("pharos.jl")

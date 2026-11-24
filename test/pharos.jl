@@ -406,4 +406,158 @@ _calls(e) = [(c.caller, c.callee) for c in e.calls]
             @test "..parent" in e.imports
         end
     end
+
+    @testset "Rust advanced extraction (comments, attributes, generics, mod/type/const)" begin
+        d = mktempdir()
+        try
+            _write(joinpath(d, "adv.rs"), """
+            pub mod submod;
+            mod inline_mod {
+                pub type HandleId = u64;
+            }
+            pub const MAX_ELEMS: usize = 1024;
+            pub static GLOBAL_LOCK: u32 = 0;
+            /*
+               fn inside_block_comment() {}
+               /* struct NestedCommentFake {} */
+            */
+            const FAKE_IN_STR: &str = "/* fn fake_str() {} */ // not a comment";
+            let raw_str = r#"/* struct RawFake {} */"#;
+            #[inline]
+            pub const fn fast_const_fn() -> usize { 42 }
+            #[cfg(test)] #[allow(dead_code)] pub fn attr_inline_fn() {}
+            pub type BoxedResult<T> = Result<T, ()>;
+            struct Holder<T>(T);
+            impl<T: Into<Vec<u8>>> Holder<T> where T: Clone {
+                pub fn inner(&self) {}
+            }
+            """)
+            e = CodeGraph(d).files["adv.rs"]
+            @test e.language === :rust
+            k = _defs(e)
+            @test k["submod"] === :mod
+            @test k["inline_mod"] === :mod
+            @test k["HandleId"] === :type
+            @test k["MAX_ELEMS"] === :const
+            @test k["GLOBAL_LOCK"] === :static
+            @test k["fast_const_fn"] === :fn
+            @test k["attr_inline_fn"] === :fn
+            @test k["BoxedResult"] === :type
+            @test k["Holder"] === :struct
+            @test k["Holder<T>"] === :impl
+            @test k["inner"] === :fn
+            @test !haskey(k, "inside_block_comment")
+            @test !haskey(k, "NestedCommentFake")
+            @test !haskey(k, "fake_str")
+            @test !haskey(k, "RawFake")
+        finally
+            rm(d; recursive=true, force=true)
+        end
+    end
+
+    @testset "WGSL extraction & multi-language grep_defs" begin
+        d = mktempdir()
+        try
+            _write(joinpath(d, "shaders", "pass.wgsl"), """
+            // fn commented_line() {}
+            /*
+               struct BlockCommented {}
+               /* var nested_commented: f32; */
+            */
+            alias Vec4f = vec4<f32>;
+            const WORKGROUP_SIZE: u32 = 64u;
+            @id(0) override ENABLE_BLOOM: bool = true;
+
+            struct Uniforms {
+                mvp: mat4x4<f32>,
+                exposure: f32,
+            };
+
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+            @group(0) @binding(1) var<storage, read_write> out_pixels: array<Vec4f>;
+            @group(1) @binding(0) var color_tex: texture_2d<f32>;
+
+            @compute @workgroup_size(64, 1, 1)
+            fn cs_render(@builtin(global_invocation_id) gid: vec3<u32>) {
+                var local_tmp: f32 = 1.0;
+                const local_k: u32 = 2u;
+                out_pixels[gid.x] = Vec4f(local_tmp);
+            }
+
+            fn helper_shade(v: Vec4f) -> Vec4f {
+                var local_accum: Vec4f = v;
+                return local_accum;
+            }
+            """)
+            _write(joinpath(d, "src", "renderer.rs"), """
+            pub struct RenderPass { id: u32 }
+            pub fn render_frame() {}
+            """)
+            _write(joinpath(d, "src", "bridge.jl"), """
+            struct RenderConfig
+                width::Int
+            end
+            render_dispatch(cfg::RenderConfig) = cfg.width
+            """)
+
+            g = CodeGraph(d)
+            @test haskey(g.files, "shaders/pass.wgsl")
+            ew = g.files["shaders/pass.wgsl"]
+            @test ew.language === :wgsl
+            @test ew.approximate
+            kw = _defs(ew)
+            @test kw["Vec4f"] === :alias
+            @test kw["WORKGROUP_SIZE"] === :const
+            @test kw["ENABLE_BLOOM"] === :override
+            @test kw["Uniforms"] === :struct
+            @test kw["uniforms"] === :var
+            @test kw["out_pixels"] === :var
+            @test kw["color_tex"] === :var
+            @test kw["cs_render"] === :fn
+            @test kw["helper_shade"] === :fn
+            @test !haskey(kw, "commented_line")
+            @test !haskey(kw, "BlockCommented")
+            @test !haskey(kw, "nested_commented")
+            @test !haskey(kw, "local_tmp")
+            @test !haskey(kw, "local_k")
+            @test !haskey(kw, "local_accum")
+
+            # show() remains compact (<= 5 newlines) even with wgsl line included
+            out = sprint(show, MIME"text/plain"(), g)
+            @test count(==('\n'), out) <= 5
+            @test occursin("wgsl", out)
+
+            # grep_defs across all languages vs exts filtering & regex
+            all_render = grep_defs(g, "render"; ignorecase=true)
+            @test [(m.file, m.kind, m.name) for m in all_render] == [
+                ("shaders/pass.wgsl", :fn, "cs_render"),
+                ("src/bridge.jl", :struct, "RenderConfig"),
+                ("src/bridge.jl", :function, "render_dispatch"),
+                ("src/renderer.rs", :struct, "RenderPass"),
+                ("src/renderer.rs", :fn, "render_frame"),
+            ]
+
+            wgsl_only = grep_defs(g, "render"; exts=(".wgsl",), ignorecase=true)
+            @test [(m.file, m.name) for m in wgsl_only] == [("shaders/pass.wgsl", "cs_render")]
+
+            rs_wgsl = grep_defs(g, r"^(?:Render|Uniforms|cs_)"; exts=("rs", "wgsl"))
+            @test [(m.file, m.kind, m.name) for m in rs_wgsl] == [
+                ("shaders/pass.wgsl", :struct, "Uniforms"),
+                ("shaders/pass.wgsl", :fn, "cs_render"),
+                ("src/renderer.rs", :struct, "RenderPass"),
+            ]
+
+            # Empty exts matches nothing cleanly
+            @test isempty(grep_defs(g, "render"; exts=String[], ignorecase=true))
+
+            # summary includes wgsl files & alias types
+            sm = Pharos.summary(g)
+            @test sm.file_count == 3
+            wg_sum = only(filter(f -> f.path == "shaders/pass.wgsl", sm.files))
+            @test [f.name for f in wg_sum.functions] == ["cs_render", "helper_shade"]
+            @test Set([t.name for t in wg_sum.types]) == Set(["Vec4f", "Uniforms"])
+        finally
+            rm(d; recursive=true, force=true)
+        end
+    end
 end

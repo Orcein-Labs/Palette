@@ -296,6 +296,316 @@ end
 clear_cache!(key::Union{Symbol, AbstractString}; dir::AbstractString=default_pinned_cache_dir()) =
     clear_cache!(; key=key, dir=dir)
 
+# --- first-class non-serialized RAM pins with pure constructor recipes ---
+
+mutable struct PinnedEntry
+    name::Symbol
+    fn::Union{Nothing, Function}
+    has_value::Bool
+    value::Any
+    source::Union{Nothing, String}
+    expr_hex::Union{Nothing, String}
+    call::Int
+end
+
+const PIN_REGISTRY = Dict{Symbol, PinnedEntry}()
+
+(p::PinnedRef)() = _pin_get(p.name)
+
+function Base.show(io::IO, p::PinnedRef)
+    entry = get(PIN_REGISTRY, p.name, nothing)
+    if entry === nothing
+        print(io, "PinnedRef(:", p.name, ", unpinned)")
+    elseif entry.has_value
+        print(io, "PinnedRef(:", p.name, ", loaded=true)")
+    else
+        print(io, "PinnedRef(:", p.name, ", loaded=false)")
+    end
+end
+
+function _is_pin_callee(ex)::Bool
+    ex === :pin && return true
+    if ex isa Expr && ex.head === :. && length(ex.args) == 2
+        rhs = ex.args[2]
+        return rhs === :pin || (rhs isa QuoteNode && rhs.value === :pin)
+    end
+    return false
+end
+
+function _pin_call_name(call_ex::Expr)
+    call_ex.head === :call && !isempty(call_ex.args) && _is_pin_callee(call_ex.args[1]) || return nothing
+    for a in call_ex.args[2:end]
+        a isa Expr && a.head === :parameters && continue
+        a isa Expr && a.head === :kw && continue
+        a isa QuoteNode && a.value isa Symbol && return a.value
+    end
+    return nothing
+end
+
+function _lambda_line(lam::Expr, fallback_line::Int)::Int
+    length(lam.args) >= 2 || return fallback_line
+    body = lam.args[2]
+    if body isa Expr && body.head === :block
+        for a in body.args
+            a isa LineNumberNode && return a.line
+        end
+    end
+    return fallback_line
+end
+
+function _is_zero_arg_lambda(ex)::Bool
+    ex isa Expr && ex.head === :(->) && length(ex.args) == 2 || return false
+    params = ex.args[1]
+    return params isa Expr && params.head === :tuple && isempty(params.args)
+end
+
+function _find_pin_lambda(root_ex, target_name::Symbol, target_line::Int)::Union{Nothing, Expr}
+    best_prio = typemax(Int)
+    best_lam = nothing
+    function consider(prio::Int, lam::Expr)
+        if prio < best_prio
+            best_prio = prio
+            best_lam = lam
+        end
+    end
+    function walk(node, line::Int)
+        if node isa LineNumberNode
+            return node.line
+        end
+        node isa Expr || return line
+        if node.head === :do && length(node.args) == 2 && node.args[1] isa Expr &&
+           _is_pin_callee(node.args[1].args[1]) && _is_zero_arg_lambda(node.args[2])
+            lam = node.args[2]::Expr
+            cname = _pin_call_name(node.args[1])
+            lline = _lambda_line(lam, line)
+            line_ok = target_line <= 0 || lline == target_line
+            if cname === target_name && line_ok
+                consider(1, lam)
+            elseif cname === target_name
+                consider(2, lam)
+            elseif cname === nothing && line_ok
+                consider(3, lam)
+            end
+        elseif node.head === :call && !isempty(node.args) && _is_pin_callee(node.args[1])
+            cname = _pin_call_name(node)
+            for a in node.args[2:end]
+                if _is_zero_arg_lambda(a)
+                    lam = a::Expr
+                    lline = _lambda_line(lam, line)
+                    line_ok = target_line <= 0 || lline == target_line
+                    if cname === target_name && line_ok
+                        consider(1, lam)
+                    elseif cname === target_name
+                        consider(2, lam)
+                    elseif cname === nothing && line_ok
+                        consider(3, lam)
+                    end
+                end
+            end
+        elseif _is_zero_arg_lambda(node) && target_line > 0
+            lline = _lambda_line(node, line)
+            lline == target_line && consider(4, node)
+        end
+        for a in node.args
+            line = walk(a, line)
+        end
+        return line
+    end
+    walk(root_ex, 1)
+    return best_lam
+end
+
+function _literal_capture_expr(val)
+    if val === nothing || val === missing || val isa Bool || val isa Char ||
+       val isa Union{Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float16, Float32, Float64, String}
+        return (true, val)
+    elseif val isa Symbol
+        return (true, QuoteNode(val))
+    elseif val isa Tuple
+        args = Any[]
+        for item in val
+            ok, ex = _literal_capture_expr(item)
+            ok || return (false, nothing)
+            push!(args, ex)
+        end
+        return (true, Expr(:tuple, args...))
+    elseif val isa NamedTuple
+        assigns = Any[]
+        for (k, v) in pairs(val)
+            ok, ex = _literal_capture_expr(v)
+            ok || return (false, nothing)
+            push!(assigns, Expr(:(=), k, ex))
+        end
+        return (true, Expr(:tuple, assigns...))
+    end
+    return (false, nothing)
+end
+
+function _module_rel_path(owner::Module, eval_mod::Module)
+    owner === eval_mod && return nothing
+    parts = Symbol[]
+    cur = owner
+    while cur !== eval_mod
+        parent = parentmodule(cur)
+        (parent === cur || cur in (Main, Core, Base)) && break
+        pushfirst!(parts, nameof(cur))
+        cur = parent
+    end
+    if cur === eval_mod && !isempty(parts)
+        return foldl((a, b) -> Expr(:., a, QuoteNode(b)), parts[2:end]; init=parts[1])
+    end
+    full = fullname(owner)
+    return foldl((a, b) -> Expr(:., a, QuoteNode(b)), full[2:end]; init=full[1])
+end
+
+function _extract_pin_recipe(fn::Function, name::Symbol)
+    state = GLOBAL_STATE[]
+    eval_mod = state === nothing ? Main : state.eval_module
+    fn_sym = nameof(fn)
+    nf = nfields(fn)
+
+    # Named 0-arg function (not a generated closure `#...`) with zero captured state
+    if !startswith(string(fn_sym), '#') && nf == 0
+        owner = parentmodule(fn)
+        mod_path = _module_rel_path(owner, eval_mod)
+        callee = mod_path === nothing ? fn_sym : Expr(:., mod_path, QuoteNode(fn_sym))
+        thunk = Expr(:->, Expr(:tuple), Expr(:call, callee))
+        hex = round_trips(thunk) ? nothing : expr_hex(thunk)
+        return string(thunk), hex
+    end
+
+    ms = try Base.invokelatest(methods, fn) catch; () end
+    m = isempty(ms) ? nothing : first(ms)
+    target_line = m === nothing ? 0 : Int(m.line)
+    target_file = m === nothing ? "" : string(m.file)
+
+    lam = nothing
+    # When fn was defined on disk (e.g. include(...) or test files), prefer that file;
+    # otherwise (in-turn "call N" code) check the active statement AST first.
+    if !isempty(target_file) && isfile(target_file)
+        parsed = try Meta.parseall(read(target_file, String); filename=target_file) catch; nothing end
+        parsed === nothing || (lam = _find_pin_lambda(parsed, name, target_line))
+    end
+    if lam === nothing
+        stmt = get(task_local_storage(), :palette_current_stmt, nothing)
+        stmt === nothing || (lam = _find_pin_lambda(stmt, name, target_line))
+    end
+    if lam === nothing && startswith(target_file, "call ") && state !== nothing
+        cnum = tryparse(Int, target_file[6:end])
+        if cnum !== nothing && 1 <= cnum <= length(state.execution_history)
+            parsed = try Meta.parseall(state.execution_history[cnum].code; filename=target_file) catch; nothing end
+            parsed === nothing || (lam = _find_pin_lambda(parsed, name, target_line))
+        end
+    end
+    lam === nothing && return nothing, nothing
+
+    thunk = clean_statement(deepcopy(lam))
+    if nf > 0
+        fnames = fieldnames(typeof(fn))
+        bindings = Expr[]
+        for i in 1:nf
+            isdefined(fn, i) || return (nothing, nothing)
+            raw = getfield(fn, i)
+            val = if raw isa Core.Box
+                isdefined(raw, :contents) || return (nothing, nothing)
+                raw.contents
+            else
+                raw
+            end
+            ok, lit_ex = _literal_capture_expr(val)
+            ok || return (nothing, nothing)
+            push!(bindings, Expr(:(=), fnames[i], lit_ex))
+        end
+        thunk = Expr(:let, Expr(:block, bindings...), thunk)
+    end
+    hex = round_trips(thunk) ? nothing : expr_hex(thunk)
+    return string(thunk), hex
+end
+
+function _eval_pin_recipe(entry::PinnedEntry)::Function
+    (entry.source === nothing && entry.expr_hex === nothing) &&
+        error("pinned entry :$(entry.name) has no constructor recipe to reconstruct after revival")
+    ex = if entry.expr_hex !== nothing
+        deserialize(IOBuffer(hex2bytes(entry.expr_hex)))
+    else
+        Meta.parse(entry.source)
+    end
+    mod = get_kernel_state().eval_module
+    fn = Base.invokelatest(Core.eval, mod, ex)
+    fn isa Function || error("pinned constructor recipe for :$(entry.name) did not evaluate to a Function")
+    return fn
+end
+
+function _pin_get(name::Symbol)
+    entry = get(PIN_REGISTRY, name, nothing)
+    entry === nothing && error("no pinned entry named :$name")
+    entry.has_value && return entry.value
+    fn = entry.fn
+    if fn === nothing
+        fn = _eval_pin_recipe(entry)
+        entry.fn = fn
+    end
+    val = Base.invokelatest(fn)
+    entry.value = val
+    entry.has_value = true
+    return val
+end
+
+"""
+    pin(fn::Function, name::Symbol; lazy=false) -> PinnedRef
+    pin(name::Symbol)
+
+Store a large read-only artifact under `name` inside Palette's non-serialized
+pin store (`0` bytes in snapshot bindings) while persisting its pure
+constructor recipe in the revival manifest.
+
+- `acc = Api.pin(:name) do ... end` registers `:name` and returns a callable
+  accessor `acc` (`acc()` returns the value).
+- `Api.pin(:name)` returns the pinned value directly; after kernel restart or
+  revival (or when created with `lazy=true`), calling either `acc()` or
+  `Api.pin(:name)` lazily reconstructs and caches the value on first access.
+"""
+function pin(fn::Function, name::Symbol; lazy::Bool=false)
+    isempty(string(name)) && throw(ArgumentError("pin name must not be empty"))
+    source, hex = _extract_pin_recipe(fn, name)
+    call = next_call()
+    entry = PinnedEntry(name, fn, false, nothing, source, hex, call)
+    if !lazy
+        val = Base.invokelatest(fn)
+        entry.value = val
+        entry.has_value = true
+    end
+    PIN_REGISTRY[name] = entry
+    return PinnedRef(name)
+end
+pin(name::Symbol, fn::Function; lazy::Bool=false) = pin(fn, name; lazy)
+pin(name::Symbol) = _pin_get(name)
+
+"""
+    unpin(name::Symbol) -> Bool
+
+Remove `name` from Palette's pin store, releasing the pinned value for GC and
+dropping its revival recipe. Returns `true` if `name` was pinned.
+"""
+unpin(name::Symbol)::Bool = pop!(PIN_REGISTRY, name, nothing) !== nothing
+
+"""
+    pinned() -> Vector{NamedTuple}
+
+Return sorted metadata entries `(name, loaded, bytes, call, has_recipe)` for
+every entry currently registered in Palette's pin store.
+"""
+function pinned()
+    out = NamedTuple{(:name, :loaded, :bytes, :call, :has_recipe), Tuple{Symbol, Bool, Union{Int, Nothing}, Int, Bool}}[]
+    for name in sort!(collect(keys(PIN_REGISTRY)))
+        e = PIN_REGISTRY[name]
+        sz = e.has_value ? safe_summarysize(e.value) : nothing
+        push!(out, (name=e.name, loaded=e.has_value, bytes=sz, call=e.call,
+                    has_recipe=(e.source !== nothing || e.expr_hex !== nothing)))
+    end
+    return out
+end
+
 function revival_observation!(; restored=String[], rebuilt=String[], stale=String[], lost=String[],
                                uncertain=String[], saved_call=nothing, text="")
     positive = !isempty(restored) || !isempty(rebuilt)
@@ -904,7 +1214,7 @@ end
 # (nothing inside it can refuse), a refusal, `:function` (a named function,
 # or a closure when its name starts with '#'), `:type`, or `:object` (walked).
 function value_kind(@nospecialize(T))
-    T <: Union{Nothing, Missing, Bool, Char, String, Symbol, BigInt, BigFloat} && return nothing
+    T <: Union{Nothing, Missing, Bool, Char, String, Symbol, BigInt, BigFloat, PinnedRef} && return nothing
     T <: Number && isprimitivetype(T) && Base.moduleroot(parentmodule(T)) in (Base, Core) && return nothing
     for R in REFUSED_TYPES
         T <: R && return "a $(nameof(R)) cannot be revived"
@@ -1252,6 +1562,19 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
             push!(bindings, b)
             continue
         end
+        if v isa PinnedRef
+            if haskey(PIN_REGISTRY, v.name)
+                b["class"] = "pin"
+                b["pin_name"] = string(v.name)
+            else
+                b["class"] = "runtime"
+                b["reason"] = "pin :$(v.name) was unpinned"
+                b["recipe"] = recipe(name, setcall)
+            end
+            b["files"] = [[p, evidence["stamp"]] for (p, evidence) in binding_sources(b["origin"], setcall)]
+            push!(bindings, b)
+            continue
+        end
         if _is_snapshot_skipped_type(v)
             b["class"] = "runtime"
             b["reason"] = "rebuildable index cache ($(short_type(v))); skipped by snapshot"
@@ -1423,6 +1746,15 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         "cwd" => pwd(), "env" => Dict(k => v for (k, v) in ENV if get(INITIAL_ENV[], k, nothing) != v),
         "env_removed" => [k for k in keys(INITIAL_ENV[]) if !haskey(ENV, k)],
         "definitions" => DEFINITION_LOG, "bindings" => bindings, "data" => stored,
+        "pins" => [
+            Dict{String, Any}(
+                "name" => string(entry.name),
+                "source" => entry.source,
+                "expr_hex" => entry.expr_hex,
+                "call" => entry.call,
+            )
+            for (_, entry) in sort!(collect(PIN_REGISTRY); by=kv -> string(kv.first))
+        ],
         "type_fingerprints" => Dict(t => type_fingerprint(mod, t) for t in usertypes),
         "used_files" => [[p, collect(s), c] for (p, (s, c)) in USED_FILES],
         "workspace_packages" => Dict(string(nameof(mod_)) => Dict(k => collect(v) for (k, v) in snap) for (mod_, snap) in WORKSPACE_PACKAGES),
@@ -1855,6 +2187,43 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
         end
     end
 
+    # Restore non-serialized RAM pin recipes lazily (do NOT execute constructors during revival).
+    empty!(PIN_REGISTRY)
+    for p in get(m, "pins", Any[])
+        p isa AbstractDict && haskey(p, "name") || continue
+        pname = Symbol(p["name"])
+        PIN_REGISTRY[pname] = PinnedEntry(
+            pname,
+            nothing,
+            false,
+            nothing,
+            get(p, "source", nothing),
+            get(p, "expr_hex", nothing),
+            Int(get(p, "call", call)),
+        )
+    end
+    for (n, b) in bindings
+        b["class"] == "pin" || continue
+        pin_sym = Symbol(get(b, "pin_name", n))
+        entry = get(PIN_REGISTRY, pin_sym, nothing)
+        if entry !== nothing && (entry.source !== nothing || entry.expr_hex !== nothing)
+            ref = PinnedRef(pin_sym)
+            try
+                if !(b["const"] && latest_isdefined(mod, Symbol(n)) && latest_global(mod, Symbol(n)) === ref &&
+                     Base.invokelatest(isconst, mod, Symbol(n)))
+                    Core.eval(mod, Expr(b["const"] ? :const : :global, Expr(:(=), Symbol(n), QuoteNode(ref))))
+                end
+                values[n] = ref
+            catch err
+                b["class"] = "runtime"
+                b["reason"] = "re-binding pin :$(pin_sym) failed: $(first(sprint(showerror, err), 160))"
+            end
+        else
+            b["class"] = "runtime"
+            b["reason"] = "pinned constructor recipe for :$(pin_sym) is unavailable"
+        end
+    end
+
     # Check each binding against what the old kernel had: definitions first,
     # because data that refers to a definition is only as exact as it is.
     inexact = changed_packages
@@ -1902,6 +2271,9 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(exact, fmt_binding(b))
                 push!(same, n)
             end
+        elseif cls == "pin" && haskey(values, n)
+            push!(exact, fmt_binding(b))
+            push!(same, n)
         elseif cls == "data" && haskey(values, n)
             origin = get(b, "origin", Dict{String, Any}())
             sources = binding_sources(origin, b["call"])
@@ -1929,6 +2301,11 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
             r = get(b, "recipe", "")
             push!(lost, "$(fmt_binding(b)): $(get(b, "reason", "not revived"))" * (isempty(r) ? "" : "; it came from `$r`"))
         end
+    end
+    bound_pins = Set{String}(string(get(b, "pin_name", n)) for (n, b) in bindings if b["class"] == "pin" && haskey(values, n))
+    for pname in sort!(collect(keys(PIN_REGISTRY)))
+        sp = string(pname)
+        sp in bound_pins || push!(rebuilt, "pin :$sp (lazy recipe)")
     end
 
     # This kernel continues the old one's call numbers, past calls that

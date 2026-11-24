@@ -137,13 +137,16 @@ function observed_statement(mod, ex, run; source=nothing)
     reads = Dict{String, Any}[]
     outer_sources = get(task_local_storage(), :palette_source_reads, nothing)
     source_reads = Dict{String, Any}[]
+    outer_stmt = get(task_local_storage(), :palette_current_stmt, nothing)
     task_local_storage(:palette_source_reads, source_reads)
     task_local_storage(:palette_artifact_reads, reads)
+    task_local_storage(:palette_current_stmt, ex)
     try
         value = run()
         isempty(types_before) || try stale_type_notice(mod, types_before) catch end
         return value
     finally
+        task_local_storage(:palette_current_stmt, outer_stmt)
         task_local_storage(:palette_source_reads, outer_sources)
         outer_sources === nothing || append!(outer_sources, source_reads)
         foreach(e -> inherited[e["path"]] = e, source_reads)

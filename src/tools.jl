@@ -366,8 +366,8 @@ default_codegraph_root() = something(ACTIVE_CODEGRAPH_ROOT[], WORKSPACE_ROOT[])
 """
     codegraph(root = active_root_or_workspace) -> Pharos.CodeGraph
 
-The definitions, calls, includes and imports of the Julia, Python and Rust
-files under `root`, brought up to date first. The call's X-Ray cites the
+The definitions, calls, includes and imports of the Julia, Python, Rust and
+WGSL files under `root`, brought up to date first. The call's X-Ray cites the
 graph's digest and which files were parsed again.
 """
 function codegraph(root::AbstractString=default_codegraph_root())
@@ -426,8 +426,8 @@ definitions(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Noth
 callers(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
     Pharos.callers(_resolve_query_graph(graph, root), name; match, kwargs...)
 
-grep_defs(substring::AbstractString; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, kwargs...) =
-    Pharos.grep_defs(_resolve_query_graph(graph, root), substring; path_prefix, kwargs...)
+grep_defs(pattern::Union{AbstractString, Regex}; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, exts=nothing, kwargs...) =
+    Pharos.grep_defs(_resolve_query_graph(graph, root), pattern; path_prefix, exts, kwargs...)
 
 function summary(g::Pharos.CodeGraph; max_files::Int=50)
     return Pharos.summary(g; max_files)
@@ -447,6 +447,6 @@ Api.definitions(g::Pharos.CodeGraph, name::Union{AbstractString, Symbol}; match:
     definitions(g, name; match, kwargs...)
 Api.callers(g::Pharos.CodeGraph, name::Union{AbstractString, Symbol}; match::Symbol=:exact, kwargs...) =
     callers(g, name; match, kwargs...)
-Api.grep_defs(g::Pharos.CodeGraph, substring::AbstractString; path_prefix::AbstractString="", kwargs...) =
-    grep_defs(g, substring; path_prefix, kwargs...)
+Api.grep_defs(g::Pharos.CodeGraph, pattern::Union{AbstractString, Regex}; path_prefix::AbstractString="", exts=nothing, kwargs...) =
+    grep_defs(g, pattern; path_prefix, exts, kwargs...)
 Api.summary(g::Pharos.CodeGraph; max_files::Int=50) = summary(g; max_files)
