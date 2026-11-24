@@ -44,7 +44,7 @@ using Palette
 # Palette's own UUIDs binding: a project that lists only Palette cannot
 # `using UUIDs` itself.
 const UUIDs = Palette.UUIDs
-using Palette: safe_json, execute_turn, bounded_data, text_display, scrub, with_hint
+using Palette: safe_json
 
 const EPOCH = string(UUIDs.uuid4())
 Palette.TASK_EPOCH[] = EPOCH
@@ -77,12 +77,25 @@ function request_waiting()
     return ccall(:poll, Cint, (Ptr{Cvoid}, Culong, Cint), pfd, 1, 0) > 0 && (pfd[][3] & 0x001) != 0
 end
 redirect_stdin(open("/dev/null"))
-const SINK = open(joinpath(tempdir(), "palette-background-output.log"), "a")
+const _SINK_PATH = let
+    priv = Palette.private_lab_root()
+    if priv !== nothing
+        log_dir = let d = strip(get(ENV, "PALETTE_LOGS_DIR", ""))
+            isempty(d) ? joinpath(priv, "logs") : abspath(expanduser(d))
+        end
+        Palette._ensure_private_dir!(log_dir)
+        joinpath(log_dir, "background-output.log")
+    else
+        joinpath(tempdir(), "palette-background-output.log")
+    end
+end
+const SINK = open(_SINK_PATH, "a")
+Palette._enforce_private_file_perms!(_SINK_PATH)
 redirect_stdout(SINK)
 redirect_stderr(SINK)
 # Read back at the start of each call (Palette.report_background).
 Palette.SINK[] = SINK
-Palette.SINK_PATH[] = joinpath(tempdir(), "palette-background-output.log")
+Palette.SINK_PATH[] = _SINK_PATH
 Palette.SINK_READ[] = filesize(Palette.SINK_PATH[])
 
 # Turn code's `display` writes to the turn's output, not the protocol pipe
@@ -118,6 +131,8 @@ Palette.workspace_package_first!(pwd())
 # a kernel that replaces this one. A revived kernel takes the old eval
 # module's name: values of kernel-defined types deserialize only into it.
 Palette.STATE_DIR[] = get(ENV, "PALETTE_STATE_DIR", "")
+Palette.configure_private_lab!()
+Palette.apply_configured_blas_threads!()
 Palette.INITIAL_ENV[] = Dict{String,String}(ENV)
 Palette.LOADABLE[] = Palette.loadable_packages()
 # A restore the host asked for swaps the checkpoint's snapshot in first.
@@ -128,19 +143,13 @@ let name = Palette.revival_module_name()
     Core.eval(Main, Expr(:(=), nameof(mod), mod))
 end
 
-# Finish runtime compilation and revival before advertising readiness.
-# Otherwise the host charges this preparation against the first turn's limit.
-# Warm-up calls leave no user history, receipt, binding or phase observations.
+# Revival, tool stubs and the pre-HELLO snapshot have to finish before we
+# advertise readiness: a first-turn kill used to leave started_call with no
+# manifest. Dummy execute_turn warm-ups are already in the package image
+# (`precompile_workload.jl`); running them here charged HELLO for compile
+# the first real call can pay under the turn limit.
 let state = Palette.get_kernel_state()
     Core.eval(state.eval_module, Expr(:global, Expr(:(=), :PAYLOAD, nothing)))
-    (r, _, _), out = execute_turn("print(\"\"); [1 2]", 60.0)
-    # An undefined name is the error models make most, and its message runs
-    # the REPL's hint handlers, which the package image cannot hold.
-    (e, _, _), _ = execute_turn("warm_up_undefined_name", 60.0)
-    with_hint(e.result.error, "")
-    text_display(r.result.data); bounded_data(r.result.data); bounded_data(Dict("a" => [1]))
-    scrub(out); with_hint("x", "y"); safe_json(Dict{String,Any}("a" => 1))
-    Palette.reset_kernel_state!()
     Core.eval(state.eval_module, Expr(:global, Expr(:(=), :ans, nothing)))
     Palette.REVIVAL_REPORT[] = try
         Base.invokelatest(Palette.revive_state!)
@@ -156,6 +165,12 @@ let state = Palette.get_kernel_state()
     catch e
         Palette.REVIVAL_REPORT[] = join(filter(!isempty, [Palette.REVIVAL_REPORT[],
             "[tools] Listing project and trusted tools failed ($(first(sprint(showerror, e), 200))); none are bound."]), "\n")
+    end
+    # First-turn kills used to leave started_call with no manifest ("No complete
+    # snapshot remains"). Snapshot the revived or empty world before HELLO.
+    try
+        Base.invokelatest(Palette.ensure_pre_hello_snapshot!)
+    catch
     end
 end
 

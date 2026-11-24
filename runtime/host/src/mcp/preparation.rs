@@ -93,7 +93,10 @@ pub(crate) fn identity(project_dir: &Path, repo_dir: &Path, julia_bin: &str) -> 
 
     let package_root = match std::env::var("PALETTE_PACKAGE_DEPOT") {
         Ok(p) if !p.is_empty() => util::expand_user(&p),
-        _ => util::home().join(".palette/packages"),
+        _ => match crate::private_lab::active_private_root() {
+            Some(priv_root) => crate::private_lab::PrivateLabLayout::from_root(&priv_root).packages,
+            None => util::home().join(".palette/packages"),
+        },
     };
     let package_environment = util::resolve(&package_root).join("environment");
     let mut environment_files = BTreeSet::new();

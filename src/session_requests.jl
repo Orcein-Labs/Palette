@@ -117,8 +117,21 @@ the call ended with; `request_waiting()` says whether the next request has
 arrived meanwhile, so it goes first.
 """
 function serve_requests(@nospecialize(respond), requests::IO, @nospecialize(request_waiting), epoch::String)
+    # Allow external SIGINT (e.g. palette_control action=interrupt) to raise
+    # InterruptException in Julia instead of terminating the worker process.
+    try
+        Base.exit_on_sigint(false)
+    catch
+    end
     revival_pending = true
-    for line in eachline(requests)
+    while true
+        line = try
+            eof(requests) && break
+            readline(requests)
+        catch e
+            e isa InterruptException && continue
+            rethrow()
+        end
         isempty(strip(line)) && continue
         resp, snapshot_call = handle_request(respond, line, epoch)
         if revival_pending && resp["kind"] == "RESULT"
@@ -134,6 +147,7 @@ function serve_requests(@nospecialize(respond), requests::IO, @nospecialize(requ
                 # Latest world: turn code defined methods (show, ==, enum names) since this loop began.
                 Base.invokelatest(save_end_of_call!, snapshot_call; waiting=request_waiting)
             catch e
+                e isa InterruptException && continue
                 println(stderr, "[saving the state after call $snapshot_call failed: ", first(sprint(showerror, e), 300), "]")
             end
         end
@@ -307,13 +321,17 @@ function execute_reply!(@nospecialize(respond), resp, req, code::String, payload
     resp["data"] = resp["success"] ? get(projection, "data", nothing) : nothing
     resp["display"] = resp["success"] ? get(projection, "display", nothing) : nothing
     resp["costs"] = deepcopy(get(TURN_COSTS, call, Dict{String, Any}()))
-    resp["error"] = scrub(something(receipt.result.error, ""))
+    resp["error"] = scrub_task_print_notices(scrub(something(receipt.result.error, "")))
+    external_interrupt = !interrupted && receipt isa OperationReceipt && get(receipt.metadata, "interrupted", false) === true
     if interrupted
         resp["interrupted"] = true
         resp["error"] = "Interrupted during $(get(resp["costs"], "failed_phase", "execution")): the call exceeded its $(limit_text(resp["costs"], ctx, timeout_s)). The kernel and every binding are intact; " *
                         "processes this call started were stopped. Output printed before the interrupt is above.\n" * resp["error"]
+    elseif external_interrupt
+        resp["interrupted"] = true
+        resp["error"] = "Interrupted by external signal (SIGINT). The kernel and every binding are intact.\n" * resp["error"]
     end
     isempty(resp["error"]) && (resp["error"] = nothing)
     note_completed_call!(call)
-    return interrupted ? nothing : call
+    return (interrupted || external_interrupt) ? nothing : call
 end

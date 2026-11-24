@@ -16,7 +16,12 @@ const LOADED_TOOLS = Dict{String, Tuple{Vector{Any}, Dict{String, Any}, Function
 # name => (the definition log entries, the source they give) last computed
 const TOOL_SOURCES = Dict{String, Tuple{Vector{Dict{String, Any}}, Any}}()
 
-project_tools_dir() = joinpath(WORKSPACE_ROOT[], ".palette", "tools")
+function project_tools_dir()
+    if isempty(WORKSPACE_ROOT[]) && is_private_mode()
+        return joinpath(private_lab_root(), "tools")
+    end
+    return joinpath(WORKSPACE_ROOT[], ".palette", "tools")
+end
 trusted_tools_dir() = get(ENV, "PALETTE_TRUSTED_TOOLS", "")
 # Where tools are listed from, in order, and whether the directory is the trusted one.
 tool_dirs() = ((project_tools_dir(), false), (trusted_tools_dir(), true))
@@ -354,15 +359,18 @@ end
 # changed are parsed again.
 const CODE_GRAPHS = Dict{String, Pharos.CodeGraph}()
 const MAX_CODE_GRAPHS = 4
+const ACTIVE_CODEGRAPH_ROOT = Ref{Union{Nothing, String}}(nothing)
+
+default_codegraph_root() = something(ACTIVE_CODEGRAPH_ROOT[], WORKSPACE_ROOT[])
 
 """
-    codegraph(root = workspace) -> Pharos.CodeGraph
+    codegraph(root = active_root_or_workspace) -> Pharos.CodeGraph
 
 The definitions, calls, includes and imports of the Julia, Python and Rust
 files under `root`, brought up to date first. The call's X-Ray cites the
 graph's digest and which files were parsed again.
 """
-function codegraph(root::AbstractString=WORKSPACE_ROOT[])
+function codegraph(root::AbstractString=default_codegraph_root())
     key = Pharos._normroot(root)
     isdir(key) || error("$key is not a directory")
     g = get(CODE_GRAPHS, key, nothing)
@@ -381,3 +389,64 @@ function codegraph(root::AbstractString=WORKSPACE_ROOT[])
     end
     return g
 end
+
+"""
+    codegraph!(root::AbstractString) -> Pharos.CodeGraph
+    codegraph!(nothing) -> Nothing
+
+Bind an external repository root as the session's active code graph root (useful
+in `open` workspaces whose default workspace directory is separate from the
+target repository), or pass `nothing` to reset back to `WORKSPACE_ROOT[]`.
+"""
+function codegraph!(root::AbstractString)
+    key = Pharos._normroot(root)
+    isdir(key) || error("$key is not a directory")
+    ACTIVE_CODEGRAPH_ROOT[] = key
+    return codegraph(key)
+end
+
+function codegraph!(::Nothing)
+    ACTIVE_CODEGRAPH_ROOT[] = nothing
+    return nothing
+end
+
+import .Pharos: definitions, callers, grep_defs
+
+function _resolve_query_graph(graph, root::Union{Nothing, AbstractString})
+    if graph !== nothing
+        graph isa Pharos.CodeGraph || throw(ArgumentError("graph must be a Pharos.CodeGraph or nothing, got $(typeof(graph))"))
+        return graph
+    end
+    return root === nothing ? codegraph() : codegraph(root)
+end
+
+definitions(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
+    Pharos.definitions(_resolve_query_graph(graph, root), name; match, kwargs...)
+
+callers(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
+    Pharos.callers(_resolve_query_graph(graph, root), name; match, kwargs...)
+
+grep_defs(substring::AbstractString; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, kwargs...) =
+    Pharos.grep_defs(_resolve_query_graph(graph, root), substring; path_prefix, kwargs...)
+
+function summary(g::Pharos.CodeGraph; max_files::Int=50)
+    return Pharos.summary(g; max_files)
+end
+
+function summary(target::Union{Nothing, AbstractString}=nothing; max_files::Int=50)
+    g = if target === nothing || isempty(strip(String(target)))
+        r = default_codegraph_root()
+        codegraph(isempty(r) ? pwd() : r)
+    else
+        codegraph(String(target))
+    end
+    return Pharos._summarize_graph(g; max_files)
+end
+
+Api.definitions(g::Pharos.CodeGraph, name::Union{AbstractString, Symbol}; match::Symbol=:exact, kwargs...) =
+    definitions(g, name; match, kwargs...)
+Api.callers(g::Pharos.CodeGraph, name::Union{AbstractString, Symbol}; match::Symbol=:exact, kwargs...) =
+    callers(g, name; match, kwargs...)
+Api.grep_defs(g::Pharos.CodeGraph, substring::AbstractString; path_prefix::AbstractString="", kwargs...) =
+    grep_defs(g, substring; path_prefix, kwargs...)
+Api.summary(g::Pharos.CodeGraph; max_files::Int=50) = summary(g; max_files)

@@ -20,6 +20,7 @@ mod broker;
 mod cli;
 mod install_plugin;
 mod mcp;
+mod private_lab;
 mod provisioning;
 mod receipt_archive;
 mod sandbox;
@@ -240,7 +241,7 @@ fn main() {
         Some("mcp") => match rest.first().map(String::as_str) {
             Some("child") => Ok(mcp::child::main()),
             Some("connect") if rest.len() == 1 => Ok(mcp::client::main()),
-            Some("start") if rest.len() == 1 => mcp::router::start(),
+            Some("start") => mcp::router::start(&rest[1..]),
             _ => mcp::router::main(rest),
         },
         _ => Err("usage: palette-host session|run-worker|broker|subset|prewarm|prepare|teamlab-news|reload|setup|install-plugin|service|serve|patch|control|toolchain|pal|mcp ...".into()),

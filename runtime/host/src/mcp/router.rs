@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,11 +26,11 @@ use super::child::{self, env, get, no_get};
 use super::generation::GenerationStore;
 use super::patch::{self, PatchBroker};
 use super::{atomic_json, lineage, py_json_loads, transport, valid_id, Fault};
-use crate::{provisioning, sandbox, util};
+use crate::{private_lab, provisioning, sandbox, util};
 
 const FRAME_LIMIT: usize = 1048576;
-const CONTROL_ACTIONS: [&str; 9] =
-    ["status", "prepare", "restart", "checkpoints", "restore", "receipts", "generation_status", "activate_generation", "reload_config"];
+const CONTROL_ACTIONS: [&str; 10] =
+    ["status", "prepare", "restart", "interrupt", "checkpoints", "restore", "receipts", "generation_status", "activate_generation", "reload_config"];
 const INSTRUCTIONS: &str = "Select a logical workspace for each independent experiment. Omit project_root_id to keep using the legacy workspace; otherwise select a configured ID returned by palette_workspace list. Tool arguments cannot supply filesystem paths. Project-scoped workspaces on the same project root share one durable Julia lineage; thread/open workspaces remain independent. Context keys are supplied by callers, not authenticated thread identities.";
 const ROUTING: [&str; 2] = ["workspace_id", "context_id"];
 
@@ -87,8 +87,12 @@ impl ConfigSnapshot {
         if var("PALETTE_OPERATOR_CEILING_JSON").is_some() {
             return Err(Fault::value("PALETTE_OPERATOR_CEILING_JSON is reserved for the internal workspace snapshot handoff and cannot be set on the daemon"));
         }
-        let config_dir = var("XDG_CONFIG_HOME").map(PathBuf::from)
-            .unwrap_or_else(|| util::home().join(".config")).join("palette");
+        let private_root = private_lab::resolve_private_root(None, &var).map_err(Fault::value)?;
+        let config_dir = match &private_root {
+            Some(root) => private_lab::PrivateLabLayout::from_root(root).config,
+            None => var("XDG_CONFIG_HOME").map(PathBuf::from)
+                .unwrap_or_else(|| util::home().join(".config")).join("palette"),
+        };
         let roots_path = util::expand_user(&config_dir.join("read-roots").to_string_lossy());
         let read_roots_override = var("PALETTE_READ_ROOTS");
         let read_roots_file_override = var("PALETTE_READ_ROOTS_FILE");
@@ -331,6 +335,21 @@ impl Router {
             .unwrap_or_else(|| child::default_state_dir(&base.to_string_lossy())));
         let legacy_receipts = child::receipts_dir(&legacy);
         let root = util::resolve(&env("PALETTE_WORKSPACE_STATE_ROOT").map(PathBuf::from).unwrap_or_else(child::default_workspace_root));
+        if let Some(priv_root) = private_lab::resolve_private_root(None, &env).map_err(Fault::value)? {
+            let strict = private_lab::is_private_strict(false, &env);
+            let layout = private_lab::PrivateLabLayout::from_root(&priv_root);
+            layout.ensure_dirs().map_err(Fault::permission)?;
+            let scratch = scratch_root(&root);
+            for (label, path) in [
+                ("OPERATOR_WORKSPACE", &base),
+                ("PALETTE_STATE_DIR", &legacy),
+                ("PALETTE_WORKSPACE_STATE_ROOT", &root),
+                ("PALETTE_SCRATCH_ROOT", &scratch),
+            ] {
+                private_lab::assert_contained(path, &layout.root, label).map_err(Fault::permission)?;
+            }
+            private_lab::enforce_private_isolation(strict).map_err(Fault::permission)?;
+        }
         let generations = GenerationStore::new(&root.join("runtime-generations"), &repo, Path::new(&host));
         let max_live = env("PALETTE_MAX_LIVE_WORKSPACES").unwrap_or_else(|| "4".into());
         let max_live: i64 = max_live.trim().replace('_', "").parse().map_err(|_| Fault::value(format!(
@@ -511,15 +530,37 @@ impl Router {
     fn with_registry<T>(&self, f: impl FnOnce(&mut Value) -> Result<T, Fault>) -> Result<T, Fault> {
         mkdir_private(&self.root)?;
         let lock_path = self.root.join("registry.lock");
-        let lock = OpenOptions::new().read(true).append(true).create(true).open(&lock_path).map_err(|e| Fault::os(&e, &lock_path))?;
+        let lock = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(&lock_path).map_err(|e| Fault::os(&e, &lock_path))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(patch::bare_os(&std::io::Error::last_os_error()));
         }
         let path = self.root.join("registry.json");
-        let mut value = if path.exists() {
-            py_json_loads(&fs::read_to_string(&path).map_err(|e| Fault::os(&e, &path))?)?
-        } else {
-            json!({"format": 1, "workspaces": {}, "active": {}})
+        let mut value = self.load_registry_value(&path)?;
+        let before = value.clone();
+        let out = f(&mut value)?;
+        if value != before {
+            atomic_json(&path, &value).map_err(Fault::io)?;
+        }
+        drop(lock);
+        Ok(out)
+    }
+
+    /// Lock-free read of the atomically-replaced `registry.json` snapshot.
+    /// Because every writer uses `atomic_json` (temp write + fsync + rename),
+    /// readers always observe a complete, consistent registry without blocking
+    /// behind `registry.lock` `LOCK_EX` contention or cloning the full JSON tree.
+    fn read_registry_snapshot(&self) -> Result<Value, Fault> {
+        let path = self.root.join("registry.json");
+        self.load_registry_value(&path)
+    }
+
+    fn load_registry_value(&self, path: &Path) -> Result<Value, Fault> {
+        let mut value = match fs::read_to_string(path) {
+            Ok(text) => py_json_loads(&text)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                json!({"format": 1, "workspaces": {}, "active": {}})
+            }
+            Err(e) => return Err(Fault::os(&e, path)),
         };
         let Some(fields) = value.as_object_mut() else { return Err(no_get(&value)) };
         let format_1 = match fields.get("format") {
@@ -531,13 +572,7 @@ impl Router {
             return Err(Fault::value("Unsupported workspace registry"));
         }
         fields.entry("active").or_insert_with(|| json!({}));
-        let before = value.clone();
-        let out = f(&mut value)?;
-        if value != before {
-            atomic_json(&path, &value).map_err(Fault::io)?;
-        }
-        drop(lock);
-        Ok(out)
+        Ok(value)
     }
 
     fn context_key(&self, context: &str) -> String {
@@ -648,6 +683,96 @@ impl Router {
         }).collect()
     }
 
+    /// Evicts the least-recently-used **idle** live worker (whose `call` lock is
+    /// not currently held, and not already starting/stopping), closing its stdin
+    /// cleanly so it saves its snapshot before exiting. Returns `Some(workspace_id)`
+    /// of the evicted world if one was evicted, or `None` if all live worlds are busy.
+    fn evict_lru_idle(&self, except: Option<&Arc<Worker>>) -> Option<String> {
+        let mut candidates: Vec<(Instant, Arc<Worker>)> = {
+            let children = lock(&self.children);
+            children
+                .map
+                .values()
+                .filter(|w| {
+                    !except.is_some_and(|e| Arc::ptr_eq(e, w))
+                        && w.alive()
+                        && !children.starting.contains(&w.key)
+                        && !children.stopping.contains(&w.key)
+                })
+                .map(|w| (*lock(&w.last_used), Arc::clone(w)))
+                .collect()
+        };
+        candidates.sort_by_key(|(last_used, _)| *last_used);
+        for (_, w) in candidates {
+            let Ok(_call) = w.call.try_lock() else {
+                continue;
+            };
+            let still_evictable = {
+                let children = lock(&self.children);
+                w.alive()
+                    && !children.starting.contains(&w.key)
+                    && !children.stopping.contains(&w.key)
+            };
+            if still_evictable {
+                let evicted_id = text(&w.entry, "workspace_id").to_string();
+                w.stop_proc(self);
+                return Some(evicted_id);
+            }
+        }
+        None
+    }
+
+    fn busy_workspace_ids(&self, except: Option<&Arc<Worker>>) -> Vec<String> {
+        let children = lock(&self.children);
+        let mut ids: Vec<String> = children
+            .map
+            .values()
+            .filter(|w| {
+                !except.is_some_and(|e| Arc::ptr_eq(e, w))
+                    && (w.alive()
+                        || children.starting.contains(&w.key)
+                        || children.stopping.contains(&w.key))
+            })
+            .map(|w| text(&w.entry, "workspace_id").to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    fn validate_purge_dir(&self, dir: &Path, is_default: bool) -> Result<(), Fault> {
+        let allowed_root = util::resolve(&self.root);
+        let allowed_legacy = util::resolve(&self.legacy);
+        let allowed_legacy_sb = util::resolve(&sandbox_state_dir(&self.legacy));
+        let check = |candidate: &Path| -> bool {
+            let in_worlds = util::within(candidate, &allowed_root) && candidate != allowed_root;
+            let is_legacy = is_default && (candidate == allowed_legacy || candidate == allowed_legacy_sb);
+            in_worlds || is_legacy
+        };
+        let resolved = util::resolve(dir);
+        if !check(&resolved) {
+            return Err(Fault::permission(format!(
+                "Refusing to purge snapshot outside workspace state root: {}",
+                resolved.display()
+            )));
+        }
+        if let Ok(meta) = fs::symlink_metadata(dir) {
+            if meta.file_type().is_symlink() {
+                return Err(Fault::permission("Refusing to purge symlinked snapshot directory"));
+            }
+            if meta.is_dir() {
+                let canon = fs::canonicalize(dir).map_err(|e| Fault::os(&e, dir))?;
+                if !check(&canon) {
+                    return Err(Fault::permission(format!(
+                        "Refusing to purge canonical snapshot path outside workspace state root: {}",
+                        canon.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn stop_idle(&self, except: Option<&Arc<Worker>>) {
         let idle = |w: &Worker| lock(&w.proc).child.is_some() && lock(&w.last_used).elapsed() >= self.idle;
         let candidates: Vec<Arc<Worker>> = {
@@ -684,12 +809,34 @@ impl Router {
         if action != "create" && args.contains_key("project_root_id") {
             return Err(Fault::value("project_root_id is only valid when creating a workspace"));
         }
+        if action != "create" && args.contains_key("depot_mode") {
+            return Err(Fault::value("depot_mode is only valid when creating a workspace"));
+        }
+        if action != "create" && args.contains_key("blas_threads") {
+            return Err(Fault::value("blas_threads is only valid when creating a workspace"));
+        }
+        if action != "close" && args.contains_key("purge_snapshot") {
+            return Err(Fault::value("purge_snapshot is only valid when closing a workspace"));
+        }
+        let attach_explicit = args.get("attach").is_some_and(patch::truthy);
         let attach = args.get("attach").map_or(true, patch::truthy);
         if action == "create" {
             let scope = args.get("scope").and_then(Value::as_str).unwrap_or("thread").to_string();
             if scope == "thread" && !has_context {
                 return Err(Fault::value("Thread scope requires context_id (a routing key, not authenticated identity)"));
             }
+            let depot_mode = match args.get("depot_mode").and_then(Value::as_str) {
+                None | Some("isolated") => None,
+                Some("shared_readonly") => Some("shared_readonly"),
+                Some(_) => return Err(Fault::value("depot_mode must be 'isolated' or 'shared_readonly'")),
+            };
+            let blas_threads = match args.get("blas_threads") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_i64().filter(|&n| (1..=256).contains(&n)) {
+                    Some(n) => Some(n as u64),
+                    None => return Err(Fault::value("blas_threads must be an integer in 1..=256")),
+                },
+            };
             let project_root_id = args.get("project_root_id").and_then(Value::as_str).unwrap_or("default").to_string();
             let Some(project_root) = self.project_roots.get(&project_root_id) else {
                 return Err(Fault::value("Unknown project_root_id"));
@@ -717,6 +864,12 @@ impl Router {
                     "project_dir": if scope == "project" { json!(root_text) } else { Value::Null },
                     "workspace_dir": root_text, "state_dir": state.to_string_lossy(),
                     "lineage_id": lineage::lineage_id(&scope, &project_root_id, &identifier)?});
+                if let Some(dm) = depot_mode {
+                    entry["depot_mode"] = json!(dm);
+                }
+                if let Some(bt) = blas_threads {
+                    entry["blas_threads"] = json!(bt);
+                }
                 reg["workspaces"][&identifier] = entry.clone();
                 if scope == "project" {
                     lineage::ensure_project_lineage(reg, &self.root, &project_root_id)?;
@@ -726,58 +879,124 @@ impl Router {
                     reg["active"][self.context_key(context.as_str().unwrap_or_default())] = json!(identifier);
                 }
                 entry["active_for_context"] = json!(has_context && attach);
+                if attach_explicit && !has_context {
+                    entry["warning"] = json!(format!(
+                        "attach=true requires context_id to bind a default route; workspace '{identifier}' was created without attaching."
+                    ));
+                    entry["hint"] = json!(format!(
+                        "Pass context_id on create/attach to bind a default route, or pass workspace_id=\"{identifier}\" explicitly on palette calls."
+                    ));
+                }
                 Ok(entry)
             });
         }
         if action == "list" {
-            return self.with_registry(|reg| {
-                let mut entries = Vec::new();
-                for e in reg["workspaces"].as_object().into_iter().flat_map(|w| w.values()) {
+            let reg = self.read_registry_snapshot()?;
+            let (live_by_state, live_count) = {
+                let children = lock(&self.children);
+                let mut by_state: HashMap<PathBuf, u64> = HashMap::new();
+                let mut count = 0usize;
+                for w in children.map.values() {
+                    if w.alive() {
+                        count += 1;
+                        let idle_secs = lock(&w.last_used).elapsed().as_secs();
+                        let state_key = util::resolve(&w.workspace_state_dir);
+                        by_state
+                            .entry(state_key)
+                            .and_modify(|prev| *prev = (*prev).min(idle_secs))
+                            .or_insert(idle_secs);
+                    }
+                }
+                (by_state, count)
+            };
+            let attach_live = |entry: &mut Map<String, Value>| {
+                let state_key = util::resolve(Path::new(text(entry, "state_dir")));
+                if let Some(&idle_secs) = live_by_state.get(&state_key) {
+                    entry.insert("live".into(), json!(true));
+                    entry.insert("idle_seconds".into(), json!(idle_secs));
+                } else {
+                    entry.insert("live".into(), json!(false));
+                    entry.insert("idle_seconds".into(), Value::Null);
+                }
+            };
+            let mut default_ws = self.default_entry();
+            attach_live(&mut default_ws);
+            let mut workspaces = vec![Value::Object(default_ws)];
+            let mut others = 0usize;
+            if let Some(ws_map) = reg["workspaces"].as_object() {
+                workspaces.reserve(ws_map.len());
+                for e in ws_map.values() {
                     let Value::Object(e) = e else {
                         return Err(Fault::new("TypeError", "Workspace registry entry is not an object"));
                     };
-                    let mut e = e.clone();
-                    e.entry("project_root_id").or_insert_with(|| "default".into());
-                    entries.push(e);
-                }
-                let mut workspaces = vec![Value::Object(self.default_entry())];
-                for e in &entries {
+                    let is_other_thread = e.get("scope") == Some(&json!("thread"))
+                        && *e.get("owner_context").unwrap_or(&Value::Null) != context;
+                    if is_other_thread {
+                        others += 1;
+                    }
                     if self.visible(e, &context)? {
-                        workspaces.push(Value::Object(e.clone()));
+                        let mut owned = e.clone();
+                        owned.entry("project_root_id").or_insert_with(|| "default".into());
+                        attach_live(&mut owned);
+                        workspaces.push(Value::Object(owned));
                     }
                 }
-                let roots: Vec<Value> = self.project_roots.iter()
-                    .map(|(id, path)| json!({"project_root_id": id, "workspace_dir": path.to_string_lossy()})).collect();
-                let mut listing = json!({"workspaces": workspaces, "available_project_roots": roots,
-                                         "identity": "caller-supplied context routing; not authentication"});
-                // Counted, not named: another context's threads stay out of this listing.
-                let others = entries.iter()
-                    .filter(|e| e.get("scope") == Some(&json!("thread")) && *e.get("owner_context").unwrap_or(&Value::Null) != context)
-                    .count();
-                if others > 0 {
-                    listing["other_thread_workspaces"] = json!(others);
-                    listing["note"] = json!(format!("{others} thread workspace(s) belong to other context_id values and are not listed; \
-                                                     list again with the context_id that created one to see it."));
-                }
-                Ok(listing)
+            }
+            let roots: Vec<Value> = self.project_roots.iter()
+                .map(|(id, path)| json!({"project_root_id": id, "workspace_dir": path.to_string_lossy()})).collect();
+            let mut listing = json!({
+                "workspaces": workspaces,
+                "live_count": live_count,
+                "live_limit": self.max_live,
+                "available_project_roots": roots,
+                "identity": "caller-supplied context routing; not authentication",
             });
+            if others > 0 {
+                listing["other_thread_workspaces"] = json!(others);
+                listing["note"] = json!(format!("{others} thread workspace(s) belong to other context_id values and are not listed; \
+                                                 list again with the context_id that created one to see it."));
+            }
+            return Ok(listing);
         }
         let entry = self.resolve(args)?;
         if action == "attach" {
-            if !has_context || !args.get("workspace_id").is_some_and(patch::truthy) {
-                return Err(Fault::value("Attach requires context_id and workspace_id"));
+            if !args.get("workspace_id").is_some_and(patch::truthy) {
+                return Err(Fault::value("Attach requires workspace_id"));
+            }
+            let scope = entry.get("scope").and_then(Value::as_str).unwrap_or("");
+            if !has_context {
+                if scope != "open" {
+                    return Err(Fault::value("Attach requires context_id and workspace_id"));
+                }
+                self.with_registry(|reg| {
+                    reg["active"][""] = entry["workspace_id"].clone();
+                    reg["active"][self.context_key("open")] = entry["workspace_id"].clone();
+                    Ok(())
+                })?;
+                let mut attached = entry.clone();
+                attached.insert("active_workspace_id".into(), entry["workspace_id"].clone());
+                attached.insert("context_id".into(), json!("open"));
+                attached.insert("scope".into(), json!("open"));
+                attached.insert("auto_context".into(), json!(true));
+                attached.insert("active_for_context".into(), json!(false));
+                return Ok(Value::Object(attached));
             }
             self.with_registry(|reg| {
                 reg["active"][self.context_key(context.as_str().unwrap_or_default())] = entry["workspace_id"].clone();
                 Ok(())
             })?;
-            return Ok(json!({"active_workspace_id": entry["workspace_id"]}));
+            let mut attached = entry.clone();
+            attached.insert("active_workspace_id".into(), entry["workspace_id"].clone());
+            attached.insert("context_id".into(), context.clone());
+            attached.insert("active_for_context".into(), json!(true));
+            return Ok(Value::Object(attached));
         }
         let state_dir = PathBuf::from(text(&entry, "state_dir"));
         let workers: Vec<Arc<Worker>> = lock(&self.children).map.values()
             .filter(|w| w.workspace_state_dir == state_dir).cloned().collect();
         let current = |w: &Arc<Worker>| lock(&self.children).map.get(&w.key).is_some_and(|c| Arc::ptr_eq(c, w));
         if action == "close" {
+            let purge_snapshot = args.get("purge_snapshot").is_some_and(patch::truthy);
             // close is linearized against starts and waits for any in-flight call
             // to finish before stopping the worker. A later call may start it again.
             for w in workers {
@@ -786,6 +1005,26 @@ impl Router {
                 if current(&w) && has_proc {
                     w.stop_proc(self);
                 }
+            }
+            if purge_snapshot {
+                let is_default = entry.get("workspace_id").and_then(Value::as_str) == Some("default");
+                let mut purged_dirs = Vec::new();
+                for dir in [state_dir.clone(), sandbox_state_dir(&state_dir)] {
+                    self.validate_purge_dir(&dir, is_default)?;
+                    if let Ok(meta) = fs::symlink_metadata(&dir) {
+                        if meta.is_dir() && !meta.file_type().is_symlink() {
+                            fs::remove_dir_all(&dir).map_err(|e| Fault::os(&e, &dir))?;
+                            purged_dirs.push(dir.to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                return Ok(json!({
+                    "workspace_id": entry["workspace_id"],
+                    "closed": true,
+                    "state_retained": false,
+                    "snapshot_purged": true,
+                    "purged_dirs": purged_dirs
+                }));
             }
             return Ok(json!({"workspace_id": entry["workspace_id"], "closed": true, "state_retained": true}));
         }
@@ -904,7 +1143,7 @@ impl Worker {
         if lock(&self.proc).child.is_some() && !self.alive() {
             self.stop_proc(r);
         }
-        if self.reserve(r)? {
+        if self.reserve_or_evict(r)? {
             let started = self.start(r, &mut frames);
             lock(&r.children).starting.remove(&self.key);
             started?;
@@ -915,6 +1154,70 @@ impl Worker {
         }
         *lock(&self.last_used) = Instant::now();
         result
+    }
+
+    /// Reserves a live slot, transparently evicting the least-recently-used idle
+    /// live worker (saving its snapshot cleanly) if `max_live` is currently full.
+    /// Only fails if ALL `max_live` worlds are actively executing a turn right now.
+    fn reserve_or_evict(self: &Arc<Self>, r: &Router) -> Result<bool, Fault> {
+        loop {
+            match self.reserve(r) {
+                Ok(needs_start) => return Ok(needs_start),
+                Err(_) => {
+                    if r.evict_lru_idle(Some(self)).is_some() {
+                        continue;
+                    }
+                    let busy = r.busy_workspace_ids(Some(self));
+                    return Err(Fault::new(
+                        "RuntimeError",
+                        format!(
+                            "Live workspace limit ({}); all live workspaces are actively executing a turn: [{}]",
+                            r.max_live,
+                            busy.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Out-of-band fast interrupt for `palette_control(action="interrupt")` that
+    /// does NOT block behind `self.call`. Sends `SIGINT` to the active Julia worker,
+    /// waits up to `grace` (2.5s), and falls back to `SIGKILL` if wedged.
+    fn interrupt_fast(&self, grace: Duration) -> Value {
+        let started = Instant::now();
+        let (running, adapter_pid) = self.pid();
+        if !running {
+            return json!({
+                "success": true,
+                "interrupted": false,
+                "status": "not_running",
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            });
+        }
+        if self.call.try_lock().is_ok() {
+            return json!({
+                "success": true,
+                "interrupted": false,
+                "status": "idle",
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            });
+        }
+        let res = child::interrupt_worker_in_state_dir(&self.state_dir, adapter_pid, grace, || {
+            self.call.try_lock().is_err()
+        });
+        if res.get("method") == Some(&json!("sigkill")) && self.call.try_lock().is_err() {
+            if let Some(pid) = adapter_pid {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                let settle = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < settle && self.call.try_lock().is_err() {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        res
     }
 
     /// Reserves a live slot when this worker has no adapter. A workspace
@@ -986,7 +1289,7 @@ impl Worker {
         }
         // Outside the state mount; a worker cannot unlink its ownership lock.
         let lease_path = lineage::owner_lock_path(&state);
-        let lease = OpenOptions::new().read(true).append(true).create(true).open(&lease_path).map_err(|e| Fault::os(&e, &lease_path))?;
+        let lease = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(&lease_path).map_err(|e| Fault::os(&e, &lease_path))?;
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -1009,10 +1312,14 @@ impl Worker {
             .env("PALETTE_HOST", &generation_host)
             .env("PALETTE_READ_ROOTS", &config.read_roots_spec)
             .env("PALETTE_MODE", &self.mode)
+            .env("PALETTE_DEPOT_MODE", self.entry.get("depot_mode").and_then(Value::as_str).unwrap_or("isolated"))
             .env("PALETTE_CONFIG_REVISION", config.revision.to_string())
             .env("PALETTE_OPERATOR_CEILING_JSON", config.ceiling.to_string())
             .env("PALETTE_SCRATCH_ROOT", &scratch)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        if let Some(n) = self.entry.get("blas_threads").and_then(Value::as_u64) {
+            command.env("PALETTE_BLAS_THREADS", n.to_string());
+        }
         if let Some(path) = &config.host_commands {
             command.env("PALETTE_HOST_COMMANDS", path);
         } else {
@@ -1132,7 +1439,10 @@ fn tools(limits: (f64, f64)) -> Value {
     control["properties"]["generation_id"] = json!({"type": "string", "maxLength": 64});
     let workspace = json!({"type": "object", "properties": {
         "action": {"enum": ["create", "attach", "list", "status", "close"]}, "scope": {"enum": ["thread", "project", "open"]},
-        "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64}},
+        "attach": {"type": "boolean"}, "project_root_id": {"type": "string", "maxLength": 64},
+        "depot_mode": {"enum": ["isolated", "shared_readonly"], "description": "isolated (default) uses only the workspace depot; shared_readonly appends the user's standard ~/.julia depot read-only behind the workspace depot to reuse precompiled caches."},
+        "blas_threads": {"type": "integer", "minimum": 1, "maximum": 256, "description": "Optional OpenBLAS/BLAS thread count applied automatically on kernel boot and revival (e.g. 1 for deterministic CPU benchmarks)."},
+        "purge_snapshot": {"type": "boolean", "description": "Only valid on close. When true, deletes saved snapshot and sidecar files for this workspace instead of retaining them."}},
         "required": ["action"], "additionalProperties": false});
     let tools = [
         ("palette", format!("Persistent Julia world. mode selects operator or sandbox for this workspace; omitted mode uses the active config default. source is transport-safe opaque Julia text; legacy code remains accepted. Explicit workspace_id wins over context_id's active workspace. Without either, uses the shared legacy world. context_id is a caller-chosen routing key, not verified identity. Files may remain shared. Quiet/full projection, payload and scratch retain their existing semantics. {}", transport::PALETTE_GUIDE), palette),
@@ -1173,6 +1483,13 @@ fn validate(args: &Value, schema: &Value) -> Result<(), Fault> {
                 }
             }
             Some("boolean") if !value.is_boolean() => return Err(bad()),
+            Some("integer") => {
+                let lo = spec.get("minimum").and_then(Value::as_i64).unwrap_or(i64::MIN);
+                let hi = spec.get("maximum").and_then(Value::as_i64).unwrap_or(i64::MAX);
+                if !value.as_i64().is_some_and(|v| v >= lo && v <= hi) {
+                    return Err(Fault::value(format!("Invalid {key}: must be an integer in [{lo}, {hi}]")));
+                }
+            }
             Some("number") => {
                 let lo = spec.get("exclusiveMinimum").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
                 let hi = spec.get("maximum").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
@@ -1333,6 +1650,17 @@ impl Session<'_> {
             }
         }
         let worker = r.child_for_mode(&entry, mode.clone());
+        if name == "palette_control" && control_action.as_deref() == Some("interrupt") {
+            let mut value = worker.interrupt_fast(Duration::from_millis(2500));
+            if let Some(fields) = value.as_object_mut() {
+                fields.insert("workspace_id".into(), entry["workspace_id"].clone());
+                fields.insert("workspace_scope".into(), entry["scope"].clone());
+                fields.insert("project_root_id".into(), entry["project_root_id"].clone());
+                fields.insert("lineage_id".into(), entry.get("lineage_id").cloned().unwrap_or(Value::Null));
+                fields.insert("mode".into(), json!(worker.mode));
+            }
+            return Ok(child::text_result(&value, false));
+        }
         if name == "palette_control"
             && matches!(control_action.as_deref(), Some("restart" | "restore"))
             && worker.config_revision().is_some_and(|revision| revision != config.revision.to_string())
@@ -1530,14 +1858,62 @@ fn serve_socket(r: Arc<Router>, path: &str) -> Result<(), Fault> {
     }
 }
 
-/// `palette-host mcp [--socket PATH]`. Returns the exit code.
+struct McpCliArgs {
+    socket: Option<String>,
+    private_dir: Option<String>,
+    private_strict: bool,
+}
+
+fn parse_mcp_cli_args(rest: &[String]) -> Result<McpCliArgs, String> {
+    let usage = "usage: palette-host mcp [--socket PATH] [--private-dir DIR] [--private-strict] | palette-host mcp start [--private-dir DIR] [--private-strict] | palette-host mcp connect | palette-host mcp child";
+    let mut out = McpCliArgs { socket: None, private_dir: None, private_strict: false };
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = rest[i].as_str();
+        if arg == "--socket" {
+            i += 1;
+            out.socket = Some(rest.get(i).ok_or_else(|| usage.to_string())?.clone());
+        } else if let Some(val) = arg.strip_prefix("--socket=") {
+            out.socket = Some(val.to_string());
+        } else if arg == "--private-dir" {
+            i += 1;
+            out.private_dir = Some(rest.get(i).ok_or_else(|| usage.to_string())?.clone());
+        } else if let Some(val) = arg.strip_prefix("--private-dir=") {
+            out.private_dir = Some(val.to_string());
+        } else if arg == "--private-strict" {
+            out.private_strict = true;
+        } else {
+            return Err(usage.to_string());
+        }
+        i += 1;
+    }
+    out.socket = out.socket.filter(|p| !p.is_empty());
+    out.private_dir = out.private_dir.filter(|p| !p.is_empty());
+    Ok(out)
+}
+
+fn apply_private_cli_env(cli: &McpCliArgs) -> Result<Option<PathBuf>, String> {
+    let root = private_lab::resolve_private_root(cli.private_dir.as_deref(), &|k| std::env::var(k).ok())?;
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let strict = private_lab::is_private_strict(cli.private_strict, &|k| std::env::var(k).ok());
+    let layout = private_lab::PrivateLabLayout::from_root(&root);
+    layout.ensure_dirs()?;
+    for (k, v) in layout.env_bindings(strict) {
+        std::env::set_var(k, v);
+    }
+    Ok(Some(layout.root))
+}
+
+/// `palette-host mcp [--socket PATH] [--private-dir DIR] [--private-strict]`. Returns the exit code.
 pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
-    let socket = match rest {
-        [] => None,
-        [flag, path] if flag == "--socket" => Some(path.as_str()),
-        [flag] if flag.starts_with("--socket=") => Some(&flag["--socket=".len()..]),
-        _ => return Err("usage: palette-host mcp [--socket PATH] | palette-host mcp start | palette-host mcp connect | palette-host mcp child".into()),
-    }.filter(|p| !p.is_empty());
+    let cli = parse_mcp_cli_args(rest)?;
+    let private_root = apply_private_cli_env(&cli)?;
+    if let (Some(priv_root), Some(sock)) = (&private_root, cli.socket.as_deref()) {
+        let sock_path = util::resolve(&util::expand_user(sock));
+        private_lab::assert_contained(&sock_path, priv_root, "--socket")?;
+    }
     let r = match Router::new() {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -1545,7 +1921,7 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
             return Ok(1);
         }
     };
-    if let Some(path) = socket {
+    if let Some(path) = cli.socket.as_deref() {
         if let Err(e) = serve_socket(r, path) {
             eprintln!("palette-host mcp: {e}");
         }
@@ -1565,10 +1941,15 @@ pub(crate) fn main(rest: &[String]) -> Result<i32, String> {
     }
 }
 
-/// `palette-host mcp start`, the clients' entry:
+/// `palette-host mcp start [--private-dir DIR] [--private-strict]`, the clients' entry:
 /// checks the instance is set up, fills the local instance's defaults for
 /// whatever its launcher left unset, then serves stdio.
-pub(crate) fn start() -> Result<i32, String> {
+pub(crate) fn start(rest: &[String]) -> Result<i32, String> {
+    let cli = parse_mcp_cli_args(rest)?;
+    if cli.socket.is_some() {
+        return Err("palette-host mcp start does not accept --socket; use `palette-host mcp --socket PATH`".into());
+    }
+    apply_private_cli_env(&cli)?;
     for (key, value) in start_defaults(&|k| std::env::var_os(k))? {
         std::env::set_var(key, value);
     }
@@ -1579,6 +1960,7 @@ pub(crate) fn start() -> Result<i32, String> {
 /// variable set, even empty, is the launcher's.
 fn start_defaults(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let given = |k: &str| var(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let var_str = |k: &str| var(k).map(|v| v.to_string_lossy().into_owned());
     let repo = match given("PALETTE_REPO") {
         Some(r) => r,
         None => crate::util::installed_checkout().ok_or("Palette setup incomplete: this binary is not inside a Palette checkout; set PALETTE_REPO")?,
@@ -1592,6 +1974,29 @@ fn start_defaults(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Ve
     }
     if !crate::util::executable(&host) {
         return Err(format!("Palette host is not executable: {}", host.display()));
+    }
+    if let Some(priv_root) = private_lab::resolve_private_root(None, &var_str)? {
+        let layout = private_lab::PrivateLabLayout::from_root(&priv_root);
+        let mut defaults: Vec<(&'static str, PathBuf)> = vec![
+            ("PALETTE_REPO", repo),
+            ("PALETTE_HOST", host),
+            ("PALETTE_HOME", layout.root.clone()),
+            ("PALETTE_PRIVATE_DIR", layout.root.clone()),
+            ("PALETTE_DATA_HOME", layout.root.clone()),
+            ("PALETTE_PRIVATE_MODE", PathBuf::from("1")),
+            ("OPERATOR_WORKSPACE", layout.workspace),
+            ("PALETTE_STATE_DIR", layout.state),
+            ("PALETTE_WORKSPACE_STATE_ROOT", layout.worlds),
+            ("PALETTE_SCRATCH_ROOT", layout.scratch),
+            ("PALETTE_PACKAGE_DEPOT", layout.packages),
+            ("PALETTE_LOGS_DIR", layout.logs),
+            ("PALETTE_PROVENANCE_DIR", layout.provenance),
+            ("PALETTE_PHAROS_CACHE_DIR", layout.pharos),
+            ("PALETTE_PINNED_CACHE_DIR", layout.pinned_cache),
+            ("PALETTE_TEAMLAB_DIR", PathBuf::from("off")),
+        ];
+        defaults.retain(|(key, _)| var(key).is_none());
+        return Ok(defaults);
     }
     let home = given("HOME").unwrap_or_default();
     let data = crate::util::resolve(&given("PALETTE_DATA_HOME").unwrap_or_else(|| home.join(".local/share/palette")));
@@ -1665,7 +2070,8 @@ mod tests {
             assert_eq!(tool["annotations"]["destructiveHint"], json!(true));
         }
         assert_eq!(schema("palette")["required"], json!([]));
-        assert_eq!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().len(), 9);
+        assert_eq!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().len(), 10);
+        assert!(schema("palette_control")["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("interrupt")));
         assert_eq!(schema("palette")["properties"]["mode"]["enum"], json!(["operator", "sandbox"]));
         assert_eq!(schema("palette_control")["properties"]["mode"]["enum"], json!(["operator", "sandbox"]));
         assert_eq!(schema("palette_control")["properties"]["generation_id"]["maxLength"], json!(64));
@@ -2098,5 +2504,454 @@ mod tests {
         a.stop_proc(&r);
         assert!(c.reserve(&r).unwrap());
         assert_eq!(lock(&r.children).starting, HashSet::from([b.key.clone(), c.key.clone()]));
+    }
+
+    #[test]
+    fn workspace_create_attach_true_without_context_id_emits_warning_and_hint() {
+        let (_tmp, r) = router(4);
+        // Explicit attach=true without context_id warns cleanly and does not hijack default route
+        let Value::Object(args) = json!({"action": "create", "workspace_id": "open-warn", "scope": "open", "attach": true}) else { unreachable!() };
+        let res = r.workspace_control(&args).unwrap();
+        assert_eq!(res["active_for_context"], json!(false));
+        assert!(res["warning"].as_str().unwrap_or("").contains("context_id"));
+        assert!(res["hint"].as_str().unwrap_or("").contains("open-warn"));
+        // Default resolution without workspace_id/context_id remains legacy "default"
+        let resolved = r.resolve(&Map::new()).unwrap();
+        assert_eq!(resolved["workspace_id"], json!("default"));
+
+        // Omitting attach without context_id creates quietly without warning
+        let Value::Object(quiet_args) = json!({"action": "create", "workspace_id": "open-quiet", "scope": "open"}) else { unreachable!() };
+        let quiet_res = r.workspace_control(&quiet_args).unwrap();
+        assert_eq!(quiet_res["active_for_context"], json!(false));
+        assert!(quiet_res.get("warning").is_none());
+
+        // attach=true WITH context_id attaches cleanly with no warning
+        let Value::Object(ctx_args) = json!({"action": "create", "workspace_id": "open-attached", "scope": "open", "attach": true, "context_id": "ctx-1"}) else { unreachable!() };
+        let ctx_res = r.workspace_control(&ctx_args).unwrap();
+        assert_eq!(ctx_res["active_for_context"], json!(true));
+        assert!(ctx_res.get("warning").is_none());
+    }
+
+    #[test]
+    fn workspace_create_supports_opt_in_depot_mode() {
+        let (_tmp, r) = router(4);
+        let schema = tools(r.limits).as_array().unwrap().iter().find(|t| t["name"] == "palette_workspace").unwrap()["inputSchema"].clone();
+        assert!(validate(&json!({"action": "create", "scope": "open", "depot_mode": "shared_readonly"}), &schema).is_ok());
+        assert!(validate(&json!({"action": "create", "scope": "open", "depot_mode": "isolated"}), &schema).is_ok());
+        assert!(validate(&json!({"action": "create", "scope": "open", "depot_mode": "invalid"}), &schema).is_err());
+
+        let Value::Object(args) = json!({"action": "create", "workspace_id": "shared-ws", "scope": "open", "depot_mode": "shared_readonly"}) else { unreachable!() };
+        let res = r.workspace_control(&args).unwrap();
+        assert_eq!(res["depot_mode"], json!("shared_readonly"));
+
+        // depot_mode is rejected on non-create actions
+        let Value::Object(bad_args) = json!({"action": "list", "depot_mode": "shared_readonly"}) else { unreachable!() };
+        assert!(r.workspace_control(&bad_args).unwrap_err().message.contains("only valid when creating"));
+    }
+
+    #[test]
+    fn workspace_attach_on_open_scope_without_context_id() {
+        let (_tmp, r) = router(4);
+        let Value::Object(create_open) = json!({"action": "create", "workspace_id": "open-attach-me", "scope": "open"}) else { unreachable!() };
+        r.workspace_control(&create_open).unwrap();
+
+        // Attaching an open world without context_id succeeds and auto-binds both default route and "open" context.
+        let Value::Object(attach_open) = json!({"action": "attach", "workspace_id": "open-attach-me"}) else { unreachable!() };
+        let res = r.workspace_control(&attach_open).unwrap();
+        assert_eq!(res["active_workspace_id"], json!("open-attach-me"));
+        assert_eq!(res["context_id"], json!("open"));
+        assert_eq!(res["auto_context"], json!(true));
+        assert_eq!(r.resolve(&Map::new()).unwrap()["workspace_id"], json!("open-attach-me"));
+        let Value::Object(open_ctx) = json!({"context_id": "open"}) else { unreachable!() };
+        assert_eq!(r.resolve(&open_ctx).unwrap()["workspace_id"], json!("open-attach-me"));
+
+        // Non-open (project) scope still requires context_id on attach.
+        let Value::Object(create_proj) = json!({"action": "create", "workspace_id": "proj-needs-ctx", "scope": "project"}) else { unreachable!() };
+        r.workspace_control(&create_proj).unwrap();
+        let Value::Object(attach_proj) = json!({"action": "attach", "workspace_id": "proj-needs-ctx"}) else { unreachable!() };
+        assert!(r.workspace_control(&attach_proj).unwrap_err().message.contains("context_id"));
+    }
+
+    #[test]
+    fn workspace_close_with_purge_snapshot_deletes_state_and_sidecars() {
+        let (_tmp, r) = router(4);
+        let schema = tools(r.limits).as_array().unwrap().iter().find(|t| t["name"] == "palette_workspace").unwrap()["inputSchema"].clone();
+        assert!(validate(&json!({"action": "close", "workspace_id": "purge-ws", "purge_snapshot": true}), &schema).is_ok());
+
+        let Value::Object(create) = json!({"action": "create", "workspace_id": "purge-ws", "scope": "open"}) else { unreachable!() };
+        let entry = r.workspace_control(&create).unwrap();
+        let state_dir = PathBuf::from(entry["state_dir"].as_str().unwrap());
+        let sb_state_dir = sandbox_state_dir(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&sb_state_dir).unwrap();
+        fs::write(state_dir.join("manifest.json"), r#"{"call": 1}"#).unwrap();
+        fs::write(state_dir.join("sidecar-abc.jls"), vec![0u8; 64]).unwrap();
+        fs::write(sb_state_dir.join("manifest.json"), r#"{"call": 1}"#).unwrap();
+
+        // Reject purge_snapshot on non-close actions
+        let Value::Object(bad) = json!({"action": "status", "workspace_id": "purge-ws", "purge_snapshot": true}) else { unreachable!() };
+        assert!(r.workspace_control(&bad).unwrap_err().message.contains("only valid when closing"));
+
+        // Close with purge_snapshot=true deletes both operator and sandbox state dirs
+        let Value::Object(close) = json!({"action": "close", "workspace_id": "purge-ws", "purge_snapshot": true}) else { unreachable!() };
+        let res = r.workspace_control(&close).unwrap();
+        assert_eq!(res["closed"], json!(true));
+        assert_eq!(res["state_retained"], json!(false));
+        assert_eq!(res["snapshot_purged"], json!(true));
+        assert!(!state_dir.exists(), "operator state_dir should have been purged");
+        assert!(!sb_state_dir.exists(), "sandbox state_dir should have been purged");
+    }
+
+    #[test]
+    fn workspace_create_supports_blas_threads_option() {
+        let (_tmp, r) = router(4);
+        let schema = tools(r.limits).as_array().unwrap().iter().find(|t| t["name"] == "palette_workspace").unwrap()["inputSchema"].clone();
+        assert!(validate(&json!({"action": "create", "scope": "open", "blas_threads": 1}), &schema).is_ok());
+        assert!(validate(&json!({"action": "create", "scope": "open", "blas_threads": 0}), &schema).is_err());
+        assert!(validate(&json!({"action": "create", "scope": "open", "blas_threads": 257}), &schema).is_err());
+        assert!(validate(&json!({"action": "create", "scope": "open", "blas_threads": 1.5}), &schema).is_err());
+        assert!(validate(&json!({"action": "create", "scope": "open", "blas_threads": "1"}), &schema).is_err());
+
+        let Value::Object(args) = json!({"action": "create", "workspace_id": "blas-1", "scope": "open", "blas_threads": 1}) else { unreachable!() };
+        let res = r.workspace_control(&args).unwrap();
+        assert_eq!(res["blas_threads"], json!(1));
+
+        let Value::Object(bad) = json!({"action": "list", "blas_threads": 1}) else { unreachable!() };
+        assert!(r.workspace_control(&bad).unwrap_err().message.contains("only valid when creating"));
+    }
+
+    #[test]
+    fn workspace_list_is_fast_and_lock_free_over_35_worlds() {
+        let (_tmp, r) = router(4);
+        for i in 0..35 {
+            let Value::Object(args) = json!({
+                "action": "create",
+                "workspace_id": format!("bench-world-{i:02}"),
+                "scope": if i % 2 == 0 { "open" } else { "thread" },
+                "context_id": format!("ctx-{i}")
+            }) else { unreachable!() };
+            r.workspace_control(&args).unwrap();
+        }
+        // Hold LOCK_EX on registry.lock to simulate concurrent writer/migration contention.
+        // A concurrently forking test can briefly inherit the previous O_CLOEXEC fd until exec().
+        let lock_path = r.root.join("registry.lock");
+        let lock_file = OpenOptions::new().read(true).append(true).create(true).open(&lock_path).unwrap();
+        let mut locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        for _ in 0..50 {
+            if locked == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        }
+        assert_eq!(locked, 0);
+
+        let Value::Object(list_args) = json!({"action": "list"}) else { unreachable!() };
+        let started = Instant::now();
+        let listed = r.workspace_control(&list_args).unwrap();
+        let elapsed = started.elapsed();
+
+        drop(lock_file);
+        assert!(elapsed < Duration::from_millis(50), "list took {:?}, expected < 50ms", elapsed);
+        // 1 default + 18 open worlds (even indices 0,2,...,34)
+        assert_eq!(listed["workspaces"].as_array().unwrap().len(), 19);
+        assert_eq!(listed["other_thread_workspaces"], json!(17));
+    }
+
+    #[test]
+    fn palette_home_private_mode_routes_all_paths_strictly_inside_root() {
+        let tmp = Tmp(util::resolve(&util::mkdtemp("palette-home-priv-").unwrap()));
+        let (repo, priv_home) = (tmp.0.join("repo"), tmp.0.join("inquisitor-home"));
+        let host = repo.join("runtime/host/target/release/palette-host");
+        fs::create_dir_all(host.parent().unwrap()).unwrap();
+        fs::write(repo.join("Project.toml"), "").unwrap();
+        fs::write(repo.join("Manifest.toml"), "").unwrap();
+        fs::write(&host, "").unwrap();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let vars: HashMap<String, String> = HashMap::from([
+            ("PALETTE_REPO".into(), repo.to_string_lossy().into()),
+            ("PALETTE_HOME".into(), priv_home.to_string_lossy().into()),
+            ("PALETTE_PRIVATE_MODE".into(), "1".into()),
+        ]);
+        let defaults: HashMap<_, _> = start_defaults(&move |k| vars.get(k).map(Into::into))
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        for key in [
+            "OPERATOR_WORKSPACE",
+            "PALETTE_STATE_DIR",
+            "PALETTE_WORKSPACE_STATE_ROOT",
+            "PALETTE_SCRATCH_ROOT",
+            "PALETTE_PACKAGE_DEPOT",
+            "PALETTE_LOGS_DIR",
+            "PALETTE_PROVENANCE_DIR",
+            "PALETTE_PHAROS_CACHE_DIR",
+            "PALETTE_PINNED_CACHE_DIR",
+        ] {
+            let p = defaults.get(key).unwrap_or_else(|| panic!("missing {key}"));
+            assert!(util::within(p, &priv_home), "{key} ({}) escaped PALETTE_HOME ({})", p.display(), priv_home.display());
+        }
+        assert_eq!(defaults["PALETTE_TEAMLAB_DIR"], PathBuf::from("off"));
+    }
+
+    #[test]
+    fn w4_2_workspace_list_exposes_live_idle_seconds_count_and_limit() {
+        let (_tmp, r) = router(4);
+        let w1 = open_worker(&r, "live-one");
+        let _w2 = open_worker(&r, "cold-two");
+        let Value::Object(list_args) = json!({"action": "list"}) else { unreachable!() };
+
+        let before = r.workspace_control(&list_args).unwrap();
+        assert_eq!(before["live_count"], json!(0));
+        assert_eq!(before["live_limit"], json!(4));
+        for ws in before["workspaces"].as_array().unwrap() {
+            assert_eq!(ws["live"], json!(false));
+            assert!(ws["idle_seconds"].is_null());
+        }
+
+        make_live(&w1);
+        *lock(&w1.last_used) = Instant::now() - Duration::from_secs(12);
+        let after = r.workspace_control(&list_args).unwrap();
+        assert_eq!(after["live_count"], json!(1));
+        assert_eq!(after["live_limit"], json!(4));
+        let ws_list = after["workspaces"].as_array().unwrap();
+        let live_entry = ws_list.iter().find(|w| w["workspace_id"] == "live-one").unwrap();
+        assert_eq!(live_entry["live"], json!(true));
+        assert!(live_entry["idle_seconds"].as_u64().unwrap() >= 12);
+        let cold_entry = ws_list.iter().find(|w| w["workspace_id"] == "cold-two").unwrap();
+        assert_eq!(cold_entry["live"], json!(false));
+        assert!(cold_entry["idle_seconds"].is_null());
+
+        w1.stop_proc(&r);
+    }
+
+    #[test]
+    fn w4_2_purge_snapshot_enforces_strict_containment() {
+        let (_tmp, r) = router(4);
+        let valid = r.root.join("workspaces/safe-ws");
+        assert!(r.validate_purge_dir(&valid, false).is_ok());
+        // Cannot purge the worlds root directory itself
+        assert!(r.validate_purge_dir(&r.root, false).is_err());
+        // Cannot purge outside r.root
+        let outside = r.base.join("outside-dir");
+        fs::create_dir_all(&outside).unwrap();
+        assert!(r.validate_purge_dir(&outside, false).is_err());
+        // Legacy state dir allowed ONLY for default workspace
+        assert!(r.validate_purge_dir(&r.legacy, false).is_err());
+        assert!(r.validate_purge_dir(&r.legacy, true).is_ok());
+        // Symlink inside r.root pointing outside is rejected
+        fs::create_dir_all(r.root.join("workspaces")).unwrap();
+        let sym = r.root.join("workspaces/escape-link");
+        std::os::unix::fs::symlink(&outside, &sym).unwrap();
+        assert!(r.validate_purge_dir(&sym, false).is_err());
+    }
+
+    #[test]
+    fn w4_2_lru_idle_eviction_and_busy_limit_error() {
+        let (_tmp, r) = router(2);
+        let w1 = open_worker(&r, "lru-oldest");
+        let w2 = open_worker(&r, "lru-recent");
+        let w3 = open_worker(&r, "lru-third");
+        let w4 = open_worker(&r, "lru-fourth");
+
+        make_live(&w1);
+        make_live(&w2);
+        *lock(&w1.last_used) = Instant::now() - Duration::from_secs(60);
+        *lock(&w2.last_used) = Instant::now() - Duration::from_secs(5);
+
+        // At limit (2), requesting w3 transparently evicts w1 (oldest idle) and keeps w2 live!
+        assert!(w3.reserve_or_evict(&r).unwrap());
+        assert!(!w1.alive(), "LRU oldest idle worker should have been evicted");
+        assert!(w2.alive(), "More recent idle worker should remain live");
+        lock(&r.children).starting.remove(&w3.key);
+        make_live(&w3);
+
+        // When ALL max_live workers are actively executing a turn, return busy workspace IDs
+        let _busy2 = lock(&w2.call);
+        let _busy3 = lock(&w3.call);
+        let err = w4.reserve_or_evict(&r).unwrap_err();
+        assert!(err.message.contains("Live workspace limit (2)"), "unexpected error: {}", err.message);
+        assert!(err.message.contains("lru-recent"), "missing busy ID lru-recent: {}", err.message);
+        assert!(err.message.contains("lru-third"), "missing busy ID lru-third: {}", err.message);
+
+        drop(_busy2);
+        drop(_busy3);
+        w2.stop_proc(&r);
+        w3.stop_proc(&r);
+    }
+
+    #[test]
+    fn w4_3_out_of_band_interrupt_sigint_and_sigkill_fallback() {
+        let (_tmp, r) = router(4);
+        let w = open_worker(&r, "interrupt-ws");
+        fs::create_dir_all(&w.state_dir).unwrap();
+
+        // 1. Not running -> instant status
+        let res_off = w.interrupt_fast(Duration::from_millis(500));
+        assert_eq!(res_off["success"], json!(true));
+        assert_eq!(res_off["interrupted"], json!(false));
+        assert_eq!(res_off["status"], json!("not_running"));
+
+        // 2. Live & idle -> instant status
+        make_live(&w);
+        let res_idle = w.interrupt_fast(Duration::from_millis(500));
+        assert_eq!(res_idle["success"], json!(true));
+        assert_eq!(res_idle["interrupted"], json!(false));
+        assert_eq!(res_idle["status"], json!("idle"));
+        w.stop_proc(&r);
+
+        // 3. Busy worker that handles SIGINT cleanly -> fast SIGINT unwind
+        let sigint_child = Command::new("sh")
+            .args(["-c", "trap 'kill $! 2>/dev/null; exit 0' INT; sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let sigint_pid = sigint_child.id();
+        fs::write(
+            w.state_dir.join(".worker_pid"),
+            json!({"pid": sigint_pid, "pgid": null, "session_pid": std::process::id(), "epoch": "e1"}).to_string(),
+        ).unwrap();
+        {
+            let mut proc = lock(&w.proc);
+            proc.child = Some(sigint_child);
+        }
+        // Hold w.call in a background thread until the child exits
+        let w_bg = Arc::clone(&w);
+        let holder = std::thread::spawn(move || {
+            let _call = lock(&w_bg.call);
+            for _ in 0..100 {
+                if !w_bg.alive() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let res_int = w.interrupt_fast(Duration::from_millis(1500));
+        let elapsed_int = t0.elapsed();
+        holder.join().unwrap();
+        assert_eq!(res_int["success"], json!(true));
+        assert_eq!(res_int["interrupted"], json!(true));
+        assert_eq!(res_int["method"], json!("sigint"));
+        assert!(elapsed_int < Duration::from_secs(2), "SIGINT interrupt took {:?}", elapsed_int);
+        w.stop_proc(&r);
+
+        // 4. Wedged worker ignoring SIGINT -> escalates cleanly to SIGKILL within < 2s
+        let wedged_child = Command::new("sh")
+            .args(["-c", "trap '' INT; sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let wedged_pid = wedged_child.id();
+        fs::write(
+            w.state_dir.join(".worker_pid"),
+            json!({"pid": wedged_pid, "pgid": null, "session_pid": std::process::id(), "epoch": "e2"}).to_string(),
+        ).unwrap();
+        {
+            let mut proc = lock(&w.proc);
+            proc.child = Some(wedged_child);
+        }
+        let w_bg2 = Arc::clone(&w);
+        let holder2 = std::thread::spawn(move || {
+            let _call = lock(&w_bg2.call);
+            for _ in 0..150 {
+                if !w_bg2.alive() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t1 = Instant::now();
+        let res_kill = w.interrupt_fast(Duration::from_millis(350));
+        let elapsed_kill = t1.elapsed();
+        holder2.join().unwrap();
+        assert_eq!(res_kill["success"], json!(true));
+        assert_eq!(res_kill["interrupted"], json!(true));
+        assert_eq!(res_kill["method"], json!("sigkill"));
+        assert_eq!(res_kill["kernel_preserved"], json!(false));
+        assert_eq!(res_kill["auto_respawn"], json!(true));
+        assert!(elapsed_kill < Duration::from_secs(3), "SIGKILL fallback took {:?}", elapsed_kill);
+        w.stop_proc(&r);
+    }
+
+    #[test]
+    fn w5_3_workspace_attach_open_without_context_id_and_thread_enforcement() {
+        let (_tmp, r) = router(4);
+        let Value::Object(create_open) = json!({
+            "action": "create",
+            "workspace_id": "w5-open-shared",
+            "scope": "open"
+        }) else { unreachable!() };
+        r.workspace_control(&create_open).unwrap();
+
+        // 1. Attach to scope="open" with context_id = None succeeds, returns metadata + active_for_context=false
+        let Value::Object(attach_open_no_ctx) = json!({
+            "action": "attach",
+            "workspace_id": "w5-open-shared"
+        }) else { unreachable!() };
+        let res_no_ctx = r.workspace_control(&attach_open_no_ctx).unwrap();
+        assert_eq!(res_no_ctx["workspace_id"], json!("w5-open-shared"));
+        assert_eq!(res_no_ctx["active_workspace_id"], json!("w5-open-shared"));
+        assert_eq!(res_no_ctx["scope"], json!("open"));
+        assert_eq!(res_no_ctx["owner_context"], Value::Null);
+        assert_eq!(res_no_ctx["lineage_id"], json!("workspace:w5-open-shared"));
+        assert!(res_no_ctx["state_dir"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(res_no_ctx["active_for_context"], json!(false));
+
+        // 2. Attach to scope="open" WITH explicit context_id sets active_for_context=true and binds that context
+        let Value::Object(attach_open_with_ctx) = json!({
+            "action": "attach",
+            "workspace_id": "w5-open-shared",
+            "context_id": "w5-caller-ctx"
+        }) else { unreachable!() };
+        let res_with_ctx = r.workspace_control(&attach_open_with_ctx).unwrap();
+        assert_eq!(res_with_ctx["workspace_id"], json!("w5-open-shared"));
+        assert_eq!(res_with_ctx["active_workspace_id"], json!("w5-open-shared"));
+        assert_eq!(res_with_ctx["context_id"], json!("w5-caller-ctx"));
+        assert_eq!(res_with_ctx["active_for_context"], json!(true));
+        let Value::Object(caller_ctx) = json!({"context_id": "w5-caller-ctx"}) else { unreachable!() };
+        assert_eq!(r.resolve(&caller_ctx).unwrap()["workspace_id"], json!("w5-open-shared"));
+
+        // 3. Thread-scoped workspaces continue to strictly enforce context_id ownership
+        let Value::Object(create_thread) = json!({
+            "action": "create",
+            "workspace_id": "w5-thread-owned",
+            "scope": "thread",
+            "context_id": "w5-owner-ctx"
+        }) else { unreachable!() };
+        r.workspace_control(&create_thread).unwrap();
+
+        let Value::Object(attach_thread_no_ctx) = json!({
+            "action": "attach",
+            "workspace_id": "w5-thread-owned"
+        }) else { unreachable!() };
+        let err_no_ctx = r.workspace_control(&attach_thread_no_ctx).unwrap_err();
+        assert_eq!(err_no_ctx.kind, "PermissionError");
+
+        let Value::Object(attach_thread_wrong_ctx) = json!({
+            "action": "attach",
+            "workspace_id": "w5-thread-owned",
+            "context_id": "w5-wrong-ctx"
+        }) else { unreachable!() };
+        let err_wrong_ctx = r.workspace_control(&attach_thread_wrong_ctx).unwrap_err();
+        assert_eq!(err_wrong_ctx.kind, "PermissionError");
+
+        let Value::Object(attach_thread_right_ctx) = json!({
+            "action": "attach",
+            "workspace_id": "w5-thread-owned",
+            "context_id": "w5-owner-ctx"
+        }) else { unreachable!() };
+        let res_thread_ok = r.workspace_control(&attach_thread_right_ctx).unwrap();
+        assert_eq!(res_thread_ok["workspace_id"], json!("w5-thread-owned"));
+        assert_eq!(res_thread_ok["active_for_context"], json!(true));
+        assert_eq!(res_thread_ok["owner_context"], json!("w5-owner-ctx"));
     }
 }

@@ -27,8 +27,8 @@ const TIME_MACHINE_NOTICE = Ref("")
 # The restore this kernel started with: set before revival, read when it ends.
 const RESTORE_INFO = Ref{Union{Nothing, Dict{String, Any}}}(nothing)
 
-checkpoints_dir() = joinpath(STATE_DIR[], "checkpoints")
-blobs_dir() = joinpath(STATE_DIR[], "blobs")
+checkpoints_dir() = joinpath(effective_state_dir(), "checkpoints")
+blobs_dir() = joinpath(effective_state_dir(), "blobs")
 blob_path(sha::AbstractString) = joinpath(blobs_dir(), sha)
 utc_now() = Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 
@@ -174,12 +174,16 @@ Links the snapshot `manifest` describes into a checkpoint called `name`, and
 returns its record.
 """
 function save_checkpoint!(name::String, note::String, m::AbstractDict)
-    dir = STATE_DIR[]
+    dir = effective_state_dir(; create=true)
     final = joinpath(checkpoints_dir(), name)
     isdir(final) && error("checkpoint `$name` exists")
     tmp = final * ".partial"
     rm(tmp; force=true, recursive=true)
-    mkpath(tmp)
+    if is_private_mode()
+        _ensure_private_dir!(tmp)
+    else
+        mkpath(tmp)
+    end
     link_or_copy(joinpath(dir, "manifest.json"), joinpath(tmp, "manifest.json"))
     for g in m["data"]
         link_or_copy(joinpath(dir, g["file"]), joinpath(tmp, g["file"]))
@@ -192,15 +196,18 @@ function save_checkpoint!(name::String, note::String, m::AbstractDict)
                           for b in m["bindings"] if b["class"] == "definition"],
         "includes" => keep_include_sources!(m),
         "data" => [Dict{String, Any}("names" => g["names"], "file" => g["file"], "sha256" => g["sha256"]) for g in m["data"]])
-    write(joinpath(tmp, "checkpoint.json"), JSON.json(record))   # last: a checkpoint without it is incomplete
+    cp_json = joinpath(tmp, "checkpoint.json")
+    write(cp_json, JSON.json(record))   # last: a checkpoint without it is incomplete
+    _enforce_private_file_perms!(cp_json)
     mv(tmp, final)
+    is_private_mode() && _ensure_private_dir!(final)
     note_world_event!(Dict{String, Any}("event" => "checkpoint", "time" => record["created"], "checkpoint" => name, "call" => m["call"]); world=w)
     return record
 end
 
 # --- world identity ------------------------------------------------------
 
-world_path() = joinpath(STATE_DIR[], "world.json")
+world_path() = joinpath(effective_state_dir(), "world.json")
 
 # This state directory's world: its id, the checkpoint it was forked from, and
 # what happened to it. Made on first use.
@@ -208,7 +215,7 @@ function world_record()
     path = world_path()
     isfile(path) && return try read_json(path) catch; new_world(nothing) end
     w = new_world(nothing)
-    write_state_file!(STATE_DIR[], "world.json", JSON.json(w))
+    write_state_file!(effective_state_dir(; create=true), "world.json", JSON.json(w))
     return w
 end
 
@@ -217,7 +224,7 @@ new_world(parent) = Dict{String, Any}("id" => string(uuid4()), "parent" => paren
 function note_world_event!(event::AbstractDict; world=world_record())
     push!(world["history"], event)
     length(world["history"]) > MAX_WORLD_HISTORY && deleteat!(world["history"], 1:length(world["history"]) - MAX_WORLD_HISTORY)
-    write_state_file!(STATE_DIR[], "world.json", JSON.json(world))
+    write_state_file!(effective_state_dir(; create=true), "world.json", JSON.json(world))
     return world
 end
 
@@ -225,7 +232,7 @@ end
 
 # Every checkpoint's record, oldest first, and how many records could not be
 # read. A corrupt checkpoint.json is skipped rather than failing the listing.
-function read_checkpoint_records(dir::String=STATE_DIR[])
+function read_checkpoint_records(dir::String=effective_state_dir())
     root = joinpath(dir, "checkpoints")
     records = Dict{String, Any}[]
     unreadable = 0
@@ -244,7 +251,7 @@ function read_checkpoint_records(dir::String=STATE_DIR[])
     return sort!(records; by=r -> (r["created"], r["name"])), unreadable
 end
 
-checkpoint_records(dir::String=STATE_DIR[]) = first(read_checkpoint_records(dir))
+checkpoint_records(dir::String=effective_state_dir()) = first(read_checkpoint_records(dir))
 
 """
     Palette.checkpoints() -> (; world, checkpoints)
@@ -391,7 +398,7 @@ function swap_in_checkpoint!(name::String, fork::Bool)
     write_state_file!(dir, "manifest.json", JSON.json(m))   # the commit point
     rm(joinpath(dir, "started_call"); force=true)
     for f in readdir(dir)
-        startswith(f, "data-") && !(f in keep) && rm(joinpath(dir, f); force=true)
+        (startswith(f, "data-") || startswith(f, "sidecar-")) && !(f in keep) && rm(joinpath(dir, f); force=true)
     end
     # Clean-up only: the restore has already happened and must not fail on it.
     pruned = try prune_auto_checkpoints!(name, m["definitions"]) catch; String[] end

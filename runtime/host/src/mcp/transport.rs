@@ -18,6 +18,46 @@ use crate::{cli, util};
 pub(crate) const PREPARATION_TIMEOUT_SECS: u64 = 1800;
 pub(crate) const WORKER_STARTUP_TIMEOUT_SECS: u64 = 180;
 const ROUTER_TRANSPORT_GRACE_SECS: u64 = 30;
+pub(crate) const DEFAULT_MCP_GATEWAY_TIMEOUT_SECS: f64 = 180.0;
+pub(crate) const PRE_GATEWAY_HEADROOM_SECS: f64 = 15.0;
+
+/// Reads `PALETTE_MCP_GATEWAY_TIMEOUT` (default 180s). Set to `0`, `off`, or `none`
+/// to disable pre-gateway timeout clamping.
+pub(crate) fn mcp_gateway_timeout(var: impl Fn(&str) -> Option<String>) -> Option<f64> {
+    match var("PALETTE_MCP_GATEWAY_TIMEOUT") {
+        None => Some(DEFAULT_MCP_GATEWAY_TIMEOUT_SECS),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("off")
+                || trimmed == "0"
+            {
+                None
+            } else {
+                trimmed
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|&v| v.is_finite() && v > PRE_GATEWAY_HEADROOM_SECS)
+            }
+        }
+    }
+}
+
+/// Enforces a clean bounded pre-gateway timeout ceiling (`gateway - PRE_GATEWAY_HEADROOM_SECS`)
+/// so Palette always returns a structured timeout response with captured output and clean
+/// worker recovery before an upstream MCP transport drops the connection (e.g. at 180s).
+pub(crate) fn effective_mcp_timeout(requested: f64, gateway_timeout_s: Option<f64>) -> (f64, bool) {
+    let Some(gw) = gateway_timeout_s.filter(|&g| g.is_finite() && g > PRE_GATEWAY_HEADROOM_SECS) else {
+        return (requested, false);
+    };
+    let cap = (gw - PRE_GATEWAY_HEADROOM_SECS).max(1.0);
+    if requested > cap {
+        (cap, true)
+    } else {
+        (requested, false)
+    }
+}
 
 pub(crate) fn normalize_palette_call(args: &Value) -> Result<Map<String, Value>, String> {
     let mut value = args.as_object().ok_or("Palette arguments must be an object")?.clone();
@@ -281,5 +321,22 @@ mod tests {
         );
         assert_eq!(props["context"]["enum"], json!(CONTEXT_NAMES));
         assert_eq!(control_properties()["checkpoint"], json!({"type": "string", "maxLength": 64}));
+    }
+
+    #[test]
+    fn pre_gateway_timeout_clamps_cleanly_under_180s_ceiling() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(mcp_gateway_timeout(env(&[])), Some(180.0));
+        assert_eq!(mcp_gateway_timeout(env(&[("PALETTE_MCP_GATEWAY_TIMEOUT", "0")])), None);
+        assert_eq!(mcp_gateway_timeout(env(&[("PALETTE_MCP_GATEWAY_TIMEOUT", "off")])), None);
+        assert_eq!(mcp_gateway_timeout(env(&[("PALETTE_MCP_GATEWAY_TIMEOUT", "240")])), Some(240.0));
+
+        assert_eq!(effective_mcp_timeout(60.0, Some(180.0)), (60.0, false));
+        assert_eq!(effective_mcp_timeout(165.0, Some(180.0)), (165.0, false));
+        assert_eq!(effective_mcp_timeout(180.0, Some(180.0)), (165.0, true));
+        assert_eq!(effective_mcp_timeout(600.0, Some(180.0)), (165.0, true));
+        assert_eq!(effective_mcp_timeout(600.0, None), (600.0, false));
     }
 }

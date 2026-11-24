@@ -98,6 +98,12 @@ pub(crate) fn dir_from_env(var: impl Fn(&str) -> Option<String>) -> Result<Optio
     let configured = match var("PALETTE_TEAMLAB_DIR") {
         Some(d) => d,
         None => {
+            // Private lab isolation disables the shared TeamLab shop unless explicitly configured.
+            if crate::private_lab::is_truthy_str(var("PALETTE_PRIVATE_MODE").as_deref())
+                || var("PALETTE_PRIVATE_DIR").is_some_and(|v| !v.trim().is_empty())
+            {
+                return Ok(None);
+            }
             let data = var("XDG_DATA_HOME").map(PathBuf::from).filter(|d| d.is_absolute())
                 .or_else(|| Some(Path::new(&var("HOME")?).join(".local/share")));
             return Ok(data.map(|d| d.join("palette/teamlab")));

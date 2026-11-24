@@ -26,9 +26,29 @@ using UUIDs
 using Sockets
 using JSON
 using SHA
+using Joovy
 using PrecompileTools: @compile_workload
 using Base.CoreLogging: AbstractLogger, with_logger, current_logger
-using Statistics: mean as stdlib_mean
+using Statistics: mean as stdlib_mean, median as stdlib_median
+
+"""
+    bind_joovy!(mod)
+
+Put Joovy's TTFX helpers on the session module. `joovy_use` / `joovy_compile_tiered`
+must compile into `mod`, not host `Main`.
+"""
+function bind_joovy!(mod::Module)
+    Core.eval(mod, :(const Joovy = $(Joovy)))
+    Core.eval(mod, :(joovy_compile_tiered(code::AbstractString; kwargs...) =
+        $(Joovy.joovy_compile_tiered)(String(code); mod=@__MODULE__, kwargs...)))
+    Core.eval(mod, :(joovy_use(path::AbstractString; kwargs...) =
+        $(Joovy.joovy_use)(String(path); mod=@__MODULE__, kwargs...)))
+    Core.eval(mod, :(joovy_warm(packages; kwargs...) = $(Joovy.joovy_warm)(packages; kwargs...)))
+    Core.eval(mod, :(prepare_cold_load!(args...; kwargs...) = $(Joovy.prepare_cold_load!)(args...; kwargs...)))
+    Core.eval(mod, :(finish_cold_load!() = $(Joovy.finish_cold_load!)()))
+    Core.eval(mod, :(compile_report() = $(Joovy.compile_report)()))
+    return nothing
+end
 
 #==============================================================================
 PHASE 2: Operator Types & Vocabulary (leaf types first)
@@ -209,6 +229,7 @@ mutable struct KernelState
         # `Palette.request_capability(...)` without importing it each turn.
         Core.eval(state.eval_module, :(const Palette = $(Api)))
         Core.eval(state.eval_module, :(const Api = $(Api)))
+        Core.eval(state.eval_module, :(const Pharos = $(Pharos)))
         Core.eval(state.eval_module, :(const Main = $(state.eval_module)))
         # A bare `Module(...)` has no `include` of its own. This one loads
         # files into the eval module, not Main, so code written to disk
@@ -230,11 +251,30 @@ mutable struct KernelState
         # it becomes a string-macro suffix, which Julia reported as a
         # MethodError for @sh_str that did not say what happened.
         Core.eval(state.eval_module, :(macro sh_str(script, suffix) $(sh_suffix_error)(suffix) end))
+        Core.eval(state.eval_module, :(macro ephemeral(ex) $(_ephemeral_macro_expand)(ex) end))
+        Core.eval(state.eval_module, :(macro alloc_barrier(ex) $(_alloc_barrier_macro_expand)(ex) end))
+        Core.eval(state.eval_module, :(reinclude_module!(path::AbstractString; mod_name::Union{Nothing, Symbol}=nothing, into::Union{Nothing, Module}=nothing) = $(reinclude_module!)(path; mod_name, into)))
+        Core.eval(state.eval_module, :(reinclude_module!(mod_name::Symbol, path::AbstractString; into::Union{Nothing, Module}=nothing) = $(reinclude_module!)(mod_name, path; into)))
+        Core.eval(state.eval_module, :(reset_bindings!(syms::Symbol...; mod::Union{Nothing, Module}=nothing) = $(reset_bindings!)(syms...; mod)))
+        Core.eval(state.eval_module, :(reset_bindings!(syms::AbstractVector{Symbol}; mod::Union{Nothing, Module}=nothing) = $(reset_bindings!)(syms; mod)))
         Core.eval(state.eval_module, :(const ShellResult = $(ShellResult)))
         # The InteractiveUtils varinfo() lists Main, not this module, and is not
         # loaded here at all; this one lists the session's own bindings.
         Core.eval(state.eval_module, :(varinfo() = $(varinfo)(@__MODULE__)))
         Core.eval(state.eval_module, :(kernelinfo() = $(kernelinfo)()))
+        # Models type `ls`; Julia Base only has readdir. Bind both names.
+        Core.eval(state.eval_module, :(ls(path::AbstractString=".") = readdir(path)))
+        bind_joovy!(state.eval_module)
+        if ccall(:jl_generating_output, Cint, ()) == 0
+            scope_sym = nameof(state.eval_module)
+            if startswith(string(scope_sym), "KernelScope_") &&
+               (!latest_isdefined(Core.Main, scope_sym) || !Base.invokelatest(isconst, Core.Main, scope_sym))
+                try
+                    Core.eval(Core.Main, Expr(:(=), scope_sym, state.eval_module))
+                catch
+                end
+            end
+        end
         state.variables = Dict{String, Any}()
         state.execution_history = ExecutionRecord[]
         state.operator_registry = Dict{String, Function}()
@@ -275,6 +315,11 @@ Resets the kernel state (useful for testing or clean restarts).
 """
 function reset_kernel_state()
     GLOBAL_STATE[] = nothing
+    empty!(MMAP_BINDINGS)
+    empty!(EPHEMERAL_BINDINGS)
+    empty!(SANDBOX_MODULES)
+    empty!(SANDBOX_MODULE_GENERATIONS)
+    ACTIVE_CODEGRAPH_ROOT[] = nothing
     return nothing
 end
 
@@ -302,6 +347,9 @@ function reset_kernel_state!(; process::Bool=false)
     empty!(DEFINITION_LOG); clear_definition_index!()
     empty!(CALL_FILES); empty!(USED_FILES)
     empty!(BINDING_SEEN); empty!(BINDING_ORIGINS); empty!(BINDING_IDENTITIES)
+    empty!(MMAP_BINDINGS)
+    empty!(EPHEMERAL_BINDINGS)
+    empty!(SANDBOX_MODULES); empty!(SANDBOX_MODULE_GENERATIONS)
     empty!(OUTPUTS); empty!(XRAY)
     OBSERVATION_ACK[] = nothing
     empty!(LAST_RUNNING[])
@@ -327,6 +375,7 @@ function reset_kernel_state!(; process::Bool=false)
     PENDING_CHECKPOINT[] = nothing
     TIME_MACHINE_NOTICE[] = ""
     SESSION_CONTEXT[] = nothing
+    ACTIVE_CODEGRAPH_ROOT[] = nothing
     empty!(CODE_GRAPHS)
     return nothing
 end
@@ -491,11 +540,19 @@ the command's stdout and then its stderr, and returns them with the exit code
 instead of throwing on a nonzero one. Turn code reaches it as `bash(script)`,
 or as `sh"..."`, which passes `\$` to the shell instead of interpolating it.
 """
+const TURN_TASK = Ref{Union{Task, Nothing}}(nothing)
+const TURN_DONE = Ref{Union{Base.Event, Nothing}}(nothing)
+
 function run_bash(script::AbstractString)
     # Files, not pipes: a command that puts a job in the background (`job &`)
     # hands it the pipe, and reading a pipe to its end waited for the job,
     # up to the call's time limit, which then killed it. Only bash is waited
     # for; what the job writes later is reported at the start of a later call.
+    done = TURN_DONE[]
+    # Background `@async bash(...)` (the turn task is someone else, or the turn
+    # already returned). Synchronous bash on the turn task keeps the ShellResult
+    # in that call and does not ring the host doorbell.
+    notify_when_done = current_task() !== TURN_TASK[]
     out, err = tempname(), tempname()
     # Append mode, so the files can be truncated safely once reported (turn.jl).
     p = open(out, "a") do o
@@ -508,7 +565,54 @@ function run_bash(script::AbstractString)
     keep_for_late_output!(err, ncodeunits(e))
     print(stdout, o)
     print(stderr, e)
-    return ShellResult(p.termsignal > 0 ? 128 + p.termsignal : p.exitcode, o, e)
+    exitcode = p.termsignal > 0 ? 128 + p.termsignal : p.exitcode
+    notify_when_done && maybe_notify_bash_completed(bash_completion_id(p), script, exitcode, done)
+    return ShellResult(exitcode, o, e)
+end
+
+const BASH_COMPLETED_COMMAND_CAP = 2000
+const BASH_COMPLETION_SEQ = Threads.Atomic{Int}(0)
+
+# Julia 1.12 Process drops its OS pid once reaped (`getpid` → ESRCH). Long
+# jobs can still report the real pid; instant ones get a positive job id.
+function bash_completion_id(p)
+    try
+        pid = Int(getpid(p))
+        pid > 0 && return pid
+    catch
+    end
+    return Threads.atomic_add!(BASH_COMPLETION_SEQ, 1) + 1
+end
+
+# Independent `@async bash(...)` work: after the creating turn returns, ask the
+# agent host to start a follow-up, the same class as IPython `[bash-done …]`.
+# Synchronous bash during a turn already returns the ShellResult in that call.
+function maybe_notify_bash_completed(pid, command::AbstractString, exitcode::Integer, done)
+    isempty(get(ENV, "PALETTE_BROKER_SOCKET", "")) && return nothing
+    try
+        pid = Int(pid)
+        pid > 0 || return nothing
+        cmd = String(command)
+        if ncodeunits(cmd) > BASH_COMPLETED_COMMAND_CAP
+            cmd = cmd[1:prevind(cmd, BASH_COMPLETED_COMMAND_CAP + 1)] * "\n... [command truncated]"
+        end
+        payload = Dict{String, Any}("pid" => pid, "command" => cmd, "exitCode" => Int(exitcode))
+        @async begin
+            try
+                done !== nothing && wait(done)
+            catch e
+                e isa InterruptException && rethrow()
+            end
+            try
+                host_request("bash.completed", payload)
+            catch e
+                e isa InterruptException && rethrow()
+            end
+        end
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return nothing
 end
 
 function sh_suffix_error(suffix::AbstractString)
@@ -820,9 +924,70 @@ forget_reference!(f, sig::Type{<:Tuple}) = Palette.forget_reference!(f, sig)
 promote(name::Symbol; doc::Union{Nothing, AbstractString}=nothing) = Palette.promote_tool(name; doc)
 tools() = Palette.tool_index()
 trust(name::Symbol) = Palette.trust_request(name)
-codegraph(root::AbstractString=Palette.WORKSPACE_ROOT[]) = Palette.codegraph(root)
-definitions(name::AbstractString) = Palette.Pharos.definitions(Palette.codegraph(), name)
-callers(name::AbstractString) = Palette.Pharos.callers(Palette.codegraph(), name)
+codegraph(root::AbstractString=Palette.default_codegraph_root()) = Palette.codegraph(root)
+codegraph!(root::Union{Nothing, AbstractString}) = Palette.codegraph!(root)
+definitions(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
+    Palette.definitions(name; graph, root, match, kwargs...)
+callers(name::Union{AbstractString, Symbol}; graph=nothing, root::Union{Nothing, AbstractString}=nothing, match::Symbol=:exact, kwargs...) =
+    Palette.callers(name; graph, root, match, kwargs...)
+grep_defs(substring::AbstractString; graph=nothing, path_prefix::AbstractString="", root::Union{Nothing, AbstractString}=nothing, kwargs...) =
+    Palette.grep_defs(substring; graph, path_prefix, root, kwargs...)
+bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, dims::Tuple{Vararg{Integer}}; offset::Integer=0) where {T} =
+    Palette.bind_mmap(name, path, T, dims; offset)
+bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, len::Integer; offset::Integer=0) where {T} =
+    Palette.bind_mmap(name, path, T, len; offset)
+ephemeral!(sym::Symbol) = Palette.ephemeral!(sym)
+ephemeral!(syms::Symbol...) = Palette.ephemeral!(syms...)
+unephemeral!(sym::Symbol) = Palette.unephemeral!(sym)
+ephemerals() = Palette.ephemerals()
+safe_summarysize(x; kwargs...) = Palette.safe_summarysize(x; kwargs...)
+macro ephemeral(ex)
+    return Palette._ephemeral_macro_expand(ex)
+end
+isolate_module(name::Symbol, path::AbstractString; reset::Bool=true) =
+    Palette.isolate_module(name, path; reset)
+reset_sandbox_module!(name::Symbol) = Palette.reset_sandbox_module!(name)
+sandbox_modules() = Palette.sandbox_modules()
+reinclude_module!(path::AbstractString; mod_name::Union{Nothing, Symbol}=nothing, into::Union{Nothing, Module}=nothing) =
+    Palette.reinclude_module!(path; mod_name, into)
+reinclude_module!(mod_name::Symbol, path::AbstractString; into::Union{Nothing, Module}=nothing) =
+    Palette.reinclude_module!(mod_name, path; into)
+reset_bindings!(syms::Symbol...; mod::Union{Nothing, Module}=nothing) =
+    Palette.reset_bindings!(syms...; mod)
+reset_bindings!(syms::AbstractVector{Symbol}; mod::Union{Nothing, Module}=nothing) =
+    Palette.reset_bindings!(syms; mod)
+eval_isolated(code::AbstractString; entry::Union{Nothing, Symbol}=nothing, args=(), kwargs=NamedTuple(), tests::Union{Nothing, AbstractString}=nothing) =
+    Palette.eval_isolated(code; entry, args, kwargs, tests)
+depot_mode() = Palette.depot_mode()
+enable_shared_depot!(path::AbstractString=joinpath(homedir(), ".julia")) = Palette.enable_shared_depot!(path)
+reload_methods!(path::AbstractString; mod::Module=Palette.get_kernel_state().eval_module) =
+    Palette.reload_methods!(path; mod)
+pin_cache!(key::Union{Symbol, AbstractString}, val; kwargs...) = Palette.pin_cache!(key, val; kwargs...)
+get_cache(key::Union{Symbol, AbstractString}; kwargs...) = Palette.get_cache(key; kwargs...)
+cache_get!(builder::Function, key::Union{Symbol, AbstractString}; kwargs...) =
+    Palette.cache_get!(builder, key; kwargs...)
+clear_cache!(; kwargs...) = Palette.clear_cache!(; kwargs...)
+clear_cache!(key::Union{Symbol, AbstractString}; kwargs...) = Palette.clear_cache!(key; kwargs...)
+summary(target::Union{Nothing, AbstractString}=nothing; max_files::Int=50) =
+    Palette.summary(target; max_files)
+bench(f::F, args::Vararg{Any, N}; warmup::Int=2, samples::Int=11) where {F, N} =
+    Palette.bench(f, args...; warmup, samples)
+macro bench(ex, opts...)
+    return Palette._bench_macro_expand(ex, opts)
+end
+macro alloc_barrier(ex)
+    return Palette._alloc_barrier_macro_expand(ex)
+end
+warntype_summary(f, args...) = Palette.warntype_summary(f, args...)
+warntype_summary_call(f, args...) = Palette.warntype_summary_call(f, args...)
+set_blas_threads!(n::Integer) = Palette.set_blas_threads!(n)
+get_blas_threads() = Palette.get_blas_threads()
+serve_unix_socket(handler::Function, path::AbstractString; kwargs...) =
+    Palette.serve_unix_socket(handler, path; kwargs...)
+stop!(handle) = Palette.stop!(handle)
+check_private_isolation(; kwargs...) = Palette.check_private_isolation(; kwargs...)
+private_lab_root() = Palette.private_lab_root()
+configure_private_lab!(; kwargs...) = Palette.configure_private_lab!(; kwargs...)
 function costs(n::Integer)
     haskey(Palette.TURN_COSTS, n) || error("no phase observations retained for call $n")
     return deepcopy(Palette.TURN_COSTS[n])
@@ -849,8 +1014,12 @@ end
 
 # Bindings the kernel creates in every session module. They are not the
 # model's own variables, so GetState and varinfo() leave them out.
-const KERNEL_BINDINGS = (:eval, :include, :bash, Symbol("@sh_str"), :Palette, :Api, :ShellResult,
-                         :varinfo, :kernelinfo, :ans, :PAYLOAD, :Main)
+const KERNEL_BINDINGS = (:eval, :include, :bash, Symbol("@sh_str"), Symbol("@ephemeral"), Symbol("@alloc_barrier"),
+                         :reinclude_module!, :reset_bindings!,
+                         :Palette, :Api, :Pharos, :ShellResult,
+                         :varinfo, :kernelinfo, :ls, :Joovy, :joovy_compile_tiered, :joovy_use,
+                         :joovy_warm, :prepare_cold_load!, :finish_cold_load!, :compile_report,
+                         :ans, :PAYLOAD, :Main)
 
 """
     VarInfo
@@ -876,7 +1045,7 @@ function _summary(v)
     v isa Type && return "type"
     v isa Module && return "module"
     return try
-        summary(v)
+        Base.summary(v)
     catch
         string(typeof(v))
     end
@@ -893,10 +1062,15 @@ function varinfo(mod::Module=get_kernel_state().eval_module)
         session_binding(mod, sym) || continue
         latest_isdefined(mod, sym) || continue
         v = latest_global(mod, sym)
-        size = try
-            Base.format_bytes(Base.summarysize(v))
-        catch
-            "?"
+        size = if sym in EPHEMERAL_BINDINGS
+            "ephemeral"
+        else
+            nbytes = try
+                safe_summarysize(v)
+            catch
+                nothing
+            end
+            nbytes === nothing ? "?" : Base.format_bytes(nbytes)
         end
         push!(rows, (string(sym), size, _summary(v)))
     end
@@ -934,7 +1108,9 @@ function kernelinfo()
                    loaded: $(isempty(loaded) ? "none" : join(loaded, ", "))
         helpers    bash("cmd") or sh"cmd" -> ShellResult(exitcode, stdout, stderr); sh"..." keeps \$ for the shell
                    PAYLOAD: this call's payload text, raw; write(path, PAYLOAD) writes a file with no Julia quoting
-                   ans: the last call's value.  varinfo(): your bindings.  include("file.jl") loads a workspace file
+                   ans: the last call's value.  varinfo(): your bindings.  ls(path="."): directory listing (readdir)
+                   include("file.jl") loads a workspace file.  joovy_use("file.jl") lazy-loads it (tier 1, promotes when hot)
+                   joovy_compile_tiered("f(x)=..."); prepare_cold_load!(0); finish_cold_load!(); compile_report()
                    Palette.output(n): everything call n printed, in full, when the result you saw was elided
         reloading  a package loaded from the workspace is reloaded when its source changes, before the next
                    call or include runs, so `using` it again is not needed. When the workspace is itself a
@@ -1012,7 +1188,10 @@ function describe_error(e, bt, call_file::AbstractString, scope::Module)
     catch
         return msg
     end
-    boundary = findfirst(f -> f.func === :execute && endswith(string(f.file), "Palette.jl"), frames)
+    boundary = findfirst(f -> (f.func === :execute && endswith(string(f.file), "Palette.jl")) ||
+                              (f.func in (:eval_observed, :observed_statement) && endswith(string(f.file), "provenance.jl")) ||
+                              (startswith(string(f.func), "#eval_observed") && endswith(string(f.file), "provenance.jl")),
+                         frames)
     frames = boundary === nothing ? frames : frames[1:boundary-1]
     filter!(f -> !(f.func === :eval && clean(f.file) == "boot.jl"), frames)
     # No frame from the model's own code (a failed `using`, say): the rest is
@@ -1071,6 +1250,7 @@ function execute(op::ExecuteCode)::OperationReceipt
 
     result = OperationResult(nothing, true, nothing)
     error_msg = nothing
+    was_interrupted = false
     call_file = "call $(next_call())"
 
     try
@@ -1109,12 +1289,14 @@ function execute(op::ExecuteCode)::OperationReceipt
                 state.variables[string(sym)] = latest_global(state.eval_module, sym)
             end
         end
+        sync_kernel_modules_to_main!(state.eval_module)
     catch e
         # invokelatest: rendering a frame of a function this call defined
         # reads its binding, and from this function's older world age Julia
         # 1.12 warned "access to binding ... in a world prior to its definition".
         error_msg = Base.invokelatest(describe_error, e, catch_backtrace(), call_file, state.eval_module)
         result = OperationResult(nothing, false, error_msg)
+        e isa InterruptException && (was_interrupted = true)
     end
 
     duration_ms = (time_ns() - start_time) / 1_000_000.0
@@ -1135,7 +1317,8 @@ function execute(op::ExecuteCode)::OperationReceipt
         "ExecuteCode",
         result,
         duration_ms,
-        state.id
+        state.id,
+        was_interrupted ? Dict{String, Any}("interrupted" => true) : Dict{String, Any}()
     )
     push!(state.receipt_log, _logged(receipt))
 
@@ -1308,6 +1491,7 @@ function execute(op::EphemeralTool)::OperationReceipt
     # API, never the whole package.
     Core.eval(tool_module, :(const Palette = $(Api)))
     Core.eval(tool_module, :(const Api = $(Api)))
+    Core.eval(tool_module, :(const Pharos = $(Pharos)))
     # Deliberately NOT given an `include` binding, unlike the persistent
     # eval_module: check_ephemeral_source! only inspects the source string
     # passed directly to EphemeralTool -- it cannot see inside a file that
@@ -1344,6 +1528,1466 @@ function execute(op::EphemeralTool)::OperationReceipt
 end
 
 """
+    eval_isolated(code::AbstractString;
+                  entry::Union{Nothing, Symbol}=nothing,
+                  args=(),
+                  kwargs=NamedTuple(),
+                  tests::Union{Nothing, AbstractString}=nothing)
+        -> NamedTuple{(:ok, :module_name, :value, :elapsed_s, :error)}
+
+Evaluate `code` inside a fresh anonymous `Module`, optionally run `tests` inside
+that same isolated module, and optionally invoke `entry` via `Base.invokelatest`
+so newly defined methods work immediately without Julia 1.12 world-age errors.
+"""
+function eval_isolated(code::AbstractString;
+                       entry::Union{Nothing, Symbol}=nothing,
+                       args=(),
+                       kwargs=NamedTuple(),
+                       tests::Union{Nothing, AbstractString}=nothing)
+    t0 = time_ns()
+    mod_sym = Symbol("Isolated_", replace(string(uuid4()), '-' => '_'))
+    m = Module(mod_sym)
+    Core.eval(m, :(eval(x) = Core.eval(@__MODULE__, x)))
+    Core.eval(m, :(include(p) = Base.include(@__MODULE__, p)))
+    try
+        val = Base.include_string(m, String(code), "isolated_code")
+        if tests !== nothing
+            val = Base.include_string(m, String(tests), "isolated_tests")
+        end
+        if entry !== nothing
+            Base.invokelatest(isdefined, m, entry) || error("entry symbol :$entry is not defined in isolated module")
+            fn = Base.invokelatest(getglobal, m, entry)
+            kw = kwargs isa NamedTuple ? kwargs : NamedTuple(kwargs)
+            val = Base.invokelatest(fn, args...; kw...)
+        end
+        elapsed_s = (time_ns() - t0) / 1e9
+        return (ok=true, module_name=mod_sym, value=val, elapsed_s=elapsed_s, error=nothing)
+    catch e
+        bt = catch_backtrace()
+        inner = e isa LoadError ? e.error : e
+        err_msg = Base.invokelatest(describe_error, inner, bt, "isolated_code", m)
+        elapsed_s = (time_ns() - t0) / 1e9
+        return (ok=false, module_name=mod_sym, value=nothing, elapsed_s=elapsed_s, error=err_msg)
+    end
+end
+
+"""
+    depot_mode() -> Symbol
+
+Return the active depot mode for this session (`:isolated` by default, or
+`:shared_readonly` when the user's shared Julia depot is appended read-only).
+"""
+function depot_mode()
+    raw = lowercase(strip(get(ENV, "PALETTE_DEPOT_MODE", "isolated")))
+    return raw == "shared_readonly" ? :shared_readonly : :isolated
+end
+
+"""
+    enable_shared_depot!(path::AbstractString = joinpath(homedir(), ".julia")) -> Vector{String}
+
+Append `path` to the end of `Base.DEPOT_PATH` as a read-only fallback cache
+entry (behind the workspace's primary writable depot) so precompiled `.ji`/`.so`
+caches for heavy local packages are reused instead of re-precompiled from scratch.
+"""
+function enable_shared_depot!(path::AbstractString=joinpath(homedir(), ".julia"))
+    dir = abspath(expanduser(String(path)))
+    isdir(dir) || error("shared depot directory does not exist: $dir")
+    if !(dir in Base.DEPOT_PATH)
+        push!(Base.DEPOT_PATH, dir)
+    end
+    ENV["PALETTE_DEPOT_MODE"] = "shared_readonly"
+    return copy(Base.DEPOT_PATH)
+end
+
+const _MAIN_SYNC_EXCLUDED_NAMES = Set{Symbol}((:Base, :Core, :Main, :Palette, :Api, :Pharos, :Joovy))
+
+"""
+    sync_kernel_modules_to_main!(scope_mod::Module) -> Vector{Symbol}
+
+Mirror user-defined `Module` bindings from `scope_mod` (such as Palette's
+isolated `KernelScope_*` module) into `Core.Main` using safe non-const bindings
+so `Serialization.deserialize` can resolve `Main.<Mod>.<Type>` transparently.
+Skips built-in/kernel modules and any name already bound as a `const` in `Core.Main`.
+"""
+function sync_kernel_modules_to_main!(scope_mod::Module)
+    mirrored = Symbol[]
+    ccall(:jl_generating_output, Cint, ()) != 0 && return mirrored
+    scope_mod === Core.Main && return mirrored
+    scope_name = nameof(scope_mod)
+    for sym in Base.invokelatest(names, scope_mod; all=true, imported=false)
+        (sym === scope_name || sym in _MAIN_SYNC_EXCLUDED_NAMES || sym in KERNEL_BINDINGS) && continue
+        startswith(string(sym), '#') && continue
+        latest_isdefined(scope_mod, sym) || continue
+        val = latest_global(scope_mod, sym)
+        val isa Module || continue
+        _is_sandbox_module(val) && continue
+        (val === scope_mod || val === Base || val === Core || val === Core.Main ||
+         val === Palette || val === Api || val === Pharos || val === Joovy) && continue
+        if latest_isdefined(Core.Main, sym)
+            if Base.invokelatest(isconst, Core.Main, sym)
+                continue
+            end
+            if latest_global(Core.Main, sym) === val
+                push!(mirrored, sym)
+                continue
+            end
+        end
+        try
+            Core.eval(Core.Main, Expr(:(=), sym, val))
+            push!(mirrored, sym)
+        catch
+        end
+    end
+    return mirrored
+end
+
+function _const_lhs_symbols(lhs)
+    lhs isa Symbol && return Symbol[lhs]
+    lhs isa Expr && lhs.head === :(::) && !isempty(lhs.args) && return _const_lhs_symbols(lhs.args[1])
+    if lhs isa Expr && lhs.head === :tuple
+        out = Symbol[]
+        for a in lhs.args
+            append!(out, _const_lhs_symbols(a))
+        end
+        return out
+    end
+    return Symbol[]
+end
+
+function _unwrap_reload_macros(ex)
+    cur = ex
+    is_enum = false
+    while cur isa Expr && cur.head === :macrocall && !isempty(cur.args)
+        mname = macro_name(cur)
+        if endswith(mname, "@enum")
+            is_enum = true
+            break
+        end
+        cur = cur.args[end]
+    end
+    return cur, is_enum
+end
+
+function _reload_eval_stmt!(target_mod::Module, line_node::LineNumberNode, stmt)
+    Core.eval(target_mod, Expr(:toplevel, line_node, stmt))
+    return nothing
+end
+
+function _reload_methods_walk!(ex, target_mod::Module, cur_file::String, line_ref::Base.RefValue{LineNumberNode},
+                               counts::Dict{Symbol, Int}, visited_files::Set{String})
+    if ex isa LineNumberNode
+        line_ref[] = ex
+        return nothing
+    end
+    ex isa Expr || return nothing
+    if ex.head in (:toplevel, :block)
+        for arg in ex.args
+            _reload_methods_walk!(arg, target_mod, cur_file, line_ref, counts, visited_files)
+        end
+        return nothing
+    end
+
+    inner, is_enum = _unwrap_reload_macros(ex)
+    if is_enum
+        enames = enum_names(inner)
+        if !isempty(enames) && latest_isdefined(target_mod, Symbol(enames[1]))
+            counts[:skipped_types] += 1
+        else
+            _reload_eval_stmt!(target_mod, line_ref[], ex)
+        end
+        return nothing
+    end
+    inner isa Expr || return nothing
+
+    h = inner.head
+    if h === :module && length(inner.args) >= 3 && inner.args[2] isa Symbol
+        mod_sym = inner.args[2]
+        if latest_isdefined(target_mod, mod_sym)
+            existing = latest_global(target_mod, mod_sym)
+            if existing isa Module
+                _reload_methods_walk!(inner.args[3], existing, cur_file, line_ref, counts, visited_files)
+                return nothing
+            end
+        end
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        return nothing
+    elseif h === :struct && length(inner.args) >= 2
+        tname = type_head(inner.args[2])
+        if tname isa Symbol && latest_isdefined(target_mod, tname)
+            counts[:skipped_types] += 1
+        else
+            _reload_eval_stmt!(target_mod, line_ref[], ex)
+        end
+        return nothing
+    elseif (h === :abstract || h === :primitive) && !isempty(inner.args)
+        tname = type_head(inner.args[1])
+        if tname isa Symbol && latest_isdefined(target_mod, tname)
+            counts[:skipped_types] += 1
+        else
+            _reload_eval_stmt!(target_mod, line_ref[], ex)
+        end
+        return nothing
+    elseif h === :const && !isempty(inner.args)
+        a = inner.args[1]
+        syms = (a isa Expr && a.head === :(=) && !isempty(a.args)) ? _const_lhs_symbols(a.args[1]) : Symbol[]
+        if !isempty(syms) && all(s -> latest_isdefined(target_mod, s) && Base.invokelatest(isconst, target_mod, s), syms)
+            return nothing
+        end
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        return nothing
+    elseif h === :function
+        if length(inner.args) == 1 && inner.args[1] isa Symbol && latest_isdefined(target_mod, inner.args[1])
+            return nothing
+        end
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        length(inner.args) >= 2 && (counts[:updated_methods] += 1)
+        return nothing
+    elseif h === :macro
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        counts[:updated_methods] += 1
+        return nothing
+    elseif h === :(=) && length(inner.args) == 2 && is_signature(inner.args[1])
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        counts[:updated_methods] += 1
+        return nothing
+    elseif h in (:using, :import, :export)
+        _reload_eval_stmt!(target_mod, line_ref[], ex)
+        return nothing
+    elseif h === :call && length(inner.args) == 2 && inner.args[1] === :include && inner.args[2] isa AbstractString
+        sub_path = abspath(dirname(cur_file), String(inner.args[2]))
+        if isfile(sub_path) && !(sub_path in visited_files)
+            _reload_methods_file!(sub_path, target_mod, counts, visited_files)
+        end
+        return nothing
+    end
+    return nothing
+end
+
+function _reload_methods_file!(abs_path::String, target_mod::Module, counts::Dict{Symbol, Int}, visited_files::Set{String})
+    push!(visited_files, abs_path)
+    parsed = parse_complete(read(abs_path, String); filename=abs_path)
+    line_ref = Ref(LineNumberNode(1, Symbol(abs_path)))
+    task_local_storage(:SOURCE_PATH, abs_path) do
+        with_logger(DocReplacementFilter(current_logger())) do
+            _reload_methods_walk!(parsed, target_mod, abs_path, line_ref, counts, visited_files)
+        end
+    end
+    return nothing
+end
+
+"""
+    reload_methods!(path::AbstractString; mod::Module=get_kernel_state().eval_module)
+        -> NamedTuple{(:path, :updated_methods, :skipped_types, :target_module)}
+
+Revise-style hot-reload for a Julia source file: updates `function`, short-form
+method, macro-decorated method, and `macro` definitions in place while skipping
+already-defined `struct`/`abstract`/`primitive` types and `const` bindings, and
+descending into already-defined submodules without replacing their module identity.
+"""
+function reload_methods!(path::AbstractString; mod::Module=get_kernel_state().eval_module)
+    abs_path = abspath(String(path))
+    isfile(abs_path) || throw(ArgumentError("file not found: $abs_path"))
+    counts = Dict{Symbol, Int}(:updated_methods => 0, :skipped_types => 0)
+    visited = Set{String}()
+    _reload_methods_file!(abs_path, mod, counts, visited)
+    sync_kernel_modules_to_main!(mod)
+    return (
+        path=abs_path,
+        updated_methods=counts[:updated_methods],
+        skipped_types=counts[:skipped_types],
+        target_module=nameof(mod),
+    )
+end
+
+@noinline function _bench_sample(f::F, args::Args) where {F, Args<:Tuple}
+    gc0 = Base.gc_num()
+    t0 = time_ns()
+    val = f(args...)
+    dt_ns = time_ns() - t0
+    gc1 = Base.gc_num()
+    diff = Base.GC_Diff(gc1, gc0)
+    return val, dt_ns, Int(diff.allocd)
+end
+
+"""
+    bench(f, args...; warmup=2, samples=11)
+        -> NamedTuple{(:value, :median_ms, :p95_ms, :min_ms, :mean_ms, :allocated_bytes, :alloc_bytes, :samples)}
+
+Run `warmup` unmeasured calls followed by `samples` timed and allocation-measured
+calls of `f(args...)` inside a fully typed function barrier (eliminating non-const
+global dispatch overhead), returning the last value, median/p95/min/mean latency
+in milliseconds, minimum allocated bytes (`allocated_bytes` and Wave-2 alias
+`alloc_bytes`), and sample count.
+"""
+function bench(f::F, args::Vararg{Any, N}; warmup::Int=2, samples::Int=11) where {F, N}
+    warmup >= 0 || throw(ArgumentError("warmup must be non-negative, got $warmup"))
+    samples >= 1 || throw(ArgumentError("samples must be at least 1, got $samples"))
+    local val
+    for _ in 1:warmup
+        val, _, _ = _bench_sample(f, args)
+    end
+    times_ms = Vector{Float64}(undef, samples)
+    min_alloc = typemax(Int)
+    for i in 1:samples
+        val, dt_ns, alloc = _bench_sample(f, args)
+        times_ms[i] = dt_ns / 1e6
+        alloc < min_alloc && (min_alloc = alloc)
+    end
+    sorted = sort(times_ms)
+    idx = 1.0 + 0.95 * (samples - 1)
+    lo = floor(Int, idx)
+    hi = ceil(Int, idx)
+    p95 = lo == hi ? sorted[lo] : sorted[lo] + (idx - lo) * (sorted[hi] - sorted[lo])
+    return (
+        value=val,
+        median_ms=Float64(stdlib_median(sorted)),
+        p95_ms=Float64(p95),
+        min_ms=sorted[1],
+        mean_ms=Float64(stdlib_mean(sorted)),
+        allocated_bytes=min_alloc,
+        alloc_bytes=min_alloc,
+        samples=samples,
+    )
+end
+
+_is_pure_bench_arg(x) = x isa Union{Symbol, Number, Bool, Char, String, Nothing, Missing, QuoteNode}
+
+function _bench_macro_expand(ex, opts)
+    kws = Any[]
+    has_warmup = false
+    has_samples = false
+    for opt in opts
+        if opt isa Expr && opt.head === :(=) && opt.args[1] isa Symbol
+            opt.args[1] === :warmup && (has_warmup = true)
+            opt.args[1] === :samples && (has_samples = true)
+            push!(kws, Expr(:kw, opt.args[1], esc(opt.args[2])))
+        else
+            throw(ArgumentError("@bench options must be keyword assignments like `warmup=1` or `samples=5`, got: $opt"))
+        end
+    end
+    has_warmup || push!(kws, Expr(:kw, :warmup, 1))
+    has_samples || push!(kws, Expr(:kw, :samples, 5))
+    bench_ref = GlobalRef(Palette, :bench)
+    if ex isa Expr && ex.head === :call && !isempty(ex.args)
+        fn = ex.args[1]
+        cargs = ex.args[2:end]
+        if !(fn isa Expr && fn.head === :...) && all(_is_pure_bench_arg, cargs)
+            return Expr(:call, bench_ref, Expr(:parameters, kws...), esc(fn), map(esc, cargs)...)
+        end
+    end
+    thunk = Expr(:(->), Expr(:tuple), esc(ex))
+    return Expr(:call, bench_ref, Expr(:parameters, kws...), thunk)
+end
+
+"""
+    @bench expr [warmup=1] [samples=5]
+
+One-call warmup, latency, and allocation probe wrapping `Palette.bench`.
+Simple calls with symbol/literal arguments hoist argument evaluation so non-const
+top-level globals do not cause spurious allocation noise.
+"""
+macro bench(ex, opts...)
+    return _bench_macro_expand(ex, opts)
+end
+
+#==============================================================================
+Wave 4: @ephemeral RAM-Only Guard, Safe summarysize, Sandbox Modules & Warntype Summary
+==============================================================================#
+
+const EPHEMERAL_BINDINGS = Set{Symbol}()
+
+"""
+    ephemeral!(sym::Symbol...) -> Symbol
+
+Mark one or more session bindings as RAM-only ephemeral: they remain resident in
+memory across turns, but are completely skipped by snapshot serialization,
+`Walk` graph scans, and `summarysize` scans.
+"""
+function ephemeral!(sym::Symbol)
+    push!(EPHEMERAL_BINDINGS, sym)
+    return sym
+end
+function ephemeral!(syms::Symbol...)
+    for s in syms
+        push!(EPHEMERAL_BINDINGS, s)
+    end
+    return collect(syms)
+end
+
+"""
+    unephemeral!(sym::Symbol) -> Symbol
+
+Remove `sym` from the ephemeral RAM-only binding set so future snapshots may
+serialize it normally.
+"""
+function unephemeral!(sym::Symbol)
+    delete!(EPHEMERAL_BINDINGS, sym)
+    return sym
+end
+
+"""
+    ephemerals() -> Vector{Symbol}
+
+Return the sorted list of binding names currently marked `@ephemeral`.
+"""
+ephemerals() = sort!(collect(EPHEMERAL_BINDINGS))
+
+function _ephemeral_lhs_symbols(lhs)
+    lhs isa Symbol && return Symbol[lhs]
+    if lhs isa Expr
+        if lhs.head === :(::) && !isempty(lhs.args)
+            return _ephemeral_lhs_symbols(lhs.args[1])
+        elseif lhs.head === :tuple
+            out = Symbol[]
+            for a in lhs.args
+                append!(out, _ephemeral_lhs_symbols(a))
+            end
+            return out
+        elseif lhs.head === :const && !isempty(lhs.args)
+            return _ephemeral_lhs_symbols(lhs.args[1])
+        end
+    end
+    return Symbol[]
+end
+
+function _ephemeral_macro_expand(ex)
+    reg_fn = GlobalRef(Palette, :ephemeral!)
+    if ex isa Symbol
+        return Expr(:call, reg_fn, QuoteNode(ex))
+    elseif ex isa Expr && ex.head === :(=) && length(ex.args) == 2
+        syms = _ephemeral_lhs_symbols(ex.args[1])
+        isempty(syms) && throw(ArgumentError("@ephemeral expects a variable assignment or symbol, got: $ex"))
+        reg_calls = [Expr(:call, reg_fn, QuoteNode(s)) for s in syms]
+        return Expr(:block, reg_calls..., esc(ex))
+    elseif ex isa Expr && ex.head === :const && length(ex.args) == 1 && ex.args[1] isa Expr && ex.args[1].head === :(=)
+        syms = _ephemeral_lhs_symbols(ex.args[1].args[1])
+        isempty(syms) && throw(ArgumentError("@ephemeral const expects a variable assignment, got: $ex"))
+        reg_calls = [Expr(:call, reg_fn, QuoteNode(s)) for s in syms]
+        return Expr(:block, reg_calls..., esc(ex))
+    else
+        throw(ArgumentError("@ephemeral expects `x = expr`, `a, b = expr`, `const X = expr`, or a symbol, got: $ex"))
+    end
+end
+
+"""
+    @ephemeral x = expr
+    @ephemeral x
+
+Mark `x` as a RAM-only ephemeral binding (skipped by snapshot serialization and
+`summarysize` scans) and evaluate the assignment in the caller's scope.
+"""
+macro ephemeral(ex)
+    return _ephemeral_macro_expand(ex)
+end
+
+"""
+    safe_summarysize(x; max_depth::Int=32, max_nodes::Int=20_000) -> Union{Int, Nothing}
+
+Iterative, cycle-guarded, depth-bounded byte-size estimator that never overflows
+the call stack on deep or cyclic graphs and immediately short-circuits rebuildable
+graph caches such as `Pharos.CodeGraph`. Returns `nothing` if the object exceeds
+`max_depth` or `max_nodes`, or is an excluded graph type.
+"""
+function safe_summarysize(@nospecialize(x); max_depth::Int=32, max_nodes::Int=20_000)::Union{Int, Nothing}
+    max_depth >= 0 || throw(ArgumentError("max_depth must be non-negative, got $max_depth"))
+    max_nodes >= 1 || throw(ArgumentError("max_nodes must be positive, got $max_nodes"))
+    isdefined(@__MODULE__, :Pharos) && x isa Pharos.CodeGraph && return nothing
+
+    seen = IdDict{Any, Nothing}()
+    stack = Tuple{Any, Int}[(x, 0)]
+    nodes = 0
+    total = 0
+
+    while !isempty(stack)
+        cur, depth = pop!(stack)
+        depth > max_depth && return nothing
+        nodes += 1
+        nodes > max_nodes && return nothing
+
+        isdefined(@__MODULE__, :Pharos) && cur isa Pharos.CodeGraph && return nothing
+        T = typeof(cur)
+        if cur === nothing || cur === missing || cur isa Module || cur isa Type || cur isa Task ||
+           cur isa Method || cur isa Core.CodeInfo || cur isa Core.MethodInstance
+            continue
+        elseif cur isa Function && isdefined(T, :instance) && nfields(cur) == 0
+            continue
+        elseif cur isa AbstractString
+            total += sizeof(cur) + sizeof(Int)
+            continue
+        elseif cur isa Symbol
+            total += sizeof(cur)
+            continue
+        elseif isbitstype(T)
+            total += sizeof(T)
+            continue
+        end
+
+        if ismutable(cur)
+            haskey(seen, cur) && continue
+            seen[cur] = nothing
+        end
+
+        if cur isa Array
+            E = eltype(cur)
+            if isbitstype(E)
+                total += sizeof(cur) + 40
+                continue
+            end
+            n = length(cur)
+            if n > max_nodes - nodes
+                return nothing
+            end
+            total += n * sizeof(Ptr{Cvoid}) + 40
+            next_depth = depth + 1
+            for i in eachindex(cur)
+                isassigned(cur, i) || continue
+                push!(stack, (@inbounds(cur[i]), next_depth))
+            end
+        elseif isdefined(Core, :Memory) && cur isa getfield(Core, :Memory)
+            E = eltype(cur)
+            if isbitstype(E)
+                total += sizeof(cur) + 16
+                continue
+            end
+            n = length(cur)
+            if n > max_nodes - nodes
+                return nothing
+            end
+            total += n * sizeof(Ptr{Cvoid}) + 16
+            next_depth = depth + 1
+            for i in eachindex(cur)
+                isassigned(cur, i) || continue
+                push!(stack, (@inbounds(cur[i]), next_depth))
+            end
+        elseif cur isa Tuple
+            next_depth = depth + 1
+            for item in cur
+                push!(stack, (item, next_depth))
+            end
+        else
+            nf = nfields(cur)
+            total += nf * sizeof(Ptr{Cvoid})
+            next_depth = depth + 1
+            for i in 1:nf
+                isdefined(cur, i) || continue
+                push!(stack, (getfield(cur, i), next_depth))
+            end
+        end
+    end
+    return total
+end
+
+# --- W4-4: Sandbox Module Isolation ---
+
+const SANDBOX_MODULES = Dict{Symbol, Module}()
+const SANDBOX_MODULE_GENERATIONS = Dict{Symbol, Int}()
+
+function _is_sandbox_module(m::Module)
+    cur = m
+    while true
+        startswith(string(nameof(cur)), "PaletteSandbox_") && return true
+        parent = parentmodule(cur)
+        (parent === cur || parent === Main || parent === Core || parent === Base) && return false
+        cur = parent
+    end
+end
+
+"""
+    isolate_module(name::Symbol, path::AbstractString; reset::Bool=true) -> Module
+
+Load (or cleanly reload when `reset=true`) the Julia source file at `path` inside
+a fresh, versioned isolated container module tracked under `name`, without
+polluting `Main`'s export namespace or triggering `UndefVarError` ambiguity or
+struct redefinition conflicts on cached session data.
+
+If `path` defines a submodule with the same name as `name`, returns that inner
+module handle; otherwise returns the isolated container module directly.
+"""
+function isolate_module(name::Symbol, path::AbstractString; reset::Bool=true)::Module
+    abs_path = abspath(String(path))
+    isfile(abs_path) || throw(ArgumentError("file not found: $abs_path"))
+    if !reset && haskey(SANDBOX_MODULES, name)
+        return SANDBOX_MODULES[name]
+    end
+    gen = get(SANDBOX_MODULE_GENERATIONS, name, 0) + 1
+    SANDBOX_MODULE_GENERATIONS[name] = gen
+    container_sym = Symbol("PaletteSandbox_", name, "_v", gen, "_", first(replace(string(uuid4()), '-' => ""), 8))
+    container = Module(container_sym)
+    Core.eval(container, :(eval(x) = Core.eval(@__MODULE__, x)))
+    Core.eval(container, :(include(p) = Base.include(@__MODULE__, p)))
+    Core.eval(container, :(const Palette = $(Api)))
+    Core.eval(container, :(const Api = $(Api)))
+    Core.eval(container, :(const Pharos = $(Pharos)))
+    with_logger(DocReplacementFilter(current_logger())) do
+        Base.include(container, abs_path)
+    end
+    handle = if latest_isdefined(container, name)
+        v = latest_global(container, name)
+        v isa Module && v !== container ? v : container
+    else
+        container
+    end
+    SANDBOX_MODULES[name] = handle
+    return handle
+end
+
+"""
+    reset_sandbox_module!(name::Symbol) -> Bool
+
+Remove `name` from the isolated sandbox module registry so the next
+`isolate_module(name, path; reset=false)` loads a fresh module. Returns `true`
+if an entry existed and was removed.
+"""
+function reset_sandbox_module!(name::Symbol)::Bool
+    existed = haskey(SANDBOX_MODULES, name)
+    delete!(SANDBOX_MODULES, name)
+    return existed
+end
+
+"""
+    sandbox_modules() -> Vector{Symbol}
+
+Return the sorted list of currently registered isolated sandbox module names.
+"""
+sandbox_modules() = sort!(collect(keys(SANDBOX_MODULES)))
+
+# --- W5-1: Clean In-Place Module Reloading & Binding Reset ---
+
+function _top_level_module_names(ex)
+    out = Symbol[]
+    function visit(node)
+        node isa Expr || return
+        if node.head === :module && length(node.args) >= 2 && node.args[2] isa Symbol
+            push!(out, node.args[2])
+        elseif node.head in (:toplevel, :block)
+            for a in node.args
+                visit(a)
+            end
+        end
+    end
+    visit(ex)
+    return out
+end
+
+function _sandbox_key_from_path(abs_path::String)::Symbol
+    stem = first(splitext(basename(abs_path)))
+    clean = replace(stem, r"[^A-Za-z0-9_]" => "_")
+    (isempty(clean) || isdigit(first(clean))) && (clean = "Mod_" * clean)
+    return Symbol(clean)
+end
+
+const _SANDBOX_BUILTINS = Set{Symbol}((:Palette, :Api, :Pharos, :Main, :Base, :Core, :eval, :include))
+
+function _detect_sandbox_submodule(container::Module)
+    found = Module[]
+    c_name = nameof(container)
+    for sym in Base.invokelatest(names, container; all=true, imported=false)
+        (sym === c_name || sym in _SANDBOX_BUILTINS || startswith(string(sym), '#')) && continue
+        latest_isdefined(container, sym) || continue
+        val = latest_global(container, sym)
+        if val isa Module && val !== container && parentmodule(val) === container
+            push!(found, val)
+        end
+    end
+    isempty(found) && return nothing
+    return last(found)
+end
+
+"""
+    reinclude_module!(path::AbstractString; mod_name=nothing, into=nothing) -> Module
+    reinclude_module!(mod_name::Symbol, path::AbstractString; into=nothing) -> Module
+
+Cleanly reload a Julia source file containing a `module` (or flat definitions)
+inside a fresh `PaletteSandbox_*` container module via `isolate_module`,
+detecting the inner module automatically (or using `mod_name`) and returning
+the freshly loaded module handle without polluting `Core.Main` or producing
+`using` ambiguities or stale-struct binding conflicts.
+"""
+function reinclude_module!(path::AbstractString;
+                           mod_name::Union{Nothing, Symbol}=nothing,
+                           into::Union{Nothing, Module}=nothing)::Module
+    abs_path = abspath(String(path))
+    isfile(abs_path) || throw(ArgumentError("file not found: $abs_path"))
+    parsed = parse_complete(read(abs_path, String); filename=abs_path)
+    ast_mods = _top_level_module_names(parsed)
+    key_sym = if mod_name !== nothing
+        mod_name
+    elseif !isempty(ast_mods)
+        last(ast_mods)
+    else
+        _sandbox_key_from_path(abs_path)
+    end
+
+    reset_sandbox_module!(key_sym)
+    handle = isolate_module(key_sym, abs_path; reset=true)
+    if mod_name === nothing && isempty(ast_mods) && startswith(string(nameof(handle)), "PaletteSandbox_")
+        detected = _detect_sandbox_submodule(handle)
+        if detected !== nothing
+            det_sym = nameof(detected)
+            det_sym !== key_sym && reset_sandbox_module!(key_sym)
+            SANDBOX_MODULES[det_sym] = detected
+            handle = detected
+        end
+    end
+
+    if into !== nothing
+        bind_sym = mod_name !== nothing ? mod_name :
+                   (!startswith(string(nameof(handle)), "PaletteSandbox_") ? nameof(handle) : nothing)
+        if bind_sym !== nothing && (!latest_isdefined(into, bind_sym) || !Base.invokelatest(isconst, into, bind_sym))
+            try
+                Core.eval(into, Expr(:global, Expr(:(=), bind_sym, QuoteNode(handle))))
+            catch
+            end
+        end
+    end
+    return handle
+end
+
+reinclude_module!(mod_name::Symbol, path::AbstractString; into::Union{Nothing, Module}=nothing)::Module =
+    reinclude_module!(path; mod_name, into)
+
+function _reset_bindings!(syms, mod::Union{Nothing, Module})
+    target_mod = mod === nothing ? get_kernel_state().eval_module : mod
+    state = GLOBAL_STATE[]
+    is_session_mod = state !== nothing && target_mod === state.eval_module
+    target_name = nameof(target_mod)
+
+    reset_syms = Symbol[]
+    skipped_syms = Symbol[]
+    for sym in syms
+        if sym === target_name || sym in KERNEL_BINDINGS || !latest_isdefined(target_mod, sym)
+            push!(skipped_syms, sym)
+            continue
+        end
+        if Base.invokelatest(isconst, target_mod, sym)
+            push!(skipped_syms, sym)
+            continue
+        end
+        ok = try
+            Core.eval(target_mod, Expr(:global, Expr(:(=), sym, QuoteNode(nothing))))
+            true
+        catch
+            false
+        end
+        if ok
+            push!(reset_syms, sym)
+            if is_session_mod
+                delete!(EPHEMERAL_BINDINGS, sym)
+                delete!(MMAP_BINDINGS, sym)
+                delete!(BINDING_SEEN, sym)
+                delete!(BINDING_ORIGINS, sym)
+                delete!(BINDING_IDENTITIES, sym)
+                delete!(state.variables, string(sym))
+            end
+        else
+            push!(skipped_syms, sym)
+        end
+    end
+    return (reset=reset_syms, skipped=skipped_syms)
+end
+
+"""
+    reset_bindings!(syms::Symbol...; mod::Union{Nothing, Module}=nothing)
+        -> NamedTuple{(:reset, :skipped), Tuple{Vector{Symbol}, Vector{Symbol}}}
+    reset_bindings!(syms::AbstractVector{Symbol}; mod::Union{Nothing, Module}=nothing)
+
+Safely reset mutable user bindings in `mod` (defaulting to the active session
+`eval_module`) to `nothing` and clear associated ephemeral/tracking caches.
+Never throws on `const`, kernel, or undefined symbols; reports them in `skipped`.
+"""
+reset_bindings!(syms::Symbol...; mod::Union{Nothing, Module}=nothing) = _reset_bindings!(syms, mod)
+reset_bindings!(syms::AbstractVector{Symbol}; mod::Union{Nothing, Module}=nothing) = _reset_bindings!(syms, mod)
+
+# --- W5-2: @alloc_barrier Macro ---
+
+@noinline function _alloc_barrier_call(f::F, args::Args) where {F, Args<:Tuple}
+    f(args...)
+    gc0 = Base.gc_num()
+    val = f(args...)
+    diff = Base.GC_Diff(Base.gc_num(), gc0)
+    bytes = Int(diff.allocd)
+    return (value=val, alloc_bytes=bytes, bytes=bytes)
+end
+
+@noinline function _alloc_barrier_call(::Type{T}, args::Args) where {T, Args<:Tuple}
+    T(args...)
+    gc0 = Base.gc_num()
+    val = T(args...)
+    diff = Base.GC_Diff(Base.gc_num(), gc0)
+    bytes = Int(diff.allocd)
+    return (value=val, alloc_bytes=bytes, bytes=bytes)
+end
+
+@noinline function _alloc_barrier_kwcall(f::F, args::Args, kwargs::KW) where {F, Args<:Tuple, KW<:NamedTuple}
+    f(args...; kwargs...)
+    gc0 = Base.gc_num()
+    val = f(args...; kwargs...)
+    diff = Base.GC_Diff(Base.gc_num(), gc0)
+    bytes = Int(diff.allocd)
+    return (value=val, alloc_bytes=bytes, bytes=bytes)
+end
+
+@noinline function _alloc_barrier_kwcall(::Type{T}, args::Args, kwargs::KW) where {T, Args<:Tuple, KW<:NamedTuple}
+    T(args...; kwargs...)
+    gc0 = Base.gc_num()
+    val = T(args...; kwargs...)
+    diff = Base.GC_Diff(Base.gc_num(), gc0)
+    bytes = Int(diff.allocd)
+    return (value=val, alloc_bytes=bytes, bytes=bytes)
+end
+
+function _is_dotted_broadcast_op(fn)::Bool
+    fn isa Symbol || return false
+    s = string(fn)
+    return length(s) >= 2 && s[1] == '.' && fn !== :.. && fn !== :...
+end
+
+function _escape_alloc_kw(item)
+    if item isa Expr && item.head === :kw && length(item.args) == 2
+        return Expr(:kw, item.args[1], esc(item.args[2]))
+    elseif item isa Expr && item.head === :... && length(item.args) == 1
+        return Expr(:..., esc(item.args[1]))
+    elseif item isa Symbol
+        return Expr(:kw, item, esc(item))
+    end
+    return esc(item)
+end
+
+function _alloc_barrier_macro_expand(ex)
+    call_ref = GlobalRef(Palette, :_alloc_barrier_call)
+    kwcall_ref = GlobalRef(Palette, :_alloc_barrier_kwcall)
+    if ex isa Expr && ex.head === :call && !isempty(ex.args) && !_is_dotted_broadcast_op(ex.args[1])
+        fn = ex.args[1]
+        pos = Any[]
+        kws = Any[]
+        for arg in ex.args[2:end]
+            if arg isa Expr && arg.head === :parameters
+                for p in arg.args
+                    push!(kws, _escape_alloc_kw(p))
+                end
+            elseif arg isa Expr && arg.head === :kw && length(arg.args) == 2
+                push!(kws, _escape_alloc_kw(arg))
+            elseif arg isa Expr && arg.head === :... && length(arg.args) == 1
+                push!(pos, Expr(:..., esc(arg.args[1])))
+            else
+                push!(pos, esc(arg))
+            end
+        end
+        args_tuple = Expr(:tuple, pos...)
+        if isempty(kws)
+            return quote
+                let _f = $(esc(fn)), _args = $args_tuple
+                    $call_ref(_f, _args)
+                end
+            end
+        else
+            kw_nt = Expr(:tuple, Expr(:parameters, kws...))
+            return quote
+                let _f = $(esc(fn)), _args = $args_tuple, _kw = $kw_nt
+                    $kwcall_ref(_f, _args, _kw)
+                end
+            end
+        end
+    end
+    return quote
+        let _thunk = () -> $(esc(ex))
+            $call_ref(_thunk, ())
+        end
+    end
+end
+
+"""
+    @alloc_barrier expr
+
+Evaluate call arguments once, hoist them through a typed function barrier
+(with 1 warmup invocation so JIT compilation does not pollute the measurement),
+and measure heap allocations via `Base.gc_num()` / `Base.GC_Diff`.
+Returns `(value=val, alloc_bytes=bytes, bytes=bytes)` — reporting `0` even
+when called on non-const global workspace bindings.
+"""
+macro alloc_barrier(ex)
+    return _alloc_barrier_macro_expand(ex)
+end
+
+# --- W4-6 & W5-2: Compact Warntype Summary ---
+
+function _unwrap_ir_type(@nospecialize(t))
+    if t isa Core.Const
+        return typeof(t.val)
+    elseif isdefined(Core, :PartialStruct) && t isa Core.PartialStruct
+        return t.typ
+    elseif isdefined(Core, :Conditional) && t isa Core.Conditional
+        return Bool
+    elseif isdefined(Core, :InterConditional) && t isa Core.InterConditional
+        return Bool
+    end
+    return t
+end
+
+function _is_stable_type(@nospecialize(raw_t))::Bool
+    t = _unwrap_ir_type(raw_t)
+    t === Union{} && return true
+    t === Any && return false
+    t isa Union && return false
+    t isa UnionAll && return false
+    if t isa DataType
+        t.name === Type.body.name && return true
+        return Base.isconcretetype(t)
+    end
+    return false
+end
+
+function _is_control_stmt(@nospecialize(stmt))::Bool
+    stmt isa Union{Core.GotoNode, Core.GotoIfNot, Core.ReturnNode, Core.NewvarNode, LineNumberNode, Nothing} && return true
+    if stmt isa Expr && stmt.head in (:meta, :loopinfo, :boundscheck, :inbounds, :enter, :leave, :pop_exception)
+        return true
+    end
+    return false
+end
+
+function _normalize_argtypes(argtypes)
+    if argtypes isa Type && argtypes <: Tuple
+        return argtypes
+    elseif argtypes isa Tuple
+        return Tuple{argtypes...}
+    elseif argtypes isa AbstractVector
+        return Tuple{argtypes...}
+    end
+    throw(ArgumentError("argtypes must be a Tuple of types or Tuple{...} DataType, got $(typeof(argtypes))"))
+end
+
+_is_argtype_spec(x) =
+    (x isa Type && x <: Tuple) ||
+    (x isa Tuple && all(a -> a isa Type, x)) ||
+    (x isa AbstractVector && (eltype(x) <: Type || (!isempty(x) && all(a -> a isa Type, x))))
+
+function _warntype_summary_tuple(f, tt::Type{<:Tuple})
+    unopt = Base.invokelatest(Base.code_typed, f, tt; optimize=false)
+    isempty(unopt) && error("no matching method found for $(f) with argtypes $(tt)")
+    opt = Base.invokelatest(Base.code_typed, f, tt; optimize=true)
+
+    ci_unopt, rt_unopt = unopt[1]
+    ci_opt, rt_opt = isempty(opt) ? (ci_unopt, rt_unopt) : opt[1]
+    rettype = _unwrap_ir_type(rt_opt)
+
+    unstable_vars = NamedTuple[]
+    if ci_unopt.slottypes !== nothing
+        seen_vars = Set{Symbol}()
+        for (i, sname) in enumerate(ci_unopt.slotnames)
+            i == 1 && continue
+            (sname === Symbol("") || startswith(string(sname), '#')) && continue
+            i <= length(ci_unopt.slottypes) || continue
+            stype = _unwrap_ir_type(ci_unopt.slottypes[i])
+            if !_is_stable_type(stype) && !(sname in seen_vars)
+                push!(seen_vars, sname)
+                push!(unstable_vars, (name=sname, type=stype))
+            end
+        end
+    end
+
+    unstable_exprs = 0
+    if ci_opt.ssavaluetypes isa Vector
+        for (stmt, st) in zip(ci_opt.code, ci_opt.ssavaluetypes)
+            _is_control_stmt(stmt) && continue
+            _is_stable_type(st) || (unstable_exprs += 1)
+        end
+    end
+
+    sig_str = try
+        string(Base.invokelatest(which, f, tt).sig)
+    catch
+        string("Tuple{", typeof(f), ", ", join(string.(tt.parameters), ", "), "}")
+    end
+
+    concrete = _is_stable_type(rettype) && isempty(unstable_vars) && unstable_exprs == 0
+    return (
+        is_concretely_typed=concrete,
+        return_type=rettype,
+        unstable_vars=unstable_vars,
+        unstable_exprs=unstable_exprs,
+        method_signature=sig_str,
+    )
+end
+
+"""
+    warntype_summary(f, argtypes)
+    warntype_summary(f, args...)
+    warntype_summary_call(f, args...)
+        -> NamedTuple{(:is_concretely_typed, :return_type, :unstable_vars, :unstable_exprs, :method_signature)}
+
+Inspect `code_typed(f, argtypes)` and return a compact type-stability report
+listing ONLY non-concrete (`Any`, `Union`, abstract, or `UnionAll`) user slots
+and SSA expressions instead of dumping a full `@code_warntype` IR wall.
+Accepts a `Tuple{...}` type, a tuple/vector of types, or runtime argument
+values (`warntype_summary(f, x, y)`).
+"""
+function warntype_summary(f, argtypes)
+    tt = _is_argtype_spec(argtypes) ? _normalize_argtypes(argtypes) : Tuple{Core.Typeof(argtypes)}
+    return _warntype_summary_tuple(f, tt)
+end
+warntype_summary(f) = _warntype_summary_tuple(f, Tuple{})
+warntype_summary(f, arg1, arg2, args...) =
+    _warntype_summary_tuple(f, Base.typesof(arg1, arg2, args...))
+warntype_summary_call(f, args...) = _warntype_summary_tuple(f, Base.typesof(args...))
+
+#==============================================================================
+Wave 3: Private Lab Isolation, BLAS Thread Control, and AF_UNIX Warm Worker
+==============================================================================#
+
+const DEFAULT_BUILDER_COMMS = ("grok", "gemini", "agy", "antigravity")
+const LINEAR_ALGEBRA_PKG = Base.PkgId(Base.UUID("37e2e46d-f89d-539d-b4ee-838fcccc9c8e"), "LinearAlgebra")
+
+function _env_truthy(key::AbstractString)
+    return lowercase(strip(get(ENV, String(key), ""))) in ("1", "true", "yes", "on")
+end
+
+"""
+    private_lab_root() -> Union{Nothing, String}
+
+Returns the active Private Lab containment root (`PALETTE_PRIVATE_DIR` or
+`PALETTE_HOME`, or `PALETTE_DATA_HOME` when `PALETTE_PRIVATE_MODE=1` is set),
+or `nothing` when Private Lab isolation is not enabled.
+"""
+function private_lab_root()
+    for key in ("PALETTE_PRIVATE_DIR", "PALETTE_HOME")
+        raw = strip(get(ENV, key, ""))
+        if !isempty(raw)
+            return abspath(expanduser(raw))
+        end
+    end
+    if _env_truthy("PALETTE_PRIVATE_MODE")
+        raw = strip(get(ENV, "PALETTE_DATA_HOME", ""))
+        isempty(raw) && error("PALETTE_PRIVATE_MODE=1 requires PALETTE_HOME or PALETTE_PRIVATE_DIR")
+        return abspath(expanduser(raw))
+    end
+    return nothing
+end
+
+is_private_mode() = private_lab_root() !== nothing
+
+function _assert_within_private_root(path::AbstractString, label::AbstractString="path")
+    root = private_lab_root()
+    p = abspath(expanduser(String(path)))
+    root === nothing && return p
+    r = rstrip(abspath(root), '/')
+    if !(p == r || startswith(p, r * "/"))
+        error("private lab containment violation: $label ($p) escapes PALETTE_HOME ($r)")
+    end
+    return p
+end
+
+function _ensure_private_dir!(path::AbstractString)
+    p = abspath(expanduser(String(path)))
+    root = private_lab_root()
+    if root !== nothing
+        _assert_within_private_root(p, "private directory")
+    end
+    mkpath(p)
+    if Sys.isunix() && root !== nothing
+        r = rstrip(abspath(root), '/')
+        cur = p
+        while true
+            if isdir(cur) && !islink(cur)
+                chmod(cur, 0o700)
+            end
+            cur == r && break
+            parent = dirname(cur)
+            parent == cur && break
+            cur = parent
+        end
+        isdir(r) && !islink(r) && chmod(r, 0o700)
+    end
+    return p
+end
+
+function _enforce_private_file_perms!(path::AbstractString; mode::Integer=0o600)
+    if Sys.isunix() && is_private_mode() && ispath(path) && !islink(path)
+        chmod(path, UInt32(mode))
+    end
+    return path
+end
+
+function _matches_builder_comm(comm::AbstractString, builder_comms=DEFAULT_BUILDER_COMMS)
+    c = lowercase(strip(String(comm)))
+    isempty(c) && return false
+    for known in builder_comms
+        k = lowercase(String(known))
+        if c == k || startswith(c, k * "-") || startswith(c, k * "_") || startswith(c, k * ".") ||
+           (k == "antigravity" && startswith(c, "antigravity"))
+            return true
+        end
+    end
+    return false
+end
+
+function _parse_proc_status_uids(status_text::AbstractString)
+    for line in eachsplit(status_text, '\n')
+        if startswith(line, "Uid:")
+            parts = split(strip(line[5:end]))
+            length(parts) >= 1 || return nothing
+            ruid = tryparse(Int, parts[1])
+            ruid === nothing && return nothing
+            euid = length(parts) >= 2 ? something(tryparse(Int, parts[2]), ruid) : ruid
+            return (ruid, euid)
+        end
+    end
+    return nothing
+end
+
+"""
+    check_private_isolation(; allow_unboxed=false, proc_root="/proc", ...)
+
+Audits `/proc` for other processes belonging to the same Linux UID and sharing
+the same mount namespace (`/proc/<pid>/ns/mnt`) whose `comm` matches known
+builder binaries (`grok`, `gemini`, `agy`, `antigravity`).
+
+- A builder running in `builder-box` has a different mount namespace and is
+  classified as `boxed_builders` (isolated).
+- A builder running under a different Linux user (when the private lab runs as
+  e.g. `inquisitor`) has a different UID and is classified as `other_uid_builders`
+  (isolated).
+- Any same-UID, same-mount-namespace builder is classified as `unboxed_builders`.
+  When `!allow_unboxed` and `unboxed_builders` is non-empty, this throws an
+  `ErrorException` naming the offending PID(s)/`comm`(s) and both real fixes.
+"""
+function check_private_isolation(;
+    allow_unboxed::Bool=false,
+    proc_root::AbstractString="/proc",
+    own_pid::Integer=getpid(),
+    own_uid::Union{Nothing, Integer}=nothing,
+    own_mnt_ns::Union{Nothing, AbstractString}=nothing,
+    builder_comms=DEFAULT_BUILDER_COMMS,
+)
+    uid_val = own_uid === nothing ? Int(Sys.isunix() ? ccall(:getuid, Cuint, ()) : 0) : Int(own_uid)
+    ns_val = if own_mnt_ns !== nothing
+        String(own_mnt_ns)
+    else
+        self_ns = joinpath(String(proc_root), "self", "ns", "mnt")
+        try
+            islink(self_ns) ? String(readlink(self_ns)) : nothing
+        catch
+            nothing
+        end
+    end
+
+    EntryT = NamedTuple{(:pid, :comm, :uid, :mnt_ns), Tuple{Int, String, Int, Union{Nothing, String}}}
+    unboxed = EntryT[]
+    boxed = EntryT[]
+    other_uid = EntryT[]
+
+    if isdir(proc_root)
+        for name in readdir(proc_root)
+            pid = tryparse(Int, name)
+            (pid === nothing || pid == Int(own_pid)) && continue
+            pdir = joinpath(proc_root, name)
+            comm_path = joinpath(pdir, "comm")
+            comm = try
+                strip(read(comm_path, String))
+            catch
+                continue
+            end
+            _matches_builder_comm(comm, builder_comms) || continue
+            status_text = try
+                read(joinpath(pdir, "status"), String)
+            catch
+                continue
+            end
+            uids = _parse_proc_status_uids(status_text)
+            uids === nothing && continue
+            ruid, euid = uids
+            mnt_ns = try
+                ns_path = joinpath(pdir, "ns", "mnt")
+                islink(ns_path) ? String(readlink(ns_path)) : nothing
+            catch
+                nothing
+            end
+            rec = (pid=pid, comm=String(comm), uid=ruid, mnt_ns=mnt_ns)
+            if ruid != uid_val && euid != uid_val
+                push!(other_uid, rec)
+            elseif ns_val !== nothing && mnt_ns !== nothing && mnt_ns != ns_val
+                push!(boxed, rec)
+            else
+                push!(unboxed, rec)
+            end
+        end
+    end
+
+    sort!(unboxed; by=r -> r.pid)
+    sort!(boxed; by=r -> r.pid)
+    sort!(other_uid; by=r -> r.pid)
+
+    isolated = isempty(unboxed)
+    message = if isolated
+        "private lab isolation OK (uid=$uid_val, mnt_ns=$(something(ns_val, "unknown")), boxed_builders=$(length(boxed)), other_uid_builders=$(length(other_uid)))"
+    else
+        offenders = join(["pid=$(r.pid) comm=$(r.comm) uid=$(r.uid) mnt_ns=$(something(r.mnt_ns, "unreadable"))" for r in unboxed], ", ")
+        "PALETTE_PRIVATE_STRICT isolation failure: unboxed same-user builder process(es) detected in the same mount namespace " *
+        "(uid=$uid_val, mnt_ns=$(something(ns_val, "unknown"))): [$offenders]. " *
+        "A same-UID process in the same mount namespace can read 0o700 files under PALETTE_HOME. " *
+        "Real fixes: (1) run builders inside `builder-box` (separate mount namespace hiding PALETTE_HOME), " *
+        "or (2) run this Private Lab under a dedicated Linux user (e.g. `inquisitor`) owning 0o700 PALETTE_HOME."
+    end
+
+    report = (
+        isolated=isolated,
+        own_pid=Int(own_pid),
+        own_uid=uid_val,
+        own_mnt_ns=ns_val,
+        unboxed_builders=unboxed,
+        boxed_builders=boxed,
+        other_uid_builders=other_uid,
+        message=message,
+    )
+
+    if !isolated
+        if !allow_unboxed
+            error(message)
+        end
+        @warn message
+    end
+    return report
+end
+
+"""
+    configure_private_lab!(; strict=nothing)
+
+Initializes Private Lab single-root containment when `PALETTE_HOME`,
+`PALETTE_PRIVATE_DIR`, or `PALETTE_PRIVATE_MODE=1` is active: creates `0o700`
+directories under `PALETTE_HOME`, binds `STATE_DIR` strictly inside it, and
+runs `check_private_isolation`.
+"""
+function configure_private_lab!(; strict::Union{Nothing, Bool}=nothing)
+    root = private_lab_root()
+    root === nothing && return nothing
+    _ensure_private_dir!(root)
+    for sub in ("workspace", "state", "worlds", "scratch", "packages", "logs", "run", "provenance", "pharos", "pinned_cache")
+        _ensure_private_dir!(joinpath(root, sub))
+    end
+    if isempty(STATE_DIR[])
+        STATE_DIR[] = joinpath(root, "state")
+    else
+        _assert_within_private_root(STATE_DIR[], "STATE_DIR")
+        _ensure_private_dir!(STATE_DIR[])
+    end
+    is_strict = strict === nothing ? _env_truthy("PALETTE_PRIVATE_STRICT") : strict
+    audit = check_private_isolation(; allow_unboxed=!is_strict)
+    return (
+        root=root,
+        state_dir=STATE_DIR[],
+        pinned_cache=joinpath(root, "pinned_cache"),
+        logs=joinpath(root, "logs"),
+        provenance=joinpath(root, "provenance"),
+        pharos=joinpath(root, "pharos"),
+        audit=audit,
+    )
+end
+
+"""
+    set_blas_threads!(n::Integer) -> Int
+
+Sets `LinearAlgebra.BLAS.set_num_threads(Int(n))` and records
+`ENV["PALETTE_BLAS_THREADS"]` so the setting survives kernel revival.
+"""
+function set_blas_threads!(n::Integer)
+    n >= 1 || throw(ArgumentError("blas_threads must be >= 1, got $n"))
+    la = Base.require(LINEAR_ALGEBRA_PKG)
+    Base.invokelatest(la.BLAS.set_num_threads, Int(n))
+    ENV["PALETTE_BLAS_THREADS"] = string(Int(n))
+    return get_blas_threads()
+end
+
+"""
+    get_blas_threads() -> Int
+
+Returns the active `LinearAlgebra.BLAS.get_num_threads()` thread count.
+"""
+function get_blas_threads()
+    la = Base.require(LINEAR_ALGEBRA_PKG)
+    return Int(Base.invokelatest(la.BLAS.get_num_threads))
+end
+
+"""
+    apply_configured_blas_threads!() -> Union{Nothing, Int}
+
+If `ENV["PALETTE_BLAS_THREADS"]` is set to a positive integer, applies it via
+`set_blas_threads!` and returns the active thread count; otherwise returns `nothing`.
+"""
+function apply_configured_blas_threads!()
+    raw = strip(get(ENV, "PALETTE_BLAS_THREADS", ""))
+    isempty(raw) && return nothing
+    n = tryparse(Int, raw)
+    (n === nothing || n < 1) && return nothing
+    return set_blas_threads!(n)
+end
+
+mutable struct UnixSocketServerHandle
+    path::String
+    server::Sockets.PipeServer
+    task::Union{Nothing, Task}
+    running::Threads.Atomic{Bool}
+    requests_handled::Threads.Atomic{Int}
+    max_requests::Int
+end
+
+Base.isopen(h::UnixSocketServerHandle) = h.running[] && isopen(h.server)
+Base.close(h::UnixSocketServerHandle) = stop!(h)
+
+"""
+    stop!(handle::UnixSocketServerHandle) -> UnixSocketServerHandle
+
+Cleanly stops a Unix socket server created by `serve_unix_socket`, closes its
+listening socket, waits briefly for its background task, and unlinks the socket
+file if it is still a Unix socket.
+"""
+function stop!(h::UnixSocketServerHandle)
+    h.running[] = false
+    try
+        isopen(h.server) && close(h.server)
+    catch
+    end
+    t = h.task
+    if t !== nothing && t !== current_task() && !istaskdone(t)
+        deadline = time() + 2.0
+        while !istaskdone(t) && time() < deadline
+            sleep(0.01)
+        end
+    end
+    try
+        st = lstat(h.path)
+        if Base.Filesystem.issocket(st)
+            rm(h.path; force=true)
+        end
+    catch
+    end
+    return h
+end
+
+function _format_socket_reply(val)
+    if val isa AbstractString
+        return replace(chomp(String(val)), '\n' => "\\n")
+    end
+    return safe_json(val)
+end
+
+function _serve_unix_socket_loop!(h::UnixSocketServerHandle, handler::Function)
+    try
+        while h.running[] && isopen(h.server)
+            conn = try
+                Sockets.accept(h.server)
+            catch
+                break
+            end
+            try
+                while h.running[] && isopen(conn) && !eof(conn)
+                    line = try
+                        readline(conn; keep=false)
+                    catch
+                        break
+                    end
+                    (isempty(line) && eof(conn)) && break
+                    reply = try
+                        _format_socket_reply(Base.invokelatest(handler, line))
+                    catch e
+                        JSON.json(Dict{String, Any}(
+                            "ok" => false,
+                            "error" => sprint(showerror, e),
+                            "error_type" => string(typeof(e)),
+                        ))
+                    end
+                    write(conn, reply, "\n")
+                    flush(conn)
+                    handled = Threads.atomic_add!(h.requests_handled, 1) + 1
+                    if h.max_requests > 0 && handled >= h.max_requests
+                        h.running[] = false
+                        try
+                            close(h.server)
+                        catch
+                        end
+                        break
+                    end
+                end
+            catch
+            finally
+                try
+                    close(conn)
+                catch
+                end
+            end
+        end
+    finally
+        h.running[] = false
+        try
+            isopen(h.server) && close(h.server)
+        catch
+        end
+    end
+    return h
+end
+
+"""
+    serve_unix_socket(handler::Function, path::AbstractString;
+                      max_requests::Int=0, permissions::UInt32=0o600, async::Bool=true) -> UnixSocketServerHandle
+
+Serves newline-delimited requests over a Unix domain socket (`AF_UNIX`) at `path`
+using stdlib `Sockets.listen`. Safely removes stale socket files (refusing
+non-sockets or live active sockets), enforces `chmod(path, permissions)` (default
+`0o600`), isolates `handler(line)` inside `try/catch` (returning a structured JSON
+error object instead of crashing the worker), and returns a handle that can be
+cleanly shut down with `stop!(handle)`.
+"""
+function serve_unix_socket(
+    handler::Function,
+    path::AbstractString;
+    max_requests::Int=0,
+    permissions::Integer=0o600,
+    async::Bool=true,
+)
+    max_requests >= 0 || throw(ArgumentError("max_requests must be >= 0, got $max_requests"))
+    perms = UInt32(permissions)
+    sock_path = abspath(expanduser(String(path)))
+    parent = dirname(sock_path)
+    if is_private_mode()
+        _ensure_private_dir!(parent)
+    else
+        mkpath(parent)
+    end
+    if ispath(sock_path) || islink(sock_path)
+        st = lstat(sock_path)
+        if !Base.Filesystem.issocket(st)
+            error("refusing to overwrite non-socket path: $sock_path")
+        end
+        live = try
+            c = Sockets.connect(sock_path)
+            close(c)
+            true
+        catch
+            false
+        end
+        live && error("Unix socket is already active: $sock_path")
+        rm(sock_path; force=true)
+    end
+    server = Sockets.listen(sock_path)
+    if Sys.isunix()
+        chmod(sock_path, perms)
+    end
+    handle = UnixSocketServerHandle(
+        sock_path,
+        server,
+        nothing,
+        Threads.Atomic{Bool}(true),
+        Threads.Atomic{Int}(0),
+        max_requests,
+    )
+    if async
+        handle.task = @async _serve_unix_socket_loop!(handle, handler)
+        yield()
+        return handle
+    end
+    _serve_unix_socket_loop!(handle, handler)
+    return handle
+end
+
+"""
     record_tool_capsule(tool_id, code, result, duration_ms)
 
 Appends one mechanical, non-authoritative provenance record for a retired
@@ -1363,8 +3007,18 @@ authorization: nothing in this codebase reads this file to decide whether
 to permit anything, and it is never treated as such.
 """
 function record_tool_capsule(tool_id::String, code::String, result::OperationResult, duration_ms::Float64)
-    dir = get(ENV, "PALETTE_PROVENANCE_DIR", joinpath(pwd(), ".palette"))
-    mkpath(dir)
+    dir = if haskey(ENV, "PALETTE_PROVENANCE_DIR") && !isempty(strip(ENV["PALETTE_PROVENANCE_DIR"]))
+        ENV["PALETTE_PROVENANCE_DIR"]
+    elseif is_private_mode()
+        joinpath(private_lab_root(), "provenance")
+    else
+        joinpath(pwd(), ".palette")
+    end
+    if is_private_mode()
+        _ensure_private_dir!(dir)
+    else
+        mkpath(dir)
+    end
     capsule = Dict{String,Any}(
         "schema" => "palette.tool_capsule.v1",
         "tool_id" => tool_id,
@@ -1378,9 +3032,11 @@ function record_tool_capsule(tool_id::String, code::String, result::OperationRes
         # apart from a successful one in the provenance log.
         "disposition" => result.success ? "RETIRED" : "FAILED",
     )
-    open(joinpath(dir, "provenance.jsonl"), "a") do io
+    prov_file = joinpath(dir, "provenance.jsonl")
+    open(prov_file, "a") do io
         println(io, JSON.json(capsule))
     end
+    _enforce_private_file_perms!(prov_file)
     nothing
 end
 
@@ -2081,6 +3737,14 @@ export demo_setup, run_demo
 export execute, mean
 export request_capability
 export host_request, runtime
+export Api, Pharos, codegraph, codegraph!, definitions, callers, grep_defs
+export bind_mmap, eval_isolated, depot_mode, enable_shared_depot!
+export reload_methods!, sync_kernel_modules_to_main!, pin_cache!, get_cache, cache_get!, clear_cache!, bench, @bench
+export set_blas_threads!, get_blas_threads, serve_unix_socket, stop!, UnixSocketServerHandle
+export private_lab_root, is_private_mode, check_private_isolation, configure_private_lab!
+export @ephemeral, ephemeral!, unephemeral!, ephemerals, safe_summarysize
+export isolate_module, reset_sandbox_module!, sandbox_modules, warntype_summary
+export reinclude_module!, reset_bindings!, @alloc_barrier, warntype_summary_call
 
 """
     ephemeral_main(code)

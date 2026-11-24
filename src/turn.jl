@@ -44,6 +44,11 @@ function Base.unsafe_write(w::FdWriter, p::Ptr{UInt8}, n::UInt)
 end
 Base.write(w::FdWriter, b::UInt8) = (r = Ref(b); GC.@preserve r unsafe_write(w, Base.unsafe_convert(Ptr{UInt8}, r), UInt(1)))
 Base.isopen(::FdWriter) = true
+Base.iswritable(::FdWriter) = true
+Base.isreadable(::FdWriter) = false
+Base.displaysize(::FdWriter) = (24, 80)
+Base.lock(::FdWriter) = nothing
+Base.unlock(::FdWriter) = nothing
 Base.flush(::FdWriter) = nothing
 
 # `redirect_stdout(devnull) do ... end` in turn code restores the stream it
@@ -234,34 +239,78 @@ function project_turn_result!(receipt::OperationReceipt)
     return receipt
 end
 
-# Processes in this sandbox, other than the kernel and bwrap's reaper (PID 1,
-# the kernel's parent). The sandbox has its own PID namespace, so /proc lists
-# exactly what turns started. Outside such a namespace (a bare test run) there
-# is no safe way to tell, and nothing is reaped.
+# Processes owned by this kernel: in a sandbox PID namespace, /proc lists
+# everything the kernel started (including double-forked daemons adopted by
+# bwrap's PID 1). Outside a private PID namespace (operator mode), walk /proc
+# parent links so we only ever see this kernel's own descendants (e.g., stray
+# `julia --precompile` or `run`/`bash` children) and never touch unrelated host
+# processes.
 own_namespace() = getpid() == 1 ||
     (ccall(:getppid, Cint, ()) == 1 && isfile("/proc/1/comm") && strip(read("/proc/1/comm", String)) == "bwrap")
-function sandbox_pids()
-    own_namespace() || return Set{Int}()
-    pids = Set{Int}()
-    self = getpid()
+
+function descendant_pids(root_pid::Integer=Int(getpid()))
+    isdir("/proc") || return Set{Int}()
+    root = Int(root_pid)
+    children = Dict{Int, Vector{Int}}()
     for d in readdir("/proc")
         pid = tryparse(Int, d)
-        pid === nothing || pid == 1 || pid == self || push!(pids, pid)
+        (pid === nothing || pid == 1 || pid == root) && continue
+        stat = try read("/proc/$pid/stat", String) catch; continue end
+        rparen = findlast(')', stat)
+        rparen === nothing && continue
+        rest = split(stat[rparen+2:end])
+        length(rest) >= 2 || continue
+        ppid = tryparse(Int, rest[2])
+        ppid === nothing && continue
+        push!(get!(children, ppid, Int[]), pid)
     end
-    return pids
+    descendants = Set{Int}()
+    queue = Int[root]
+    while !isempty(queue)
+        cur = popfirst!(queue)
+        for child in get(children, cur, Int[])
+            if !(child in descendants) && child != root && child != 1
+                push!(descendants, child)
+                push!(queue, child)
+            end
+        end
+    end
+    return descendants
 end
+
+function sandbox_pids()
+    if own_namespace()
+        pids = Set{Int}()
+        self = Int(getpid())
+        for d in readdir("/proc")
+            pid = tryparse(Int, d)
+            pid === nothing || pid == 1 || pid == self || push!(pids, pid)
+        end
+        return pids
+    end
+    return descendant_pids(Int(getpid()))
+end
+
 # Kills what a turn started, so a wait on it returns, and nothing it began
 # keeps running after the turn is reported interrupted. Processes earlier
 # turns started are left alone.
 function reap(before::Set{Int})
-    for pid in setdiff(sandbox_pids(), before)
-        ccall(:kill, Cint, (Cint, Cint), pid, 9)
+    self = Int(getpid())
+    for _ in 1:3
+        victims = setdiff(sandbox_pids(), before)
+        delete!(victims, self)
+        delete!(victims, 1)
+        isempty(victims) && break
+        for pid in victims
+            ccall(:kill, Cint, (Cint, Cint), pid, 9)
+        end
+        sleep(0.01)
     end
 end
 
 # How long after the deadline a turn has to finish once interrupted. Turn code
 # that catches the InterruptException gets it again every second.
-const INTERRUPT_GRACE_S = 5.0
+const INTERRUPT_GRACE_S = 3.0
 
 """
     run_turn(f, timeout_s; alloc_limit=nothing, tripped=Ref(:none)) -> (value, interrupted, stuck)
@@ -292,12 +341,15 @@ function run_turn(@nospecialize(f), timeout_s; alloc_limit=nothing, tripped=Ref(
     deadline = timeout_s === nothing ? nothing : Timer(_ -> trip!(:seconds), timeout_s)
     if alloc_limit !== nothing
         allocated0 = Base.gc_total_bytes(Base.gc_num())
-        @async while !istaskdone(t) && tripped[] === :none
-            Base.gc_total_bytes(Base.gc_num()) - allocated0 >= alloc_limit && (trip!(:bytes); break)
-            sleep(0.05)
+        @async try
+            while !istaskdone(t) && tripped[] === :none
+                Base.gc_total_bytes(Base.gc_num()) - allocated0 >= alloc_limit && (trip!(:bytes); break)
+                sleep(0.05)
+            end
+        catch
         end
     end
-    watchdog = @async begin
+    watchdog = @async try
         wait(trip)
         istaskdone(t) && return  # the turn finished in time
         interrupted[] = true
@@ -311,6 +363,7 @@ function run_turn(@nospecialize(f), timeout_s; alloc_limit=nothing, tripped=Ref(
             timedwait(() -> istaskdone(t), 1.0; pollint=0.05)
         end
         istaskdone(t) || put!(outcome, :stuck)
+    catch
     end
     result = take!(outcome)
     deadline === nothing || close(deadline)
@@ -390,9 +443,26 @@ function task_observations()
         "listed" => min(length(pairs), MAX_LISTED_BINDINGS), "total_named" => length(pairs))
 end
 
+const _TASK_PRINT_NOTICE_RE = r"(?m)^[ \t]*SYSTEM: caught exception(?: of type :?[A-Za-z0-9_]+)? while trying to print a failed Task notice[^\r\n]*\r?\n?"
+
+"""
+    scrub_task_print_notices(text) -> String
+
+Remove spurious Julia runtime `SYSTEM: caught exception ... while trying to
+print a failed Task notice` lines that leak from `Base.errormonitor` when
+background tasks race with redirected streams.
+"""
+function scrub_task_print_notices(text::AbstractString)
+    s = String(text)
+    occursin("while trying to print a failed Task notice", s) || return s
+    cleaned = replace(s, _TASK_PRINT_NOTICE_RE => "")
+    return isempty(strip(cleaned)) ? "" : cleaned
+end
+
 function task_notice_hint(text::String)
-    (occursin("failed Task notice", text) || occursin("Unhandled Task ERROR", strip_ansi(text))) || return text
-    return text * "\n[Julia reported a task failure without an established task identity. Palette.jobs() inspects named tasks; this notice alone cannot establish its origin or creation call.]\n"
+    cleaned = scrub_task_print_notices(text)
+    occursin(r"(?im)^Unhandled Task ERROR:", strip_ansi(cleaned)) || return cleaned
+    return cleaned * "\n[Julia reported a task failure without an established task identity. Palette.jobs() inspects named tasks; this notice alone cannot establish its origin or creation call.]\n"
 end
 
 # Each Task the session holds, once, under the model's own name before `ans`.
@@ -515,6 +585,7 @@ function report_background(mod::Module)
             SINK_READ[] = drop_reported!(SINK_PATH[], total)
         end
     end
+    text = scrub_task_print_notices(text)
     if !isempty(text)
         length(text) > MAX_BACKGROUND_BYTES && (text = "…" * last(text, MAX_BACKGROUND_BYTES))
         print("[background output since the last call]\n", text, endswith(text, '\n') ? "" : "\n")
@@ -780,11 +851,16 @@ function execute_turn(code::String, timeout_s::Union{Nothing, Float64}; session_
     call = next_call()
     CURRENT_CALL[] = call
     CALL_CONTEXT[] = context
+    TURN_TASK[] = current_task()
+    done = Base.Event()
+    TURN_DONE[] = done
     try
         return run_execute_turn(code, timeout_s, call, context, session_request)
     finally
+        TURN_TASK[] = nothing
         CURRENT_CALL[] = 0
         CALL_CONTEXT[] = nothing
+        notify(done)
     end
 end
 
@@ -814,6 +890,9 @@ function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call
         costs["maintenance_seconds"] = (time_ns() - maintained) / 1e9
         costs["phase"] = "execution"
         turn = run_turn(() -> with_context(ctx) do
+            # User eval runs on this task, not execute_turn's caller. Sync bash
+            # on this task keeps the ShellResult; @async bash rings the doorbell.
+            TURN_TASK[] = current_task()
             # Compile timing nests (it counts enables), so user code may still use @time.
             Base.cumulative_compile_timing(true)
             compiled = first(Base.cumulative_compile_time_ns())
@@ -845,6 +924,7 @@ function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call
         # the closure finish, so the phase it already recorded is the one to keep.
         turn[2] && get!(costs, "failed_phase", costs["phase"])
         refresh_workspace_packages!(reload=false)
+        sync_kernel_modules_to_main!(state.eval_module)
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]
         ex = log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module)

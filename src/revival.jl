@@ -25,13 +25,49 @@ using Serialization
 
 const STATE_DIR = Ref("")
 
+function effective_state_dir(; create::Bool=false)
+    sd = STATE_DIR[]
+    root = private_lab_root()
+    if !isempty(sd)
+        if root !== nothing
+            _assert_within_private_root(sd, "STATE_DIR")
+            create && _ensure_private_dir!(sd)
+        elseif create
+            mkpath(sd)
+        end
+        return sd
+    end
+    if root !== nothing
+        priv_state = joinpath(root, "state")
+        create && _ensure_private_dir!(priv_state)
+        return priv_state
+    end
+    return ""
+end
+
 read_json(path) = JSON.parse(read(path, String); dicttype=Dict{String, Any})
 file_sha(path) = bytes2hex(open(sha256, path))
 const REVIVAL_FORMAT = 2
 # Per binding (or group of bindings sharing data) and per snapshot; the
 # environment can lower them, as the tests do.
-max_binding_bytes() = parse(Int, get(ENV, "PALETTE_STATE_MAX_BINDING_BYTES", string(16 * 1024 * 1024)))
+const DEFAULT_MAX_BINDING_BYTES = 16 * 1024 * 1024
+const DEFAULT_MAX_SIDECAR_BYTES = 512 * 1024 * 1024
+const DEFAULT_MAX_SIDECAR_TOTAL_BYTES = 1024 * 1024 * 1024
+
+max_binding_bytes() = parse(Int, get(ENV, "PALETTE_STATE_MAX_BINDING_BYTES", string(DEFAULT_MAX_BINDING_BYTES)))
 max_snapshot_bytes() = parse(Int, get(ENV, "PALETTE_STATE_MAX_BYTES", string(128 * 1024 * 1024)))
+function max_sidecar_bytes()
+    if haskey(ENV, "PALETTE_STATE_MAX_SIDECAR_BYTES")
+        return parse(Int, ENV["PALETTE_STATE_MAX_SIDECAR_BYTES"])
+    end
+    # Preserve strict drop-behavior when a caller explicitly lowers the per-binding
+    # cap below the 16 MiB default without setting a sidecar cap.
+    if haskey(ENV, "PALETTE_STATE_MAX_BINDING_BYTES") && max_binding_bytes() < DEFAULT_MAX_BINDING_BYTES
+        return 0
+    end
+    return DEFAULT_MAX_SIDECAR_BYTES
+end
+max_sidecar_total_bytes() = parse(Int, get(ENV, "PALETTE_STATE_MAX_SIDECAR_TOTAL_BYTES", string(DEFAULT_MAX_SIDECAR_TOTAL_BYTES)))
 const MAX_RECIPE_CHARS = 240
 
 # Definition statements from every call, in order: what a new kernel
@@ -45,6 +81,220 @@ const INITIAL_ENV = Ref{Dict{String, String}}(Dict{String, String}())
 # What the first call after a revival is told.
 const REVIVAL_REPORT = Ref("")
 const REVIVAL_OBSERVATION = Ref{Dict{String, Any}}(Dict("state" => "fresh_empty_world", "states" => ["fresh_empty_world"]))
+
+# Disk-backed read-only mmap bindings: stored in the manifest as tiny metadata
+# recipes (path, eltype, dims, offset, stamp) instead of serializing raw array
+# bytes, so multi-gigabyte read-only matrices revive cleanly with zero snapshot bloat.
+const MMAP_PKG = Base.PkgId(Base.UUID("a63ad114-7e13-5084-954f-fe012c677804"), "Mmap")
+const MMAP_BINDINGS = Dict{Symbol, Dict{String, Any}}()
+
+const _MMAP_PRIMITIVE_TYPES = Dict{String, DataType}(
+    "Bool" => Bool,
+    "Int8" => Int8, "Int16" => Int16, "Int32" => Int32, "Int64" => Int64, "Int128" => Int128,
+    "UInt8" => UInt8, "UInt16" => UInt16, "UInt32" => UInt32, "UInt64" => UInt64, "UInt128" => UInt128,
+    "Float16" => Float16, "Float32" => Float32, "Float64" => Float64,
+    "ComplexF16" => ComplexF16, "ComplexF32" => ComplexF32, "ComplexF64" => ComplexF64,
+)
+
+function _mmap_type_tag(::Type{T}) where {T}
+    for (k, v) in _MMAP_PRIMITIVE_TYPES
+        v === T && return k
+    end
+    return string(T)
+end
+
+function _mmap_resolve_type(mod::Module, tag::AbstractString)
+    t = get(_MMAP_PRIMITIVE_TYPES, String(tag), nothing)
+    t !== nothing && return t
+    ex = Meta.parse(String(tag))
+    val = try
+        Base.invokelatest(Core.eval, mod, ex)
+    catch
+        Base.invokelatest(Core.eval, Base, ex)
+    end
+    (val isa DataType && isbitstype(val)) || error("unsupported mmap element type: $tag")
+    return val
+end
+
+function _open_readonly_mmap(path::AbstractString, ::Type{T}, dims::Tuple{Vararg{Int}}, offset::Int64) where {T}
+    isbitstype(T) || throw(ArgumentError("bind_mmap requires an isbits element type, got $T"))
+    offset >= 0 || throw(ArgumentError("bind_mmap offset must be non-negative, got $offset"))
+    all(d -> d >= 0, dims) || throw(ArgumentError("bind_mmap dims must be non-negative, got $dims"))
+    isfile(path) || throw(ArgumentError("bind_mmap backing file does not exist: $path"))
+    nelems = isempty(dims) ? Int64(1) : prod(Int64, dims)
+    needed = offset + Int64(sizeof(T)) * nelems
+    actual = filesize(path)
+    actual >= needed || throw(ArgumentError("bind_mmap file $path has $actual bytes, need at least $needed bytes for Array{$T}$dims at offset $offset"))
+    mmap_mod = Base.require(MMAP_PKG)
+    return open(path, "r") do io
+        Base.invokelatest(mmap_mod.mmap, io, Array{T, length(dims)}, dims, offset; grow=false)
+    end
+end
+
+"""
+    bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, dims::Tuple; offset::Integer=0)
+
+Memory-map `path` read-only as `Array{T, N}` with dimensions `dims` starting at
+byte `offset`, bind it to `name` in the session module, and register a tiny
+revival recipe so the array is automatically re-mmapped after kernel revival
+without writing array bytes into the snapshot.
+"""
+function bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, dims::Tuple{Vararg{Integer}}; offset::Integer=0) where {T}
+    abs_path = abspath(String(path))
+    dims_i = Tuple(Int.(dims))
+    off_i = Int64(offset)
+    arr = _open_readonly_mmap(abs_path, T, dims_i, off_i)
+    mod = get_kernel_state().eval_module
+    Core.eval(mod, Expr(:global, Expr(:(=), name, QuoteNode(arr))))
+    MMAP_BINDINGS[name] = Dict{String, Any}(
+        "path" => abs_path,
+        "eltype" => _mmap_type_tag(T),
+        "dims" => Int[dims_i...],
+        "offset" => off_i,
+        "objectid" => objectid(arr),
+        "stamp" => collect(file_stamp(abs_path)),
+    )
+    return arr
+end
+bind_mmap(name::Symbol, path::AbstractString, ::Type{T}, len::Integer; offset::Integer=0) where {T} =
+    bind_mmap(name, path, T, (Int(len),); offset)
+
+# --- persistent pinned large-tensor cache --------------------------------
+
+const _PINNED_CACHE_MISS = gensym(:pinned_cache_miss)
+
+function default_pinned_cache_dir()
+    root = private_lab_root()
+    if root !== nothing
+        custom = strip(get(ENV, "PALETTE_PINNED_CACHE_DIR", ""))
+        dir = isempty(custom) ? joinpath(root, "pinned_cache") : abspath(expanduser(custom))
+        return _assert_within_private_root(dir, "pinned_cache")
+    end
+    custom = strip(get(ENV, "PALETTE_PINNED_CACHE_DIR", ""))
+    if !isempty(custom)
+        return abspath(expanduser(custom))
+    end
+    ws = WORKSPACE_ROOT[]
+    if !isempty(ws) && isdir(ws)
+        return joinpath(ws, ".palette", "pinned_cache")
+    end
+    sd = STATE_DIR[]
+    if !isempty(sd) && isdir(sd)
+        return joinpath(sd, "pinned_cache")
+    end
+    return joinpath(tempdir(), "palette_pinned_cache")
+end
+
+function _pinned_cache_filename(key::Union{Symbol, AbstractString})
+    raw = String(key)
+    isempty(raw) && throw(ArgumentError("cache key must not be empty"))
+    safe = replace(raw, r"[^A-Za-z0-9._-]" => "_")
+    length(safe) > 64 && (safe = first(safe, 64))
+    tag = first(bytes2hex(sha256(raw)), 16)
+    return "$(safe)_$(tag).jls"
+end
+
+function _pinned_cache_path(key::Union{Symbol, AbstractString}, dir::AbstractString)
+    return joinpath(String(dir), _pinned_cache_filename(key))
+end
+
+function _read_pinned_cache(path::String)
+    isfile(path) || return _PINNED_CACHE_MISS
+    state = GLOBAL_STATE[]
+    state !== nothing && sync_kernel_modules_to_main!(state.eval_module)
+    try
+        return open(path, "r") do io
+            Base.invokelatest(deserialize, io)
+        end
+    catch
+        return _PINNED_CACHE_MISS
+    end
+end
+
+"""
+    pin_cache!(key, val; dir=default_pinned_cache_dir()) -> val
+
+Persist `val` atomically to a `.jls` file under `dir` (defaulting to
+`<workspace>/.palette/pinned_cache` or a temp fallback) so large models and
+cached tensors survive kernel restarts and timeouts without hitting snapshot limits.
+"""
+function pin_cache!(key::Union{Symbol, AbstractString}, val; dir::AbstractString=default_pinned_cache_dir())
+    cache_dir = String(dir)
+    if is_private_mode()
+        _ensure_private_dir!(cache_dir)
+    else
+        mkpath(cache_dir)
+    end
+    path = _pinned_cache_path(key, cache_dir)
+    tmp = path * ".tmp." * string(getpid()) * "." * string(uuid4())
+    try
+        open(tmp, "w") do io
+            Base.invokelatest(serialize, io, val)
+        end
+        _enforce_private_file_perms!(tmp)
+        mv(tmp, path; force=true)
+        _enforce_private_file_perms!(path)
+    catch
+        rm(tmp; force=true)
+        rethrow()
+    end
+    return val
+end
+
+"""
+    get_cache(key; default=nothing, dir=default_pinned_cache_dir())
+
+Load the value previously pinned under `key` from `dir`, or return `default`
+if no readable entry exists.
+"""
+function get_cache(key::Union{Symbol, AbstractString}; default=nothing, dir::AbstractString=default_pinned_cache_dir())
+    path = _pinned_cache_path(key, dir)
+    val = _read_pinned_cache(path)
+    return val === _PINNED_CACHE_MISS ? default : val
+end
+
+"""
+    cache_get!(builder::Function, key; dir=default_pinned_cache_dir())
+
+Return the pinned cached value for `key` if present on disk; otherwise invoke
+`builder()`, persist the result with `pin_cache!`, and return it.
+"""
+function cache_get!(builder::Function, key::Union{Symbol, AbstractString}; dir::AbstractString=default_pinned_cache_dir())
+    path = _pinned_cache_path(key, dir)
+    val = _read_pinned_cache(path)
+    val !== _PINNED_CACHE_MISS && return val
+    built = builder()
+    pin_cache!(key, built; dir=dir)
+    return built
+end
+
+"""
+    clear_cache!(; key=nothing, dir=default_pinned_cache_dir()) -> Int
+    clear_cache!(key; dir=default_pinned_cache_dir()) -> Int
+
+Remove either a single pinned cache entry (`key`) or all `.jls` entries in `dir`.
+Returns the number of cache files removed.
+"""
+function clear_cache!(; key::Union{Nothing, Symbol, AbstractString}=nothing, dir::AbstractString=default_pinned_cache_dir())
+    cache_dir = String(dir)
+    isdir(cache_dir) || return 0
+    if key !== nothing
+        path = _pinned_cache_path(key, cache_dir)
+        isfile(path) || return 0
+        rm(path; force=true)
+        return 1
+    end
+    removed = 0
+    for f in readdir(cache_dir)
+        endswith(f, ".jls") || continue
+        rm(joinpath(cache_dir, f); force=true)
+        removed += 1
+    end
+    return removed
+end
+
+clear_cache!(key::Union{Symbol, AbstractString}; dir::AbstractString=default_pinned_cache_dir()) =
+    clear_cache!(; key=key, dir=dir)
 
 function revival_observation!(; restored=String[], rebuilt=String[], stale=String[], lost=String[],
                                uncertain=String[], saved_call=nothing, text="")
@@ -507,7 +757,39 @@ function value_kind(@nospecialize(T))
     return :object
 end
 
-function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
+const MAX_WALK_DEPTH = 128
+
+function _is_snapshot_skipped_type(@nospecialize(x))
+    isdefined(@__MODULE__, :Pharos) && x isa Pharos.CodeGraph && return true
+    return false
+end
+
+# Fast O(1) lower-bound byte size for dense containers so huge ML weight arrays
+# exceeding the inline + sidecar caps are rejected before allocating an IOBuffer.
+function _fast_shallow_byte_bound(@nospecialize(x))::Int
+    if x isa Array && isbitstype(eltype(x))
+        return sizeof(x)
+    elseif x isa AbstractString
+        return sizeof(x)
+    elseif x isa Tuple
+        total = 0
+        for item in x
+            total += _fast_shallow_byte_bound(item)
+        end
+        return total
+    elseif x isa NamedTuple
+        total = 0
+        for item in values(x)
+            total += _fast_shallow_byte_bound(item)
+        end
+        return total
+    end
+    return 0
+end
+
+function refusal(w::Walk, @nospecialize(x), depth::Int=0)::Union{Nothing, String}
+    depth > MAX_WALK_DEPTH && return "object graph exceeds safe snapshot depth ($MAX_WALK_DEPTH)"
+    _is_snapshot_skipped_type(x) && return "rebuildable index cache ($(short_type(x))) is skipped by snapshot"
     T = typeof(x)
     kind = get(w.kinds, T, :unknown)
     kind === :unknown && (kind = w.kinds[T] = value_kind(T))
@@ -539,26 +821,28 @@ function refusal(w::Walk, @nospecialize(x))::Union{Nothing, String}
         (w.visits[] += 1) % WALK_YIELD_EVERY == 0 && w.give_way() && throw(GaveWay())
     end
     (r = check_type(w, T)) === nothing || return r
-    return refusal_struct(w, x)
+    return refusal_struct(w, x, depth)
 end
 
-function refusal_struct(w::Walk, @nospecialize(x))
+function refusal_struct(w::Walk, @nospecialize(x), depth::Int=0)
     T = typeof(x)
-    x isa ELEMENT_CONTAINERS && return refusal_elements(w, x)
+    x isa ELEMENT_CONTAINERS && return refusal_elements(w, x, depth)
     isbitstype(T) && return ptr_free(T) ? nothing : "it holds a pointer"
+    next_depth = depth + 1
     for i in 1:nfields(x)
         isdefined(x, i) || continue
-        (r = refusal(w, getfield(x, i))) === nothing || return r
+        (r = refusal(w, getfield(x, i), next_depth)) === nothing || return r
     end
     return nothing
 end
 
 # Compiled per array type, so the loop indexes without dynamic dispatch.
-function refusal_elements(w::Walk, x::AbstractArray{E}) where {E}
+function refusal_elements(w::Walk, x::AbstractArray{E}, depth::Int=0) where {E}
     isbitstype(E) && return ptr_free(E) ? nothing : "its elements hold pointers"
+    next_depth = depth + 1
     for i in eachindex(x)
         isassigned(x, i) || continue
-        (r = refusal(w, @inbounds x[i])) === nothing || return r
+        (r = refusal(w, @inbounds x[i], next_depth)) === nothing || return r
     end
     return nothing
 end
@@ -670,13 +954,21 @@ Records in STATE_DIR that `call` completed. A snapshot can give way and fall
 behind; a revival compares this with the call its snapshot holds and says
 which calls' effects on the kernel it could not bring back.
 """
-note_completed_call!(call::Int) = (isempty(STATE_DIR[]) || write_state_file!(STATE_DIR[], "last_call", string(call)); nothing)
+note_completed_call!(call::Int) = (d = effective_state_dir(; create=true); isempty(d) || write_state_file!(d, "last_call", string(call)); nothing)
 
 # Replaces `name` in `dir` whole: a reader sees the old text or the new, never part.
 function write_state_file!(dir::String, name::String, text::String)
+    if is_private_mode()
+        _ensure_private_dir!(dir)
+    else
+        mkpath(dir)
+    end
     tmp = joinpath(dir, name * ".tmp")
     write(tmp, text)
-    mv(tmp, joinpath(dir, name); force=true)
+    _enforce_private_file_perms!(tmp)
+    dest = joinpath(dir, name)
+    mv(tmp, dest; force=true)
+    _enforce_private_file_perms!(dest)
     return nothing
 end
 
@@ -690,8 +982,9 @@ before the call completes, a revival names the call and what it assigns, and
 the next kernel does not reuse its number.
 """
 function note_started_call!(call::Int, code::String)
-    isempty(STATE_DIR[]) && return nothing
-    write_state_file!(STATE_DIR[], "started_call", JSON.json(Dict("call" => call, "code" => first(code, MAX_STOPPED_CODE_CHARS))))
+    dir = effective_state_dir(; create=true)
+    isempty(dir) && return nothing
+    write_state_file!(dir, "started_call", JSON.json(Dict("call" => call, "code" => first(code, MAX_STOPPED_CODE_CHARS))))
     return nothing
 end
 
@@ -728,6 +1021,20 @@ calls_text(a::Int, b::Int) = a == b ? "call $(a)" : "calls $(a)–$(b)"
 calls_pronoun(a::Int, b::Int) = a == b ? "it" : "they"
 
 """
+    ensure_pre_hello_snapshot!()
+
+When `STATE_DIR` is set and has no complete snapshot (`manifest.json`), write
+call 0 of the current world. The session loop runs this after revival and
+before HELLO so a later kernel does not report that no complete snapshot remains.
+"""
+function ensure_pre_hello_snapshot!()
+    dir = effective_state_dir(; create=true)
+    isempty(dir) && return nothing
+    isfile(joinpath(dir, "manifest.json")) && return nothing
+    return snapshot_state!(0)
+end
+
+"""
     snapshot_state!(call; waiting = () -> false)
 
 Writes the state at the end of `call` to STATE_DIR, replacing the last
@@ -738,7 +1045,7 @@ returns `nothing`; the last complete snapshot stays.
 # Unspecialized: each kernel passes its own callback, and the body compiled
 # into the package image must serve it.
 function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> false))
-    dir = STATE_DIR[]
+    dir = effective_state_dir(; create=true)
     isempty(dir) && return nothing
     started = time()
     # Gives way when this snapshot or the last one is slow: a first slow
@@ -762,9 +1069,29 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
                               # Asked of Julia: a const from an included file has no const entry.
                               "const" => Base.invokelatest(isconst, mod, sym))
         b["origin"] = get(BINDING_ORIGINS, sym, Dict{String, Any}())
+        if sym in EPHEMERAL_BINDINGS
+            b["class"] = "ephemeral"
+            b["reason"] = "marked @ephemeral (RAM-only; skipped by snapshot)"
+            b["files"] = [[p, evidence["stamp"]] for (p, evidence) in binding_sources(b["origin"], setcall)]
+            push!(bindings, b)
+            continue
+        end
+        if _is_snapshot_skipped_type(v)
+            b["class"] = "runtime"
+            b["reason"] = "rebuildable index cache ($(short_type(v))); skipped by snapshot"
+            b["recipe"] = recipe(name, setcall)
+            b["files"] = [[p, evidence["stamp"]] for (p, evidence) in binding_sources(b["origin"], setcall)]
+            push!(bindings, b)
+            continue
+        end
         own = v isa Function ? isdefined(typeof(v), :instance) && parentmodule(v) === mod && nameof(v) === sym :
               v isa Type && Base.unwrap_unionall(v) isa DataType && parentmodule(Base.unwrap_unionall(v)) === mod &&
               nameof(Base.unwrap_unionall(v)) === sym
+        mmap_rec = get(MMAP_BINDINGS, sym, nothing)
+        if mmap_rec !== nothing && objectid(v) != mmap_rec["objectid"]
+            delete!(MMAP_BINDINGS, sym)
+            mmap_rec = nothing
+        end
         if own && name in defnames
             b["class"] = "definition"
             b["check"] = v isa Function ? method_set(mod, name) : type_fingerprint(mod, name)
@@ -778,6 +1105,15 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         elseif v isa Module
             b["class"] = haskey(Base.loaded_modules, Base.PkgId(v)) ? "import" : "runtime"
             b["class"] == "runtime" && (b["reason"] = "a module defined in the session cannot be revived")
+        elseif mmap_rec !== nothing
+            b["class"] = "mmap"
+            b["mmap"] = Dict{String, Any}(
+                "path" => mmap_rec["path"],
+                "eltype" => mmap_rec["eltype"],
+                "dims" => copy(mmap_rec["dims"]),
+                "offset" => mmap_rec["offset"],
+                "stamp" => copy(mmap_rec["stamp"]),
+            )
         else
             w = Walk(mod, IdDict{Any, Nothing}(), Set{String}(), Set{UInt}(), IdDict{Any, Union{Nothing, String}}(), Ref(0), give_way)
             why = try
@@ -808,10 +1144,29 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
     written = String[]
     stored = Dict{String, Any}[]
     total = 0
+    sidecar_total = 0
     for g in groups
         if give_way()
             foreach(f -> rm(joinpath(dir, f * ".tmp"); force=true), written)
             return nothing
+        end
+        inline_limit = max_binding_bytes() * length(g.names)
+        sidecar_limit = max_sidecar_bytes() * length(g.names)
+        hard_cap = sidecar_limit > 0 ? max(inline_limit, sidecar_limit) : inline_limit
+        shallow_bytes = 0
+        for n in g.names
+            shallow_bytes += _fast_shallow_byte_bound(latest_global(mod, Symbol(n)))
+        end
+        if shallow_bytes > hard_cap
+            why_pre = sidecar_limit == 0 ?
+                "$(Base.format_bytes(shallow_bytes)) is over the $(Base.format_bytes(max_binding_bytes())) limit per binding" :
+                "$(Base.format_bytes(shallow_bytes)) is over the $(Base.format_bytes(max_sidecar_bytes())) sidecar limit per binding"
+            for n in g.names
+                byname[n]["class"] = "runtime"
+                byname[n]["reason"] = "not saved: " * why_pre
+                byname[n]["recipe"] = recipe(n, byname[n]["call"])
+            end
+            continue
         end
         bytes = UInt8[]
         ok = try
@@ -826,10 +1181,23 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
             false
         end
         ok || continue
-        why = length(bytes) > max_binding_bytes() * length(g.names) ?
-                  "$(Base.format_bytes(length(bytes))) is over the $(Base.format_bytes(max_binding_bytes())) limit per binding" :
-              total + length(bytes) > max_snapshot_bytes() ?
-                  "the snapshot reached its $(Base.format_bytes(max_snapshot_bytes())) limit" : nothing
+        nbytes = length(bytes)
+        fits_inline = nbytes <= inline_limit && total + nbytes <= max_snapshot_bytes()
+        use_sidecar = false
+        why = nothing
+        if !fits_inline
+            if sidecar_limit > 0 && nbytes <= sidecar_limit && sidecar_total + nbytes <= max_sidecar_total_bytes()
+                use_sidecar = true
+            elseif sidecar_limit == 0
+                why = nbytes > inline_limit ?
+                    "$(Base.format_bytes(nbytes)) is over the $(Base.format_bytes(max_binding_bytes())) limit per binding" :
+                    "the snapshot reached its $(Base.format_bytes(max_snapshot_bytes())) limit"
+            elseif nbytes > sidecar_limit
+                why = "$(Base.format_bytes(nbytes)) is over the $(Base.format_bytes(max_sidecar_bytes())) sidecar limit per binding"
+            else
+                why = "sidecar storage reached its $(Base.format_bytes(max_sidecar_total_bytes())) limit"
+            end
+        end
         if why !== nothing
             for n in g.names
                 byname[n]["class"] = "runtime"
@@ -838,18 +1206,33 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
             end
             continue
         end
-        total += length(bytes)
+        if use_sidecar
+            sidecar_total += nbytes
+        else
+            total += nbytes
+        end
         sha = bytes2hex(sha256(bytes))
         # Named by content: data that did not change keeps its file, which the
         # checkpoints that link it share instead of each pinning a copy.
-        file = "data-$(first(sha, 32)).jls"
+        file = (use_sidecar ? "sidecar-" : "data-") * "$(first(sha, 32)).jls"
         existing = joinpath(dir, file)
-        if !(file in written) && !(isfile(existing) && filesize(existing) == length(bytes))
-            write(joinpath(dir, file * ".tmp"), bytes)
+        if !(file in written) && !(isfile(existing) && filesize(existing) == nbytes)
+            tmp_file = joinpath(dir, file * ".tmp")
+            write(tmp_file, bytes)
+            _enforce_private_file_perms!(tmp_file)
             push!(written, file)
         end
-        push!(stored, Dict{String, Any}("file" => file, "names" => sort(g.names), "sha256" => sha,
-                                        "user_types" => sort!(collect(g.user))))
+        entry = Dict{String, Any}("file" => file, "names" => sort(g.names), "sha256" => sha,
+                                  "user_types" => sort!(collect(g.user)))
+        if use_sidecar
+            entry["sidecar"] = true
+            entry["bytes"] = nbytes
+            for n in g.names
+                byname[n]["sidecar"] = file
+                byname[n]["sidecar_bytes"] = nbytes
+            end
+        end
+        push!(stored, entry)
     end
     usertypes = Set(t for g in stored for t in g["user_types"])
     manifest = Dict{String, Any}(
@@ -863,16 +1246,18 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
         "used_files" => [[p, collect(s), c] for (p, (s, c)) in USED_FILES],
         "workspace_packages" => Dict(string(nameof(mod_)) => Dict(k => collect(v) for (k, v) in snap) for (mod_, snap) in WORKSPACE_PACKAGES),
         "processes" => [first(cmd, 200) for (_, cmd, _) in background_processes()],
-        "bytes" => total, "seconds" => round(time() - started, digits=3))
+        "bytes" => total, "sidecar_bytes" => sidecar_total, "seconds" => round(time() - started, digits=3))
     for f in written
-        mv(joinpath(dir, f * ".tmp"), joinpath(dir, f); force=true)
+        dest = joinpath(dir, f)
+        mv(joinpath(dir, f * ".tmp"), dest; force=true)
+        _enforce_private_file_perms!(dest)
     end
     write_state_file!(dir, "manifest.json", JSON.json(manifest))   # the commit point
     LAST_SAVED_CALL[] = call
     LAST_SNAPSHOT_SECONDS[] = time() - started
     keep = Set(String(g["file"]) for g in stored)
     for f in readdir(dir)
-        startswith(f, "data-") && !(f in keep) && rm(joinpath(dir, f); force=true)
+        (startswith(f, "data-") || startswith(f, "sidecar-")) && !(f in keep) && rm(joinpath(dir, f); force=true)
     end
     return manifest
 end
@@ -886,8 +1271,9 @@ The eval-module name the last kernel used, so this one can take it: values
 of kernel-defined types deserialize only into a module of the same name.
 """
 function revival_module_name()
-    path = joinpath(STATE_DIR[], "manifest.json")
-    isempty(STATE_DIR[]) || !isfile(path) ? nothing : try
+    dir = effective_state_dir()
+    path = joinpath(dir, "manifest.json")
+    isempty(dir) || !isfile(path) ? nothing : try
         m = read_json(path)
         get(m, "workspace", nothing) == WORKSPACE_ROOT[] ? String(m["module"]) : nothing
     catch
@@ -923,7 +1309,7 @@ first call shows.
 read_or_empty(path) = isfile(path) ? read(path, String) : ""
 
 function revive_state!()
-    dir = STATE_DIR[]
+    dir = effective_state_dir()
     path = joinpath(dir, "manifest.json")
     if isempty(dir) || !isfile(path)
         previous = !isempty(dir) && (isfile(joinpath(dir, "last_call")) || isfile(joinpath(dir, "started_call")))
@@ -948,8 +1334,9 @@ function revive_state!()
 
     # Keep the current launcher's managed package environment available when
     # reviving a snapshot created before broker provisioning was configured.
-    # Snapshot ENV changes cannot replace this host-selected, read-only mount.
+    # Snapshot ENV changes cannot replace host-selected managed mounts or private lab containment.
     package_environment = get(INITIAL_ENV[], "PALETTE_PACKAGE_ENVIRONMENT", "")
+    initial_blas = get(INITIAL_ENV[], "PALETTE_BLAS_THREADS", "")
     # The environment turn code set up: where packages load from, and where it works.
     # Only what this kernel can see; the rest is named in the report.
     empty!(LOAD_PATH); append!(LOAD_PATH, filter(!unseen_path, String.(m["load_path"])))
@@ -959,6 +1346,13 @@ function revive_state!()
     for (k, v) in m["env"]; ENV[k] = v; end
     for k in m["env_removed"]; delete!(ENV, k); end
     isempty(package_environment) || (ENV["PALETTE_PACKAGE_ENVIRONMENT"] = package_environment)
+    if !isempty(initial_blas) && !haskey(m["env"], "PALETTE_BLAS_THREADS")
+        ENV["PALETTE_BLAS_THREADS"] = initial_blas
+    end
+    try
+        apply_configured_blas_threads!()
+    catch
+    end
 
     # Definitions, in call order. Package code loads first from `using`.
     errors = Dict{String, String}()
@@ -1069,6 +1463,7 @@ function revive_state!()
     failed = with_logger(DocReplacementFilter(current_logger())) do
         replay(pending)
     end
+    sync_kernel_modules_to_main!(mod)
 
     # Everything after the replay runs in the world the replay made: checks
     # call methods it defined (an @enum's names, a type's `show`).
@@ -1076,9 +1471,9 @@ function revive_state!()
 end
 
 function finish_revival(m, mod, state, call, pending, failed, errors, changed_files, replay, attempted)
-    dir = STATE_DIR[]
+    dir = effective_state_dir()
     lines = String[]
-    exact = String[]; rebuilt = String[]; approx = String[]; stale = String[]; lost = String[]
+    exact = String[]; rebuilt = String[]; approx = String[]; stale = String[]; lost = String[]; ephem = String[]
     # Bindings found the same as when they were saved, for a restore's receipt.
     same = Set{String}()
     pins = pinned_files(m["definitions"])
@@ -1111,13 +1506,16 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 isempty(bad) || (why = "type $(join(bad, ", ")) is defined differently now")
             end
             file = joinpath(dir, g["file"])
+            is_sidecar = get(g, "sidecar", false) === true
             if why === nothing
-                bytes = isfile(file) ? read(file) : nothing
-                why = bytes === nothing ? "its data file is missing" :
-                      bytes2hex(sha256(bytes)) != g["sha256"] ? "its data file is damaged" : nothing
+                kind_label = is_sidecar ? "sidecar" : "data"
+                why = !isfile(file) ? "its $(kind_label) file is missing" :
+                      file_sha(file) != g["sha256"] ? "its $(kind_label) file is damaged" : nothing
                 if why === nothing
                     try
-                        d = Base.invokelatest(deserialize, IOBuffer(bytes))
+                        d = open(file, "r") do io
+                            Base.invokelatest(deserialize, io)
+                        end
                         for n in names
                             values[n] = d[n]
                         end
@@ -1182,6 +1580,48 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
             push!(rebuilt, "$name (workspace package)")
         end
     end
+    # Re-mmap registered disk-backed read-only arrays from their manifest recipes.
+    mmapped = Dict{String, Bool}()
+    empty!(MMAP_BINDINGS)
+    for (n, b) in bindings
+        b["class"] == "mmap" || continue
+        spec = get(b, "mmap", nothing)
+        if !(spec isa AbstractDict)
+            b["class"] = "runtime"
+            b["reason"] = "mmap revival metadata is missing"
+            continue
+        end
+        mpath = String(get(spec, "path", ""))
+        eltag = String(get(spec, "eltype", ""))
+        mdims = Tuple(Int.(get(spec, "dims", Int[])))
+        moffset = Int64(get(spec, "offset", 0))
+        old_stamp = get(spec, "stamp", nothing)
+        if !isfile(mpath)
+            b["class"] = "runtime"
+            b["reason"] = "mmap backing file is missing: $mpath"
+            continue
+        end
+        try
+            T = _mmap_resolve_type(mod, eltag)
+            arr = _open_readonly_mmap(mpath, T, mdims, moffset)
+            Core.eval(mod, Expr(b["const"] ? :const : :global, Expr(:(=), Symbol(n), QuoteNode(arr))))
+            now_stamp = collect(file_stamp(mpath))
+            MMAP_BINDINGS[Symbol(n)] = Dict{String, Any}(
+                "path" => mpath,
+                "eltype" => _mmap_type_tag(T),
+                "dims" => Int[mdims...],
+                "offset" => moffset,
+                "objectid" => objectid(arr),
+                "stamp" => now_stamp,
+            )
+            values[n] = arr
+            mmapped[n] = old_stamp !== nothing && Tuple(old_stamp) != Tuple(now_stamp)
+        catch err
+            b["class"] = "runtime"
+            b["reason"] = "re-mmapping $mpath failed: $(first(sprint(showerror, err), 160))"
+        end
+    end
+
     # Check each binding against what the old kernel had: definitions first,
     # because data that refers to a definition is only as exact as it is.
     inexact = changed_packages
@@ -1216,6 +1656,14 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(rebuilt, "$n (module)")
                 push!(same, n)
             end
+        elseif cls == "mmap" && haskey(mmapped, n)
+            if mmapped[n]
+                push!(stale, "$(fmt_binding(b)): mmap backing file changed on disk")
+                push!(same, n)
+            else
+                push!(exact, fmt_binding(b))
+                push!(same, n)
+            end
         elseif cls == "data" && haskey(values, n)
             origin = get(b, "origin", Dict{String, Any}())
             sources = binding_sources(origin, b["call"])
@@ -1237,6 +1685,8 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
                 push!(stale, "$(fmt_binding(b)): $(join(changed, ", ")) changed since")
                 push!(same, n)
             end
+        elseif cls == "ephemeral"
+            push!(ephem, fmt_binding(b))
         else
             r = get(b, "recipe", "")
             push!(lost, "$(fmt_binding(b)): $(get(b, "reason", "not revived"))" * (isempty(r) ? "" : "; it came from `$r`"))
@@ -1302,6 +1752,7 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
     isempty(stale) || push!(lines, "  restored but stale (a file it was computed from changed): " * join(stale, "; "))
     isempty(rebuilt) || push!(lines, short_list("rebuilt from source", rebuilt))
     isempty(exact) || push!(lines, short_list("restored exactly", exact))
+    isempty(ephem) || push!(lines, short_list("ephemeral (RAM-only, skipped by design)", ephem))
     isempty(bindings) && push!(lines, "  (the previous kernel had no bindings)")
     unseen = filter(unseen_path, unique!([String(m["active_project"]); String.(m["load_path"])]))
     isempty(unseen) || push!(lines, "  The saved active project or LOAD_PATH named " * join(("`$p`" for p in unseen), ", ") *

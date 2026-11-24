@@ -18,9 +18,47 @@ pub const SANDBOX_USER: &str = "palette";
 /// The sandbox sets these itself; a task environment cannot move them.
 const SANDBOX_OWNED_ENV: &[&str] = &[
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "JULIA_DEPOT_PATH", "JULIA_PROJECT", "JULIA_LOAD_PATH",
-    "JULIA_PKG_OFFLINE", "PALETTE_MODE", "PALETTE_CONFIG_REVISION", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
+    "JULIA_PKG_OFFLINE", "PALETTE_MODE", "PALETTE_DEPOT_MODE", "PALETTE_CONFIG_REVISION", "PALETTE_PACKAGE_ENVIRONMENT", "PALETTE_REPO_DIR", "PALETTE_STATE_DIR", "PALETTE_BROKER_SOCKET",
     "PALETTE_TRUSTED_TOOLS",
 ];
+
+/// How a session's `JULIA_DEPOT_PATH` handles the host user's standard `~/.julia` depot.
+/// `Isolated` (the default) uses only the configured workspace/Palette depot.
+/// `SharedReadonly` appends the user's `~/.julia` depot behind the primary writable depot
+/// as a read-only fallback cache so heavy precompiled packages (e.g. Gesso/CUDA) are reused.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DepotMode {
+    #[default]
+    Isolated,
+    SharedReadonly,
+}
+
+impl DepotMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "isolated" => Ok(Self::Isolated),
+            "shared_readonly" => Ok(Self::SharedReadonly),
+            other => Err(format!("depot_mode must be 'isolated' or 'shared_readonly', not {other:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::SharedReadonly => "shared_readonly",
+        }
+    }
+}
+
+/// The user's standard Julia depot (`~/.julia`), or `PALETTE_SHARED_DEPOT` when overridden.
+pub fn user_shared_depot() -> PathBuf {
+    if let Ok(over) = std::env::var("PALETTE_SHARED_DEPOT") {
+        if !over.is_empty() {
+            return util::expand_user(&over);
+        }
+    }
+    util::home().join(".julia")
+}
 
 /// The real julia binary, past the juliaup shim. An explicit PALETTE_JULIA_BIN
 /// wins: asked under a fresh HOME, the shim installs its current default
@@ -95,10 +133,30 @@ pub fn operator_julia_env(
     package_depot: Option<&str>,
     package_environment: Option<&str>,
 ) -> BTreeMap<String, String> {
+    operator_julia_env_with_depot_mode(repo_dir, project_dir, package_depot, package_environment, DepotMode::Isolated)
+}
+
+pub fn operator_julia_env_with_depot_mode(
+    repo_dir: &str,
+    project_dir: &str,
+    package_depot: Option<&str>,
+    package_environment: Option<&str>,
+    depot_mode: DepotMode,
+) -> BTreeMap<String, String> {
     let mut depots = std::env::var("JULIA_DEPOT_PATH").ok().filter(|p| !p.is_empty()).unwrap_or_else(default_depot);
     if let Some(package_depot) = package_depot.filter(|p| !depots.split(':').any(|d| d == *p)) {
         depots.push(':');
         depots.push_str(package_depot);
+    }
+    if depot_mode == DepotMode::SharedReadonly {
+        let shared = user_shared_depot();
+        if shared.is_dir() {
+            let shared_s = shared.to_string_lossy();
+            if !depots.split(':').any(|d| d == shared_s.as_ref()) {
+                depots.push(':');
+                depots.push_str(&shared_s);
+            }
+        }
     }
 
     let load_path = operator_load_path(std::env::var("JULIA_LOAD_PATH").ok().as_deref(), repo_dir, package_environment);
@@ -108,6 +166,7 @@ pub fn operator_julia_env(
     env.insert("JULIA_DEPOT_PATH".into(), depots);
     env.insert("JULIA_LOAD_PATH".into(), load_path.join(":"));
     env.insert("PALETTE_MODE".into(), "operator".into());
+    env.insert("PALETTE_DEPOT_MODE".into(), depot_mode.as_str().into());
     env.insert("PALETTE_REPO_DIR".into(), repo_dir.to_string());
     if let Some(package_environment) = package_environment {
         env.insert("PALETTE_PACKAGE_ENVIRONMENT".into(), package_environment.to_string());
@@ -410,7 +469,10 @@ pub(crate) fn command_overlap(root: &Path, commands: &CommandPaths) -> Option<Pa
 pub fn package_store_paths(protected_paths: &[PathBuf], ceiling: Option<&serde_json::Value>) -> Result<PackageStore, String> {
     let root = match std::env::var("PALETTE_PACKAGE_DEPOT") {
         Ok(path) if !path.is_empty() => PathBuf::from(path),
-        _ => util::home().join(".palette").join("packages"),
+        _ => match crate::private_lab::active_private_root() {
+            Some(priv_root) => crate::private_lab::PrivateLabLayout::from_root(&priv_root).packages,
+            None => util::home().join(".palette").join("packages"),
+        },
     };
     let configured_ceiling = if ceiling.is_none() { configured_ceiling_paths()? } else { None };
     package_store_paths_at(root, protected_paths, ceiling.or(configured_ceiling.as_ref()), &|key| std::env::var(key).ok())
@@ -662,7 +724,11 @@ pub fn remove_session_depot(depot: &Path) {
 /// deleted with it. Returns the root and the retention, or None for 0.
 pub fn default_receipts_root() -> Result<Option<(PathBuf, Duration)>, String> {
     let retention = receipt_retention(std::env::var("PALETTE_RECEIPT_RETENTION_DAYS").ok().as_deref())?;
-    Ok(retention.map(|r| (util::home().join(".palette").join("receipts"), r)))
+    let root = match crate::private_lab::active_private_root() {
+        Some(priv_root) => crate::private_lab::PrivateLabLayout::from_root(&priv_root).receipts,
+        None => util::home().join(".palette").join("receipts"),
+    };
+    Ok(retention.map(|r| (root, r)))
 }
 
 fn receipt_retention(days: Option<&str>) -> Result<Option<Duration>, String> {
@@ -1227,18 +1293,39 @@ fn check_unreadable(name: &str, hidden: &Path, roots: &[PathBuf]) -> Result<(), 
 }
 
 pub fn build_bwrap_argv(s: &SandboxSpec) -> Result<Vec<String>, String> {
-    bwrap_argv(s, std::env::var("PALETTE_READ_ROOTS").ok().as_deref(),
-               std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref())
+    build_bwrap_argv_with_depot_mode(s, DepotMode::Isolated)
+}
+
+pub fn build_bwrap_argv_with_depot_mode(s: &SandboxSpec, depot_mode: DepotMode) -> Result<Vec<String>, String> {
+    bwrap_argv_with_depot_mode(s, std::env::var("PALETTE_READ_ROOTS").ok().as_deref(),
+               std::env::var("PALETTE_TRUSTED_TOOLS").ok().as_deref(), depot_mode)
 }
 
 /// `build_bwrap_argv` with PALETTE_READ_ROOTS and PALETTE_TRUSTED_TOOLS passed in.
+#[cfg(test)]
 fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec: Option<&str>)
+    -> Result<Vec<String>, String> {
+    bwrap_argv_with_depot_mode(s, read_roots_spec, trusted_tools_spec, DepotMode::Isolated)
+}
+
+fn bwrap_argv_with_depot_mode(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec: Option<&str>, depot_mode: DepotMode)
     -> Result<Vec<String>, String> {
     let toolchain = Path::new(s.julia_bin).parent().and_then(Path::parent).unwrap_or(Path::new("/"));
     let workspace = canonical_dir("workspace", Path::new(s.workspace_dir))?;
     let repo = canonical_dir("repository", Path::new(s.repo_dir))?;
     let project = canonical_dir("project", Path::new(s.project_dir))?;
     let original_depot = canonical_dir("shared Julia depot", Path::new(s.julia_depot))?;
+    let shared_readonly_depot = if depot_mode == DepotMode::SharedReadonly {
+        let candidate = user_shared_depot();
+        if candidate.is_dir() {
+            let canon = canonical_dir("shared read-only Julia depot", &candidate)?;
+            (canon != original_depot).then_some(canon)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let depot_clone = s.depot_clone_dir.map(|p| canonical_dir("private Julia depot clone", Path::new(p))).transpose()?;
     let depot_overlay = depot_clone.as_deref().map(overlay_depot_layers).transpose()?.flatten();
     let package_store = s.package_store_root.map(|p| canonical_dir("persistent package store", Path::new(p))).transpose()?;
@@ -1280,6 +1367,7 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
     if let Some(path) = depot_clone.as_deref() { protected.push(("private Julia depot clone source", path)); }
     if let Some([lower, _, _]) = depot_overlay.as_ref() { protected.push(("depot snapshot", lower.as_path())); }
     if let Some(path) = package_store.as_deref() { protected.push(("persistent package store", path)); }
+    if let Some(path) = shared_readonly_depot.as_deref() { protected.push(("shared read-only Julia depot", path)); }
     if let Some(path) = task_tools_root.as_deref() { protected.push(("task tools", path)); }
     if let Some(path) = broker_root.as_deref() { protected.push(("broker socket directory", path)); }
     let mut writable = vec![("workspace", workspace.as_path())];
@@ -1352,6 +1440,10 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
         let root = root.to_str().ok_or("package store path is not valid UTF-8")?;
         push(&["--ro-bind", root, root]);
     }
+    if let Some(shared) = shared_readonly_depot.as_deref() {
+        let shared = shared.to_str().ok_or("shared read-only Julia depot path is not valid UTF-8")?;
+        push(&["--ro-bind", shared, shared]);
+    }
     let etc = identity_files()?;
     let (pw, gr) = (etc.join("passwd"), etc.join("group"));
     push(&["--ro-bind", &pw.to_string_lossy(), "/etc/passwd", "--ro-bind", &gr.to_string_lossy(), "/etc/group"]);
@@ -1367,11 +1459,19 @@ fn bwrap_argv(s: &SandboxSpec, read_roots_spec: Option<&str>, trusted_tools_spec
         Some(env) => format!("@:{}:@v#.#:{}:@stdlib", s.project_dir, env.display()),
         None => format!("@:{}:@v#.#:@stdlib", s.project_dir),
     };
-    let depot_path = match package_depot.as_deref() {
+    let mut depot_path = match package_depot.as_deref() {
         Some(depot) => format!("{}:{}", s.julia_depot, depot.display()),
         None => s.julia_depot.to_string(),
     };
+    if let Some(shared) = shared_readonly_depot.as_deref() {
+        let shared_s = shared.to_string_lossy();
+        if !depot_path.split(':').any(|d| d == shared_s.as_ref()) {
+            depot_path.push(':');
+            depot_path.push_str(&shared_s);
+        }
+    }
     push(&["--setenv", "HOME", "/run/palette/home", "--setenv", "JULIA_DEPOT_PATH", &depot_path,
+           "--setenv", "PALETTE_DEPOT_MODE", depot_mode.as_str(),
            "--setenv", "JULIA_PROJECT", s.project_dir,
            // The session project stays loadable after turn code activates another.
            "--setenv", "JULIA_LOAD_PATH", &load_path,
@@ -1446,6 +1546,33 @@ mod tests {
         assert!(repo < global);
         let load_path = operator_load_path(Some("/custom"), "/palette-checkout", None);
         assert_eq!(load_path, ["/custom", "@", "/palette-checkout"]);
+    }
+
+    #[test]
+    fn depot_mode_shared_readonly_appends_user_depot_behind_primary() {
+        let tmp = util::mkdtemp("depot-mode-").unwrap();
+        let primary = dir(&tmp, "primary-depot");
+        let shared = dir(&tmp, "shared-depot");
+        let prev_depot = std::env::var_os("JULIA_DEPOT_PATH");
+        let prev_shared = std::env::var_os("PALETTE_SHARED_DEPOT");
+        unsafe {
+            std::env::set_var("JULIA_DEPOT_PATH", &primary);
+            std::env::set_var("PALETTE_SHARED_DEPOT", &shared);
+        }
+        let isolated = operator_julia_env_with_depot_mode("/palette-checkout", "/selected-project", None, None, DepotMode::Isolated);
+        let shared_env = operator_julia_env_with_depot_mode("/palette-checkout", "/selected-project", None, None, DepotMode::SharedReadonly);
+        unsafe {
+            match prev_depot { Some(v) => std::env::set_var("JULIA_DEPOT_PATH", v), None => std::env::remove_var("JULIA_DEPOT_PATH") }
+            match prev_shared { Some(v) => std::env::set_var("PALETTE_SHARED_DEPOT", v), None => std::env::remove_var("PALETTE_SHARED_DEPOT") }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(isolated["PALETTE_DEPOT_MODE"], "isolated");
+        assert_eq!(isolated["JULIA_DEPOT_PATH"], primary.to_string_lossy());
+        assert_eq!(shared_env["PALETTE_DEPOT_MODE"], "shared_readonly");
+        assert_eq!(shared_env["JULIA_DEPOT_PATH"], format!("{}:{}", primary.display(), shared.display()));
+        assert_eq!(DepotMode::parse("isolated").unwrap(), DepotMode::Isolated);
+        assert_eq!(DepotMode::parse("shared_readonly").unwrap(), DepotMode::SharedReadonly);
+        assert!(DepotMode::parse("bogus").is_err());
     }
 
     #[test]

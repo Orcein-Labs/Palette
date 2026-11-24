@@ -23,6 +23,9 @@ pub(crate) fn socket_path() -> Result<PathBuf, String> {
     {
         return Ok(util::expand_user(&explicit));
     }
+    if let Some(priv_root) = crate::private_lab::active_private_root() {
+        return Ok(crate::private_lab::PrivateLabLayout::from_root(&priv_root).socket);
+    }
     let runtime = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|v| !v.is_empty())

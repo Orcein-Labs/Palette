@@ -98,6 +98,10 @@ enum Incoming {
 
 struct Args {
     mode: SessionMode,
+    depot_mode: crate::sandbox::DepotMode,
+    blas_threads: Option<usize>,
+    private_dir: Option<String>,
+    private_strict: bool,
     config_revision: Option<String>,
     project_dir: String,
     repo_dir: Option<String>,
@@ -113,10 +117,13 @@ struct Args {
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
-    let mut a = Args { mode: SessionMode::default(), config_revision: None,
+    let mut a = Args { mode: SessionMode::default(), depot_mode: crate::sandbox::DepotMode::default(), blas_threads: None,
+                       private_dir: None, private_strict: false, config_revision: None,
                        project_dir: String::new(), repo_dir: None, ceiling: "{}".into(), network: false,
                        turn_timeout: 60.0, max_turn_timeout: None, startup_timeout: 180.0, workspace_dir: None, state_dir: None, receipts_dir: None, scratch_root: None };
     let mut explicit_mode = None;
+    let mut explicit_depot_mode = None;
+    let mut explicit_blas_threads = None;
     let mut i = 0;
     let val = |i: &mut usize| -> Result<String, String> {
         *i += 1;
@@ -125,6 +132,17 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     while i < argv.len() {
         match argv[i].as_str() {
             "--mode" => explicit_mode = Some(SessionMode::parse(&val(&mut i)?)?),
+            "--depot-mode" => explicit_depot_mode = Some(crate::sandbox::DepotMode::parse(&val(&mut i)?)?),
+            "--blas-threads" => {
+                let raw = val(&mut i)?;
+                let parsed = raw.parse::<usize>().map_err(|e| format!("--blas-threads: {e}"))?;
+                if parsed == 0 || parsed > 256 {
+                    return Err("--blas-threads must be an integer in 1..=256".into());
+                }
+                explicit_blas_threads = Some(parsed);
+            }
+            "--private-dir" => a.private_dir = Some(val(&mut i)?),
+            "--private-strict" => a.private_strict = true,
             "--project-dir" => a.project_dir = val(&mut i)?,
             "--repo-dir" => a.repo_dir = Some(val(&mut i)?),
             "--ceiling" => a.ceiling = val(&mut i)?,
@@ -147,6 +165,24 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         Some(mode) => mode,
         None => std::env::var("PALETTE_MODE").ok().filter(|value| !value.is_empty())
             .map(|value| SessionMode::parse(&value)).transpose()?.unwrap_or_default(),
+    };
+    a.depot_mode = match explicit_depot_mode {
+        Some(dm) => dm,
+        None => std::env::var("PALETTE_DEPOT_MODE").ok().filter(|value| !value.is_empty())
+            .map(|value| crate::sandbox::DepotMode::parse(&value)).transpose()?.unwrap_or_default(),
+    };
+    a.blas_threads = match explicit_blas_threads {
+        Some(n) => Some(n),
+        None => match std::env::var("PALETTE_BLAS_THREADS").ok().filter(|v| !v.trim().is_empty()) {
+            Some(raw) => {
+                let parsed = raw.trim().parse::<usize>().map_err(|e| format!("PALETTE_BLAS_THREADS: {e}"))?;
+                if parsed == 0 || parsed > 256 {
+                    return Err("PALETTE_BLAS_THREADS must be an integer in 1..=256".into());
+                }
+                Some(parsed)
+            }
+            None => None,
+        },
     };
     a.config_revision = std::env::var("PALETTE_CONFIG_REVISION").ok().filter(|value| !value.is_empty());
     let max_turn_timeout = a.max_turn_timeout.unwrap_or(a.turn_timeout);
@@ -217,6 +253,23 @@ pub fn main(argv: &[String]) -> i32 {
             return 2;
         }
     };
+    if let Ok(Some(priv_root)) = crate::private_lab::resolve_private_root(
+        args.private_dir.as_deref(),
+        &|k| std::env::var(k).ok(),
+    ) {
+        let strict = crate::private_lab::is_private_strict(args.private_strict, &|k| std::env::var(k).ok());
+        let layout = crate::private_lab::PrivateLabLayout::from_root(&priv_root);
+        if let Err(e) = layout.ensure_dirs().and_then(|()| crate::private_lab::enforce_private_isolation(strict).map(|_| ())) {
+            respond(&json!({"kind": "ERROR", "error": format!("failed to start PaletteSession: {e}")}));
+            return 1;
+        }
+        std::env::set_var("PALETTE_HOME", &layout.root);
+        std::env::set_var("PALETTE_PRIVATE_DIR", &layout.root);
+        std::env::set_var("PALETTE_PRIVATE_MODE", "1");
+        if strict {
+            std::env::set_var("PALETTE_PRIVATE_STRICT", "1");
+        }
+    }
     let (tx, rx) = mpsc::channel::<Incoming>();
     let (stop, signum) = signal_thread(tx.clone());
 
@@ -255,6 +308,8 @@ pub fn main(argv: &[String]) -> i32 {
     let max_turn_timeout = args.max_turn_timeout.unwrap_or(turn_timeout);
     let session = PaletteSession::start(SessionOptions {
         mode: args.mode,
+        depot_mode: args.depot_mode,
+        blas_threads: args.blas_threads,
         config_revision: args.config_revision,
         project_dir: args.project_dir.clone(),
         repo_dir: args.repo_dir.clone().unwrap_or_default(),
@@ -271,7 +326,10 @@ pub fn main(argv: &[String]) -> i32 {
     }, stop.clone());
     let mut session = match session {
         Ok(s) => s,
-        Err(SessionError::Dead(e)) | Err(SessionError::Protocol(e)) => {
+        Err(SessionError::Dead(e))
+        | Err(SessionError::PreTurnDead(e))
+        | Err(SessionError::Protocol(e))
+        | Err(SessionError::TimedOut { message: e, .. }) => {
             respond(&json!({"kind": "ERROR", "error": format!("failed to start PaletteSession: {e}")}));
             return 1;
         }
@@ -412,6 +470,32 @@ pub fn main(argv: &[String]) -> i32 {
                 "context": r.get("context").cloned().unwrap_or(Value::Null),
                 "transport_shortened": r.get("transport_shortened").cloned().unwrap_or(Value::Null),
             })),
+            Err(SessionError::PreTurnDead(e)) => {
+                respond(&json!({
+                    "request_id": request_id,
+                    "success": false,
+                    "data": null,
+                    "error": e,
+                    "session_dead": true,
+                    "pre_turn_dead": true,
+                }));
+                break;
+            }
+            Err(SessionError::TimedOut { message, limit, stdout, stderr }) => {
+                respond(&json!({
+                    "request_id": request_id,
+                    "success": false,
+                    "data": null,
+                    "output": stdout,
+                    "stderr_tail": stderr,
+                    "error": message,
+                    "timed_out": true,
+                    "interrupted": true,
+                    "timeout_s": limit,
+                    "session_dead": true,
+                }));
+                break;
+            }
             Err(SessionError::Dead(e)) => {
                 // `session_dead` lets the host stop sending calls now, rather
                 // than racing this process's exit.

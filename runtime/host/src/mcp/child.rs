@@ -299,7 +299,161 @@ pub(crate) fn control_schema(actions: &[&str]) -> Value {
     json!({"type": "object", "properties": properties, "required": ["action"], "additionalProperties": false})
 }
 
-pub(crate) const CONTROL_ACTIONS: [&str; 6] = ["status", "prepare", "restart", "checkpoints", "restore", "receipts"];
+pub(crate) const CONTROL_ACTIONS: [&str; 7] = ["status", "prepare", "restart", "interrupt", "checkpoints", "restore", "receipts"];
+
+/// Returns true if `target` is `ancestor` or a Linux `/proc` descendant of `ancestor`.
+pub(crate) fn is_descendant_pid(ancestor: u32, target: i32) -> bool {
+    if target <= 1 {
+        return false;
+    }
+    let anc = ancestor as i32;
+    if target == anc {
+        return true;
+    }
+    let mut cur = target;
+    for _ in 0..16 {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{cur}/stat")) else {
+            return false;
+        };
+        let Some(rparen) = stat.rfind(')') else {
+            return false;
+        };
+        let Some(ppid) = stat[rparen + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            return false;
+        };
+        if ppid == anc {
+            return true;
+        }
+        if ppid <= 1 || ppid == cur {
+            return false;
+        }
+        cur = ppid;
+    }
+    false
+}
+
+fn read_worker_pid_info(state_dir: &Path) -> Option<(i32, Option<i32>)> {
+    let text = fs::read_to_string(state_dir.join(".worker_pid")).ok()?;
+    let val: Value = serde_json::from_str(&text).ok()?;
+    let pid = val.get("pid").and_then(Value::as_i64).filter(|&p| p > 1)? as i32;
+    let pgid = val
+        .get("pgid")
+        .and_then(Value::as_i64)
+        .filter(|&g| g > 1)
+        .map(|g| g as i32);
+    Some((pid, pgid))
+}
+
+fn read_partial_stdout_in_state(state_dir: &Path) -> String {
+    let Some((pid, _)) = read_worker_pid_info(state_dir) else {
+        return String::new();
+    };
+    let path = std::env::temp_dir().join(format!("palette-turn-output-{pid}"));
+    let Ok(bytes) = fs::read(&path) else {
+        return String::new();
+    };
+    util::tail(&String::from_utf8_lossy(&bytes), 16_384)
+}
+
+fn pid_alive(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    // Check zombie state on Linux so an unreaped child isn't treated as still running.
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if let Some(rparen) = stat.rfind(')') {
+            if stat[rparen + 1..].split_whitespace().next() == Some("Z") {
+                return false;
+            }
+        }
+    }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Fast out-of-band interrupt: sends `SIGINT` to the active Julia worker, waits
+/// up to `grace` (typically 2.5s) for the in-flight turn to unwind cleanly, and
+/// falls back to `SIGKILL` on the worker process group if wedged in native C/BLAS.
+pub(crate) fn interrupt_worker_in_state_dir(
+    state_dir: &Path,
+    ancestor_pid: Option<u32>,
+    grace: Duration,
+    is_busy: impl Fn() -> bool,
+) -> Value {
+    let started = Instant::now();
+    let target = read_worker_pid_info(state_dir)
+        .filter(|(pid, _)| {
+            pid_alive(*pid) && ancestor_pid.is_none_or(|anc| is_descendant_pid(anc, *pid))
+        })
+        .or_else(|| {
+            ancestor_pid
+                .map(|p| p as i32)
+                .filter(|&p| pid_alive(p))
+                .map(|p| (p, None))
+        });
+    let Some((pid, pgid)) = target else {
+        return json!({
+            "success": true,
+            "interrupted": false,
+            "status": "not_running",
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        });
+    };
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !is_busy() {
+            return json!({
+                "success": true,
+                "interrupted": true,
+                "method": "sigint",
+                "kernel_preserved": pid_alive(pid),
+                "auto_respawn": !pid_alive(pid),
+                "target_pid": pid,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !is_busy() {
+        return json!({
+            "success": true,
+            "interrupted": true,
+            "method": "sigint",
+            "kernel_preserved": pid_alive(pid),
+            "auto_respawn": !pid_alive(pid),
+            "target_pid": pid,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        });
+    }
+    // Still wedged after grace (e.g., native C/BLAS or non-yielding loop): hard kill.
+    if let Some(pg) = pgid {
+        unsafe {
+            libc::kill(-pg as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let settle = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < settle && is_busy() {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    json!({
+        "success": true,
+        "interrupted": true,
+        "method": "sigkill",
+        "kernel_preserved": false,
+        "auto_respawn": true,
+        "target_pid": pid,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })
+}
 
 /// The repair broker's client when a kernel asks: there is no MCP client to
 /// ask for approval, so nothing ever answers.
@@ -322,8 +476,11 @@ struct Adapter {
     receipts_dir: PathBuf,
     ceiling: Value,
     limits: (f64, f64),
+    mcp_gateway_timeout_s: Option<f64>,
     workspace_id: String,
     mode: String,
+    depot_mode: String,
+    blas_threads: Option<usize>,
     configured_revision: Option<String>,
     registry: Registry,
     repair: Arc<RepairBroker>,
@@ -361,10 +518,16 @@ pub(crate) fn repo_and_host() -> Result<(String, String), String> {
 }
 
 pub(crate) fn default_state_dir(workspace: &str) -> PathBuf {
+    if let Some(root) = crate::private_lab::active_private_root() {
+        return crate::private_lab::PrivateLabLayout::from_root(&root).state;
+    }
     util::home().join(".local/share/operator-surfaces/palette-state").join(util::sha256_hex(workspace.as_bytes()))
 }
 
 pub(crate) fn default_workspace_root() -> PathBuf {
+    if let Some(root) = crate::private_lab::active_private_root() {
+        return crate::private_lab::PrivateLabLayout::from_root(&root).worlds;
+    }
     util::home().join(".local/share/operator-surfaces/palette-workspaces")
 }
 
@@ -411,6 +574,21 @@ impl Adapter {
         if !matches!(mode.as_str(), "operator" | "sandbox") {
             return Err("ValueError: PALETTE_MODE must be operator or sandbox".into());
         }
+        let depot_mode = env("PALETTE_DEPOT_MODE").unwrap_or_else(|| "isolated".into());
+        if !matches!(depot_mode.as_str(), "isolated" | "shared_readonly") {
+            return Err("ValueError: PALETTE_DEPOT_MODE must be isolated or shared_readonly".into());
+        }
+        let blas_threads = match env("PALETTE_BLAS_THREADS").filter(|v| !v.trim().is_empty()) {
+            Some(raw) => {
+                let n = raw.trim().parse::<usize>()
+                    .map_err(|_| format!("ValueError: PALETTE_BLAS_THREADS must be an integer in 1..=256, got {raw:?}"))?;
+                if n == 0 || n > 256 {
+                    return Err(format!("ValueError: PALETTE_BLAS_THREADS must be an integer in 1..=256, got {n}"));
+                }
+                Some(n)
+            }
+            None => None,
+        };
         let configured_revision = env("PALETTE_CONFIG_REVISION");
         let state_dir = util::absolute(&env("PALETTE_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| default_state_dir(&workspace)));
         let receipts_dir = receipts_dir(&state_dir);
@@ -441,8 +619,11 @@ impl Adapter {
             receipts_dir,
             ceiling,
             limits,
+            mcp_gateway_timeout_s: transport::mcp_gateway_timeout(env),
             workspace_id: env("PALETTE_WORKSPACE_ID").unwrap_or_else(|| "default".into()),
             mode,
+            depot_mode,
+            blas_threads,
             configured_revision,
             registry,
             repair: Arc::new(repair),
@@ -540,10 +721,16 @@ impl Adapter {
     fn start(&mut self, prepared: bool) -> Result<(), Fault> {
         if self.proc.is_some() {
             if !self.alive() {
+                self.connection_failure = Some(json!({
+                    "epoch": self.epoch(),
+                    "error": "worker exited while idle; auto-reviving from saved snapshot",
+                    "auto_revived": true,
+                }));
                 self.stop();
-                return Err(Fault::new("RuntimeError", "operator died; restoration has not been established"));
+                // Fall through to transparently boot and revive from the saved snapshot.
+            } else {
+                return Ok(());
             }
-            return Ok(());
         }
         if prepared {
             self.prepare_session()?;
@@ -561,7 +748,11 @@ impl Adapter {
             "--ceiling".into(), util::py_dumps(&self.ceiling, None),
             "--turn-timeout".into(), transport::seconds_text(self.limits.0),
             "--max-turn-timeout".into(), transport::seconds_text(self.limits.1),
+            "--depot-mode".into(), self.depot_mode.clone(),
         ];
+        if let Some(n) = self.blas_threads {
+            command.extend(["--blas-threads".into(), n.to_string()]);
+        }
         if let Some(scratch) = env("PALETTE_SCRATCH_ROOT").filter(|s| !s.is_empty()) {
             command.extend(["--scratch-root".into(), scratch]);
         }
@@ -610,8 +801,36 @@ impl Adapter {
         };
         let rid = util::hex(32);
         let ephemeral = args.get("ephemeral") == Some(&Value::Bool(true));
+        let requested_limit = transport::call_limit(&args, self.limits);
+        let (effective_limit, clamped) = if ephemeral {
+            (requested_limit, false)
+        } else {
+            transport::effective_mcp_timeout(requested_limit, self.mcp_gateway_timeout_s)
+        };
+        if clamped {
+            args.insert("timeout_s".into(), json!(effective_limit));
+        }
         let started = Instant::now();
-        match self.receive_result(&rid, &args) {
+        let mut attempt = self.receive_result(&rid, &args);
+        let mut auto_revived = false;
+        if let Ok(ref event) = attempt {
+            if event.get("session_dead") == Some(&Value::Bool(true))
+                && event.get("pre_turn_dead") == Some(&Value::Bool(true))
+                && !ephemeral
+            {
+                self.connection_failure = Some(json!({
+                    "epoch": self.epoch(),
+                    "error": event.get("error"),
+                    "auto_revived": true,
+                }));
+                self.stop();
+                self.start(false)?;
+                let retry_rid = util::hex(32);
+                attempt = self.receive_result(&retry_rid, &args);
+                auto_revived = true;
+            }
+        }
+        match attempt {
             Ok(event) => {
                 if !ephemeral {
                     self.note_call_cost(&event, started.elapsed().as_secs_f64());
@@ -627,6 +846,38 @@ impl Adapter {
                 if let Some(revision) = self.effective_config_revision() {
                     result.insert("config_revision".into(), json!(revision));
                 }
+                if clamped {
+                    result.insert("timeout_clamped".into(), json!(true));
+                    result.insert("effective_timeout_s".into(), json!(effective_limit));
+                    result.insert("requested_timeout_s".into(), json!(requested_limit));
+                }
+                if auto_revived {
+                    result.insert("auto_revived".into(), json!(true));
+                }
+                Ok(result)
+            }
+            Err(e) if e.kind == "Timeout" => {
+                let partial_out = read_partial_stdout_in_state(&self.state_dir);
+                self.connection_failure = Some(json!({"epoch": self.epoch(), "error": e.message, "timed_out": true}));
+                self.stop();
+                let mut result = Map::new();
+                result.insert("success".into(), json!(false));
+                result.insert("timed_out".into(), json!(true));
+                result.insert("interrupted".into(), json!(true));
+                result.insert("timeout_s".into(), json!(effective_limit));
+                if clamped {
+                    result.insert("timeout_clamped".into(), json!(true));
+                    result.insert("requested_timeout_s".into(), json!(requested_limit));
+                }
+                if !partial_out.is_empty() {
+                    result.insert("output".into(), json!(partial_out));
+                }
+                result.insert("error".into(), json!(format!(
+                    "Call exceeded pre-gateway timeout ({}s); worker was reclaimed cleanly and will auto-revive on next call.",
+                    transport::seconds_text(effective_limit)
+                )));
+                result.insert("recovery".into(), json!("worker_reclaimed_auto_revive_on_next_call"));
+                result.insert("mode".into(), json!(self.effective_mode()));
                 Ok(result)
             }
             Err(e) => {
@@ -911,6 +1162,30 @@ impl Adapter {
                           "preparation": preparation, "costs": self.cost_status()}))
             }
             Some("prepare") => self.prepare_session(),
+            Some("interrupt") => {
+                if !self.alive() {
+                    return Ok(json!({
+                        "success": true,
+                        "interrupted": false,
+                        "status": "not_running",
+                        "elapsed_ms": 0,
+                    }));
+                }
+                let anc = self.live.lock().unwrap().pid.map(|p| p as u32);
+                let mut res = interrupt_worker_in_state_dir(
+                    &self.state_dir,
+                    anc,
+                    Duration::from_millis(2500),
+                    || false,
+                );
+                if res.get("method") == Some(&json!("sigkill")) {
+                    self.stop();
+                }
+                if let Some(obj) = res.as_object_mut() {
+                    obj.insert("epoch".into(), self.epoch());
+                }
+                Ok(res)
+            }
             Some("checkpoints") => Ok(time_machine::list_checkpoints(&self.state_dir)),
             Some("receipts") => {
                 // Call numbers restart in every kernel: call n means this kernel's unless an epoch is named.

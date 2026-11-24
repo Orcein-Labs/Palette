@@ -11,6 +11,7 @@ use crate::util;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 /// How much longer than the call limit the host waits for a reply: the
 /// worker's own interrupt grace plus slack. Only compute that never yields
 /// gets here.
-const HARD_TIMEOUT_MARGIN_S: f64 = 12.0;
+const HARD_TIMEOUT_MARGIN_S: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
@@ -56,11 +57,24 @@ impl Default for SessionMode {
 pub enum SessionError {
     /// The worker is gone; nothing after this can be served.
     Dead(String),
+    /// The worker died while idle BEFORE this turn began executing, so the
+    /// caller may safely auto-revive and run this turn once without replay risk.
+    PreTurnDead(String),
+    /// The turn exceeded its time limit and was hard-reclaimed, returning any
+    /// captured stdout/stderr for a structured pre-gateway timeout response.
+    TimedOut {
+        message: String,
+        limit: f64,
+        stdout: String,
+        stderr: String,
+    },
     Protocol(String),
 }
 
 pub struct SessionOptions {
     pub mode: SessionMode,
+    pub depot_mode: sandbox::DepotMode,
+    pub blas_threads: Option<usize>,
     pub config_revision: Option<String>,
     pub project_dir: String,
     pub repo_dir: String,
@@ -111,6 +125,8 @@ pub struct PaletteSession {
     turn_timeout: f64,
     /// A state directory is set, so the next kernel revives the last saved state.
     revives: bool,
+    state_dir: Option<PathBuf>,
+    worker_pid: u32,
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<Option<String>>,
@@ -213,7 +229,11 @@ impl PaletteSession {
     fn start_inner(o: &SessionOptions, session_id: &str, cleanser: &mut PaletteCleanser, stop: Arc<AtomicBool>)
         -> Result<PaletteSession, SessionError> {
         let err = |e: String| dead(e);
-        let sessions_root = util::home().join(".palette-sessions");
+        let private_root = crate::private_lab::active_private_root();
+        let sessions_root = match &private_root {
+            Some(root) => crate::private_lab::PrivateLabLayout::from_root(root).sessions,
+            None => util::home().join(".palette-sessions"),
+        };
         let tmp_root = o.scratch_root.as_deref().map(PathBuf::from).unwrap_or_else(|| sessions_root.join(session_id));
         let default_receipts = match o.receipts_dir {
             Some(_) => None,
@@ -386,7 +406,7 @@ impl PaletteSession {
                 let depot = sandbox::default_depot();
                 let sock_dir_s = sock_dir.to_string_lossy().into_owned();
                 let depot_clone_s = depot_clone.as_ref().map(|p| p.to_string_lossy().into_owned());
-                let mut argv = sandbox::build_bwrap_argv(&SandboxSpec {
+                let mut argv = sandbox::build_bwrap_argv_with_depot_mode(&SandboxSpec {
                     workspace_dir: &workspace,
                     broker_socket_dir: Some(&sock_dir_s),
                     project_dir: &o.project_dir,
@@ -399,7 +419,7 @@ impl PaletteSession {
                     package_depot_dir: Some(package_store.depot.to_str().ok_or_else(|| err("package depot path is not valid UTF-8".into()))?),
                     package_environment_dir: Some(package_store.environment.to_str().ok_or_else(|| err("package environment path is not valid UTF-8".into()))?),
                     state_dir: o.state_dir.as_deref(),
-                }).map_err(err)?;
+                }, o.depot_mode).map_err(err)?;
                 let mut setenv = |k: &str, v: String| argv.extend(["--setenv".to_string(), k.to_string(), v]);
                 setenv("PALETTE_PROVENANCE_DIR", "/run/palette/home/.palette".into());
                 setenv("PALETTE_MODE", o.mode.as_str().into());
@@ -408,7 +428,16 @@ impl PaletteSession {
                 if let Some(revision) = &o.config_revision {
                     setenv("PALETTE_CONFIG_REVISION", revision.clone());
                 }
-                for name in ["PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS"] {
+                if let Some(n) = o.blas_threads {
+                    let s = n.to_string();
+                    setenv("PALETTE_BLAS_THREADS", s.clone());
+                    setenv("OPENBLAS_NUM_THREADS", s);
+                }
+                for name in [
+                    "PALETTE_STATE_MAX_BINDING_BYTES", "PALETTE_STATE_MAX_BYTES", "PALETTE_AUTO_CHECKPOINTS",
+                    "PALETTE_HOME", "PALETTE_PRIVATE_DIR", "PALETTE_PRIVATE_MODE", "PALETTE_PRIVATE_STRICT",
+                    "PALETTE_LOGS_DIR", "PALETTE_PHAROS_CACHE_DIR", "PALETTE_PINNED_CACHE_DIR",
+                ] {
                     if let Ok(v) = std::env::var(name) {
                         setenv(name, v);
                     }
@@ -421,8 +450,8 @@ impl PaletteSession {
             SessionMode::Operator => {
                 let package_environment = package_store.as_ref().map(|store| store.environment.to_string_lossy().into_owned());
                 let package_depot = package_store.as_ref().map(|store| store.depot.to_string_lossy().into_owned());
-                let operator_env = sandbox::operator_julia_env(
-                    &o.repo_dir, &o.project_dir, package_depot.as_deref(), package_environment.as_deref());
+                let operator_env = sandbox::operator_julia_env_with_depot_mode(
+                    &o.repo_dir, &o.project_dir, package_depot.as_deref(), package_environment.as_deref(), o.depot_mode);
                 let provenance = std::env::var_os("PALETTE_PROVENANCE_DIR").map(PathBuf::from)
                     .unwrap_or_else(|| tmp_root.join("home").join(".palette"));
                 let mut command = Command::new(&julia);
@@ -442,6 +471,11 @@ impl PaletteSession {
                 if let Some(revision) = &o.config_revision {
                     command.env("PALETTE_CONFIG_REVISION", revision);
                 }
+                if let Some(n) = o.blas_threads {
+                    let s = n.to_string();
+                    command.env("PALETTE_BLAS_THREADS", &s);
+                    command.env("OPENBLAS_NUM_THREADS", &s);
+                }
                 command
             }
         };
@@ -456,7 +490,8 @@ impl PaletteSession {
             .spawn()
             .map_err(|e| err(format!("starting the worker: {e}")))?;
         let stdin = child.stdin.take();
-        let worker_pgid = (o.mode == SessionMode::Operator).then_some(child.id() as i32);
+        let worker_pid = child.id();
+        let worker_pgid = (o.mode == SessionMode::Operator).then_some(worker_pid as i32);
         // Nothing else reads the worker's stderr; left undrained, 64 KiB of
         // warnings fills the pipe and blocks the worker mid-call.
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -508,6 +543,8 @@ impl PaletteSession {
             broker,
             turn_timeout: o.turn_timeout,
             revives: o.state_dir.is_some(),
+            state_dir: o.state_dir.as_deref().map(PathBuf::from),
+            worker_pid,
             child,
             stdin,
             lines,
@@ -543,6 +580,9 @@ impl PaletteSession {
             }
         }
         s.capabilities = parsed.get("capabilities").cloned().unwrap_or_else(|| json!({}));
+        if let Some(dir) = &s.state_dir {
+            write_worker_pid_file(dir, s.worker_pid, s.worker_pgid, &s.epoch);
+        }
         Ok(s)
     }
 
@@ -572,8 +612,12 @@ impl PaletteSession {
         }
         if !self.worker_running() {
             let st = self.stop_worker();
-            return Err(dead(format!("session {} worker process exited (code {}) since epoch {} was issued",
-                                    self.session_id, st.and_then(|s| s.code()).unwrap_or(-1), self.epoch)));
+            return Err(SessionError::PreTurnDead(format!(
+                "session {} worker process exited while idle (code {}) since epoch {} was issued",
+                self.session_id,
+                st.and_then(|s| s.code()).unwrap_or(-1),
+                self.epoch
+            )));
         }
         // A scratch call's broker child is bounded by the session default, so
         // it never runs under a different limit.
@@ -619,12 +663,32 @@ impl PaletteSession {
             // kernel save its state, as it would at any other exit.
             Err(Wait::Stopped) => return Err(dead("the session host is shutting down")),
             Err(Wait::TimedOut) => {
-                // Killed, not left pending: its eventual answer would be read
-                // as the next call's.
-                self.stop_worker();
-                return Err(dead(format!(
-                    "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. {}",
-                    util::fmt_g(limit), after_kernel_stop(self.revives))));
+                // First send SIGINT directly to the Julia worker and give it a
+                // short 2s grace window to unwind cleanly with kernel state intact.
+                if self.worker_pid > 1 {
+                    unsafe { libc::kill(self.worker_pid as libc::pid_t, libc::SIGINT) };
+                }
+                match self.read_line(Duration::from_secs(2)) {
+                    Ok(Some(l)) => Some(l),
+                    _ => {
+                        // Still wedged (native C/BLAS or non-yielding compute):
+                        // capture any partial stdout/stderr, then kill cleanly.
+                        let captured_stdout = read_partial_turn_stdout(self.worker_pid);
+                        self.stop_worker();
+                        std::thread::sleep(Duration::from_millis(50));
+                        let captured_stderr = util::tail(&self.stderr_tail.lock().unwrap(), 4000).trim().to_string();
+                        return Err(SessionError::TimedOut {
+                            limit,
+                            stdout: captured_stdout,
+                            stderr: captured_stderr,
+                            message: format!(
+                                "The call exceeded its {}s limit and did not respond to the interrupt: compute that never yields cannot be interrupted, so the kernel was stopped. {}",
+                                util::fmt_g(limit),
+                                after_kernel_stop(self.revives)
+                            ),
+                        });
+                    }
+                }
             }
         };
         let Some(line) = line else {
@@ -711,6 +775,9 @@ impl PaletteSession {
         if let Some(s) = self.server.take() {
             s.shutdown();
         }
+        if let Some(dir) = &self.state_dir {
+            let _ = fs::remove_file(dir.join(".worker_pid"));
+        }
         self.cleanser.cleanse();
     }
 
@@ -726,6 +793,35 @@ impl Drop for PaletteSession {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+fn write_worker_pid_file(state_dir: &Path, pid: u32, pgid: Option<i32>, epoch: &str) {
+    let path = state_dir.join(".worker_pid");
+    let tmp = state_dir.join(format!(".worker_pid.tmp.{}", std::process::id()));
+    let payload = json!({
+        "pid": pid,
+        "pgid": pgid,
+        "session_pid": std::process::id(),
+        "epoch": epoch,
+    });
+    if fs::write(&tmp, payload.to_string()).is_ok() {
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        if fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+fn read_partial_turn_stdout(worker_pid: u32) -> String {
+    if worker_pid == 0 {
+        return String::new();
+    }
+    let path = std::env::temp_dir().join(format!("palette-turn-output-{worker_pid}"));
+    let Ok(bytes) = fs::read(&path) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    util::tail(&text, 16_384)
 }
 
 #[cfg(test)]

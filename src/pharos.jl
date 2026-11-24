@@ -1,8 +1,12 @@
 module Pharos
 
 using SHA
+using Serialization
 
-export CodeGraph, refresh!, definitions, callers, digest, source_files
+export CodeGraph, refresh!, definitions, callers, grep_defs, digest, source_files,
+       save_index, load_index, load_or_build
+
+const INDEX_CACHE_FORMAT = 1
 
 const SKIP_DIRS = Set(["vendor", "target", "node_modules", "__pycache__", "build", "dist", "_build", "venv"])
 const MAX_FILES = 50_000
@@ -362,33 +366,353 @@ function refresh!(g::CodeGraph; files=nothing, full::Bool=false)
     return g
 end
 
-# Matches a name equal to `name` or ending in "." * name.
-_matcher(name::AbstractString) = (suffix = "." * name; n -> n == name || endswith(n, suffix))
+function _unqualified_tail(n::AbstractString)
+    idx = findlast('.', n)
+    return idx === nothing ? n : SubString(n, nextind(n, idx))
+end
 
-"Definitions whose name equals `name` or ends with \".\" * name, as (path, definition) pairs."
-function definitions(g::CodeGraph, name::AbstractString)
+# Matches a symbol name according to `match`:
+#   :exact     — equals `name` or ends with "." * name (default)
+#   :prefix    — starts with `name`, or its unqualified tail after "." starts with `name`
+#   :substring — contains `name` anywhere
+#   :regex     — matches Regex(name)
+function _matcher(name::AbstractString, match::Symbol=:exact)
+    s = String(name)
+    if match === :exact
+        suffix = "." * s
+        return n -> n == s || endswith(n, suffix)
+    elseif match === :prefix
+        return n -> startswith(n, s) || startswith(_unqualified_tail(n), s)
+    elseif match === :substring
+        return n -> occursin(s, n)
+    elseif match === :regex
+        rx = Regex(s)
+        return n -> occursin(rx, n)
+    else
+        throw(ArgumentError("unsupported match mode :$match (expected :exact, :prefix, :substring, or :regex)"))
+    end
+end
+
+function _norm_relpath(p::AbstractString)
+    s = replace(String(p), '\\' => '/')
+    while startswith(s, "./")
+        s = s[3:end]
+    end
+    return s == "." ? "" : s
+end
+
+function _prefix_match(path::AbstractString, norm_prefix::String)
+    isempty(norm_prefix) && return true
+    p = _norm_relpath(path)
+    return startswith(p, norm_prefix)
+end
+
+"Definitions matching `name` (`match` in `:exact`, `:prefix`, `:substring`, `:regex`), as (path, definition) pairs."
+function definitions(g::CodeGraph, name::Union{AbstractString, Symbol}; path_prefix::AbstractString="", match::Symbol=:exact)
     out = Tuple{String,Definition}[]
-    matches = _matcher(name)
-    for (path, e) in g.files, d in e.definitions
-        matches(d.name) && push!(out, (path, d))
+    matches = _matcher(String(name), match)
+    prefix = _norm_relpath(path_prefix)
+    for (path, e) in g.files
+        _prefix_match(path, prefix) || continue
+        for d in e.definitions
+            matches(d.name) && push!(out, (path, d))
+        end
     end
     return sort!(out; by=t -> (t[1], t[2].line))
 end
 
-"Calls whose callee equals `name` or ends with \".\" * name, as (path, call) pairs."
-function callers(g::CodeGraph, name::AbstractString)
+"Calls whose callee matches `name` (`match` in `:exact`, `:prefix`, `:substring`, `:regex`), as (path, call) pairs."
+function callers(g::CodeGraph, name::Union{AbstractString, Symbol}; path_prefix::AbstractString="", match::Symbol=:exact)
     out = Tuple{String,Call}[]
-    matches = _matcher(name)
-    for (path, e) in g.files, c in e.calls
-        matches(c.callee) && push!(out, (path, c))
+    matches = _matcher(String(name), match)
+    prefix = _norm_relpath(path_prefix)
+    for (path, e) in g.files
+        _prefix_match(path, prefix) || continue
+        for c in e.calls
+            matches(c.callee) && push!(out, (path, c))
+        end
     end
     return sort!(out; by=t -> (t[1], t[2].line))
+end
+
+"""
+    grep_defs(g::CodeGraph, substring::AbstractString; path_prefix::AbstractString="", ignorecase::Bool=false)
+
+Concise structured matches (`(file, line, kind, name)` NamedTuples) for definitions
+whose name contains `substring`, optionally filtered to relative paths matching
+`path_prefix` (with leading `./` normalized away).
+"""
+function grep_defs(g::CodeGraph, substring::AbstractString;
+                   path_prefix::AbstractString="", ignorecase::Bool=false)
+    out = NamedTuple{(:file, :line, :kind, :name), Tuple{String, Int, Symbol, String}}[]
+    prefix = _norm_relpath(path_prefix)
+    needle = ignorecase ? lowercase(String(substring)) : String(substring)
+    for (path, e) in g.files
+        _prefix_match(path, prefix) || continue
+        norm_path = _norm_relpath(path)
+        for d in e.definitions
+            hay = ignorecase ? lowercase(d.name) : d.name
+            occursin(needle, hay) && push!(out, (file=norm_path, line=d.line, kind=d.kind, name=d.name))
+        end
+    end
+    return sort!(out; by=t -> (t.file, t.line, t.name))
+end
+
+const _SUMMARY_MODULE_KINDS = (:module, :mod)
+const _SUMMARY_TYPE_KINDS = (:struct, :abstract, :primitive, :class, :enum, :trait, :type)
+const _SUMMARY_FUNCTION_KINDS = (:function, :fn, :macro)
+
+function _default_summary_root()
+    m = @__MODULE__
+    p = parentmodule(m)
+    if p !== m && isdefined(p, :default_codegraph_root)
+        r = try
+            p.default_codegraph_root()
+        catch
+            ""
+        end
+        !isempty(r) && isdir(r) && return r
+    end
+    return pwd()
+end
+
+function _summarize_graph(g::CodeGraph; max_files::Int=50)
+    max_files >= 0 || throw(ArgumentError("max_files must be non-negative, got $max_files"))
+    sorted_paths = sort!(collect(keys(g.files)))
+    symbol_count = sum(e -> length(e.definitions), values(g.files); init=0)
+    limit = min(max_files, length(sorted_paths))
+    files = NamedTuple{(:path, :modules, :types, :functions, :includes)}[]
+    sizehint!(files, limit)
+    for i in 1:limit
+        path = sorted_paths[i]
+        e = g.files[path]
+        mods = [(name=d.name, line=d.line) for d in e.definitions if d.kind in _SUMMARY_MODULE_KINDS]
+        typs = [(name=d.name, kind=d.kind, line=d.line) for d in e.definitions if d.kind in _SUMMARY_TYPE_KINDS]
+        fns = [(name=d.name, line=d.line) for d in e.definitions if d.kind in _SUMMARY_FUNCTION_KINDS]
+        sort!(mods; by=t -> (t.line, t.name))
+        sort!(typs; by=t -> (t.line, t.name))
+        sort!(fns; by=t -> (t.line, t.name))
+        push!(files, (
+            path=_norm_relpath(path),
+            modules=mods,
+            types=typs,
+            functions=fns,
+            includes=copy(e.includes),
+        ))
+    end
+    return (
+        root=g.root,
+        file_count=length(g.files),
+        symbol_count=symbol_count,
+        files=files,
+    )
+end
+
+"""
+    Pharos.summary(target=nothing; max_files=50)
+
+Refresh or load a `CodeGraph` for `target` (a `CodeGraph`, directory path, or
+`nothing`/`""` for the active workspace root) and return a compact structured
+overview `(root, file_count, symbol_count, files)` where each file entry lists
+`(path, modules, types, functions, includes)` with line numbers.
+"""
+function summary(g::CodeGraph; max_files::Int=50)
+    refresh!(g)
+    return _summarize_graph(g; max_files)
+end
+
+function summary(target::Union{Nothing, AbstractString}=nothing; max_files::Int=50)
+    if target === nothing || isempty(strip(String(target)))
+        m = @__MODULE__
+        p = parentmodule(m)
+        if p !== m && isdefined(p, :codegraph)
+            r = _default_summary_root()
+            g = try
+                p.codegraph(r)
+            catch
+                CodeGraph(r)
+            end
+            return _summarize_graph(g; max_files)
+        end
+        return _summarize_graph(CodeGraph(_default_summary_root()); max_files)
+    end
+    return _summarize_graph(CodeGraph(String(target)); max_files)
 end
 
 "sha256 hex over the sorted \"path sha\" lines of every entry."
 function digest(g::CodeGraph)
     lines = sort!(["$(path) $(e.sha256)" for (path, e) in g.files])
     return _sha256_hex(join(lines, "\n"))
+end
+
+function _pharos_private_root()
+    m = @__MODULE__
+    p = parentmodule(m)
+    if p !== m && isdefined(p, :private_lab_root)
+        return try
+            p.private_lab_root()
+        catch
+            nothing
+        end
+    end
+    for key in ("PALETTE_PRIVATE_DIR", "PALETTE_HOME")
+        raw = strip(get(ENV, key, ""))
+        isempty(raw) || return abspath(expanduser(raw))
+    end
+    return nothing
+end
+
+function _ensure_cache_dir!(dir::AbstractString)
+    d = abspath(expanduser(String(dir)))
+    priv = _pharos_private_root()
+    if priv !== nothing
+        m = @__MODULE__
+        p = parentmodule(m)
+        if p !== m && isdefined(p, :_ensure_private_dir!)
+            p._ensure_private_dir!(d)
+            return d
+        end
+        mkpath(d)
+        Sys.isunix() && chmod(d, 0o700)
+        return d
+    end
+    mkpath(d)
+    return d
+end
+
+"""
+    default_index_cache_path(root::AbstractString) -> String
+
+Returns the default on-disk cache path for `Pharos` index persistence for `root`.
+When Private Lab isolation (`PALETTE_HOME` / `PALETTE_PRIVATE_DIR`) is active,
+strictly stores caches under `<PALETTE_HOME>/pharos/`.
+"""
+function default_index_cache_path(root::AbstractString)
+    norm_root = _normroot(root)
+    key = first(_sha256_hex(norm_root), 24)
+    priv = _pharos_private_root()
+    if priv !== nothing
+        custom = strip(get(ENV, "PALETTE_PHAROS_CACHE_DIR", ""))
+        base = isempty(custom) ? joinpath(priv, "pharos") : abspath(expanduser(custom))
+        r = rstrip(abspath(priv), '/')
+        (base == r || startswith(base, r * "/")) ||
+            error("private lab containment violation: Pharos cache dir ($base) escapes PALETTE_HOME ($r)")
+        return joinpath(base, "index_$(key).jls")
+    end
+    custom = strip(get(ENV, "PALETTE_PHAROS_CACHE_DIR", ""))
+    if !isempty(custom)
+        return joinpath(abspath(expanduser(custom)), "index_$(key).jls")
+    end
+    m = @__MODULE__
+    p = parentmodule(m)
+    if p !== m && isdefined(p, :STATE_DIR)
+        sd = try
+            p.STATE_DIR[]
+        catch
+            ""
+        end
+        if !isempty(sd)
+            return joinpath(sd, "pharos", "index_$(key).jls")
+        end
+    end
+    return joinpath(norm_root, ".palette", "pharos_index_$(key).jls")
+end
+
+"""
+    save_index(g::CodeGraph, path::AbstractString = default_index_cache_path(g.root)) -> String
+
+Atomically persists `g` to `path` (with `0o600` file permissions) so future
+sessions can reload it and incrementally `refresh!` unchanged files in milliseconds.
+"""
+function save_index(g::CodeGraph, path::AbstractString=default_index_cache_path(g.root))
+    dest = abspath(expanduser(String(path)))
+    _ensure_cache_dir!(dirname(dest))
+    tmp = dest * ".tmp." * string(getpid()) * "." * string(rand(UInt32))
+    payload = (
+        format=INDEX_CACHE_FORMAT,
+        julia_version=string(VERSION),
+        root=g.root,
+        graph=g,
+    )
+    try
+        open(tmp, "w") do io
+            Serialization.serialize(io, payload)
+        end
+        Sys.isunix() && chmod(tmp, 0o600)
+        mv(tmp, dest; force=true)
+        Sys.isunix() && chmod(dest, 0o600)
+    catch
+        rm(tmp; force=true)
+        rethrow()
+    end
+    return dest
+end
+
+"""
+    load_index(path::AbstractString; expected_root=nothing) -> Union{Nothing, CodeGraph}
+
+Loads a previously saved `CodeGraph` from `path`. Returns `nothing` if the file
+is missing, corrupt, from an incompatible format, or for a different `expected_root`.
+"""
+function load_index(path::AbstractString; expected_root::Union{Nothing, AbstractString}=nothing)
+    src = abspath(expanduser(String(path)))
+    isfile(src) || return nothing
+    payload = try
+        open(src, "r") do io
+            Serialization.deserialize(io)
+        end
+    catch
+        return nothing
+    end
+    payload isa NamedTuple || return nothing
+    get(payload, :format, 0) == INDEX_CACHE_FORMAT || return nothing
+    g = get(payload, :graph, nothing)
+    g isa CodeGraph || return nothing
+    if expected_root !== nothing && _normroot(g.root) != _normroot(expected_root)
+        return nothing
+    end
+    return g
+end
+
+"""
+    load_or_build(root::AbstractString; cache_path=nothing, save::Bool=true, files=nothing) -> CodeGraph
+
+Reloads a cached `CodeGraph` from `cache_path` (defaulting to
+`default_index_cache_path(root)`) and calls `refresh!(g)` so unchanged files are
+skipped via mtime/size/inode stamps (or git status fast-path) in milliseconds.
+Falls back to building a fresh `CodeGraph` on cache miss and persists it when `save=true`.
+"""
+function load_or_build(
+    root::AbstractString;
+    cache_path::Union{Nothing, AbstractString}=nothing,
+    save::Bool=true,
+    files=nothing,
+)
+    norm_root = _normroot(root)
+    cpath = cache_path === nothing ? default_index_cache_path(norm_root) : abspath(expanduser(String(cache_path)))
+    cached = load_index(cpath; expected_root=norm_root)
+    if cached !== nothing
+        refresh!(cached; files=files)
+        cached.last["cache_hit"] = true
+        cached.last["cache_path"] = cpath
+        if save && (get(cached.last, "reparsed", 0) > 0 || get(cached.last, "removed", 0) > 0 || get(cached.last, "hashed", 0) > 0)
+            try
+                save_index(cached, cpath)
+            catch
+            end
+        end
+        return cached
+    end
+    g = CodeGraph(norm_root; files=files)
+    g.last["cache_hit"] = false
+    g.last["cache_path"] = cpath
+    if save
+        try
+            save_index(g, cpath)
+        catch
+        end
+    end
+    return g
 end
 
 function Base.show(io::IO, ::MIME"text/plain", g::CodeGraph)
