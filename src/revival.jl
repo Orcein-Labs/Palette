@@ -378,6 +378,78 @@ function top_statements(ex)
     return out
 end
 
+is_pure_module_path(ex) = ex isa Symbol || ex isa GlobalRef ||
+    (ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+     is_pure_module_path(ex.args[1]) && ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol)
+
+"""
+    module_alias_parts(ex) -> Union{Nothing, NamedTuple{(:name, :rhs, :is_const)}}
+
+Extract `(name, rhs, is_const)` when `ex` is a pure top-level module-alias
+assignment (`const Alias = Mod.SubMod`, `Alias = Mod.SubMod`, `global`/`const global`).
+Rejects arbitrary expressions (calls, blocks, conditionals) on the RHS.
+"""
+function module_alias_parts(ex)
+    ex isa Expr || return nothing
+    is_const = false
+    cur = ex
+    if cur.head === :const
+        length(cur.args) == 1 || return nothing
+        is_const = true
+        cur = cur.args[1]
+        cur isa Expr || return nothing
+    end
+    if cur.head === :global
+        length(cur.args) == 1 || return nothing
+        cur = cur.args[1]
+        cur isa Expr || return nothing
+    end
+    cur.head === :(=) && length(cur.args) == 2 || return nothing
+    lhs, rhs = cur.args[1], cur.args[2]
+    is_signature(lhs) && return nothing
+    alias_sym = if lhs isa Symbol
+        lhs
+    elseif lhs isa Expr && lhs.head === :(::) && length(lhs.args) == 2 &&
+           lhs.args[1] isa Symbol && is_pure_module_path(lhs.args[2])
+        lhs.args[1]
+    else
+        return nothing
+    end
+    alias_sym in KERNEL_BINDINGS && return nothing
+    is_pure_module_path(rhs) || return nothing
+    return (name=alias_sym, rhs=rhs, is_const=is_const)
+end
+
+function _resolve_pure_module_value(mod::Module, ex)
+    if ex isa Symbol
+        latest_isdefined(mod, ex) || return nothing
+        val = latest_global(mod, ex)
+        return val isa Module ? val : nothing
+    elseif ex isa GlobalRef
+        latest_isdefined(ex.mod, ex.name) || return nothing
+        val = latest_global(ex.mod, ex.name)
+        return val isa Module ? val : nothing
+    elseif ex isa Expr && ex.head === :. && length(ex.args) == 2 &&
+           ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol
+        parent = _resolve_pure_module_value(mod, ex.args[1])
+        parent isa Module || return nothing
+        sub = ex.args[2].value
+        latest_isdefined(parent, sub) || return nothing
+        val = latest_global(parent, sub)
+        return val isa Module ? val : nothing
+    end
+    return nothing
+end
+
+function is_resolved_module_alias(mod::Module, ex)
+    parts = module_alias_parts(ex)
+    parts === nothing && return false
+    latest_isdefined(mod, parts.name) || return false
+    val = latest_global(mod, parts.name)
+    val isa Module || return false
+    return _resolve_pure_module_value(mod, parts.rhs) === val
+end
+
 function defined_names(ex)
     ex isa Expr || return String[]
     h = ex.head
@@ -400,11 +472,20 @@ function defined_names(ex)
         name = string(f)
         return [h === :macro ? "@" * name : name]
     elseif h === :const
+        parts = module_alias_parts(ex)
+        parts !== nothing && return [string(parts.name)]
         a = ex.args[1]
         a isa Expr && a.head === :(=) || return String[]
         return a.args[1] isa Symbol ? [string(a.args[1])] : String[]
     end
     return String[]
+end
+
+function statement_names(st, kind=definition_kind(st))
+    kind == "using" && return imported_names(st)
+    parts = module_alias_parts(st)
+    parts !== nothing && return [string(parts.name)]
+    return defined_names(st)
 end
 
 type_head(x) = x isa Symbol ? x : x isa Expr && x.head in (:curly, :<:, :(::)) ? type_head(x.args[1]) : x
@@ -486,7 +567,7 @@ function reconstruction_dependencies(ex)
         local_names = Set{Symbol}()
         for st in top_statements(ex.args[3])
             union!(refs, Symbol.(reconstruction_dependencies(st)))
-            union!(local_names, Symbol.(defined_names(st)), assigned_symbols(st))
+            union!(local_names, Symbol.(statement_names(st)), assigned_symbols(st))
             st isa Expr && st.head in (:using, :import) && union!(local_names, Symbol.(imported_names(st)))
         end
         setdiff!(refs, local_names)
@@ -505,6 +586,68 @@ function reconstruction_dependencies(ex)
         setdiff!(refs, assigned_symbols(ex))
     end
     return sort!(string.(setdiff(refs, Set(KERNEL_BINDINGS))))
+end
+
+function _signature_param_symbols(sig, out=Set{Symbol}())
+    sig isa Expr || return out
+    if sig.head === :call
+        for arg in sig.args[2:end]
+            if arg isa Symbol
+                push!(out, arg)
+            elseif arg isa Expr
+                if arg.head === :(::) && length(arg.args) == 2 && arg.args[1] isa Symbol
+                    push!(out, arg.args[1])
+                elseif arg.head in (:(=), :kw) && !isempty(arg.args)
+                    _signature_param_symbols(Expr(:call, :_, arg.args[1]), out)
+                elseif arg.head === :... && !isempty(arg.args)
+                    _signature_param_symbols(Expr(:call, :_, arg.args[1]), out)
+                elseif arg.head === :parameters
+                    foreach(a -> _signature_param_symbols(Expr(:call, :_, a), out), arg.args)
+                end
+            end
+        end
+    elseif sig.head === :where
+        _signature_param_symbols(sig.args[1], out)
+        for arg in sig.args[2:end]
+            name = arg isa Symbol ? arg : arg isa Expr ? type_head(arg) : nothing
+            name isa Symbol && push!(out, name)
+        end
+    elseif sig.head === :(::)
+        _signature_param_symbols(sig.args[1], out)
+    end
+    return out
+end
+
+function _body_alias_references(ex, alias_names::AbstractSet{String})
+    ex isa Expr || return String[]
+    cur = ex
+    while cur isa Expr && cur.head === :macrocall
+        cur = cur.args[end]
+    end
+    cur isa Expr || return String[]
+    refs = Set{Symbol}()
+    if cur.head in (:function, :macro) || (cur.head === :(=) && is_signature(cur.args[1]))
+        length(cur.args) >= 2 || return String[]
+        symbol_references(cur.args[2], refs)
+        setdiff!(refs, _signature_param_symbols(cur.args[1]))
+        for st in top_statements(cur.args[2])
+            setdiff!(refs, assigned_symbols(st))
+        end
+    elseif cur.head === :module && length(cur.args) >= 3
+        local_names = Set{Symbol}()
+        for st in top_statements(cur.args[3])
+            union!(refs, Symbol.(_body_alias_references(st, alias_names)))
+            union!(local_names, Symbol.(statement_names(st)), assigned_symbols(st))
+            st isa Expr && st.head in (:using, :import) && union!(local_names, Symbol.(imported_names(st)))
+        end
+        setdiff!(refs, local_names)
+    elseif cur.head === :struct && length(cur.args) >= 3
+        for st in top_statements(cur.args[3])
+            st isa Expr && (st.head in (:function, :macro) || (st.head === :(=) && is_signature(st.args[1]))) &&
+                union!(refs, Symbol.(_body_alias_references(st, alias_names)))
+        end
+    end
+    return sort!(String[string(s) for s in refs if string(s) in alias_names])
 end
 
 function round_trips(st)
@@ -526,17 +669,24 @@ end
 # A logged definition statement: the Expr itself when it was kept, else its text.
 logged_statement(e) = haskey(e, "expr_hex") ? deserialize(IOBuffer(hex2bytes(e["expr_hex"]))) : Meta.parse(e["code"])
 
-function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Module}=nothing)
+function log_definitions!(code::String, call::Int;
+                          failed_in::Union{Nothing, Module}=nothing,
+                          eval_mod::Union{Nothing, Module}=(failed_in !== nothing ? failed_in :
+                              (GLOBAL_STATE[] === nothing ? nothing : GLOBAL_STATE[].eval_module)))
     ex = try
         parse_complete(code; filename="call $call")
     catch
         return
     end
     for st in top_statements(ex)
-        kind = definition_kind(st)
+        kind = if eval_mod !== nothing && is_resolved_module_alias(eval_mod, st)
+            "module_alias"
+        else
+            definition_kind(st)
+        end
         kind === nothing && continue
         entry = Dict{String, Any}("call" => call, "kind" => kind, "code" => string(st),
-                                  "names" => kind == "using" ? imported_names(st) : defined_names(st), "requires" => reconstruction_dependencies(st))
+                                  "names" => statement_names(st, kind), "requires" => reconstruction_dependencies(st))
         # Expr printing does not always read back (a multi-iterator generator
         # with a filter prints as `$(Expr(:filter, ...))`). Such a statement is
         # kept as the Expr itself, so revival rebuilds exactly what ran.
@@ -546,7 +696,13 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
             any(e -> e["kind"] == "include" && e["call"] == call && e["path"] == path, DEFINITION_LOG) && continue
             entry["path"] = path
             entry["stamp"] = isfile(path) ? collect(file_stamp(path)) : nothing
-            entry["names"] = isfile(path) ? unique(reduce(vcat, (defined_names(d) for (_, d) in file_definitions(path)); init=String[])) : String[]
+            defs = isfile(path) ? file_definitions(path; eval_mod) : Any[]
+            entry["names"] = unique(reduce(vcat, (statement_names(d) for (_, d) in defs); init=String[]))
+            if eval_mod !== nothing
+                entry["aliases"] = unique([string(parts.name) for (_, d) in defs
+                                           for parts in (module_alias_parts(d),)
+                                           if parts !== nothing && is_resolved_module_alias(eval_mod, d)])
+            end
         end
         # In a call that failed, a statement after the error never ran. One
         # that bound nothing is left out, or a revival would report the loss
@@ -554,7 +710,7 @@ function log_definitions!(code::String, call::Int; failed_in::Union{Nothing, Mod
         if failed_in !== nothing
             # A method of another module's function (`Base.show`) cannot be
             # looked up by name here, so it is kept.
-            bound = kind == "using" ? imported_names(st) : entry["names"]
+            bound = entry["names"]
             !isempty(bound) && !any(n -> occursin('.', n) || latest_isdefined(failed_in, Symbol(n)), bound) && continue
         end
         push!(DEFINITION_LOG, entry)
@@ -565,7 +721,9 @@ end
 # Definition forms of an included file, as they are on disk now (or in
 # `sources`, a checkpoint's copies by path), with nested includes resolved the
 # same way.
-function file_definitions(path::String, depth::Int=0; sources=nothing)
+function file_definitions(path::String, depth::Int=0; sources=nothing,
+                          eval_mod::Union{Nothing, Module}=nothing,
+                          alias_names::Union{Nothing, AbstractSet{String}}=nothing)
     depth > 8 && return Any[]
     text = sources !== nothing && haskey(sources, path) ? sources[path] : read(path, String)
     ex = Meta.parseall(text; filename=path)
@@ -575,9 +733,14 @@ function file_definitions(path::String, depth::Int=0; sources=nothing)
         if kind == "include"
             inner = abspath(dirname(path), st.args[2])
             (isfile(inner) || (sources !== nothing && haskey(sources, inner))) &&
-                append!(out, file_definitions(inner, depth + 1; sources))
+                append!(out, file_definitions(inner, depth + 1; sources, eval_mod, alias_names))
         elseif kind in ("def", "using")
             push!(out, (path, st))
+        elseif (parts = module_alias_parts(st)) !== nothing
+            if (eval_mod !== nothing && is_resolved_module_alias(eval_mod, st)) ||
+               (alias_names !== nothing && string(parts.name) in alias_names)
+                push!(out, (path, st))
+            end
         end
     end
     return out
@@ -1055,7 +1218,20 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
     give_way() && return nothing
     mod = get_kernel_state().eval_module
     consts = Set(n for e in DEFINITION_LOG if e["kind"] == "const" for n in e["names"])
-    defnames = Set(n for e in DEFINITION_LOG if e["kind"] in ("def", "include") for n in e["names"])
+    defnames = Set(n for e in DEFINITION_LOG if e["kind"] in ("def", "include")
+                   for n in (e["kind"] == "include" ? setdiff(e["names"], get(e, "aliases", String[])) : e["names"]))
+    alias_calls = Dict{String, Int}()
+    for e in DEFINITION_LOG
+        if e["kind"] == "module_alias"
+            for n in e["names"]
+                alias_calls[n] = max(get(alias_calls, n, 0), Int(e["call"]))
+            end
+        elseif e["kind"] == "include"
+            for n in get(e, "aliases", String[])
+                alias_calls[n] = max(get(alias_calls, n, 0), Int(e["call"]))
+            end
+        end
+    end
     bindings = Dict{String, Any}[]
     groups = Group[]
     for (k, sym) in enumerate(sort!(Base.invokelatest(names, mod; all=true)))
@@ -1103,8 +1279,13 @@ function snapshot_state!(call::Int; @nospecialize(waiting::Function = () -> fals
             b["class"] = "runtime"
             b["reason"] = "it was not defined by top-level code of a call (inside `let`, `@eval` or a block), so it cannot be rebuilt"
         elseif v isa Module
-            b["class"] = haskey(Base.loaded_modules, Base.PkgId(v)) ? "import" : "runtime"
-            b["class"] == "runtime" && (b["reason"] = "a module defined in the session cannot be revived")
+            if get(alias_calls, name, 0) >= setcall
+                b["class"] = "definition"
+                b["check"] = "value:" * repr(v)
+            else
+                b["class"] = haskey(Base.loaded_modules, Base.PkgId(v)) ? "import" : "runtime"
+                b["class"] == "runtime" && (b["reason"] = "a module defined in the session cannot be revived")
+            end
         elseif mmap_rec !== nothing
             b["class"] = "mmap"
             b["mmap"] = Dict{String, Any}(
@@ -1354,6 +1535,11 @@ function revive_state!()
     catch
     end
 
+    bindings_by_name = Dict(b["name"] => b for b in m["bindings"])
+    include_alias_names = Set{String}(n for (n, b) in bindings_by_name if b["type"] == "module" && b["class"] == "definition")
+    legacy_include_alias_names = Set{String}(n for (n, b) in bindings_by_name
+                                             if b["type"] == "module" &&
+                                                (b["class"] == "definition" || (get(b, "const", false) === true && b["class"] != "ephemeral")))
     # Definitions, in call order. Package code loads first from `using`.
     errors = Dict{String, String}()
     changed_files = Set{String}()
@@ -1363,10 +1549,12 @@ function revive_state!()
     # the latest says whether the file changed.
     latest = Dict(e["path"] => e for e in m["definitions"] if e["kind"] == "include")
     for e in m["definitions"]
-        e["kind"] == "const" && continue
         if e["kind"] == "include"
             p = e["path"]
             superseded = latest[p] !== e
+            alias_names = haskey(e, "aliases") ?
+                Set{String}(n for n in String.(e["aliases"]) if n in include_alias_names) :
+                legacy_include_alias_names
             pinned = get(e, "pinned", nothing)
             if pinned isa AbstractDict
                 # A restored checkpoint's include: its code is the checkpoint's
@@ -1376,7 +1564,7 @@ function revive_state!()
                     foreach(n -> errors[n] = sources, e["names"])
                     continue
                 end
-                for (file, st) in file_definitions(p; sources)
+                for (file, st) in file_definitions(p; sources, alias_names)
                     push!(pending, (file, st, e))
                 end
                 continue
@@ -1388,7 +1576,7 @@ function revive_state!()
             superseded ||
                 ((e["stamp"] !== nothing && Tuple(e["stamp"]) != file_stamp(p)) || (get(e, "sha256", nothing) !== nothing && file_sha(p) != e["sha256"])) &&
                 push!(changed_files, p)
-            for (file, st) in file_definitions(p)
+            for (file, st) in file_definitions(p; alias_names)
                 push!(pending, (file, st, e))
             end
         else
@@ -1397,34 +1585,70 @@ function revive_state!()
             st = try
                 logged_statement(e)
             catch err
-                foreach(n -> errors[n] = "its definition could not be read back ($(typeof(err)))", e["names"])
+                e["kind"] == "const" || foreach(n -> errors[n] = "its definition could not be read back ($(typeof(err)))", e["names"])
                 continue
+            end
+            if e["kind"] == "const"
+                parts = module_alias_parts(st)
+                parts === nothing && continue
+                b = get(bindings_by_name, string(parts.name), nothing)
+                (b !== nothing && b["type"] == "module" && b["class"] != "ephemeral") || continue
+            elseif e["kind"] == "module_alias"
+                parts = module_alias_parts(st)
+                parts === nothing && continue
+                b = get(bindings_by_name, string(parts.name), nothing)
+                (b === nothing || (b["type"] == "module" && b["class"] == "definition")) || continue
             end
             push!(pending, (nothing, st, e))
         end
     end
     # Keep original order among replacements of the same binding, but build
     # foundational providers before eager consumers. Only deferred nodes run later.
+    alias_indices = Set{Int}(i for (i, (_, st, e)) in enumerate(pending)
+                             if e["kind"] == "module_alias" ||
+                                (module_alias_parts(st) !== nothing && definition_kind(st) != "using"))
     providers = Dict{String, Vector{Int}}()
-    names_by_item = [definition_kind(st) == "using" ? imported_names(st) : defined_names(st) for (_, st, _) in pending]
+    names_by_item = [statement_names(st, definition_kind(st)) for (_, st, _) in pending]
     for (i, names_) in enumerate(names_by_item), name in names_
         push!(get!(providers, name, Int[]), i)
     end
+    using_indices = [i for (i, (_, st, _)) in enumerate(pending) if definition_kind(st) == "using"]
+    item_requires = [reconstruction_dependencies(st) for (_, st, _) in pending]
+    alias_provider_names = Set{String}(name for i in alias_indices for name in names_by_item[i])
     dependencies = [Set{Int}() for _ in pending]
     value_dependencies = [String[] for _ in pending]
     for (i, (_, st, e)) in enumerate(pending)
-        e["requires"] = reconstruction_dependencies(st)
+        e["requires"] = item_requires[i]
         for name in e["requires"]
-            options = [j for j in get(providers, name, Int[]) if j != i && definition_kind(pending[j][2]) != "using"]
+            options = [j for j in get(providers, name, Int[])
+                       if j != i && (definition_kind(pending[j][2]) != "using" ||
+                                     (!(name in names_by_item[i]) && !any(n -> n in item_requires[j], names_by_item[i])))]
             if !isempty(options)
                 earlier = filter(j -> j < i, options)
                 push!(dependencies[i], isempty(earlier) ? first(options) : last(earlier))
             elseif !(name in names_by_item[i]) && any(b -> b["name"] == name, m["bindings"])
                 push!(value_dependencies[i], name)
+            elseif i in alias_indices && !(name in names_by_item[i]) &&
+                   !isdefined(Base, Symbol(name)) && !isdefined(Core, Symbol(name))
+                for j in using_indices
+                    any(n -> n in item_requires[j], names_by_item[i]) || push!(dependencies[i], j)
+                end
+            end
+        end
+        if !(i in alias_indices) && !isempty(alias_provider_names)
+            for name in _body_alias_references(st, alias_provider_names)
+                name in names_by_item[i] && continue
+                options = [j for j in get(providers, name, Int[]) if j != i && j in alias_indices]
+                isempty(options) && continue
+                earlier = filter(j -> j < i, options)
+                push!(dependencies[i], isempty(earlier) ? first(options) : last(earlier))
             end
         end
         for name in names_by_item[i]
-            earlier = filter(j -> j < i, get(providers, name, Int[]))
+            earlier = filter(j -> j < i &&
+                                  !(pending[j][2] isa Expr && pending[j][2].head === :using &&
+                                    st isa Expr && st.head === :module),
+                             get(providers, name, Int[]))
             isempty(earlier) || push!(dependencies[i], last(earlier))
         end
     end
@@ -1444,6 +1668,15 @@ function revive_state!()
                 delete!(waiting, i); push!(attempted, i)
                 file, st, e = pending[i]
                 try
+                    if i in alias_indices && (parts = module_alias_parts(st)) !== nothing
+                        target = _resolve_pure_module_value(mod, parts.rhs)
+                        target isa Module || error("module alias target $(parts.rhs) did not resolve to a Module")
+                        if latest_isdefined(mod, parts.name) && latest_global(mod, parts.name) === target &&
+                           (!parts.is_const || Base.invokelatest(isconst, mod, parts.name))
+                            push!(done, i)
+                            continue
+                        end
+                    end
                     file === nothing ? Core.eval(mod, st) : task_local_storage(:SOURCE_PATH, file) do
                         Core.eval(mod, st)
                     end
@@ -1642,6 +1875,11 @@ function finish_revival(m, mod, state, call, pending, failed, errors, changed_fi
             elseif any(e -> e["kind"] == "include" && n in e["names"] && e["path"] in changed_files, m["definitions"])
                 push!(inexact, n)
                 push!(approx, "$(fmt_binding(b)): rebuilt from a file that changed since")
+            elseif b["type"] == "module" && latest_isdefined(mod, Symbol(n)) &&
+                   latest_global(mod, Symbol(n)) isa Module &&
+                   string(nameof(Base.moduleroot(latest_global(mod, Symbol(n))))) in changed_packages
+                push!(inexact, n)
+                push!(approx, "$(fmt_binding(b)): rebuilt from a workspace package whose sources changed since")
             else
                 push!(rebuilt, fmt_binding(b))
                 push!(same, n)

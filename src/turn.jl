@@ -927,7 +927,7 @@ function run_execute_turn(code::String, timeout_s::Union{Nothing, Float64}, call
         sync_kernel_modules_to_main!(state.eval_module)
         note_files_named!(code, call)
         ok = turn[1] isa OperationReceipt && turn[1].result.success && !turn[2]
-        ex = log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module)
+        ex = log_definitions!(code, call; failed_in=ok ? nothing : state.eval_module, eval_mod=state.eval_module)
         ok && note_tool_uses!(ex, call, session_request)
         observe_tasks!(state.eval_module, call, code)
         turn

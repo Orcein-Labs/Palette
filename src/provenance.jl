@@ -19,9 +19,17 @@ function named_statement_sources(ex)
     return files
 end
 
+_is_main_expr(ex) = ex === :Main ||
+    (ex isa Expr && ex.head === :. && length(ex.args) == 2 && _is_main_expr(ex.args[1]) &&
+     ex.args[2] isa QuoteNode && ex.args[2].value === :Main)
+
 function symbol_references(ex, out=Set{Symbol}())
     ex isa Symbol && push!(out, ex)
     if ex isa Expr && ex.head !== :quote
+        if ex.head === :. && length(ex.args) == 2 && _is_main_expr(ex.args[1]) &&
+           ex.args[2] isa QuoteNode && ex.args[2].value isa Symbol && ex.args[2].value !== :Main
+            push!(out, ex.args[2].value)
+        end
         args = ex.head === :(=) && !is_signature(ex.args[1]) ? ex.args[2:end] : ex.args
         foreach(a -> symbol_references(a, out), args)
     end
@@ -35,7 +43,9 @@ function assigned_symbols(ex)
         return reduce(union, (assigned_symbols(a) for a in ex.args); init=Set{Symbol}())
     elseif ex.head === :(=) && !is_signature(ex.args[1])
         lhs = ex.args[1]
-        return lhs isa Symbol ? Set([lhs]) : lhs isa Expr && lhs.head === :tuple ? Set(a for a in lhs.args if a isa Symbol) : Set{Symbol}()
+        return lhs isa Symbol ? Set([lhs]) :
+               lhs isa Expr && lhs.head === :(::) && lhs.args[1] isa Symbol ? Set([lhs.args[1]]) :
+               lhs isa Expr && lhs.head === :tuple ? Set(a for a in lhs.args if a isa Symbol) : Set{Symbol}()
     end
     return Set{Symbol}()
 end
@@ -193,9 +203,9 @@ function include_observed(mod, path::AbstractString)
     finally
         if evidence !== nothing
             after = Base.invokelatest(binding_ids, mod)
-            defs = try file_definitions(full) catch; Tuple{String, Any}[] end
+            defs = try file_definitions(full; eval_mod=mod) catch; Tuple{String, Any}[] end
             statements = try top_statements(Meta.parseall(read(full, String))) catch; Any[] end
-            declared = Set(Symbol(n) for (_, st) in defs for n in defined_names(st))
+            declared = Set(Symbol(n) for (_, st) in defs for n in statement_names(st))
             union!(declared, reduce(union, (assigned_symbols(st) for st in statements); init=Set{Symbol}()))
             for (name, id) in after
                 get(before, name, nothing) == id && !(name in declared) && continue
@@ -203,9 +213,13 @@ function include_observed(mod, path::AbstractString)
                 BINDING_ORIGINS[name] = Dict{String, Any}("epoch" => TASK_EPOCH[], "source_digest" => evidence["sha256"],
                     "observed_call" => call, "sources" => Dict(full => evidence), "artifacts" => Dict{String, Any}[])
             end
-            names_ = unique(reduce(vcat, (defined_names(st) for (_, st) in defs); init=String[]))
+            names_ = unique(reduce(vcat, (statement_names(st) for (_, st) in defs); init=String[]))
+            aliases_ = unique([string(parts.name) for (_, st) in defs
+                               for parts in (module_alias_parts(st),)
+                               if parts !== nothing && is_resolved_module_alias(mod, st)])
             push!(DEFINITION_LOG, Dict{String, Any}("call" => call, "kind" => "include", "code" => "include(" * repr(full) * ")",
                 "path" => full, "stamp" => collect(file_stamp(full)), "sha256" => evidence["sha256"], "names" => names_,
+                "aliases" => aliases_,
                 "requires" => unique(reduce(vcat, (reconstruction_dependencies(st) for (_, st) in defs); init=String[]))))
         end
     end

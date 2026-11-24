@@ -850,6 +850,125 @@ end
     end
 end
 
+@testset "Revival persists and replays pure module aliases in prerequisite order" begin
+    Palette.reset_kernel_state!(; process=true)
+    old_ws, old_st = Palette.WORKSPACE_ROOT[], Palette.STATE_DIR[]
+    ws, st, side_log = mktempdir(), mktempdir(), tempname()
+    try
+        # Unit checks: pure module-alias AST gate rejects side effects and non-paths
+        @test Palette.module_alias_parts(:(const BF44 = GrailV46.BF)) == (name=:BF44, rhs=:(GrailV46.BF), is_const=true)
+        @test Palette.module_alias_parts(:(const C = A.B.C)) == (name=:C, rhs=:(A.B.C), is_const=true)
+        @test Palette.module_alias_parts(:(bf_var = GrailV46.BF)) == (name=:bf_var, rhs=:(GrailV46.BF), is_const=false)
+        @test Palette.module_alias_parts(:(const global CG = A.B)) == (name=:CG, rhs=:(A.B), is_const=true)
+        @test Palette.module_alias_parts(:(const X = make_something())) === nothing
+        @test Palette.module_alias_parts(:(const X = (println(1); GrailV46.BF))) === nothing
+        @test Palette.module_alias_parts(:(X = make_mod())) === nothing
+
+        Palette.WORKSPACE_ROOT[] = ws; Palette.STATE_DIR[] = st
+        write(joinpath(ws, "inc_aliases.jl"), "module IncMod; module Sub; k() = 7; end; end\nconst INC_SUB = IncMod.Sub\n")
+        t1, _ = Palette.execute_turn("""
+        module GrailV46; module BF; struct Box; x::Int; end; foo(x) = x + 44; end; end
+        module Outer; module Mid; module Leaf; tag() = :leaf; end; end; end
+        module ExpMod; export ExpSub; module ExpSub; v() = 9; end; end
+        using .ExpMod
+        include($(repr(joinpath(ws, "inc_aliases.jl"))))
+        const BF44 = GrailV46.BF
+        const BF44_M = Main.GrailV46.BF
+        const A_MID = Outer.Mid
+        const B_LEAF = A_MID.Leaf
+        const EXP_ALIAS = ExpSub
+        const IT_ALIAS = Base.Iterators
+        const PREBOUND_IT = Base.Iterators
+        bf_var = GrailV46.BF
+        bf_overwritten = GrailV46.BF
+        bf_dyn_over = GrailV46.BF
+        enc44(x) = BF44.foo(x)
+        struct AliasBoxHolder; b::BF44.Box; end
+        holder = AliasBoxHolder(BF44.Box(8))
+        enc_struct_box(b::BF44_M.Box) = b.x
+        enc_chain() = (B_LEAF.tag(), INC_SUB.k(), EXP_ALIAS.v())
+        enc_nonconst(x) = bf_var.foo(x)
+        make_cl(off) = x -> BF44.foo(x) + off
+        cl = make_cl(10)
+        const CL_CONST = x -> BF44_M.foo(x) + 100
+        """, 20.0)
+        @test t1[1].result.success
+        t2, _ = Palette.execute_turn("""
+        side_effects = Int[]
+        _log_side(n) = (push!(side_effects, n); open($(repr(side_log)), "a") do io; println(io, n); end)
+        make_something() = (_log_side(1); (val=99,))
+        make_mod() = (_log_side(2); Module(:DynMod))
+        struct TrapObj; sub::Module; end
+        module TrapTarget; z() = 5; end
+        trap = TrapObj(TrapTarget)
+        Base.getproperty(t::TrapObj, s::Symbol) = (_log_side(3); getfield(t, s))
+        const X_CALL = make_something()
+        const X_DYNMOD = make_mod()
+        const X_TRAP = trap.sub
+        x_dynvar = make_mod()
+        bf_overwritten = 123
+        bf_dyn_over = make_mod()
+        """, 20.0)
+        @test t2[1].result.success
+        @test read(side_log, String) == "1\n2\n3\n2\n2\n"
+        @test [e["kind"] for e in Palette.DEFINITION_LOG if "X_CALL" in e["names"]] == ["const"]
+        @test !any(e -> "x_dynvar" in e["names"], Palette.DEFINITION_LOG)
+        @test !any(e -> "X_TRAP" in e["names"] && e["kind"] == "module_alias", Palette.DEFINITION_LOG)
+        write(side_log, "")
+        @test Palette.snapshot_state!(2) !== nothing
+
+        # Reverse definitions in manifest to verify prerequisite graph topological ordering
+        mpath = joinpath(st, "manifest.json")
+        m = JSON.parse(read(mpath, String))
+        m["definitions"] = reverse(m["definitions"])
+        write(mpath, JSON.json(m))
+
+        # Full cold subprocess revival + idempotency + side-effect negative controls
+        verify_script = """
+        using Palette, Test
+        Palette.WORKSPACE_ROOT[] = $(repr(ws))
+        Palette.STATE_DIR[] = $(repr(st))
+        name = Palette.revival_module_name()
+        Palette.GLOBAL_STATE[] = Palette.KernelState(Module(Symbol(name)))
+        mod = Palette.get_kernel_state().eval_module
+        Core.eval(Main, Expr(:(=), nameof(mod), mod))
+        Core.eval(mod, :(const PREBOUND_IT = Base.Iterators))
+        rep = Base.invokelatest(Palette.revive_state!)
+        @test !occursin("BF44", Palette.REVIVAL_OBSERVATION[]["lost"] |> join)
+        @test Base.invokelatest(isdefined, mod, :BF44) && Base.invokelatest(isconst, mod, :BF44)
+        @test Base.invokelatest(isdefined, mod, :bf_var) && !Base.invokelatest(isconst, mod, :bf_var)
+        @test Base.invokelatest(getglobal, mod, :BF44) === Base.invokelatest(getglobal, mod, :BF44_M)
+        @test Base.invokelatest(getglobal, mod, :bf_var) === Base.invokelatest(getglobal, mod, :BF44)
+        @test Base.invokelatest(getglobal, mod, :IT_ALIAS) === Base.Iterators
+        @test Base.invokelatest(getglobal, mod, :PREBOUND_IT) === Base.Iterators && Base.invokelatest(isconst, mod, :PREBOUND_IT)
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :enc44), 1) == 45
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :enc_struct_box), Base.invokelatest(getglobal, mod, :BF44).Box(7)) == 7
+        @test Base.invokelatest(getglobal, mod, :holder).b.x == 8
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :enc_chain)) == (:leaf, 7, 9)
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :enc_nonconst), 2) == 46
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :cl), 1) == 55
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :CL_CONST), 1) == 145
+        @test Base.invokelatest(getglobal, mod, :bf_overwritten) == 123
+        @test !Base.invokelatest(isdefined, mod, :bf_dyn_over)
+        @test !Base.invokelatest(isdefined, mod, :X_DYNMOD)
+        @test !Base.invokelatest(isdefined, mod, :x_dynvar)
+        @test !Base.invokelatest(isdefined, mod, :X_TRAP)
+        @test Base.invokelatest(getglobal, mod, :X_CALL) == (val=99,)
+        @test Base.invokelatest(getglobal, mod, :side_effects) == [1, 2, 3, 2, 2]
+        @test read($(repr(side_log)), String) == ""
+        # Idempotent re-revival when const aliases already exist in mod
+        Base.invokelatest(Palette.revive_state!)
+        @test Base.invokelatest(Base.invokelatest(getglobal, mod, :enc44), 3) == 47
+        @test read($(repr(side_log)), String) == ""
+        """
+        run(`$(Base.julia_cmd()) -t1 --startup-file=no --project=$(dirname(@__DIR__)) -e $verify_script`)
+    finally
+        Palette.reset_kernel_state!(; process=true)
+        Palette.WORKSPACE_ROOT[] = old_ws; Palette.STATE_DIR[] = old_st
+        rm(ws; recursive=true, force=true); rm(st; recursive=true, force=true); rm(side_log; force=true)
+    end
+end
+
 # The code graph Palette.codegraph() serves, tested on its own.
 isdefined(@__MODULE__, :Pharos) || (const Pharos = Palette.Pharos)
 include("pharos.jl")
